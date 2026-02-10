@@ -184,3 +184,11 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+kpass/demo/echo_server
+kpass/demo/test_client
+kpass/lib/*.o
+kpass/lib/*.so
+kpass/lib/*.a
+kpass/kernel/*.ko
+kpass/kernel/*.o
+kpass/kernel/*.mod*

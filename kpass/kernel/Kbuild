@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Kbuild file for ceph_kpass kernel module
+#
+
+obj-m := ceph_kpass.o
+
+ccflags-y := -I$(src)
