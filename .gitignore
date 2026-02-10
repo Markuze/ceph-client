@@ -194,3 +194,13 @@ sphinx_*/
 
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc
+
+# kpass build artifacts
+kpass/demo/echo_server
+kpass/demo/test_client
+kpass/lib/*.o
+kpass/lib/*.so
+kpass/lib/*.a
+kpass/kernel/*.ko
+kpass/kernel/*.o
+kpass/kernel/*.mod*
