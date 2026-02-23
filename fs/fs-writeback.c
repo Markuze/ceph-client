@@ -653,7 +653,7 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
 	if (atomic_read(&isw_nr_in_flight) > WB_FRN_MAX_IN_FLIGHT)
 		return;
 
-	isw = kzalloc(struct_size(isw, inodes, 2), GFP_ATOMIC);
+	isw = kzalloc_flex(*isw, inodes, 2, GFP_ATOMIC);
 	if (!isw)
 		return;
 
@@ -724,8 +724,7 @@ bool cleanup_offline_cgwb(struct bdi_writeback *wb)
 	int nr;
 	bool restart = false;
 
-	isw = kzalloc(struct_size(isw, inodes, WB_MAX_INODES_PER_ISW),
-		      GFP_KERNEL);
+	isw = kzalloc_flex(*isw, inodes, WB_MAX_INODES_PER_ISW);
 	if (!isw)
 		return restart;
 
@@ -981,7 +980,7 @@ void wbc_account_cgroup_owner(struct writeback_control *wbc, struct folio *folio
 
 	css = mem_cgroup_css_from_folio(folio);
 	/* dead cgroups shouldn't contribute to inode ownership arbitration */
-	if (!(css->flags & CSS_ONLINE))
+	if (!css_is_online(css))
 		return;
 
 	id = css->id;
@@ -1075,7 +1074,7 @@ restart:
 
 		nr_pages = wb_split_bdi_pages(wb, base_work->nr_pages);
 
-		work = kmalloc(sizeof(*work), GFP_ATOMIC);
+		work = kmalloc_obj(*work, GFP_ATOMIC);
 		if (work) {
 			*work = *base_work;
 			work->nr_pages = nr_pages;
@@ -1173,7 +1172,7 @@ int cgroup_writeback_by_id(u64 bdi_id, int memcg_id,
 	dirty = dirty * 10 / 8;
 
 	/* issue the writeback work */
-	work = kzalloc(sizeof(*work), GFP_NOWAIT);
+	work = kzalloc_obj(*work, GFP_NOWAIT);
 	if (work) {
 		work->nr_pages = dirty;
 		work->sync_mode = WB_SYNC_NONE;
