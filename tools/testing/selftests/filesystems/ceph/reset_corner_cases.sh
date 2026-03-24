@@ -173,35 +173,32 @@ test_inject_error()
 
 # --- Test 2: ebusy_rejection ------------------------------------------------
 #
-# Trigger a reset, then immediately trigger a second one. The second
-# should be rejected with EBUSY.
+# Trigger a reset while another is guaranteed in-flight. Uses
+# inject_error to make the first reset take a real code path (the
+# workfn runs, consumes the flag, fails with -EIO) which is enough
+# time to race the second trigger against in_progress=true.
 
 test_ebusy_rejection()
 {
 	local num=2
 	local name="ebusy_rejection"
-	local tc_before tc_after
+	local tc_before tc_after fc_before fc_after second_rc
 
 	tc_before="$(read_status_field "trigger_count")"
+	fc_before="$(read_status_field "failure_count")"
+
+	echo 1 > "$INJECT_PATH" 2>/dev/null || {
+		result "$num" "$name" FAIL "cannot arm inject_error"
+		return
+	}
 
 	echo "ebusy_first" > "$TRIGGER_PATH" 2>/dev/null || {
 		result "$num" "$name" FAIL "first trigger failed"
 		return
 	}
 
-	if echo "ebusy_second" > "$TRIGGER_PATH" 2>/dev/null; then
-		if ! wait_reset_done 30; then
-			result "$num" "$name" FAIL "first reset never completed"
-			return
-		fi
-		tc_after="$(read_status_field "trigger_count")"
-		if [[ "$((tc_after - tc_before))" -ge 2 ]]; then
-			result "$num" "$name" FAIL "second trigger was accepted (trigger_count +$((tc_after - tc_before)))"
-			return
-		fi
-		result "$num" "$name" PASS "second trigger silently failed"
-		return
-	fi
+	second_rc=0
+	echo "ebusy_second" > "$TRIGGER_PATH" 2>/dev/null && second_rc=0 || second_rc=$?
 
 	if ! wait_reset_done 30; then
 		result "$num" "$name" FAIL "first reset never completed"
@@ -209,9 +206,20 @@ test_ebusy_rejection()
 	fi
 
 	tc_after="$(read_status_field "trigger_count")"
+	fc_after="$(read_status_field "failure_count")"
 
 	if [[ "$((tc_after - tc_before))" -ne 1 ]]; then
-		result "$num" "$name" FAIL "expected trigger_count +1, got +$((tc_after - tc_before))"
+		result "$num" "$name" FAIL "trigger_count +$((tc_after - tc_before)), expected +1"
+		return
+	fi
+
+	if [[ "$((fc_after - fc_before))" -ne 1 ]]; then
+		result "$num" "$name" FAIL "failure_count +$((fc_after - fc_before)), expected +1 (inject)"
+		return
+	fi
+
+	if [[ "$second_rc" -eq 0 ]]; then
+		result "$num" "$name" FAIL "second trigger did not return error"
 		return
 	fi
 
@@ -228,7 +236,9 @@ test_dirty_caps_at_reset()
 	local num=3
 	local name="dirty_caps_at_reset"
 	local testfile="$MOUNT_POINT/.reset_corner_dirty_caps_$$"
-	local content_before content_after line_count
+	local content_after line_count sc_before sc_after le
+
+	sc_before="$(read_status_field "success_count")"
 
 	echo "line_1_before_dirty_write" > "$testfile"
 	sync "$testfile"
@@ -255,7 +265,14 @@ sys.stdout.write('written')
 		result "$num" "$name" FAIL "reset did not complete"
 		rm -f "$testfile"
 		return
-	}
+	fi
+
+	sc_after="$(read_status_field "success_count")"
+	if [[ "$sc_after" -le "$sc_before" ]]; then
+		result "$num" "$name" FAIL "success_count did not increment (reset not exercised)"
+		rm -f "$testfile"
+		return
+	fi
 
 	sync "$testfile" 2>/dev/null || true
 	content_after="$(cat "$testfile" 2>/dev/null)" || {
@@ -304,7 +321,9 @@ test_flock_reclaim()
 	local num=4
 	local name="flock_reclaim"
 	local testfile="$MOUNT_POINT/.reset_corner_flock_$$"
-	local lock_pid probe_rc
+	local lock_pid probe_rc sc_before sc_after
+
+	sc_before="$(read_status_field "success_count")"
 
 	echo "flock_test_content" > "$testfile"
 	sync "$testfile"
@@ -329,6 +348,14 @@ test_flock_reclaim()
 	if ! wait_reset_done 30; then
 		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
 		result "$num" "$name" FAIL "reset did not complete"
+		rm -f "$testfile"
+		return
+	fi
+
+	sc_after="$(read_status_field "success_count")"
+	if [[ "$sc_after" -le "$sc_before" ]]; then
+		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
+		result "$num" "$name" FAIL "success_count did not increment (reset not exercised)"
 		rm -f "$testfile"
 		return
 	fi

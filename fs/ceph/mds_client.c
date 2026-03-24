@@ -5297,7 +5297,6 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 	char reason[CEPH_CLIENT_RESET_REASON_LEN];
 	int max_sessions, i, n = 0;
 	bool inject_error;
-	u64 reset_gen;
 	int ret = 0;
 
 	spin_lock(&st->lock);
@@ -5305,7 +5304,6 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 	inject_error = st->inject_error;
 	if (inject_error)
 		st->inject_error = false;
-	reset_gen = st->active_reset_gen;
 	spin_unlock(&st->lock);
 
 	if (inject_error) {
@@ -5341,9 +5339,8 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 		 * mdsc->mutex -> s_mutex, which would invert the
 		 * s_mutex -> mdsc->mutex order used by
 		 * cleanup_session_requests().  s_state is an int
-		 * so loads are atomic; send_mds_reconnect() will
-		 * reject sessions that transitioned to CLOSED or
-		 * REJECTED under s_mutex before proceeding.
+		 * so loads are atomic; the teardown loop below
+		 * handles races with concurrent state transitions.
 		 */
 		switch (READ_ONCE(session->s_state)) {
 		case CEPH_MDS_SESSION_OPEN:
@@ -5354,12 +5351,12 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 			break;
 		case CEPH_MDS_SESSION_RECONNECTING:
 			pr_info_client(cl,
-				       "mds%d already reconnecting, skipping\n",
+				       "mds%d already reconnecting, skipping reset\n",
 				       session->s_mds);
 			break;
 		default:
 			pr_info_client(cl,
-				       "mds%d in state %s, skipping reconnect\n",
+				       "mds%d in state %s, skipping reset\n",
 				       session->s_mds,
 				       ceph_session_state_name(session->s_state));
 			break;
@@ -5376,53 +5373,52 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 		goto out_complete;
 	}
 
-	/* Initialize completion tracking */
-	reinit_completion(&st->reconnect_done);
-	atomic_set(&st->pending_reconnects, n);
-
+	/*
+	 * Tear down each session: close the connection, remove all
+	 * caps, clean up requests, then kick pending requests so they
+	 * re-open a fresh session on the next attempt.
+	 *
+	 * This is modeled on the check_new_map() forced-close path
+	 * for stopped MDS ranks — a proven pattern for hard session
+	 * teardown.  We do NOT attempt send_mds_reconnect() because
+	 * the MDS only accepts reconnects during its own RECONNECT
+	 * phase (after MDS restart), not from an active client.
+	 */
 	for (i = 0; i < n; i++) {
-		int err;
+		int mds = sessions[i]->s_mds;
+
+		pr_info_client(cl, "mds%d resetting session\n", mds);
+
+		mutex_lock(&mdsc->mutex);
+		if (mds >= mdsc->max_sessions ||
+		    mdsc->sessions[mds] != sessions[i]) {
+			pr_info_client(cl,
+				       "mds%d session already torn down, skipping\n",
+				       mds);
+			mutex_unlock(&mdsc->mutex);
+			ceph_put_mds_session(sessions[i]);
+			continue;
+		}
+		sessions[i]->s_state = CEPH_MDS_SESSION_CLOSED;
+		__unregister_session(mdsc, sessions[i]);
+		__wake_requests(mdsc, &sessions[i]->s_waiting);
+		mutex_unlock(&mdsc->mutex);
 
 		mutex_lock(&sessions[i]->s_mutex);
-		sessions[i]->s_reset_gen = reset_gen;
+		cleanup_session_requests(mdsc, sessions[i]);
+		remove_session_caps(sessions[i]);
 		mutex_unlock(&sessions[i]->s_mutex);
 
-		err = send_mds_reconnect(mdsc, sessions[i], true);
-		if (err) {
-			bool skipped = (err == -ESTALE || err == -ENOENT);
-
-			mutex_lock(&sessions[i]->s_mutex);
-			sessions[i]->s_reset_gen = 0;
-			mutex_unlock(&sessions[i]->s_mutex);
-
-			if (skipped) {
-				pr_info_client(cl,
-					       "mds%d reconnect skipped during reset: %d\n",
-					       sessions[i]->s_mds, err);
-			} else {
-				pr_err_client(cl,
-					      "mds%d reconnect failed: %d\n",
-					      sessions[i]->s_mds, err);
-				if (!ret)
-					ret = err;
-			}
-			if (atomic_dec_and_test(&st->pending_reconnects))
-				complete(&st->reconnect_done);
-		}
 		ceph_put_mds_session(sessions[i]);
+
+		mutex_lock(&mdsc->mutex);
+		kick_requests(mdsc, mds);
+		mutex_unlock(&mdsc->mutex);
+
+		pr_info_client(cl, "mds%d session reset complete\n", mds);
 	}
 
 	kfree(sessions);
-
-	/* Wait for all sessions to complete reconnection */
-	if (!wait_for_completion_timeout(&st->reconnect_done,
-					 CEPH_CLIENT_RESET_TIMEOUT_SEC * HZ)) {
-		pr_warn_client(cl,
-			       "reset timed out waiting for %d sessions\n",
-			       atomic_read(&st->pending_reconnects));
-		if (!ret)
-			ret = -ETIMEDOUT;
-	}
 
 out_complete:
 	ceph_mdsc_reset_complete(mdsc, ret);
