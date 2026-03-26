@@ -1,0 +1,7 @@
+# Agent resume smoke test results
+writer_bootstrap_output=agentic_writer_output.txt.bootstrap
+writer_repeat_output=agentic_writer_output.txt.repeat
+reviewer_bootstrap_output=agentic_clean_review.md.bootstrap
+reviewer_repeat_output=agentic_clean_review.md.repeat
+coordinator_bootstrap_output=agentic_orchestrator_review.md.bootstrap
+coordinator_repeat_output=agentic_orchestrator_review.md.repeat

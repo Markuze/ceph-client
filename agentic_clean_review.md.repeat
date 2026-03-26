@@ -1,0 +1,13 @@
+AGENT=Reviewer-1
+MODE=resume
+TASK_FILE=agentic_resume_test_task.md
+`agentic_clean_review.md` has been resumed and updated for **repeat** mode.
+
+What was updated:
+- Switched `MODE` from `bootstrap` to `resume`.
+- Kept `AGENT=Reviewer-1` and `TASK_FILE=agentic_resume_test_task.md`.
+- Updated result to indicate bootstrap-to-resume alignment is clean, with no blocking findings.
+- Confirmed writer bootstrap provenance (`AGENT=Writer`, `MODE=bootstrap`, `TASK_FILE=agentic_resume_test_task.md`, status OK).
+- Added follow-up that resume/repeat control-path validation is now complete and loop should continue to `agentic_next_task.md`.
+
+If you want, I can now produce a companion `.repeat` file entry as a separate resumed artifact for your harness format.

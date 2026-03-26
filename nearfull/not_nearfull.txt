@@ -1,0 +1,115 @@
+Venky,
+
+I went through the kernel client code and I don't think the nearfull
+mechanism can explain what happened here. The stall lasted ~3h52m on a
+cluster at 3% utilization (46 GiB / 1.5 TiB) with HEALTH_OK. The pgmap
+during the stall shows:
+
+    191 KiB/s wr, 4 op/s
+
+After MGR restart it jumped to:
+
+    325 MiB/s wr, 1.09k op/s
+
+That's a 1000x difference. Here's why nearfull can't produce this:
+
+1. The nearfull check is stateless -- no "mode" to get stuck in.
+
+   Every write() reads the osdmap flags fresh:
+
+       down_read(&osdc->lock);
+       map_flags = osdc->osdmap->flags;
+       pool_flags = ceph_pg_pool_flags(osdc->osdmap, ci->i_layout.pool_id);
+       up_read(&osdc->lock);
+                                               -- file.c:2388-2391
+
+   These are local variables, re-read on every syscall. At 3% used /
+   HEALTH_OK, neither CEPH_OSDMAP_NEARFULL nor CEPH_POOL_FLAG_NEARFULL
+   can be set. There is nothing to "switch back" because nothing latches.
+
+2. Nearfull does NOT reroute writes to ceph_sync_write.
+
+   The buffered-vs-sync decision at file.c:2423 is based on whether the
+   client holds Fb. Nearfull runs AFTER the write succeeds and just adds
+   IOCB_DSYNC (file.c:2493-2495), forcing a post-write flush via
+   generic_write_sync. Data still goes through page cache.
+
+3. The cluster-wide CEPH_OSDMAP_NEARFULL flag is legacy.
+
+   include/linux/ceph/rados.h:146-147:
+
+       #define CEPH_OSDMAP_NEARFULL (1<<0)  /* sync writes (near ENOSPC),
+                                               not set since ~luminous */
+
+   The code comment itself says this flag is no longer set. Only the
+   per-pool CEPH_POOL_FLAG_NEARFULL is relevant on this cluster.
+
+4. The pgmap numbers don't fit nearfull anyway.
+
+   4 op/s across 8 FIO files (nrfiles=8) points to per-write OSD
+   round-trips with high per-op latency. If this were just DSYNC
+   post-flush on buffered writes, writepages would still batch pages
+   and we'd see larger ops at higher IOPS, not 4 op/s.
+
+   4 op/s with 191 KiB/s means ~48 KiB per op -- consistent with
+   ceph_sync_write coalescing a few pages, not with writepages batching
+   hundreds of pages per request.
+
+The real question is: what persistent mechanism forced per-write OSD
+round-trips for ~4 hours on a healthy cluster?
+
+
+I have two theories and would appreciate your take:
+
+(1) Did the MDS withhold Fb after the session disruption?
+
+    The disruption (OSD-1, mon-b restarts) happened ~50 min before FIO
+    started. If the session went through STALE or RECONNECT during that
+    window, s_cap_gen gets bumped (mds_client.c:5047 for reconnect,
+    mds_client.c:4456 for STALE), invalidating all caps.
+
+    When the MDS re-grants caps, if it issued Fw without Fb -- for any
+    reason (locker state, pending revocations, pool state at the time of
+    recovery) -- the client silently falls through to ceph_sync_write on
+    every write (file.c:2423). No log, no error. The client keeps
+    requesting Fb as a "want" (file.c:2406), but try_get_cap_refs just
+    returns what's available (caps.c:2913-2916).
+
+    This is the only mechanism I can find that is:
+      - persistent (no timeout, no self-healing)
+      - consistent with 4 op/s and ~200 KiB/s
+      - consistent with all 8 FIO files stalling (s_cap_gen is per-session,
+        affects every inode)
+      - explained by the MGR restart fix (MGR restart -> MDS map epoch
+        bump -> check_new_map -> cap re-evaluation -> Fb re-granted)
+
+    Can you think of a scenario where the MDS would grant Fw but withhold
+    Fb after reconnect and not re-evaluate? Is there a code path in the
+    MDS locker where Fb stays suppressed after a pool was nearfull, even
+    after the pool flags clear? And would a map epoch bump from MGR restart
+    be enough to trigger re-evaluation on the MDS side?
+
+(2) Could the client have been holding a stale osdmap with the pool
+    NEARFULL flag still set?
+
+    After mon-b restarted, there could have been a subscription gap.
+    Notably, NEARFULL does not trigger continuous osdmap subscription
+    (osd_client.c:2364-2376 -- only FULL/PAUSERD/PAUSEWR do). So the
+    client might not aggressively request new maps.
+
+    I think this is weaker because every OSD write response carries the
+    OSD's map epoch, which should trigger a map refresh within seconds.
+    But it's worth ruling out.
+
+    @Rakshith / @Daniel -- is there any way to pull the client's osdmap
+    epoch from the must-gather or logs? We need to compare the client's
+    epoch vs the cluster's epoch during the 04:02-07:54 UTC window to
+    confirm or rule this out. The client exposes this via
+    /sys/kernel/debug/ceph/<fsid>/osdmap, but I don't know if that was
+    captured.
+
+    Also: was the per-pool NEARFULL flag actually set during the preceding
+    RBD fill test? The configured nearfull_ratio is 0.75, and the RBD test
+    filled to ~97%, so it should have been set and then cleared. Can you
+    confirm from mon logs when the CephFS data pool's NEARFULL flag was
+    set and cleared?

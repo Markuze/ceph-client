@@ -1,0 +1,228 @@
+/home/ubuntu/linux
+git pull 128
+fs/ceph/super.c:58:67: error: expected ';' after top level declarator
+   58 | static int ceph_statfs(struct dentry *dentry, struct kstatfs *buf)
+      |                                                                   ^
+      |                                                                   ;
+fs/ceph/super.c:59:63: error: use of undeclared identifier 'dentry'
+   59 |         struct ceph_fs_client *fsc = ceph_inode_to_fs_client(d_inode(dentry));
+      |                                                                      ^
+fs/ceph/super.c:60:33: error: initializer element is not a compile-time constant
+   60 |         struct ceph_mon_client *monc = &fsc->client->monc;
+      |                                        ^~~~~~~~~~~~~~~~~~
+fs/ceph/super.c:65:2: error: expected identifier or '('
+   65 |         doutc(fsc->client, "begin\n");
+      |         ^
+./include/linux/ceph/ceph_debug.h:46:2: note: expanded from macro 'doutc'
+   46 |         pr_debug(" [%pU %llu] %s: " fmt, &client->fsid,                 \
+      |         ^
+./include/linux/printk.h:635:2: note: expanded from macro 'pr_debug'
+  635 |         dynamic_pr_debug(fmt, ##__VA_ARGS__)
+      |         ^
+./include/linux/dynamic_debug.h:280:2: note: expanded from macro 'dynamic_pr_debug'
+  280 |         _dynamic_func_call(fmt, __dynamic_pr_debug,             \
+      |         ^
+./include/linux/dynamic_debug.h:261:2: note: expanded from macro '_dynamic_func_call'
+  261 |         _dynamic_func_call_cls(_DPRINTK_CLASS_DFLT, fmt, func, ##__VA_ARGS__)
+      |         ^
+./include/linux/dynamic_debug.h:259:2: note: expanded from macro '_dynamic_func_call_cls'
+  259 |         __dynamic_func_call_cls(__UNIQUE_ID(ddebug), cls, fmt, func, ##__VA_ARGS__)
+      |         ^
+./include/linux/dynamic_debug.h:228:58: note: expanded from macro '__dynamic_func_call_cls'
+  228 | #define __dynamic_func_call_cls(id, cls, fmt, func, ...) do {   \
+      |                                                          ^
+fs/ceph/super.c:65:2: error: while loop outside of a function
+./include/linux/ceph/ceph_debug.h:46:2: note: expanded from macro 'doutc'
+   46 |         pr_debug(" [%pU %llu] %s: " fmt, &client->fsid,                 \
+      |         ^
+./include/linux/printk.h:635:2: note: expanded from macro 'pr_debug'
+  635 |         dynamic_pr_debug(fmt, ##__VA_ARGS__)
+      |         ^
+./include/linux/dynamic_debug.h:280:2: note: expanded from macro 'dynamic_pr_debug'
+  280 |         _dynamic_func_call(fmt, __dynamic_pr_debug,             \
+      |         ^
+./include/linux/dynamic_debug.h:261:2: note: expanded from macro '_dynamic_func_call'
+  261 |         _dynamic_func_call_cls(_DPRINTK_CLASS_DFLT, fmt, func, ##__VA_ARGS__)
+      |         ^
+./include/linux/dynamic_debug.h:259:2: note: expanded from macro '_dynamic_func_call_cls'
+  259 |         __dynamic_func_call_cls(__UNIQUE_ID(ddebug), cls, fmt, func, ##__VA_ARGS__)
+      |         ^
+./include/linux/dynamic_debug.h:234:3: note: expanded from macro '__dynamic_func_call_cls'
+  234 | } while (0)
+      |   ^
+fs/ceph/super.c:66:2: error: expected identifier or '('
+   66 |         if (fsc->mdsc->mdsmap->m_num_data_pg_pools == 1) {
+      |         ^
+fs/ceph/super.c:68:4: error: expected identifier or '('
+   68 |         } else {
+      |           ^
+fs/ceph/super.c:72:2: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]
+   72 |         err = ceph_monc_do_statfs(monc, data_pool, &st);
+      |         ^
+      |         int
+fs/ceph/super.c:72:8: error: initializer element is not a compile-time constant
+   72 |         err = ceph_monc_do_statfs(monc, data_pool, &st);
+      |               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+fs/ceph/super.c:73:2: error: expected identifier or '('
+   73 |         if (err < 0)
+      |         ^
+fs/ceph/super.c:77:2: error: unknown type name 'buf'
+   77 |         buf->f_type = CEPH_SUPER_MAGIC;  /* ?? */
+      |         ^
+fs/ceph/super.c:77:5: error: expected identifier or '('
+   77 |         buf->f_type = CEPH_SUPER_MAGIC;  /* ?? */
+      |            ^
+fs/ceph/super.c:83:2: error: unknown type name 'buf'
+   83 |         buf->f_frsize = 1 << CEPH_BLOCK_SHIFT;
+      |         ^
+fs/ceph/super.c:83:5: error: expected identifier or '('
+   83 |         buf->f_frsize = 1 << CEPH_BLOCK_SHIFT;
+      |            ^
+fs/ceph/super.c:90:2: error: expected identifier or '('
+   90 |         if (ceph_test_mount_opt(fsc, NOQUOTADF) ||
+      |         ^
+fs/ceph/super.c:103:2: error: unknown type name 'buf'
+  103 |         buf->f_bsize = buf->f_frsize;
+      |         ^
+fs/ceph/super.c:103:5: error: expected identifier or '('
+  103 |         buf->f_bsize = buf->f_frsize;
+      |            ^
+fs/ceph/super.c:105:2: error: unknown type name 'buf'
+  105 |         buf->f_files = le64_to_cpu(st.num_objects);
+      |         ^
+fs/ceph/super.c:105:5: error: expected identifier or '('
+  105 |         buf->f_files = le64_to_cpu(st.num_objects);
+      |            ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+make[4]: *** [scripts/Makefile.build:289: fs/ceph/super.o] Error 1
+make[3]: *** [scripts/Makefile.build:546: fs/ceph] Error 2
+make[2]: *** [scripts/Makefile.build:546: fs] Error 2
+make[1]: *** [/home/ubuntu/linux/Makefile:2101: .] Error 2
+make: *** [Makefile:248: __sub-make] Error 2
+Compilation 2
+/home/ubuntu/linux
+Already up to date.
+git pull 0
+Compilation 0
+Rebooting
+  INSTALL /lib/modules/7.0.0-rc1+/modules.order
+  INSTALL /lib/modules/7.0.0-rc1+/modules.builtin
+  INSTALL /lib/modules/7.0.0-rc1+/modules.builtin.modinfo
+  SYMLINK /lib/modules/7.0.0-rc1+/build
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/arch/x86/events/rapl.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/arch/x86/events/rapl.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/arch/x86/crypto/aesni-intel.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/arch/x86/crypto/aesni-intel.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/arch/x86/crypto/ghash-clmulni-intel.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/arch/x86/crypto/ghash-clmulni-intel.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/arch/x86/kvm/kvm.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/arch/x86/kvm/kvm.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/arch/x86/kvm/kvm-intel.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/arch/x86/kvm/kvm-intel.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/arch/x86/kvm/kvm-amd.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/arch/x86/kvm/kvm-amd.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/kernel/configs.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/kernel/configs.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/nls/nls_iso8859-1.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/nls/nls_iso8859-1.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/binfmt_misc.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/binfmt_misc.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/netfs/netfs.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/netfs/netfs.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/isofs/isofs.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/isofs/isofs.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/autofs/autofs4.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/autofs/autofs4.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/btrfs/btrfs.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/btrfs/btrfs.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/fs/ceph/ceph.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/fs/ceph/ceph.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/cmac.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/cmac.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/cryptd.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/cryptd.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/camellia_generic.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/camellia_generic.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/authenc.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/authenc.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/authencesn.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/authencesn.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/krb5enc.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/krb5enc.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/xor.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/xor.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_tx.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_tx.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_memcpy.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_memcpy.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_xor.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_xor.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_pq.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_pq.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_raid6_recov.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/async_tx/async_raid6_recov.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/crypto/krb5/krb5.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/crypto/krb5/krb5.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/lib/crypto/libblake2b.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/lib/crypto/libblake2b.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/lib/raid6/raid6_pq.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/lib/raid6/raid6_pq.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/acpi/nfit/nfit.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/acpi/nfit/nfit.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/char/hw_random/virtio-rng.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/char/hw_random/virtio-rng.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/block/floppy.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/block/floppy.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/macintosh/mac_hid.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/macintosh/mac_hid.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/ata/pata_acpi.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/ata/pata_acpi.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/input/serio/serio_raw.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/input/serio/serio_raw.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/input/mouse/psmouse.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/input/mouse/psmouse.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/input/input-leds.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/input/input-leds.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/input/joydev.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/input/joydev.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/i2c/busses/i2c-piix4.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/i2c/busses/i2c-piix4.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/i2c/i2c-smbus.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/i2c/i2c-smbus.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid0.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid0.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid1.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid1.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid10.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid10.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid456.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/md/raid456.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/md/dm-multipath.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/md/dm-multipath.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/md/dm-round-robin.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/md/dm-round-robin.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/edac/skx_edac.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/edac/skx_edac.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/edac/skx_edac_common.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/edac/skx_edac_common.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/edac/i10nm_edac.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/edac/i10nm_edac.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/firmware/efi/efi-pstore.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/firmware/efi/efi-pstore.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/firmware/qemu_fw_cfg.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/firmware/qemu_fw_cfg.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/powercap/intel_rapl_common.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/powercap/intel_rapl_common.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/drivers/powercap/intel_rapl_msr.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/drivers/powercap/intel_rapl_msr.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/net/sched/sch_fq_codel.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/net/sched/sch_fq_codel.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/net/tls/tls.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/net/tls/tls.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/net/ceph/libceph.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/net/ceph/libceph.ko
+  INSTALL /lib/modules/7.0.0-rc1+/kernel/virt/lib/irqbypass.ko
+  SIGN    /lib/modules/7.0.0-rc1+/kernel/virt/lib/irqbypass.ko
+  DEPMOD  /lib/modules/7.0.0-rc1+
+  INSTALL /boot

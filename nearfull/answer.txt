@@ -1,0 +1,128 @@
+Venky,
+
+I went through the kernel client write path. The stall lasted ~3h52m
+on a cluster at 3% utilization, HEALTH_OK.
+
+I don't think nearfull can explain this. The nearfull check in the client
+is stateless -- every write() reads the flags from osdc->osdmap
+(file.c:2388-2391), which is the client's in-memory osdmap, updated
+whenever the monitor pushes a new map. There is no client-side "nearfull
+mode" that latches -- if the osdmap is current and the pool is not
+nearfull, the DSYNC path at file.c:2493 is simply not taken on the next
+write().
+
+So for nearfull to explain a multi-hour stall, one of two things would
+need to be true: either the client's osdmap was stale for the entire
+duration (see Theory 2 below), or there is some mechanism outside the
+osdmap that suppresses buffered writes. The cluster-wide
+CEPH_OSDMAP_NEARFULL is marked as legacy in the source (rados.h:146:
+"not set since ~luminous") so only the per-pool flag matters here.
+
+Do you know if there's any MDS-side mechanism that would independently
+enforce nearfull-like behavior, e.g., by withholding caps based on pool
+fullness state?
+
+Here are two theories I'd appreciate your take on:
+
+
+Theory 1: Missing Fb cap -- a different path to the same slow writes
+=====================================================================
+
+While the nearfull DSYNC path is not sticky, there is another code path
+that produces the same symptom and IS sticky: writing without the Fb
+(FILE_BUFFER) cap.
+
+The buffered-vs-sync write decision at file.c:2423 depends entirely on
+whether the client holds Fb:
+
+    if ((got & (CEPH_CAP_FILE_BUFFER|CEPH_CAP_FILE_LAZYIO)) == 0 ||
+        (iocb->ki_flags & IOCB_DIRECT) || (fi->flags & CEPH_F_SYNC) ||
+        (ci->i_ceph_flags & CEPH_I_ERROR_WRITE)) {
+        ...
+        written = ceph_sync_write(iocb, &data, pos, snapc);
+
+Without Fb, every write goes through ceph_sync_write -- one OSD
+round-trip per write, regardless of nearfull state. Unlike the nearfull
+DSYNC path, this IS sticky: the client requests Fb as a "want"
+(file.c:2406) but if the MDS doesn't grant it, try_get_cap_refs silently
+returns only what's available (caps.c:2913-2916):
+
+    if ((have & want) == want)
+        *got = need | (want & ~exclude);
+    else
+        *got = need;
+
+No error, no log, no timeout. The client will keep writing through the
+slow sync path indefinitely until the MDS re-grants Fb.
+
+The disruption (OSD-1, mon-b restarts) happened ~50 min before FIO
+started. If the client's MDS session went through STALE or RECONNECT
+during that window, s_cap_gen gets bumped (mds_client.c:5047 for
+reconnect, mds_client.c:4456 for STALE), invalidating all caps for
+every inode on the session. The MDS then re-grants caps, but the
+question is whether Fb was included.
+
+This fits all the observations:
+  - persistent -- no self-healing, persists until MDS re-evaluates caps
+  - affects all 8 FIO files simultaneously (s_cap_gen is per-session,
+    invalidates caps on every inode)
+  - explained by the MGR restart fix (MGR restart -> MDS map epoch bump
+    -> check_new_map -> cap re-evaluation -> Fb re-granted)
+
+Questions for you:
+  - Is there a scenario where the MDS locker would grant Fw but withhold
+    Fb after reconnect and not re-evaluate until a map epoch bump? Could
+    pool fullness state at reconnect time cause the MDS to suppress Fb
+    persistently, even after the pool clears nearfull?
+  - Would check_new_map triggered by a MGR restart cause the MDS to
+    re-evaluate cap grants?
+  - Can you check the MDS logs from the disruption window for this
+    client's session -- specifically whether STALE or RECONNECT occurred,
+    and what caps were granted afterward (pAsLsXsFwb vs pAsLsXsFw)?
+
+
+Theory 2: Stale osdmap retaining pool NEARFULL flag (secondary)
+===============================================================
+
+After mon-b restarted, the client may have been left holding a stale
+osdmap where the CephFS data pool still has CEPH_POOL_FLAG_NEARFULL set.
+Every write() would then hit the DSYNC path at file.c:2493-2495, forcing
+a synchronous flush after each buffered write.
+
+The kernel client does not use continuous osdmap subscription for
+nearfull -- only FULL/PAUSERD/PAUSEWR trigger continuous subscription
+(osd_client.c:2364-2376). So after a mon restart the subscription may
+not be renewed promptly.
+
+This theory is weaker because every OSD write response carries the OSD's
+map epoch, which should trigger a map refresh within seconds. A stale
+osdmap could explain the initial minutes but is hard to sustain for
+~4 hours unless the map update handling is also broken.
+
+@Rakshith / @Daniel -- is there any way to pull the client's osdmap
+epoch from the must-gather or logs? We need to compare the client's
+epoch vs the cluster's epoch during the 04:02-07:54 UTC window. The
+client exposes this via /sys/kernel/debug/ceph/<fsid>/osdmap, but I
+don't know if that was captured.
+
+Also: was the per-pool NEARFULL flag actually set during the preceding
+RBD fill test? The configured nearfull_ratio is 0.75 and the RBD test
+filled to ~97%, so it should have been set and then cleared. Can you
+confirm from mon logs when the CephFS data pool's NEARFULL flag was
+set and cleared?
+
+
+Next steps
+==========
+
+If this reproduces, the most useful diagnostic during the stall would be:
+
+    cat /sys/kernel/debug/ceph/<fsid>/caps
+
+If the target inodes show Fw without Fb, Theory 1 is confirmed. Enabling
+dynamic debug on the client would also help:
+
+    echo 'file fs/ceph/file.c +p' > /sys/kernel/debug/dynamic_debug/control
+
+The doutc at file.c:2420-2421 prints "got cap refs on %s" with the exact
+cap set obtained for each write -- Fw without Fb would be the smoking gun.

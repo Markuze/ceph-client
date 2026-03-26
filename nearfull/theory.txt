@@ -1,0 +1,72 @@
+Theory 1: Lost Fb (FILE_BUFFER) cap after MDS session disruption
+=================================================================
+
+During the OSD-1/mon-b restarts, the client's MDS session likely went
+through a STALE or RECONNECT transition. Both paths bump s_cap_gen
+(mds_client.c:5047 / 4456), which immediately invalidates all held caps.
+The MDS then re-grants caps in the reconnect/renewal response, but may
+only issue Fw (FILE_WR) without Fb (FILE_BUFFER).
+
+Without Fb, the write path at file.c:2423 falls through to
+ceph_sync_write on every write() call. For 4K sequential writes, this
+means one OSD round-trip per write: at ~5-10ms OSD latency, that's
+100-200 writes/s = 200-800 KiB/s. This matches the observed symptom
+exactly.
+
+This fallback is completely silent -- no error, no kernel log message,
+no metric. The client keeps requesting Fb as a "want" on each write,
+but try_get_cap_refs (caps.c:2913-2916) silently returns only what the
+MDS granted.
+
+The mgr restart fix also fits: mgr restart causes an MDS map epoch bump,
+which triggers check_new_map -> cap re-evaluation. The MDS reassesses
+its cap grants and re-issues Fb, immediately restoring buffered writes
+and ~300 MiB/s throughput.
+
+This is the only theory that explains all three observations:
+  - Steady ~200 KiB/s (not bursty, not zero)
+  - Persists for hours on a healthy cluster
+  - Fixed by mgr restart
+
+Question for Venky:
+  Can you pull the MDS logs from the disruption window and check whether
+  the client's session went through STALE or RECONNECT? Specifically,
+  look for the cap grant messages after recovery -- did the MDS grant
+  pAsLsXsFwb (with buffer) or just pAsLsXsFw (without)? If you have
+  the client's debugfs output from during the stall, check
+  /sys/kernel/debug/ceph/<fsid>/caps for the target inode's granted caps.
+
+
+Theory 2: Stale osdmap retaining pool NEARFULL flag
+===================================================
+
+After mon-b restarted, the client may have been left holding a stale
+osdmap where the CephFS data pool still has CEPH_POOL_FLAG_NEARFULL set.
+The kernel client checks pool flags on every write (file.c:2388-2391)
+and if NEARFULL is set, adds IOCB_DSYNC (file.c:2493-2495), forcing a
+synchronous flush after each buffered write. For single-threaded 4K
+sequential writes, this produces the same one-OSD-roundtrip-per-write
+pattern as Theory 1.
+
+The nearfull osdmap subscription is one-shot, not continuous -- the
+client only subscribes continuously for FULL/PAUSERD/PAUSEWR
+(osd_client.c:2364-2376), not for NEARFULL. So after a mon restart,
+the subscription may not be renewed promptly.
+
+However, this theory has a weakness: every OSD write response carries
+the OSD's map epoch. If the client is doing 200+ writes/s to OSDs, it
+should receive updated epoch info almost immediately, triggering a map
+refresh. A stale osdmap can explain the first few minutes but is hard
+to sustain for hours unless the OSD response handling is also broken.
+
+This is a secondary theory -- possible as an initial trigger but
+unlikely as the sole cause of a 4-hour stall.
+
+Question for Venky:
+  Was the client's osdmap epoch current during the stall? You can check
+  this on the client via /sys/kernel/debug/ceph/<fsid>/osdmap and compare
+  against the cluster's epoch (ceph osd dump | head -1). If the client's
+  epoch is behind, that confirms this theory. Also: was the pool's
+  NEARFULL flag actually set at any point during or after the RBD fill
+  test? Can you confirm from mon logs when the per-pool NEARFULL flag
+  was set and cleared?
