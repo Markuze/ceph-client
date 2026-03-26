@@ -82,11 +82,10 @@ log() {
   if (( ${#left} < 50 )); then
     pad=$((50 - ${#left}))
   fi
-  printf -v line '%s%*s%s
-' "$left" "$pad" '' "detail=${CURRENT_DETAIL_HINT}"
-  printf '%s' "$line" >&2
+  printf -v line '%s%*s%s\n' "$left" "$pad" '' "detail=${CURRENT_DETAIL_HINT}"
+  printf '%b' "$line" >&2
   mkdir -p "$(dirname "$AGENTIC_STATUS_LOG_FILE")"
-  printf '%s' "$line" >>"$AGENTIC_STATUS_LOG_FILE"
+  printf '%b' "$line" >>"$AGENTIC_STATUS_LOG_FILE"
 }
 
 set_loop_context() {
@@ -99,8 +98,8 @@ set_loop_context() {
 
 init_status_log() {
   mkdir -p "$(dirname "$AGENTIC_STATUS_LOG_FILE")"
-  printf '=== agentic run start utc=%s pid=%s mode=%s reset=%s ===
-'     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$RUN_MODE" "$RESET_SESSIONS" >>"$AGENTIC_STATUS_LOG_FILE"
+  printf '=== agentic run start utc=%s pid=%s mode=%s reset=%s ===\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$RUN_MODE" "$RESET_SESSIONS" >>"$AGENTIC_STATUS_LOG_FILE"
 }
 
 trim_whitespace() {
@@ -770,7 +769,7 @@ run_build() {
 
 should_skip_commit_path() {
   case "$1" in
-    agentic_dev_loop.sh|client_reset_dir|client_reset_dir/*|.agentic_env|.agentic_sessions|.agentic_sessions/*|.agentic_*|task.md|review.md|test_result.txt|build.log|agentic_worker_output.txt|agentic_orchestrator_output.txt|agentic_update.log|agentic_tests.log)
+    agentic_dev_loop.sh|client_reset_dir|client_reset_dir/*|.agentic_env|.agentic_sessions|.agentic_sessions/*|.agentic_*|task.md|review.md|test_result.txt|build.log|agentic_worker_output.txt|agentic_orchestrator_output.txt|agentic_update.log|agentic_tests.log|agentic_loop.log|agentic_clean_review.md|agentic_clean_review.md.*|agentic_orchestrator_review.md|agentic_orchestrator_review.md.*|agentic_resume_test.log|agentic_resume_test_task.md|agentic_writer_output.txt|agentic_writer_output.txt.*|agentic_next_task.md|update.txt|codex_53_v2.md|config-*|nearfull|nearfull/*)
       return 0
       ;;
     *)
@@ -781,14 +780,27 @@ should_skip_commit_path() {
 
 stage_commit_changes() {
   local path=""
-  git add -u
+  local -A seen=()
+
   while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    if [[ -n "${seen[$path]:-}" ]]; then
+      continue
+    fi
+    seen[$path]=1
     if should_skip_commit_path "$path"; then
       log "Skipping DO NOT COMMIT path: ${path}"
       continue
     fi
-    git add -- "$path"
-  done < <(git ls-files --others --exclude-standard)
+    git add -A -- "$path"
+  done < <(
+    {
+      git diff --name-only
+      git diff --cached --name-only
+      git ls-files --others --exclude-standard
+      git ls-files --deleted
+    } | sed '/^$/d'
+  )
 }
 
 commit_and_push() {
