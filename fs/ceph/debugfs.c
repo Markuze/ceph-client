@@ -374,8 +374,10 @@ static int reset_status_show(struct seq_file *s, void *p)
 	u64 trigger = 0, success = 0, failure = 0;
 	unsigned long last_start = 0, last_finish = 0;
 	int last_errno = 0;
-	bool in_progress = false;
+	enum ceph_client_reset_phase phase = CEPH_CLIENT_RESET_IDLE;
 	bool inject_error = false;
+	bool drain_timed_out = false;
+	int sessions_reset = 0;
 	int pending_reconnects = 0;
 	int blocked_requests = 0;
 	char reason[CEPH_CLIENT_RESET_REASON_LEN];
@@ -392,15 +394,17 @@ static int reset_status_show(struct seq_file *s, void *p)
 	last_start = st->last_start;
 	last_finish = st->last_finish;
 	last_errno = st->last_errno;
-	in_progress = st->in_progress;
+	phase = st->phase;
 	inject_error = st->inject_error;
+	drain_timed_out = st->drain_timed_out;
+	sessions_reset = st->sessions_reset;
 	strscpy(reason, st->last_reason, sizeof(reason));
 	spin_unlock(&st->lock);
 
 	pending_reconnects = atomic_read(&st->pending_reconnects);
 	blocked_requests = atomic_read(&st->blocked_requests);
 
-	seq_printf(s, "in_progress: %s\n", in_progress ? "yes" : "no");
+	seq_printf(s, "phase: %s\n", ceph_reset_phase_name(phase));
 	seq_printf(s, "trigger_count: %llu\n", trigger);
 	seq_printf(s, "success_count: %llu\n", success);
 	seq_printf(s, "failure_count: %llu\n", failure);
@@ -419,6 +423,10 @@ static int reset_status_show(struct seq_file *s, void *p)
 		   reason[0] ? reason : "(none)");
 	seq_printf(s, "inject_error_pending: %s\n",
 		   inject_error ? "yes" : "no");
+	seq_printf(s, "drain_timed_out: %s\n",
+		   drain_timed_out ? "yes" : "no");
+	seq_printf(s, "sessions_reset: %d\n", sessions_reset);
+	/* pending_reconnects: always 0 for manual reset (MDS-reconnect only) */
 	seq_printf(s, "pending_reconnects: %d\n", pending_reconnects);
 	seq_printf(s, "blocked_requests: %d\n", blocked_requests);
 

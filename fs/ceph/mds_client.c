@@ -3757,7 +3757,7 @@ int ceph_mdsc_submit_request(struct ceph_mds_client *mdsc, struct inode *dir,
 	 * If a reset is in progress, wait for it to complete.
 	 *
 	 * This is best-effort: a request can pass this check just
-	 * before in_progress is set and proceed concurrently with
+	 * before the phase leaves IDLE and proceed concurrently with
 	 * reset.  That is acceptable because (a) such requests will
 	 * either complete normally or fail and be retried by the
 	 * caller, and (b) adding lock serialization here would
@@ -5215,9 +5215,20 @@ static void ceph_mdsc_reconnect_session_done(struct ceph_mds_client *mdsc,
 		complete(&st->reconnect_done);
 }
 
+const char *ceph_reset_phase_name(enum ceph_client_reset_phase phase)
+{
+	switch (phase) {
+	case CEPH_CLIENT_RESET_IDLE:	  return "idle";
+	case CEPH_CLIENT_RESET_QUIESCING: return "quiescing";
+	case CEPH_CLIENT_RESET_DRAINING:  return "draining";
+	case CEPH_CLIENT_RESET_TEARDOWN:  return "teardown";
+	default:			  return "unknown";
+	}
+}
+
 /*
- * Wait for a reset to complete if one is in progress.
- * Returns 0 if reset completed successfully or wasn't in progress.
+ * Wait for an active reset to complete.
+ * Returns 0 if reset completed successfully or no reset was active.
  * Returns -ETIMEDOUT if we timed out waiting.
  * Returns -ERESTARTSYS if interrupted by signal.
  */
@@ -5229,7 +5240,7 @@ int ceph_mdsc_wait_for_reset(struct ceph_mds_client *mdsc)
 	int blocked_count;
 	int ret;
 
-	if (!READ_ONCE(st->in_progress))
+	if (READ_ONCE(st->phase) == CEPH_CLIENT_RESET_IDLE)
 		return 0;
 
 	blocked_count = atomic_inc_return(&st->blocked_requests);
@@ -5238,7 +5249,8 @@ int ceph_mdsc_wait_for_reset(struct ceph_mds_client *mdsc)
 	trace_ceph_client_reset_blocked(mdsc, blocked_count);
 
 	ret = wait_event_interruptible_timeout(st->blocked_wq,
-					       !READ_ONCE(st->in_progress),
+					       READ_ONCE(st->phase) ==
+						CEPH_CLIENT_RESET_IDLE,
 					       timeout);
 
 	atomic_dec(&st->blocked_requests);
@@ -5274,7 +5286,7 @@ static void ceph_mdsc_reset_complete(struct ceph_mds_client *mdsc, int ret)
 	spin_lock(&st->lock);
 	st->last_finish = jiffies;
 	st->last_errno = ret;
-	st->in_progress = false;
+	st->phase = CEPH_CLIENT_RESET_IDLE;
 	if (ret)
 		st->failure_count++;
 	else
@@ -5295,7 +5307,7 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 	struct ceph_client *cl = mdsc->fsc->client;
 	struct ceph_mds_session **sessions = NULL;
 	char reason[CEPH_CLIENT_RESET_REASON_LEN];
-	int max_sessions, i, n = 0;
+	int max_sessions, i, n = 0, torn_down = 0;
 	bool inject_error;
 	int ret = 0;
 
@@ -5373,6 +5385,70 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 		goto out_complete;
 	}
 
+	spin_lock(&st->lock);
+	st->phase = CEPH_CLIENT_RESET_DRAINING;
+	spin_unlock(&st->lock);
+
+	/*
+	 * Best-effort drain: flush dirty state while sessions are still
+	 * alive.  New requests are blocked while phase != IDLE.
+	 * The sessions are functional, so non-stuck state drains normally.
+	 * Stuck state (the cause of the stalemate the operator is trying
+	 * to break) will not drain — that is expected, and we proceed to
+	 * forced teardown after the timeout.
+	 *
+	 * Three things are drained:
+	 *  1. MDS journal — send_flush_mdlog asks each MDS to journal
+	 *     pending unsafe operations (creates, renames, setattrs).
+	 *     Once journaled, they survive the session teardown.
+	 *  2. Dirty caps — ceph_flush_dirty_caps triggers cap flush on
+	 *     all sessions.  Non-stuck caps flush in milliseconds.
+	 *  3. Cap releases — push pending cap release messages.
+	 *
+	 * All three happen concurrently during the bounded wait window.
+	 */
+	for (i = 0; i < n; i++)
+		send_flush_mdlog(sessions[i]);
+
+	ceph_flush_dirty_caps(mdsc);
+	ceph_flush_cap_releases(mdsc);
+
+	spin_lock(&mdsc->cap_dirty_lock);
+	if (!list_empty(&mdsc->cap_flush_list)) {
+		u64 want_flush = mdsc->last_cap_flush_tid;
+		long drain_ret;
+
+		spin_unlock(&mdsc->cap_dirty_lock);
+		pr_info_client(cl,
+			       "draining (want_flush=%llu, %d sessions)\n",
+			       want_flush, n);
+		drain_ret = wait_event_timeout(mdsc->cap_flushing_wq,
+					       check_caps_flush(mdsc,
+								want_flush),
+					       CEPH_CLIENT_RESET_DRAIN_SEC * HZ);
+		if (drain_ret == 0) {
+			pr_info_client(cl,
+				       "drain timed out, proceeding with forced teardown\n");
+			spin_lock(&st->lock);
+			st->drain_timed_out = true;
+			spin_unlock(&st->lock);
+		} else {
+			pr_info_client(cl, "drain completed successfully\n");
+			spin_lock(&st->lock);
+			st->drain_timed_out = false;
+			spin_unlock(&st->lock);
+		}
+	} else {
+		spin_unlock(&mdsc->cap_dirty_lock);
+		spin_lock(&st->lock);
+		st->drain_timed_out = false;
+		spin_unlock(&st->lock);
+	}
+
+	spin_lock(&st->lock);
+	st->phase = CEPH_CLIENT_RESET_TEARDOWN;
+	spin_unlock(&st->lock);
+
 	/*
 	 * Tear down each session: close the connection, remove all
 	 * caps, clean up requests, then kick pending requests so they
@@ -5383,6 +5459,11 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 	 * teardown.  We do NOT attempt send_mds_reconnect() because
 	 * the MDS only accepts reconnects during its own RECONNECT
 	 * phase (after MDS restart), not from an active client.
+	 *
+	 * Any state that did not drain (caps that didn't flush, unsafe
+	 * requests that the MDS didn't journal) is force-dropped here.
+	 * This is intentional: that state is stuck and is the reason
+	 * the operator triggered the reset.
 	 */
 	for (i = 0; i < n; i++) {
 		int mds = sessions[i]->s_mds;
@@ -5415,10 +5496,15 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 		kick_requests(mdsc, mds);
 		mutex_unlock(&mdsc->mutex);
 
+		torn_down++;
 		pr_info_client(cl, "mds%d session reset complete\n", mds);
 	}
 
 	kfree(sessions);
+
+	spin_lock(&st->lock);
+	st->sessions_reset = torn_down;
+	spin_unlock(&st->lock);
 
 out_complete:
 	ceph_mdsc_reset_complete(mdsc, ret);
@@ -5441,22 +5527,24 @@ int ceph_mdsc_schedule_reset(struct ceph_mds_client *mdsc,
 	}
 
 	spin_lock(&st->lock);
-	if (st->in_progress) {
+	if (st->phase != CEPH_CLIENT_RESET_IDLE) {
 		spin_unlock(&st->lock);
 		return -EBUSY;
 	}
 
-	st->in_progress = true;
+	st->phase = CEPH_CLIENT_RESET_QUIESCING;
 	st->active_reset_gen++;
 	st->last_start = jiffies;
 	st->last_errno = 0;
+	st->drain_timed_out = false;
+	st->sessions_reset = 0;
 	st->trigger_count++;
 	strscpy(st->last_reason, msg, sizeof(st->last_reason));
 	spin_unlock(&st->lock);
 
 	if (WARN_ON_ONCE(!queue_work(system_unbound_wq, &mdsc->reset_work))) {
 		spin_lock(&st->lock);
-		st->in_progress = false;
+		st->phase = CEPH_CLIENT_RESET_IDLE;
 		st->last_errno = -EALREADY;
 		st->failure_count++;
 		spin_unlock(&st->lock);
@@ -6017,8 +6105,10 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	mdsc->reset_state.last_start = 0;
 	mdsc->reset_state.last_finish = 0;
 	mdsc->reset_state.last_errno = 0;
-	mdsc->reset_state.in_progress = false;
+	mdsc->reset_state.phase = CEPH_CLIENT_RESET_IDLE;
 	mdsc->reset_state.inject_error = false;
+	mdsc->reset_state.drain_timed_out = false;
+	mdsc->reset_state.sessions_reset = 0;
 	mdsc->reset_state.active_reset_gen = 0;
 	mdsc->reset_state.last_reason[0] = '\0';
 	atomic_set(&mdsc->reset_state.pending_reconnects, 0);
@@ -6558,8 +6648,8 @@ void ceph_mdsc_destroy(struct ceph_fs_client *fsc)
 	 * if cancel_work_sync() prevents the work from running.
 	 */
 	spin_lock(&mdsc->reset_state.lock);
-	if (mdsc->reset_state.in_progress) {
-		mdsc->reset_state.in_progress = false;
+	if (mdsc->reset_state.phase != CEPH_CLIENT_RESET_IDLE) {
+		mdsc->reset_state.phase = CEPH_CLIENT_RESET_IDLE;
 		mdsc->reset_state.last_errno = -ESHUTDOWN;
 		mdsc->reset_state.failure_count++;
 	}

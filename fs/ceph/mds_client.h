@@ -76,8 +76,15 @@ struct ceph_cap;
 #define MDS_AUTH_UID_ANY -1
 
 #define CEPH_CLIENT_RESET_REASON_LEN	64
-#define CEPH_CLIENT_RESET_TIMEOUT_SEC	60
+#define CEPH_CLIENT_RESET_DRAIN_SEC	5
 #define CEPH_CLIENT_RESET_WAIT_TIMEOUT_SEC 120
+
+enum ceph_client_reset_phase {
+	CEPH_CLIENT_RESET_IDLE = 0,
+	CEPH_CLIENT_RESET_QUIESCING,
+	CEPH_CLIENT_RESET_DRAINING,
+	CEPH_CLIENT_RESET_TEARDOWN,
+};
 
 struct ceph_client_reset_state {
 	spinlock_t lock;
@@ -87,11 +94,13 @@ struct ceph_client_reset_state {
 	unsigned long last_start;
 	unsigned long last_finish;
 	int last_errno;
-	bool in_progress;
+	enum ceph_client_reset_phase phase;
 	bool inject_error;
+	bool drain_timed_out;
+	int sessions_reset;
 	char last_reason[CEPH_CLIENT_RESET_REASON_LEN];
 
-	/* Completion tracking for session reconnects */
+	/* Async reconnect completion (used by mds_peer_reset path) */
 	u64 active_reset_gen;
 	atomic_t pending_reconnects;
 	struct completion reconnect_done;
@@ -589,6 +598,7 @@ extern struct ceph_mds_session *
 __ceph_lookup_mds_session(struct ceph_mds_client *, int mds);
 
 extern const char *ceph_session_state_name(int s);
+extern const char *ceph_reset_phase_name(enum ceph_client_reset_phase phase);
 
 extern struct ceph_mds_session *
 ceph_get_mds_session(struct ceph_mds_session *s);

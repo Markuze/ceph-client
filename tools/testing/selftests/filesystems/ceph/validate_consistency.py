@@ -189,15 +189,15 @@ def validate_reset_and_slo(args, reset_records, io_records, rename_records, stat
     if not successful_reset_times:
         issues.append("expected reset activity but no successful reset trigger was observed")
 
-    in_progress = status.get("in_progress")
+    phase = status.get("phase")
     pending_reconnects = to_int(status.get("pending_reconnects", "0"), default=-1)
     blocked_requests = to_int(status.get("blocked_requests", "0"), default=-1)
     last_errno = to_int(status.get("last_errno", "0"), default=1)
 
-    if in_progress is None:
-        issues.append("missing final reset status file or in_progress field")
-    elif in_progress.lower() != "no":
-        issues.append(f"recovery invariant failed: in_progress={in_progress}, expected no")
+    if phase is None:
+        issues.append("missing final reset status file or phase field")
+    elif phase.lower() != "idle":
+        issues.append(f"recovery invariant failed: phase={phase}, expected idle")
 
     if pending_reconnects != 0:
         issues.append(f"recovery invariant failed: pending_reconnects={pending_reconnects}, expected 0")

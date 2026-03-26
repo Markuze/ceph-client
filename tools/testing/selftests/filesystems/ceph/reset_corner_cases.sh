@@ -59,7 +59,7 @@ wait_reset_done()
 	local timeout="${1:-30}"
 	local elapsed=0
 
-	while [[ "$(read_status_field "in_progress")" == "yes" ]]; do
+	while [[ "$(read_status_field "phase")" != "idle" ]]; do
 		sleep 1
 		elapsed=$((elapsed + 1))
 		if [[ "$elapsed" -ge "$timeout" ]]; then
@@ -176,7 +176,7 @@ test_inject_error()
 # Trigger a reset while another is guaranteed in-flight. Uses
 # inject_error to make the first reset take a real code path (the
 # workfn runs, consumes the flag, fails with -EIO) which is enough
-# time to race the second trigger against in_progress=true.
+# time to race the second trigger against phase!=idle.
 
 test_ebusy_rejection()
 {
@@ -229,7 +229,12 @@ test_ebusy_rejection()
 # --- Test 3: dirty_caps_at_reset --------------------------------------------
 #
 # Write to a file without fsync (dirty caps), trigger reset, then
-# verify the file is not corrupt.
+# verify the file is not corrupt.  The v2 reset drains dirty caps
+# before teardown (best-effort, 5s timeout).  For a non-stuck cap
+# the dirty write should be flushed during drain and persist.
+# If the drain window is too short, only the synced first line
+# persists -- that is acceptable (data loss is documented for
+# unflushed writes).
 
 test_dirty_caps_at_reset()
 {
@@ -311,15 +316,16 @@ sys.stdout.write('written')
 	result "$num" "$name" PASS "file intact ($line_count lines)"
 }
 
-# --- Test 4: flock_reclaim --------------------------------------------------
+# --- Test 4: flock_after_reset ----------------------------------------------
 #
-# Take an exclusive flock, trigger reset, verify the lock survives
-# the reconnect (from_reset=true path).
+# Take an exclusive flock, trigger reset, verify the lock is LOST
+# (v2 teardown removes all caps and locks).  Then verify the lock
+# can be re-acquired and the filesystem is consistent afterward.
 
-test_flock_reclaim()
+test_flock_after_reset()
 {
 	local num=4
-	local name="flock_reclaim"
+	local name="flock_after_reset"
 	local testfile="$MOUNT_POINT/.reset_corner_flock_$$"
 	local lock_pid probe_rc sc_before sc_after
 
@@ -338,7 +344,7 @@ test_flock_reclaim()
 		return
 	fi
 
-	echo "flock_reclaim_test" > "$TRIGGER_PATH" 2>/dev/null || {
+	echo "flock_after_reset_test" > "$TRIGGER_PATH" 2>/dev/null || {
 		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
 		result "$num" "$name" FAIL "reset trigger failed"
 		rm -f "$testfile"
@@ -355,40 +361,44 @@ test_flock_reclaim()
 	sc_after="$(read_status_field "success_count")"
 	if [[ "$sc_after" -le "$sc_before" ]]; then
 		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
-		result "$num" "$name" FAIL "success_count did not increment (reset not exercised)"
+		result "$num" "$name" FAIL "success_count did not increment"
 		rm -f "$testfile"
 		return
 	fi
 
-	if ! kill -0 "$lock_pid" 2>/dev/null; then
-		wait "$lock_pid" 2>/dev/null
-		result "$num" "$name" FAIL "flock holder died during reset"
-		rm -f "$testfile"
-		return
-	fi
-
-	probe_rc=0
-	flock --exclusive --nonblock "$testfile" true 2>/dev/null && probe_rc=0 || probe_rc=$?
-	if [[ "$probe_rc" -eq 0 ]]; then
-		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
-		result "$num" "$name" FAIL "lock was NOT reclaimed (probe acquired it)"
-		rm -f "$testfile"
-		return
-	fi
-
-	kill "$lock_pid" 2>/dev/null
-	wait "$lock_pid" 2>/dev/null
-
+	# After v2 teardown the lock should be lost on the MDS side.
+	# A probe from this client should be able to acquire it.
 	probe_rc=0
 	flock --exclusive --nonblock "$testfile" true 2>/dev/null && probe_rc=0 || probe_rc=$?
 	if [[ "$probe_rc" -ne 0 ]]; then
-		result "$num" "$name" FAIL "lock stuck after holder exited"
+		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
+		result "$num" "$name" FAIL "lock was NOT released by reset (probe blocked)"
 		rm -f "$testfile"
 		return
 	fi
 
+	# Clean up the original holder
+	kill "$lock_pid" 2>/dev/null
+	wait "$lock_pid" 2>/dev/null
+
+	# Verify we can still re-acquire the lock cleanly
+	probe_rc=0
+	flock --exclusive --nonblock "$testfile" true 2>/dev/null && probe_rc=0 || probe_rc=$?
+	if [[ "$probe_rc" -ne 0 ]]; then
+		result "$num" "$name" FAIL "cannot re-acquire lock after reset"
+		rm -f "$testfile"
+		return
+	fi
+
+	# Verify file content survived
+	grep -q "flock_test_content" "$testfile" 2>/dev/null || {
+		result "$num" "$name" FAIL "file content corrupted after reset"
+		rm -f "$testfile"
+		return
+	}
+
 	rm -f "$testfile"
-	result "$num" "$name" PASS
+	result "$num" "$name" PASS "lock lost and re-acquirable after reset"
 }
 
 # --- Test 5: unmount_during_reset -------------------------------------------
@@ -524,7 +534,7 @@ main()
 	test_inject_error
 	test_ebusy_rejection
 	test_dirty_caps_at_reset
-	test_flock_reclaim
+	test_flock_after_reset
 	test_unmount_during_reset
 
 	echo ""

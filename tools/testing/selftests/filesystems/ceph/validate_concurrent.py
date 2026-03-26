@@ -96,9 +96,9 @@ def validate_recovery(log_dir, client_id, issues):
 
     status = parse_status_file(status_file)
 
-    in_progress = status.get("in_progress", "unknown")
-    if in_progress.lower() != "no":
-        issues.append("recovery: in_progress=%s, expected no" % in_progress)
+    phase = status.get("phase", "unknown")
+    if phase.lower() != "idle":
+        issues.append("recovery: phase=%s, expected idle" % phase)
 
     pending = to_int(status.get("pending_reconnects", "0"), default=-1)
     if pending != 0:
