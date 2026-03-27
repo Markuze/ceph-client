@@ -432,9 +432,9 @@ test_flock_after_reset()
 	wait "$lock_pid" 2>/dev/null
 
 	# After the holder exits, a fresh lock should be acquirable.
-	# Retry with backoff: the MDS releases the old session's locks
-	# asynchronously after connection close, so the old lock may
-	# briefly conflict with the new request.
+	# The reset teardown sends SESSION_REQUEST_CLOSE so the MDS
+	# releases locks promptly, but retry briefly in case the
+	# message races with the connection close.
 	local attempt
 	probe_rc=1
 	for attempt in 1 2 3 4 5; do

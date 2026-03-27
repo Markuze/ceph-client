@@ -6,6 +6,7 @@
 #include <linux/slab.h>
 #include <linux/gfp.h>
 #include <linux/sched.h>
+#include <linux/delay.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/ratelimit.h>
@@ -5390,6 +5391,28 @@ static void ceph_mdsc_reset_workfn(struct work_struct *work)
 	spin_lock(&st->lock);
 	st->phase = CEPH_CLIENT_RESET_TEARDOWN;
 	spin_unlock(&st->lock);
+
+	/*
+	 * Tell each MDS to close the session before we tear it down
+	 * locally.  Without this the MDS sees a connection drop and
+	 * waits for the client to reconnect (up to session_autoclose
+	 * seconds) before evicting the session and releasing locks.
+	 * Sending REQUEST_CLOSE makes the MDS release state immediately.
+	 *
+	 * We send all close messages first, then yield briefly to let
+	 * the network stack transmit them before __unregister_session()
+	 * closes the connections.
+	 */
+	for (i = 0; i < n; i++) {
+		struct ceph_msg *msg;
+
+		msg = ceph_create_session_msg(CEPH_SESSION_REQUEST_CLOSE,
+					      sessions[i]->s_seq);
+		if (msg)
+			ceph_con_send(&sessions[i]->s_con, msg);
+	}
+	if (n > 0)
+		msleep(100);
 
 	/*
 	 * Tear down each session: close the connection, remove all
