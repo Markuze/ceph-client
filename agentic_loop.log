@@ -119,3 +119,37 @@
 [2026-03-27 03:02:35] [i=3 s=orch_review] Cursor resume start: session_id=7fd49513-0174-4c68-bdf6-1d5f8fe89b0f detail=agentic_orchestrator_output.txt
 [2026-03-27 03:03:47] [i=3 s=commit] Orchestrator requested commit before remote testing. detail=.agentic_env
 [2026-03-27 03:03:47] [i=3 s=commit] Skipping DO NOT COMMIT path: agentic_dev_loop.sh detail=.agentic_env
+[2026-03-27 03:03:47] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/run_remote_client_reset_validation.sh detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: agentic_orchestrator_output.txt detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: agentic_tests.log detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: agentic_worker_output.txt detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: build.log detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/client_reset_context.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/client_reset_design_v2.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/client_reset_sm_design.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/client_reset_testing.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/client_reset_v1.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/codex_reset_v2_review.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/loop_coherency_rules.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: client_reset_dir/opus_reset_v2_review.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: review.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: task.md detail=.agentic_env
+[2026-03-27 03:03:48] [i=3 s=commit] Skipping DO NOT COMMIT path: test_result.txt detail=.agentic_env
+[2026-03-27 03:03:50] [i=3 s=remote] Running remote validation after commit. detail=agentic_tests.log
+[2026-03-27 03:14:35] [i=3 s=orch_test] Running Orchestrator on test results. detail=agentic_orchestrator_output.txt
+[2026-03-27 03:14:35] [i=3 s=orch_test] Starting Orchestrator post-test with resume (session_id=7fd49513-0174-4c68-bdf6-1d5f8fe89b0f) detail=agentic_orchestrator_output.txt
+[2026-03-27 03:14:35] [i=3 s=orch_test] Cursor resume start: session_id=7fd49513-0174-4c68-bdf6-1d5f8fe89b0f detail=agentic_orchestrator_output.txt
+[2026-03-27 03:15:52] [i=4 s=iter] Starting iteration 4. detail=task.md
+[2026-03-27 03:15:52] [i=4 s=worker] Running Worker. detail=agentic_worker_output.txt
+[2026-03-27 03:15:52] [i=4 s=worker] Starting Worker with resume (session_id=87c09347-3b6e-4385-8ab5-2b1c48e20b1e) detail=agentic_worker_output.txt
+[2026-03-27 03:15:52] [i=4 s=worker] Worker resume start: session_id=87c09347-3b6e-4385-8ab5-2b1c48e20b1e detail=agentic_worker_output.txt
+[2026-03-27 03:18:23] [i=4 s=build] Running local build. detail=build.log
+[2026-03-27 03:18:23] [i=4 s=build] Build iteration 4: make -j32 LLVM=1 LLVM_IAS=1 CC='ccache clang' -s ARCH=x86_64 detail=build.log
+[2026-03-27 03:18:26] [i=4 s=review] Running Reviewer-1. detail=review.md
+[2026-03-27 03:18:26] [i=4 s=review] Starting Reviewer-1 with resume (session_id=12945184-1bbc-459b-9256-01055a861613) detail=review.md
+[2026-03-27 03:18:26] [i=4 s=review] Cursor resume start: session_id=12945184-1bbc-459b-9256-01055a861613 detail=review.md
+[2026-03-27 03:18:35] [i=4 s=orch_review] Running Orchestrator on review results. detail=agentic_orchestrator_output.txt
+[2026-03-27 03:18:35] [i=4 s=orch_review] Starting Orchestrator with resume (session_id=7fd49513-0174-4c68-bdf6-1d5f8fe89b0f) detail=agentic_orchestrator_output.txt
+[2026-03-27 03:18:35] [i=4 s=orch_review] Cursor resume start: session_id=7fd49513-0174-4c68-bdf6-1d5f8fe89b0f detail=agentic_orchestrator_output.txt
+[2026-03-27 03:19:23] [i=4 s=commit] Orchestrator requested commit before remote testing. detail=.agentic_env
+[2026-03-27 03:19:23] [i=4 s=commit] Skipping DO NOT COMMIT path: agentic_dev_loop.sh detail=.agentic_env

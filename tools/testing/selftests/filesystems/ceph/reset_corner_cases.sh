@@ -430,14 +430,23 @@ test_flock_after_reset()
 	# which decrements i_filelock_ref to 0 and clears CEPH_I_ERROR_FILELOCK.
 	kill "$lock_pid" 2>/dev/null
 	wait "$lock_pid" 2>/dev/null
-	sleep 0.5
 
 	# After the holder exits, a fresh lock should be acquirable.
-	probe_rc=0
-	flock --exclusive --nonblock "$testfile" true 2>/dev/null && probe_rc=0 || probe_rc=$?
+	# Retry with backoff: the MDS releases the old session's locks
+	# asynchronously after connection close, so the old lock may
+	# briefly conflict with the new request.
+	local attempt
+	probe_rc=1
+	for attempt in 1 2 3 4 5; do
+		probe_rc=0
+		flock --exclusive --nonblock "$testfile" true 2>/dev/null \
+			&& probe_rc=0 || probe_rc=$?
+		[[ "$probe_rc" -eq 0 ]] && break
+		sleep 1
+	done
 	if [[ "$probe_rc" -ne 0 ]]; then
 		result "$num" "$name" FAIL \
-			"cannot acquire fresh lock after holder exit (rc=$probe_rc)"
+			"cannot acquire fresh lock after holder exit (rc=$probe_rc, ${attempt} attempts)"
 		rm -f "$testfile"
 		return
 	fi
