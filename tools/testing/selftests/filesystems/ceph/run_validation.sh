@@ -243,7 +243,6 @@ if status_path=$(find_status_path); then
 	last_errno=$(read_status_field "$status_path" "last_errno")
 	drain_timed_out=$(read_status_field "$status_path" "drain_timed_out")
 	sessions_reset=$(read_status_field "$status_path" "sessions_reset")
-	pending=$(read_status_field "$status_path" "pending_reconnects")
 	blocked=$(read_status_field "$status_path" "blocked_requests")
 
 	# Save full status
@@ -252,7 +251,6 @@ if status_path=$(find_status_path); then
 	errors=""
 	[[ "$phase" != "idle" ]] && errors="${errors}phase=$phase "
 	[[ "$last_errno" != "0" ]] && errors="${errors}last_errno=$last_errno "
-	[[ "$pending" != "0" ]] && errors="${errors}pending_reconnects=$pending "
 	[[ "$blocked" != "0" ]] && errors="${errors}blocked_requests=$blocked "
 
 	if [[ -z "$errors" ]]; then

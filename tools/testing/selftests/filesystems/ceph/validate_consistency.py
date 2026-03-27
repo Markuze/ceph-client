@@ -190,7 +190,6 @@ def validate_reset_and_slo(args, reset_records, io_records, rename_records, stat
         issues.append("expected reset activity but no successful reset trigger was observed")
 
     phase = status.get("phase")
-    pending_reconnects = to_int(status.get("pending_reconnects", "0"), default=-1)
     blocked_requests = to_int(status.get("blocked_requests", "0"), default=-1)
     last_errno = to_int(status.get("last_errno", "0"), default=1)
 
@@ -199,8 +198,6 @@ def validate_reset_and_slo(args, reset_records, io_records, rename_records, stat
     elif phase.lower() != "idle":
         issues.append(f"recovery invariant failed: phase={phase}, expected idle")
 
-    if pending_reconnects != 0:
-        issues.append(f"recovery invariant failed: pending_reconnects={pending_reconnects}, expected 0")
     if blocked_requests != 0:
         issues.append(f"recovery invariant failed: blocked_requests={blocked_requests}, expected 0")
     if last_errno != 0:

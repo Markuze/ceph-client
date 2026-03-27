@@ -100,11 +100,6 @@ struct ceph_client_reset_state {
 	int sessions_reset;
 	char last_reason[CEPH_CLIENT_RESET_REASON_LEN];
 
-	/* Async reconnect completion (used by mds_peer_reset path) */
-	u64 active_reset_gen;
-	atomic_t pending_reconnects;
-	struct completion reconnect_done;
-
 	/* Request blocking during reset */
 	wait_queue_head_t blocked_wq;
 	atomic_t blocked_requests;
@@ -287,7 +282,6 @@ struct ceph_mds_session {
 	struct list_head  s_unsafe;   /* unsafe requests */
 	struct xarray	  s_delegated_inos;
 
-	u64		  s_reset_gen; /* generation of reset that initiated reconnect */
 };
 
 /*

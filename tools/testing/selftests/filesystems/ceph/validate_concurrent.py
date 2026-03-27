@@ -100,10 +100,6 @@ def validate_recovery(log_dir, client_id, issues):
     if phase.lower() != "idle":
         issues.append("recovery: phase=%s, expected idle" % phase)
 
-    pending = to_int(status.get("pending_reconnects", "0"), default=-1)
-    if pending != 0:
-        issues.append("recovery: pending_reconnects=%d, expected 0" % pending)
-
     blocked = to_int(status.get("blocked_requests", "0"), default=-1)
     if blocked != 0:
         issues.append("recovery: blocked_requests=%d, expected 0" % blocked)

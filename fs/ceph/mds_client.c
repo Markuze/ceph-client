@@ -62,7 +62,6 @@ struct ceph_reconnect_state {
 	struct ceph_pagelist *pagelist;
 	unsigned msg_version;
 	bool allow_multi;
-	bool from_reset;
 };
 
 static void __wake_requests(struct ceph_mds_client *mdsc,
@@ -70,8 +69,6 @@ static void __wake_requests(struct ceph_mds_client *mdsc,
 static void ceph_cap_release_work(struct work_struct *work);
 static void ceph_cap_reclaim_work(struct work_struct *work);
 static void ceph_mdsc_reset_workfn(struct work_struct *work);
-static void ceph_mdsc_reconnect_session_done(struct ceph_mds_client *mdsc,
-					     struct ceph_mds_session *session);
 
 static const struct ceph_connection_operations mds_con_ops;
 
@@ -4401,11 +4398,9 @@ skip_cap_auths:
 
 	switch (op) {
 	case CEPH_SESSION_OPEN:
-		if (session->s_state == CEPH_MDS_SESSION_RECONNECTING) {
+		if (session->s_state == CEPH_MDS_SESSION_RECONNECTING)
 			pr_info_client(cl, "mds%d reconnect success\n",
 				       session->s_mds);
-			ceph_mdsc_reconnect_session_done(mdsc, session);
-		}
 
 		session->s_features = features;
 		if (session->s_state == CEPH_MDS_SESSION_OPEN) {
@@ -4438,11 +4433,9 @@ skip_cap_auths:
 		break;
 
 	case CEPH_SESSION_CLOSE:
-		if (session->s_state == CEPH_MDS_SESSION_RECONNECTING) {
+		if (session->s_state == CEPH_MDS_SESSION_RECONNECTING)
 			pr_info_client(cl, "mds%d reconnect denied\n",
 				       session->s_mds);
-			ceph_mdsc_reconnect_session_done(mdsc, session);
-		}
 		session->s_state = CEPH_MDS_SESSION_CLOSED;
 		cleanup_session_requests(mdsc, session);
 		remove_session_caps(session);
@@ -4483,11 +4476,9 @@ skip_cap_auths:
 	case CEPH_SESSION_REJECT:
 		WARN_ON(session->s_state != CEPH_MDS_SESSION_OPENING &&
 			session->s_state != CEPH_MDS_SESSION_RECONNECTING);
-		if (session->s_state == CEPH_MDS_SESSION_RECONNECTING) {
+		if (session->s_state == CEPH_MDS_SESSION_RECONNECTING)
 			pr_info_client(cl, "mds%d reconnect rejected\n",
 				       session->s_mds);
-			ceph_mdsc_reconnect_session_done(mdsc, session);
-		}
 		pr_info_client(cl, "mds%d rejected session\n",
 			       session->s_mds);
 		session->s_state = CEPH_MDS_SESSION_REJECTED;
@@ -4775,22 +4766,9 @@ static int reconnect_caps_cb(struct inode *inode, int mds, void *arg)
 		rec.v2.issued = cpu_to_le32(cap->issued);
 		rec.v2.snaprealm = cpu_to_le64(ci->i_snap_realm->ino);
 		rec.v2.pathbase = cpu_to_le64(path_info.vino.ino);
-		if (recon_state->from_reset) {
-			/*
-			 * Reset-initiated reconnect: always try to reclaim
-			 * locks. The MDS does best-effort; failures are
-			 * handled on future lock operations.
-			 */
-			rec.v2.flock_len = cpu_to_le32(1);
-		} else {
-			/*
-			 * Normal reconnect: skip lock reclaim if locks
-			 * were already known to be in error state.
-			 */
-			rec.v2.flock_len = cpu_to_le32(
-				test_bit(CEPH_I_ERROR_FILELOCK_BIT,
-					 &ci->i_ceph_flags) ? 0 : 1);
-		}
+		rec.v2.flock_len = cpu_to_le32(
+			test_bit(CEPH_I_ERROR_FILELOCK_BIT,
+				 &ci->i_ceph_flags) ? 0 : 1);
 	} else {
 		struct timespec64 ts;
 
@@ -4988,8 +4966,7 @@ fail:
  * This is a relatively heavyweight operation, but it's rare.
  */
 static int send_mds_reconnect(struct ceph_mds_client *mdsc,
-			      struct ceph_mds_session *session,
-			      bool from_reset)
+			      struct ceph_mds_session *session)
 {
 	struct ceph_client *cl = mdsc->fsc->client;
 	struct ceph_msg *reply;
@@ -4997,7 +4974,6 @@ static int send_mds_reconnect(struct ceph_mds_client *mdsc,
 	int err = -ENOMEM;
 	struct ceph_reconnect_state recon_state = {
 		.session = session,
-		.from_reset = from_reset,
 	};
 	LIST_HEAD(dispose);
 
@@ -5179,40 +5155,6 @@ fail_nopagelist:
 	pr_err_client(cl, "error %d preparing reconnect for mds%d\n",
 		      err, mds);
 	return err;
-}
-
-/*
- * Called when a session completes reconnection (success or failure).
- * Only counts toward reset completion if this session's reconnect was
- * initiated by the currently active reset generation.  Late completions
- * from a prior (timed-out) reset are silently ignored.
- *
- * Caller must hold session->s_mutex to serialize s_reset_gen updates.
- */
-static void ceph_mdsc_reconnect_session_done(struct ceph_mds_client *mdsc,
-					     struct ceph_mds_session *session)
-{
-	struct ceph_client_reset_state *st = &mdsc->reset_state;
-	u64 active_gen;
-
-	lockdep_assert_held(&session->s_mutex);
-
-	if (!session->s_reset_gen)
-		return;
-
-	spin_lock(&st->lock);
-	active_gen = st->active_reset_gen;
-	spin_unlock(&st->lock);
-
-	if (session->s_reset_gen != active_gen) {
-		session->s_reset_gen = 0;
-		return;
-	}
-
-	session->s_reset_gen = 0;
-
-	if (atomic_dec_and_test(&st->pending_reconnects))
-		complete(&st->reconnect_done);
 }
 
 const char *ceph_reset_phase_name(enum ceph_client_reset_phase phase)
@@ -5533,7 +5475,6 @@ int ceph_mdsc_schedule_reset(struct ceph_mds_client *mdsc,
 	}
 
 	st->phase = CEPH_CLIENT_RESET_QUIESCING;
-	st->active_reset_gen++;
 	st->last_start = jiffies;
 	st->last_errno = 0;
 	st->drain_timed_out = false;
@@ -5641,7 +5582,7 @@ static void check_new_map(struct ceph_mds_client *mdsc,
 
 			mutex_unlock(&mdsc->mutex);
 			clear_bit(i, targets);
-			rc = send_mds_reconnect(mdsc, s, false);
+			rc = send_mds_reconnect(mdsc, s);
 			if (rc)
 				pr_err_client(cl,
 					      "mds%d reconnect failed: %d\n",
@@ -5709,7 +5650,7 @@ static void check_new_map(struct ceph_mds_client *mdsc,
 		}
 		doutc(cl, "send reconnect to export target mds.%d\n", i);
 		mutex_unlock(&mdsc->mutex);
-		err = send_mds_reconnect(mdsc, s, false);
+		err = send_mds_reconnect(mdsc, s);
 		if (err)
 			pr_err_client(cl,
 				      "mds%d export target reconnect failed: %d\n",
@@ -6109,10 +6050,7 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	mdsc->reset_state.inject_error = false;
 	mdsc->reset_state.drain_timed_out = false;
 	mdsc->reset_state.sessions_reset = 0;
-	mdsc->reset_state.active_reset_gen = 0;
 	mdsc->reset_state.last_reason[0] = '\0';
-	atomic_set(&mdsc->reset_state.pending_reconnects, 0);
-	init_completion(&mdsc->reset_state.reconnect_done);
 	init_waitqueue_head(&mdsc->reset_state.blocked_wq);
 	atomic_set(&mdsc->reset_state.blocked_requests, 0);
 	INIT_WORK(&mdsc->reset_work, ceph_mdsc_reset_workfn);
@@ -6838,7 +6776,7 @@ static void mds_peer_reset(struct ceph_connection *con)
 		return;
 
 	if (ceph_mdsmap_get_state(mdsc->mdsmap, s->s_mds) == CEPH_MDS_STATE_RECONNECT) {
-		int rc = send_mds_reconnect(mdsc, s, false);
+		int rc = send_mds_reconnect(mdsc, s);
 		if (rc)
 			pr_err_client(mdsc->fsc->client,
 				      "mds%d reconnect failed: %d\n",
@@ -6863,25 +6801,15 @@ static void mds_peer_reset(struct ceph_connection *con)
 	switch (session_state) {
 	case CEPH_MDS_SESSION_RECONNECTING: {
 		int rc;
-		bool was_reset;
 
 		pr_info_client(mdsc->fsc->client,
 			       "mds%d reset during reconnect, restarting\n",
 			       s->s_mds);
-		/*
-		 * Preserve from_reset if this reconnect was initiated
-		 * by a manual reset, so lock reclaim remains unconditional.
-		 */
-		was_reset = (s->s_reset_gen != 0);
-		rc = send_mds_reconnect(mdsc, s, was_reset);
-		if (rc) {
+		rc = send_mds_reconnect(mdsc, s);
+		if (rc)
 			pr_err_client(mdsc->fsc->client,
 				      "mds%d reconnect restart failed: %d\n",
 				      s->s_mds, rc);
-			mutex_lock(&s->s_mutex);
-			ceph_mdsc_reconnect_session_done(mdsc, s);
-			mutex_unlock(&s->s_mutex);
-		}
 		return;
 	}
 	case CEPH_MDS_SESSION_CLOSING:

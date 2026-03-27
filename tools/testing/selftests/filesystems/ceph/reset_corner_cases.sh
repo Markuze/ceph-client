@@ -173,56 +173,92 @@ test_inject_error()
 
 # --- Test 2: ebusy_rejection ------------------------------------------------
 #
-# Trigger a reset while another is guaranteed in-flight. Uses
-# inject_error to make the first reset take a real code path (the
-# workfn runs, consumes the flag, fails with -EIO) which is enough
-# time to race the second trigger against phase!=idle.
+# Trigger a reset while another is guaranteed in-flight.  Creates
+# dirty state so the first reset enters DRAINING (which takes
+# measurable time), then polls until phase != idle and issues the
+# second trigger.  The second trigger must be rejected with EBUSY.
 
 test_ebusy_rejection()
 {
 	local num=2
 	local name="ebusy_rejection"
-	local tc_before tc_after fc_before fc_after second_rc
+	local testfile="$MOUNT_POINT/.reset_corner_ebusy_$$"
+	local tc_before tc_after sc_before sc_after second_rc phase elapsed
 
 	tc_before="$(read_status_field "trigger_count")"
-	fc_before="$(read_status_field "failure_count")"
+	sc_before="$(read_status_field "success_count")"
 
-	echo 1 > "$INJECT_PATH" 2>/dev/null || {
-		result "$num" "$name" FAIL "cannot arm inject_error"
+	# Create dirty state so the first reset enters DRAINING
+	echo "ebusy_dirty_data" > "$testfile"
+	sync "$testfile"
+
+	python3 -c "
+import os, sys
+fd = os.open('$testfile', os.O_WRONLY | os.O_APPEND)
+os.write(fd, b'dirty_for_ebusy_test\n')
+sys.stdout.write('written')
+" 2>/dev/null || {
+		result "$num" "$name" FAIL "dirty write failed"
+		rm -f "$testfile"
 		return
 	}
 
+	# Trigger the first reset -- it will drain dirty state
 	echo "ebusy_first" > "$TRIGGER_PATH" 2>/dev/null || {
 		result "$num" "$name" FAIL "first trigger failed"
+		rm -f "$testfile"
 		return
 	}
 
+	# Poll until phase is non-idle (quiescing or draining)
+	elapsed=0
+	while true; do
+		phase="$(read_status_field "phase")"
+		if [[ "$phase" != "idle" ]]; then
+			break
+		fi
+		sleep 0.1
+		elapsed=$((elapsed + 1))
+		if [[ "$elapsed" -ge 50 ]]; then
+			result "$num" "$name" SKIP \
+				"first reset completed before overlap could be tested"
+			rm -f "$testfile" 2>/dev/null
+			return
+		fi
+	done
+
+	# Issue the second trigger -- should be rejected with EBUSY
 	second_rc=0
 	echo "ebusy_second" > "$TRIGGER_PATH" 2>/dev/null && second_rc=0 || second_rc=$?
 
 	if ! wait_reset_done 30; then
 		result "$num" "$name" FAIL "first reset never completed"
+		rm -f "$testfile"
 		return
 	fi
 
 	tc_after="$(read_status_field "trigger_count")"
-	fc_after="$(read_status_field "failure_count")"
+	sc_after="$(read_status_field "success_count")"
 
 	if [[ "$((tc_after - tc_before))" -ne 1 ]]; then
 		result "$num" "$name" FAIL "trigger_count +$((tc_after - tc_before)), expected +1"
+		rm -f "$testfile"
 		return
 	fi
 
-	if [[ "$((fc_after - fc_before))" -ne 1 ]]; then
-		result "$num" "$name" FAIL "failure_count +$((fc_after - fc_before)), expected +1 (inject)"
+	if [[ "$((sc_after - sc_before))" -ne 1 ]]; then
+		result "$num" "$name" FAIL "success_count +$((sc_after - sc_before)), expected +1"
+		rm -f "$testfile"
 		return
 	fi
 
 	if [[ "$second_rc" -eq 0 ]]; then
 		result "$num" "$name" FAIL "second trigger did not return error"
+		rm -f "$testfile"
 		return
 	fi
 
+	rm -f "$testfile" 2>/dev/null
 	result "$num" "$name" PASS
 }
 
@@ -318,9 +354,10 @@ sys.stdout.write('written')
 
 # --- Test 4: flock_after_reset ----------------------------------------------
 #
-# Take an exclusive flock, trigger reset, verify the lock is LOST
-# (v2 teardown removes all caps and locks).  Then verify the lock
-# can be re-acquired and the filesystem is consistent afterward.
+# Take an exclusive flock, trigger reset, verify stale lock state is
+# marked with CEPH_I_ERROR_FILELOCK (same-client flock attempt returns
+# EIO).  After the original holder exits (releasing the local lock
+# reference and clearing the error flag), a fresh lock can be acquired.
 
 test_flock_after_reset()
 {
@@ -366,26 +403,30 @@ test_flock_after_reset()
 		return
 	fi
 
-	# After v2 teardown the lock should be lost on the MDS side.
-	# A probe from this client should be able to acquire it.
+	# After v2 teardown, CEPH_I_ERROR_FILELOCK is set on the inode.
+	# A same-client lock attempt should fail (EIO), NOT succeed.
 	probe_rc=0
 	flock --exclusive --nonblock "$testfile" true 2>/dev/null && probe_rc=0 || probe_rc=$?
-	if [[ "$probe_rc" -ne 0 ]]; then
+	if [[ "$probe_rc" -eq 0 ]]; then
 		kill "$lock_pid" 2>/dev/null; wait "$lock_pid" 2>/dev/null
-		result "$num" "$name" FAIL "lock was NOT released by reset (probe blocked)"
+		result "$num" "$name" FAIL \
+			"same-client probe succeeded, expected EIO from stale lock state"
 		rm -f "$testfile"
 		return
 	fi
 
-	# Clean up the original holder
+	# Kill the original holder -- releases the local lock reference,
+	# which clears CEPH_I_ERROR_FILELOCK when i_filelock_ref reaches 0.
 	kill "$lock_pid" 2>/dev/null
 	wait "$lock_pid" 2>/dev/null
+	sleep 0.5
 
-	# Verify we can still re-acquire the lock cleanly
+	# After the holder exits, a fresh lock should be acquirable.
 	probe_rc=0
 	flock --exclusive --nonblock "$testfile" true 2>/dev/null && probe_rc=0 || probe_rc=$?
 	if [[ "$probe_rc" -ne 0 ]]; then
-		result "$num" "$name" FAIL "cannot re-acquire lock after reset"
+		result "$num" "$name" FAIL \
+			"cannot acquire fresh lock after holder exit (rc=$probe_rc)"
 		rm -f "$testfile"
 		return
 	fi
@@ -398,7 +439,7 @@ test_flock_after_reset()
 	}
 
 	rm -f "$testfile"
-	result "$num" "$name" PASS "lock lost and re-acquirable after reset"
+	result "$num" "$name" PASS "stale lock detected, fresh lock acquired after holder exit"
 }
 
 # --- Test 5: unmount_during_reset -------------------------------------------

@@ -55,7 +55,7 @@ Five targeted tests for specific reset code paths.
     [1/5] inject_error          inject_error flag, error propagation + recovery
     [2/5] ebusy_rejection       Second reset rejected while first in-flight
     [3/5] dirty_caps_at_reset   Reset with unflushed dirty caps
-    [4/5] flock_after_reset     Lock loss and re-acquisition after session teardown
+    [4/5] flock_after_reset     Stale lock EIO + fresh lock after holder exit
     [5/5] unmount_during_reset  umount during active reset (ESHUTDOWN path)
 
 Test 5 SKIPs if it cannot create a separate mount instance.

@@ -378,7 +378,6 @@ static int reset_status_show(struct seq_file *s, void *p)
 	bool inject_error = false;
 	bool drain_timed_out = false;
 	int sessions_reset = 0;
-	int pending_reconnects = 0;
 	int blocked_requests = 0;
 	char reason[CEPH_CLIENT_RESET_REASON_LEN];
 
@@ -401,7 +400,6 @@ static int reset_status_show(struct seq_file *s, void *p)
 	strscpy(reason, st->last_reason, sizeof(reason));
 	spin_unlock(&st->lock);
 
-	pending_reconnects = atomic_read(&st->pending_reconnects);
 	blocked_requests = atomic_read(&st->blocked_requests);
 
 	seq_printf(s, "phase: %s\n", ceph_reset_phase_name(phase));
@@ -426,8 +424,6 @@ static int reset_status_show(struct seq_file *s, void *p)
 	seq_printf(s, "drain_timed_out: %s\n",
 		   drain_timed_out ? "yes" : "no");
 	seq_printf(s, "sessions_reset: %d\n", sessions_reset);
-	/* pending_reconnects: always 0 for manual reset (MDS-reconnect only) */
-	seq_printf(s, "pending_reconnects: %d\n", pending_reconnects);
 	seq_printf(s, "blocked_requests: %d\n", blocked_requests);
 
 	return 0;
