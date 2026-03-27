@@ -72,6 +72,13 @@ stage_result()
 
 # Run a command with a timeout. Returns 0 on success, 1 on failure/timeout.
 # Sets RUN_TIMED_OUT=1 if killed by timeout.
+#
+# The stage command runs in its own session/process group (via setsid).
+# On timeout the entire process group is killed, not just the top-level
+# script PID.  This is required because stage scripts (reset_stress.sh,
+# reset_corner_cases.sh) spawn child processes — I/O workers, rename
+# workers, reset injectors, samplers — that would otherwise survive the
+# timeout and bleed into later stages, invalidating results.
 RUN_TIMED_OUT=0
 
 run_with_timeout()
@@ -82,23 +89,27 @@ run_with_timeout()
 
 	RUN_TIMED_OUT=0
 
-	# Run in background, capture pid
-	"$@" > "$logfile" 2>&1 &
+	# Start the stage in its own session via setsid so all descendant
+	# processes share a process group that we can kill atomically.
+	# In a non-interactive script, background children are not process
+	# group leaders, so setsid(1) calls setsid(2) directly (no extra
+	# fork) and the PID we capture IS the group leader.
+	setsid "$@" > "$logfile" 2>&1 &
 	local pid=$!
 
-	# Watchdog: kill after timeout
+	# Watchdog: on timeout, kill the entire process group
 	(
 		sleep "$timeout_sec"
 		if kill -0 "$pid" 2>/dev/null; then
-			echo "TIMEOUT: stage exceeded ${timeout_sec}s, killing pid $pid" >> "$logfile"
-			kill -TERM "$pid" 2>/dev/null
+			echo "TIMEOUT: stage exceeded ${timeout_sec}s, killing process group $pid" >> "$logfile"
+			kill -TERM -- -"$pid" 2>/dev/null
 			sleep 2
-			kill -KILL "$pid" 2>/dev/null
+			kill -KILL -- -"$pid" 2>/dev/null
 		fi
 	) &
 	local watchdog_pid=$!
 
-	# Wait for the actual command
+	# Wait for the stage command
 	wait "$pid" 2>/dev/null
 	local rc=$?
 

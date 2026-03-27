@@ -358,6 +358,10 @@ sys.stdout.write('written')
 # marked with CEPH_I_ERROR_FILELOCK (same-client flock attempt returns
 # EIO).  After the original holder exits (releasing the local lock
 # reference and clearing the error flag), a fresh lock can be acquired.
+#
+# The lock holder uses the fd-based flock form with exec, so killing
+# $lock_pid closes the lock fd immediately (no orphaned child with an
+# inherited fd copy that would prevent the VFS flock release).
 
 test_flock_after_reset()
 {
@@ -371,7 +375,13 @@ test_flock_after_reset()
 	echo "flock_test_content" > "$testfile"
 	sync "$testfile"
 
-	flock --exclusive --nonblock "$testfile" sleep 300 &
+	# Hold lock via fd in a subshell; exec ensures killing $lock_pid
+	# closes the lock fd directly (no fork/child fd inheritance).
+	(
+		exec 9<"$testfile"
+		flock --exclusive --nonblock 9 || exit 1
+		exec sleep 300
+	) &
 	lock_pid=$!
 	sleep 0.5
 
@@ -415,8 +425,9 @@ test_flock_after_reset()
 		return
 	fi
 
-	# Kill the original holder -- releases the local lock reference,
-	# which clears CEPH_I_ERROR_FILELOCK when i_filelock_ref reaches 0.
+	# Kill the holder -- the exec'd sleep IS $lock_pid, so killing it
+	# closes fd 9 directly.  VFS flock release fires ceph_fl_release_lock(),
+	# which decrements i_filelock_ref to 0 and clears CEPH_I_ERROR_FILELOCK.
 	kill "$lock_pid" 2>/dev/null
 	wait "$lock_pid" 2>/dev/null
 	sleep 0.5
