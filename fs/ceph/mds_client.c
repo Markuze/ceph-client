@@ -5213,6 +5213,7 @@ int ceph_mdsc_wait_for_reset(struct ceph_mds_client *mdsc)
 	blocked_count = atomic_inc_return(&st->blocked_requests);
 	doutc(cl, "request blocked during reset, %d total blocked\n",
 	      blocked_count);
+	trace_ceph_client_reset_blocked(mdsc, blocked_count);
 
 	wait_ret = wait_event_interruptible_timeout(st->blocked_wq,
 						    READ_ONCE(st->phase) ==
@@ -5223,10 +5224,13 @@ int ceph_mdsc_wait_for_reset(struct ceph_mds_client *mdsc)
 
 	if (wait_ret == 0) {
 		pr_warn_client(cl, "timed out waiting for reset to complete\n");
+		trace_ceph_client_reset_unblocked(mdsc, -ETIMEDOUT);
 		return -ETIMEDOUT;
 	}
-	if (wait_ret < 0)
+	if (wait_ret < 0) {
+		trace_ceph_client_reset_unblocked(mdsc, (int)wait_ret);
 		return (int)wait_ret;  /* -ERESTARTSYS */
+	}
 
 	/*
 	 * Propagate the reset result to all blocked callers.  If the
@@ -5245,6 +5249,7 @@ int ceph_mdsc_wait_for_reset(struct ceph_mds_client *mdsc)
 	ret = st->last_errno;
 	spin_unlock(&st->lock);
 
+	trace_ceph_client_reset_unblocked(mdsc, ret);
 	return ret;
 }
 
@@ -5273,6 +5278,8 @@ static void ceph_mdsc_reset_complete(struct ceph_mds_client *mdsc, int ret)
 
 	/* Wake up all requests that were blocked waiting for reset */
 	wake_up_all(&st->blocked_wq);
+
+	trace_ceph_client_reset_complete(mdsc, ret);
 }
 
 static void ceph_mdsc_reset_workfn(struct work_struct *work)
@@ -5557,6 +5564,7 @@ int ceph_mdsc_schedule_reset(struct ceph_mds_client *mdsc,
 	pr_info_client(mdsc->fsc->client,
 		       "manual session reset scheduled (reason=\"%s\")\n",
 		       msg);
+	trace_ceph_client_reset_schedule(mdsc, msg);
 	return 0;
 }
 
