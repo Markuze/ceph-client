@@ -168,6 +168,7 @@ static void kpass_rx_cloned_head_test(struct kunit *test)
 	read_descriptor_t desc = { .count = 64, .arg.data = ctx->buf };
 	struct sk_buff *clone;
 	struct page *pool_page = ctx->buf->pages[0];
+	struct page *copy_page;
 	int refs = page_count(pool_page);
 	u8 expected[64];
 
@@ -180,17 +181,22 @@ static void kpass_rx_cloned_head_test(struct kunit *test)
 	memcpy(expected, skb->data, sizeof(expected));
 	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, skb, 0, 64), 64);
 	KUNIT_EXPECT_EQ(test, ctx->buf->copied_len, 64U);
-	KUNIT_EXPECT_PTR_EQ(test, ctx->buf->sgvec[0].page, pool_page);
-	KUNIT_EXPECT_EQ(test, page_count(pool_page), refs + 1);
+	copy_page = ctx->buf->sgvec[0].page;
+	KUNIT_EXPECT_PTR_NE(test, copy_page, virt_to_page(skb->data));
+	KUNIT_EXPECT_PTR_NE(test, copy_page, pool_page);
+	KUNIT_EXPECT_EQ(test, page_count(copy_page), 1);
+	kpass_test_watch_page(test, copy_page);
+	KUNIT_EXPECT_EQ(test, page_count(pool_page), refs);
 	memset(clone->data, 0xcc, 64);
 	kunit_kfree_skb(test, clone);
 	kunit_kfree_skb(test, skb);
 	kpass_test_expect_bytes(test, ctx->buf, expected, sizeof(expected));
 	kpass_buf_release_capture(ctx->buf);
+	KUNIT_EXPECT_EQ(test, page_count(copy_page), 1);
 	KUNIT_EXPECT_EQ(test, page_count(pool_page), refs);
 }
 
-static void kpass_rx_slab_unaligned_pool_test(struct kunit *test)
+static void kpass_rx_slab_copy_pages_test(struct kunit *test)
 {
 	struct kpass_rx_test_ctx *ctx = test->priv;
 	unsigned int len = PAGE_SIZE + 300;
@@ -199,32 +205,41 @@ static void kpass_rx_slab_unaligned_pool_test(struct kunit *test)
 	read_descriptor_t desc = { .count = len, .arg.data = buf };
 	u8 *expected = kunit_kmalloc(test, len, GFP_KERNEL);
 	struct page *first, *second;
-	int first_refs, second_refs;
+	void *pool;
 
 	KUNIT_ASSERT_NOT_NULL(test, skb);
 	KUNIT_ASSERT_NOT_NULL(test, buf);
 	KUNIT_ASSERT_NOT_NULL(test, expected);
 	KUNIT_ASSERT_FALSE(test, skb->head_frag);
 	buf->sock = &ctx->sock;
-	first = vmalloc_to_page(kpass_buf_kaddr(&ctx->session, buf));
-	second = vmalloc_to_page(kpass_buf_kaddr(&ctx->session, buf) + PAGE_SIZE);
-	first_refs = page_count(first);
-	second_refs = page_count(second);
+	/* This buffer's pool slot has an unaligned stride. RX must ignore it. */
+	pool = kpass_buf_kaddr(&ctx->session, buf);
+	memset(pool, 0xee, len);
 	memcpy(expected, skb->data, len);
 	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, skb, 0, len), (int)len);
 	KUNIT_EXPECT_EQ(test, buf->copied_len, len);
-	KUNIT_EXPECT_EQ(test, buf->sg_count, 2U);
-	KUNIT_EXPECT_EQ(test, buf->sgvec[0].offset, 17U);
-	KUNIT_EXPECT_PTR_EQ(test, buf->sgvec[0].page, first);
-	KUNIT_EXPECT_PTR_EQ(test, buf->sgvec[1].page, second);
-	KUNIT_EXPECT_EQ(test, page_count(first), first_refs + 1);
-	KUNIT_EXPECT_EQ(test, page_count(second), second_refs + 1);
+	KUNIT_ASSERT_EQ(test, buf->sg_count, 2U);
+	first = buf->sgvec[0].page;
+	second = buf->sgvec[1].page;
+	KUNIT_EXPECT_EQ(test, buf->sgvec[0].offset, 0U);
+	KUNIT_EXPECT_EQ(test, buf->sgvec[1].offset, 0U);
+	KUNIT_EXPECT_EQ(test, buf->sgvec[0].length, (u32)PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, buf->sgvec[1].length, 300U);
+	KUNIT_EXPECT_PTR_NE(test, first, second);
+	KUNIT_EXPECT_PTR_NE(test, first, vmalloc_to_page(pool));
+	KUNIT_EXPECT_PTR_NE(test, second, vmalloc_to_page(pool + PAGE_SIZE));
+	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(pool, 0xee, len), NULL);
+	KUNIT_EXPECT_EQ(test, page_count(first), 1);
+	KUNIT_EXPECT_EQ(test, page_count(second), 1);
+	kpass_test_watch_page(test, first);
+	kpass_test_watch_page(test, second);
 	memset(skb->data, 0xcc, len);
+	memset(pool, 0xcc, len);
 	kunit_kfree_skb(test, skb);
 	kpass_test_expect_bytes(test, buf, expected, len);
 	kpass_buf_release_capture(buf);
-	KUNIT_EXPECT_EQ(test, page_count(first), first_refs);
-	KUNIT_EXPECT_EQ(test, page_count(second), second_refs);
+	KUNIT_EXPECT_EQ(test, page_count(first), 1);
+	KUNIT_EXPECT_EQ(test, page_count(second), 1);
 }
 
 static void kpass_rx_cross_page_head_test(struct kunit *test)
@@ -405,8 +420,7 @@ static void kpass_rx_reuse_test(struct kunit *test)
 	struct sk_buff *skb = kpass_test_page_skb(test, 0, 128, 64);
 	struct sk_buff *slab = kpass_test_slab_skb(test, 80);
 	read_descriptor_t desc = { .count = 144, .arg.data = ctx->buf };
-	struct page *page, *pool_page = ctx->buf->pages[0];
-	int pool_refs = page_count(pool_page);
+	struct page *page, *copy_page;
 	u8 expected[144];
 
 	KUNIT_ASSERT_NOT_NULL(test, skb);
@@ -418,12 +432,15 @@ static void kpass_rx_reuse_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, skb, 0, 64), 64);
 	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, slab, 0, 80), 80);
 	KUNIT_EXPECT_EQ(test, ctx->buf->copied_len, 80U);
-	KUNIT_EXPECT_EQ(test, ctx->buf->sgvec[1].offset, 64U);
+	KUNIT_EXPECT_EQ(test, ctx->buf->sgvec[1].offset, 0U);
+	copy_page = ctx->buf->sgvec[1].page;
+	KUNIT_EXPECT_EQ(test, page_count(copy_page), 1);
+	kpass_test_watch_page(test, copy_page);
 	kpass_test_expect_bytes(test, ctx->buf, expected, sizeof(expected));
 	/* This is the release used when RECV replaces a previous capture. */
 	kpass_buf_release_capture(ctx->buf);
 	KUNIT_EXPECT_EQ(test, page_count(page), 2);
-	KUNIT_EXPECT_EQ(test, page_count(pool_page), pool_refs);
+	KUNIT_EXPECT_EQ(test, page_count(copy_page), 1);
 	KUNIT_EXPECT_EQ(test, ctx->buf->copied_len, 0U);
 	desc.count = 64;
 	desc.written = 0;
@@ -432,6 +449,75 @@ static void kpass_rx_reuse_test(struct kunit *test)
 	/* Session teardown must also release a still-allocated capture. */
 	kunit_release_action(test, kpass_test_destroy_pool, &ctx->session);
 	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+}
+
+static int kpass_test_splice_capture(struct sk_buff *skb, struct kpass_buf *buf)
+{
+	unsigned int i;
+	int total = 0;
+
+	for (i = 0; i < buf->sg_count; i++) {
+		struct kpass_sg_entry *sg = &buf->sgvec[i];
+		struct iov_iter iter;
+		struct bio_vec bvec;
+		int ret;
+
+		bvec_set_page(&bvec, sg->page, sg->length, sg->offset);
+		iov_iter_bvec(&iter, ITER_SOURCE, &bvec, 1, sg->length);
+		ret = skb_splice_from_iter(skb, &iter, sg->length);
+		if (ret != sg->length)
+			return ret < 0 ? ret : -EIO;
+		total += ret;
+	}
+	return total;
+}
+
+static void kpass_rx_copy_reuse_test(struct kunit *test)
+{
+	struct kpass_rx_test_ctx *ctx = test->priv;
+	struct sk_buff *src = kpass_test_slab_skb(test, 64);
+	struct sk_buff *tx = kpass_test_slab_skb(test, 0);
+	read_descriptor_t desc = { .count = 64, .arg.data = ctx->buf };
+	u32 id = ctx->buf->id;
+	u8 expected[128], actual[128];
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	KUNIT_ASSERT_NOT_NULL(test, tx);
+	/* Occupy the other handle so free/alloc below returns this same ID. */
+	KUNIT_ASSERT_NOT_NULL(test, kpass_buf_alloc(&ctx->session));
+	memcpy(expected, src->data, 64);
+	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, src, 0, 64), 64);
+	KUNIT_ASSERT_EQ(test, kpass_test_splice_capture(tx, ctx->buf), 64);
+	KUNIT_ASSERT_PTR_EQ(test, skb_frag_page(&skb_shinfo(tx)->frags[0]),
+			    ctx->buf->sgvec[0].page);
+
+	/* A new receive replaces the capture while TX retains its pages. */
+	kpass_buf_release_capture(ctx->buf);
+	memset(src->data, 0x7b, 64);
+	memcpy(expected + 64, src->data, 64);
+	desc.count = 64;
+	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, src, 0, 64), 64);
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(tx, 0, actual, 64), 0);
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, 64);
+	KUNIT_ASSERT_EQ(test, kpass_test_splice_capture(tx, ctx->buf), 64);
+
+	/* Free/reallocate the handle and copy different bytes once more. */
+	kpass_buf_free(&ctx->session, ctx->buf);
+	ctx->buf = kpass_buf_alloc(&ctx->session);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->buf);
+	KUNIT_ASSERT_EQ(test, ctx->buf->id, id);
+	ctx->buf->sock = &ctx->sock;
+	desc.arg.data = ctx->buf;
+	desc.count = 64;
+	memset(src->data, 0xcc, 64);
+	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, src, 0, 64), 64);
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(tx, 0, actual, sizeof(actual)), 0);
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(expected));
+
+	/* The already-spliced bytes must also outlive the session. */
+	kunit_release_action(test, kpass_test_destroy_pool, &ctx->session);
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(tx, 0, actual, sizeof(actual)), 0);
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(expected));
 }
 
 static void kpass_test_destroy_page_pool(void *ptr)
@@ -549,10 +635,70 @@ static void kpass_rx_tcp_stream_test(struct kunit *test)
 		   ctx->buf->total_len - ctx->buf->copied_len, ctx->buf->copied_len);
 }
 
+static void kpass_rx_copy_tcp_test(struct kunit *test)
+{
+	struct kpass_rx_test_ctx *ctx = test->priv;
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	struct socket *listener = kpass_test_socket(test);
+	struct socket *client = kpass_test_socket(test);
+	struct sk_buff *src = kpass_test_slab_skb(test, 64);
+	read_descriptor_t desc = { .count = 64, .arg.data = ctx->buf };
+	struct msghdr msg = {};
+	struct socket *server;
+	u8 expected[128], actual[128];
+	struct kvec vec = { .iov_base = actual, .iov_len = sizeof(actual) };
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, listener);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, client);
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	KUNIT_ASSERT_EQ(test, kernel_bind(listener, (struct sockaddr_unsized *)&addr,
+					 sizeof(addr)), 0);
+	KUNIT_ASSERT_EQ(test, kernel_listen(listener, 1), 0);
+	KUNIT_ASSERT_GT(test, kernel_getsockname(listener, (struct sockaddr *)&addr), 0);
+	KUNIT_ASSERT_EQ(test, kernel_connect(client, (struct sockaddr_unsized *)&addr,
+					    sizeof(addr), 0), 0);
+	KUNIT_ASSERT_EQ(test, kernel_accept(listener, &server, O_NONBLOCK), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+				kpass_test_release_socket, server), 0);
+	server->sk->sk_rcvtimeo = HZ;
+
+	ctx->sock.sock = client;
+	spin_lock_init(&ctx->sock.tx_lock);
+	INIT_LIST_HEAD(&ctx->sock.tx_queue);
+	INIT_WORK(&ctx->sock.tx_work, kpass_tx_work_fn);
+	memcpy(expected, src->data, 64);
+	memcpy(expected + 64, src->data, 64);
+	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, src, 0, 64), 64);
+	/* Send the same captured bytes twice through the actual TX worker. */
+	for (i = 0; i < 2; i++) {
+		ctx->buf->offset = 0;
+		ctx->buf->length = 64;
+		ctx->buf->state = BUF_TX_QUEUED;
+		list_add_tail(&ctx->buf->list, &ctx->sock.tx_queue);
+		kpass_tx_work_fn(&ctx->sock.tx_work);
+		KUNIT_ASSERT_TRUE(test, list_empty(&ctx->sock.tx_queue));
+		KUNIT_ASSERT_EQ(test, ctx->buf->state, BUF_ALLOCATED);
+	}
+
+	/* Repost and release before the peer reads either copy of the data. */
+	kpass_buf_release_capture(ctx->buf);
+	memset(src->data, 0xcc, 64);
+	desc.count = 64;
+	KUNIT_ASSERT_EQ(test, kpass_tcp_recv_actor(&desc, src, 0, 64), 64);
+	kpass_buf_free(&ctx->session, ctx->buf);
+	KUNIT_ASSERT_EQ(test, kernel_recvmsg(server, &msg, &vec, 1, sizeof(actual),
+					    MSG_WAITALL), (int)sizeof(actual));
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(expected));
+}
+
 static struct kunit_case kpass_rx_test_cases[] = {
 	KUNIT_CASE(kpass_rx_page_head_test),
 	KUNIT_CASE(kpass_rx_cloned_head_test),
-	KUNIT_CASE(kpass_rx_slab_unaligned_pool_test),
+	KUNIT_CASE(kpass_rx_slab_copy_pages_test),
 	KUNIT_CASE(kpass_rx_cross_page_head_test),
 	KUNIT_CASE(kpass_rx_cross_page_frag_test),
 	KUNIT_CASE(kpass_rx_frag_list_test),
@@ -561,8 +707,10 @@ static struct kunit_case kpass_rx_test_cases[] = {
 	KUNIT_CASE(kpass_rx_buffer_limit_test),
 	KUNIT_CASE(kpass_rx_unreadable_test),
 	KUNIT_CASE(kpass_rx_reuse_test),
+	KUNIT_CASE(kpass_rx_copy_reuse_test),
 	KUNIT_CASE(kpass_rx_page_pool_test),
 	KUNIT_CASE(kpass_rx_tcp_stream_test),
+	KUNIT_CASE(kpass_rx_copy_tcp_test),
 	{}
 };
 

@@ -99,20 +99,29 @@ order. The build resolves liburing through pkg-config.
 The RX changes retain eligible page-backed linear heads using Linux splice's
 `skb_head_is_locked` rule, walk chained skbs, and copy unsafe backing. They
 also fix receive bounds, page-boundary handling, and capture reference
-release. See [KPASS.md](KPASS.md#rx-path-tcp_read_sock--actor) for the rules.
+release. Fallback copies now use separately allocated pages whose references
+can outlive their buffer handle or session. See
+[KPASS.md](KPASS.md#rx-path-tcp_read_sock--actor) for the rules.
 
 A separate 7.2.9 kernel with KUnit and `DEBUG_VM` was booted in QEMU. The
-module loaded, all 13 RX tests passed, and the module unloaded. An initial
+module loaded, all 15 RX tests passed, and the module unloaded. An initial
 regression test failed against the original actor: it copied a page-backed
 head instead of retaining its page. The complete suite includes a live
 loopback TCP test through `tcp_read_sock`; its 4,224 bytes were captured with
 zero RX fallback bytes on this x86-64 test configuration. This measures the
 actor's copies, not copies performed by the sender or other network layers.
 
+Two further regressions reproduced the old fallback-page overwrite before
+the fix and now pass. One holds spliced pages across receive replacement,
+free/reallocation of the same handle, and session destruction. The other
+sends a copied capture twice through the actual TX worker over loopback TCP,
+reposts the receive handle, and checks that the peer still reads both
+original payloads.
+
 Full forwarding through the userspace/io_uring API and physical NIC traffic
 have not been tested. Before evaluation, address TX ranges, partial sends,
-pool reuse while TCP retains pages, connect/EOF completion, completion
-context, and cancellation and teardown. There are no performance results
+legacy POKE pool reuse while TCP retains pages, connect/EOF handling,
+completion context, cancellation, and teardown. There are no performance results
 yet. The new object API is not implemented here.
 
 ## RX kernel tests
@@ -121,7 +130,9 @@ The test module includes `kernel/ceph_kpass_test.c` only when built with
 `KPASS_KUNIT_TEST=1`. Tests call the actual actor with constructed skbs to
 check page identity, reference lifetime after skb release, cloned/slab
 fallbacks, cross-page heads/fragments, nested `frag_list`, mutable shared
-fragments, limits, unreadable data, and release/reuse. A real page pool checks
+fragments, limits, unreadable data, and release/reuse. Copied pages are checked
+for independence from the source skb and the demo pool, balanced references,
+and stable TX contents across handle reuse. A real page pool checks
 recycling behavior. A loopback TCP connection checks a short read followed
 by capture of the remaining stream and retention after socket release.
 
@@ -146,7 +157,7 @@ It builds the test module, creates a minimal initramfs, enables guest
 loopback, loads the module to run KUnit, unloads it, and powers down the VM.
 It uses unprivileged QEMU TCG by default; set `KPASS_QEMU_ACCEL=kvm` if the
 current user can access `/dev/kvm`. It never loads the module on the host.
-The first regression run used KVM; the complete 13-test run also passed with
+The first regression run used KVM; the complete 15-test run passed with
 TCG using this runner.
 
 The runner cleans generated files in `kpass/kernel` to satisfy Kbuild's

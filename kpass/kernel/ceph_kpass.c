@@ -45,7 +45,7 @@ static struct miscdevice kpass_miscdev;
  * ============================================================================
  */
 
-/* Every sgvec entry owns a page reference, including copied pool data. */
+/* Every sgvec entry owns a page reference, including copied RX data. */
 static void kpass_buf_release_capture(struct kpass_buf *buf)
 {
 	unsigned int i;
@@ -522,13 +522,12 @@ static void kpass_accept_work_fn(struct work_struct *work)
  * ============================================================================
  */
 
-/* Callers reserve an sgvec slot before copying or retaining data. */
+/* Caller supplies an available slot and transfers one page reference. */
 static void kpass_rx_append(struct kpass_buf *buf, struct page *page,
 			    unsigned int offset, unsigned int len)
 {
 	struct kpass_sg_entry *sg = &buf->sgvec[buf->sg_count++];
 
-	get_page(page);
 	sg->page = page;
 	sg->offset = offset;
 	sg->length = len;
@@ -546,6 +545,7 @@ static int kpass_rx_pages(struct kpass_buf *buf, struct page *page,
 	while (len && buf->sg_count < buf->sg_max) {
 		unsigned int chunk = min_t(unsigned int, len, PAGE_SIZE - offset);
 
+		get_page(page);
 		kpass_rx_append(buf, page, offset, chunk);
 		consumed += chunk;
 		len -= chunk;
@@ -558,19 +558,26 @@ static int kpass_rx_pages(struct kpass_buf *buf, struct page *page,
 static int kpass_rx_copy(struct kpass_buf *buf, const struct sk_buff *skb,
 			 unsigned int offset, unsigned int len)
 {
-	struct kpass_session *sess = buf->sock->session;
 	unsigned int consumed = 0;
 
 	while (len && buf->sg_count < buf->sg_max) {
-		void *dst = kpass_buf_kaddr(sess, buf) + buf->total_len;
-		unsigned int page_off = offset_in_page(dst);
-		unsigned int chunk = min_t(unsigned int, len, PAGE_SIZE - page_off);
+		unsigned int chunk = min_t(unsigned int, len, PAGE_SIZE);
+		struct page *page;
+		void *dst;
 		int ret;
 
+		/* A reused buffer must not overwrite pages retained by TCP. */
+		page = alloc_page(GFP_KERNEL);
+		if (!page)
+			return consumed ?: -ENOMEM;
+		dst = kmap_local_page(page);
 		ret = skb_copy_bits(skb, offset, dst, chunk);
-		if (ret)
+		kunmap_local(dst);
+		if (ret) {
+			put_page(page);
 			return consumed ?: ret;
-		kpass_rx_append(buf, vmalloc_to_page(dst), page_off, chunk);
+		}
+		kpass_rx_append(buf, page, 0, chunk);
 		buf->copied_len += chunk;
 		consumed += chunk;
 		offset += chunk;

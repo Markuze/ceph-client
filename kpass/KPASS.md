@@ -65,8 +65,8 @@ The RX actor uses `tcp_read_sock` with a custom callback that:
   buffer's scatter-gather vector (`sgvec`).
 - Walks chained skbs (`frag_list`), including nested chains.
 - Copies slab-backed or cloned heads and externally mutable fragments into
-  pool pages. Linear data is not inherently a copy case: a page fragment can
-  back the linear head, even when `nr_frags == 0`.
+  separately allocated pages. Linear data is not inherently a copy case: a
+  page fragment can back the linear head, even when `nr_frags == 0`.
 
 The TX path uses `MSG_SPLICE_PAGES` with `bvec` iterators for both captured
 (sgvec) and pool (pages array) buffers, allowing TCP to take page references
@@ -158,10 +158,12 @@ mapped to userspace). Each buffer has:
   `BUF_RX_POSTED` -> `BUF_TX_INFLIGHT` -> `BUF_ALLOCATED`
 
 Every active sgvec entry owns one page reference, including entries pointing
-to copied pool data. Entries stay within one base page so PEEK's local mapping
+to copied RX data. Entries stay within one base page so PEEK's local mapping
 and TX's bvec describe the same bytes, including higher-order source pages.
 References are released when a buffer is freed, replaced by another receive,
 or destroyed with its session. TCP can free its skb while the capture lives.
+RX fallback copies use separately allocated pages, so freeing or reusing a
+buffer handle cannot overwrite bytes held by an outstanding TX reference.
 
 ### Socket Callbacks
 
@@ -185,9 +187,9 @@ head, `frags[]`, and `frag_list` in stream order.
 | RX backing | Action | Reason |
 | --- | --- | --- |
 | Linear head with `!skb_head_is_locked(skb)` | Retain page references | Linux splice's rule: `head_frag` is set and the head is not cloned |
-| Slab-backed or cloned linear head | Copy to pool pages | A page reference alone cannot safely retain this head |
+| Slab-backed or cloned linear head | Copy to newly allocated pages | A page reference alone cannot safely retain this head |
 | Ordinary readable fragments | Retain page references | The pages outlive the skb through their references |
-| Fragments marked `SKBFL_SHARED_FRAG` | Copy to pool pages | External writers may change the source after capture |
+| Fragments marked `SKBFL_SHARED_FRAG` | Copy to newly allocated pages | External writers may change the source after capture |
 | Children of an skb marked `SKBFL_SHARED_FRAG` | Copy their payload | Conservatively propagate the parent's sharing flag through the chain |
 | Unreadable skb fragments | Return `-EIO` | Device-memory payload cannot be mapped by this implementation |
 
@@ -198,9 +200,12 @@ the existing splice ownership scheme rather than retaining the entire skb.
 
 Both copied and retained extents set `captured` and extend `total_len`.
 `copied_len` counts fallback bytes for the current capture internally; it is
-not yet exposed through the UAPI. Fallback destinations are translated from
-their actual vmalloc address, including buffers with an unaligned stride.
-`skb_copy_bits` errors are checked before recording an extent.
+not yet exposed through the UAPI. Each fallback extent allocates an ordinary
+page in RX worker context and transfers the allocation's reference to sgvec.
+The vmalloc pool is used only for demo origination. Pool stride and later
+slot writes cannot affect captured RX bytes. `skb_copy_bits` errors release
+the new page before returning; allocation failure returns `-ENOMEM` when
+no prefix has been captured, or completes a short receive after a prefix.
 
 A full vector produces a short receive, not an extra payload copy. If an
 error follows a successfully captured prefix, that prefix is returned to TCP
@@ -260,15 +265,16 @@ changes to object backing when it is implemented.
 
 POKE is the prototype demo's userspace-to-pool copy ioctl and already rejects
 captured RX buffers. It is not needed for forwarding or repeated object
-sends. The concrete remaining ownership exception is the fixed vmalloc pool
-used for RX copy fallbacks: a later receive or allocation of that slot can
-explicitly overwrite its storage even while TCP holds references. Ordinary
-pages owned by each capture can resolve this without an extra immutability
-mechanism.
+sends. RX copy fallbacks now use ordinary pages owned by each capture.
+The capture and TCP release their references independently. Reposting,
+freeing/reallocating the same handle, or destroying its session leaves
+already-spliced data intact until the final page reference is released.
+The tests reproduce the old overwrite both in a TX skb and over live TCP.
 
 `MSG_NO_SHARED_FRAGS` fits the retained-object path under these semantics.
-Its use should cover pages whose contents stay stable through their normal
-reference lifetime, with the fixed-pool exception handled explicitly.
+Its use can cover captured RX pages, including the separately allocated
+copy fallback pages. Legacy POKE buffers still permit writes to fixed pool
+storage and need their own lifetime handling before using that flag.
 
 The next TX implementation work is:
 
@@ -276,9 +282,9 @@ The next TX implementation work is:
    through the end of sgvec without applying the requested length.
 2. Preserve a cumulative send count and reliable progress across partial
    sends and `EAGAIN`; the current completion reports only the last work run.
-3. Fix the copied-RX pool lifetime exception above and pool-page addressing
-   for non-page-aligned buffer strides. Repeated sends keep using the same
-   captured pages.
+3. Address legacy POKE pool lifetime and pool-page addressing for
+   non-page-aligned buffer strides. Captured RX pages now have independent
+   reference lifetimes, including copied data.
 4. Batch bvec extents into fewer send calls and use `MSG_NO_SHARED_FRAGS`
    where the retained-page ownership permits it.
 5. Measure copies with the target NIC and offload settings, including SG and
@@ -363,6 +369,6 @@ Terminal 3 (client):
 6. **Buffer size capped at 1MB** -- `KPASS_MAX_BUF_SIZE`
 7. **Scatter-gather limited to 128 entries** -- `KPASS_MAX_SG_ENTRIES`;
    fragmented receives can complete short before reaching the byte limit
-8. **Prototype completion and lifetime gaps** -- TX range/progress and pool
-   reuse issues above, plus connect/EOF completion, cancellation, and teardown,
-   must be resolved before performance evaluation
+8. **Prototype completion and lifetime gaps** -- TX range/progress and legacy
+   POKE pool reuse issues above, plus connect/EOF completion, cancellation,
+   and teardown, must be resolved before performance evaluation
