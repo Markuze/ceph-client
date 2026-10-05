@@ -248,11 +248,27 @@ Source locations: [`tcp_sendmsg_locked`](../net/ipv4/tcp.c),
 
 TCP marks these spliced fragments `SKBFL_SHARED_FRAG` unless the sender sets
 `MSG_NO_SHARED_FRAGS`. Thus a local kpass-to-kpass transfer can take our RX
-copy fallback. The flag is a possible future optimization only once payload
-immutability lasts for the entire TCP retention period. SEND completion
-means acceptance into TCP, not acknowledgment by the peer. Pool data can
-currently be changed by POKE or a later receive while TCP retains references,
-so adding `MSG_NO_SHARED_FRAGS` now would make an unsupported promise.
+copy fallback.
+
+For opaque objects, reusing a handle means sending the same retained data
+again. The object's page references prevent RX allocator recycling; TCP
+takes its own references for transmission. Repeated sends need no new
+backing, sealing operation, or additional immutability state. SEND completes
+when the requested bytes have been accepted into TCP; the page references
+provide the remaining lifetime. Compaction is deferred and will address
+changes to object backing when it is implemented.
+
+POKE is the prototype demo's userspace-to-pool copy ioctl and already rejects
+captured RX buffers. It is not needed for forwarding or repeated object
+sends. The concrete remaining ownership exception is the fixed vmalloc pool
+used for RX copy fallbacks: a later receive or allocation of that slot can
+explicitly overwrite its storage even while TCP holds references. Ordinary
+pages owned by each capture can resolve this without an extra immutability
+mechanism.
+
+`MSG_NO_SHARED_FRAGS` fits the retained-object path under these semantics.
+Its use should cover pages whose contents stay stable through their normal
+reference lifetime, with the fixed-pool exception handled explicitly.
 
 The next TX implementation work is:
 
@@ -260,10 +276,11 @@ The next TX implementation work is:
    through the end of sgvec without applying the requested length.
 2. Preserve a cumulative send count and reliable progress across partial
    sends and `EAGAIN`; the current completion reports only the last work run.
-3. Resolve pool reuse while TCP retains pages and pool-page addressing for
-   non-page-aligned buffer strides.
-4. Batch bvec extents into fewer send calls, then evaluate safe use of
-   `MSG_NO_SHARED_FRAGS` for immutable backing.
+3. Fix the copied-RX pool lifetime exception above and pool-page addressing
+   for non-page-aligned buffer strides. Repeated sends keep using the same
+   captured pages.
+4. Batch bvec extents into fewer send calls and use `MSG_NO_SHARED_FRAGS`
+   where the retained-page ownership permits it.
 5. Measure copies with the target NIC and offload settings, including SG and
    checksum fallbacks. The RX loopback test is not that measurement.
 
