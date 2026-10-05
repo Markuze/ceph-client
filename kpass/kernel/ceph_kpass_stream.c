@@ -27,6 +27,8 @@ struct kpass_object {
 	refcount_t refs;
 	struct list_head extents;
 	u64 length;
+	bool compacted;
+	bool compacting;
 };
 
 struct kpass_request {
@@ -36,6 +38,10 @@ struct kpass_request {
 	struct io_uring_cmd *ioucmd;
 	struct kpass_sqe_cmd cmd;
 	struct kpass_object *object;
+	struct kpass_object *replacement;
+	struct work_struct compact_work;
+	u64 compact_reserved;
+	bool compact_claimed;
 	u64 progress;
 	int result;
 	bool ready;
@@ -167,18 +173,26 @@ static int kpass_object_copy(struct kpass_object *object, u64 off, u64 len,
 	list_for_each_entry(extent, &object->extents, list) {
 		u64 first = max(off, extent->start);
 		u64 last = min(end, extent->start + extent->length);
-		void *mapped;
-		unsigned long left;
+		u32 pos;
 
 		if (first >= last)
 			continue;
-		mapped = kmap_local_page(extent->backing->page);
-		left = copy_to_user(dest + first - off,
-				    mapped + extent->offset + first - extent->start,
-				    last - first);
-		kunmap_local(mapped);
-		if (left)
-			return -EFAULT;
+		pos = extent->offset + first - extent->start;
+		while (first < last) {
+			u32 offset = offset_in_page(pos);
+			u32 chunk = min_t(u64, last - first, PAGE_SIZE - offset);
+			void *mapped;
+			unsigned long left;
+
+			mapped = kmap_local_page(extent->backing->page +
+						(pos >> PAGE_SHIFT));
+			left = copy_to_user(dest + first - off, mapped + offset, chunk);
+			kunmap_local(mapped);
+			if (left)
+				return -EFAULT;
+			pos += chunk;
+			first += chunk;
+		}
 	}
 	return len;
 }
@@ -196,6 +210,16 @@ static void kpass_request_finish(struct kpass_request *req, int result)
 		io_uring_cmd_complete_in_task(req->ioucmd,
 					     kpass_stream_complete_task);
 }
+
+/* A compaction worker owns its request until it has stopped touching it. */
+static void kpass_request_cancel(struct kpass_request *req)
+{
+	WRITE_ONCE(req->canceled, true);
+	if (!req->compact_claimed || req->ready)
+		kpass_request_finish(req, -ECANCELED);
+}
+
+#include "ceph_kpass_compact.c"
 
 static bool kpass_is_range(u8 op)
 {
@@ -512,6 +536,9 @@ static void kpass_stream_process(struct kpass_session *sess)
 		int ret = 0;
 
 		switch (req->cmd.op) {
+		case KPASS_OP_OBJECT_COMPACT:
+			/* The independent compaction worker drives this request. */
+			continue;
 		case KPASS_OP_READ_STREAM:
 			ret = kpass_stream_snapshot(req);
 			break;
@@ -596,10 +623,8 @@ static int kpass_stream_cancel(struct io_uring_cmd *ioucmd)
 
 	mutex_lock(&sess->stream_lock);
 	req = pdu->request;
-	if (req) {
-		req->canceled = true;
-		kpass_request_finish(req, -ECANCELED);
-	}
+	if (req)
+		kpass_request_cancel(req);
 	mutex_unlock(&sess->stream_lock);
 	return 0;
 }
@@ -619,6 +644,11 @@ static void kpass_stream_complete_task(struct io_tw_req tw_req,
 	mutex_lock(&sess->stream_lock);
 	if (tw.cancel || req->canceled)
 		ret = -ECANCELED;
+	if (req->compact_claimed) {
+		ret = kpass_compact_publish(req, ret);
+		req->object->compacting = false;
+		kpass_object_put(sess, req->replacement);
+	}
 	if (ret >= 0 && req->cmd.op == KPASS_OP_KEEP) {
 		handle = kpass_object_publish(sess, req->object);
 		if (handle)
@@ -693,7 +723,7 @@ static void kpass_stream_issue_task(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (sess->pending_count > KPASS_MAX_PENDING &&
 	    (kpass_is_range(cmd->op) || cmd->op == KPASS_OP_OBJECT_READ ||
 	     cmd->op == KPASS_OP_OBJECT_SEND || cmd->op == KPASS_OP_SOCK_ACCEPT ||
-	     cmd->op == KPASS_OP_SOCK_CONNECT)) {
+	     cmd->op == KPASS_OP_SOCK_CONNECT || cmd->op == KPASS_OP_OBJECT_COMPACT)) {
 		ret = -ENOSPC;
 		goto finish;
 	}
@@ -758,6 +788,14 @@ static void kpass_stream_issue_task(struct io_tw_req tw_req, io_tw_token_t tw)
 		if (ksock)
 			ret = kpass_stream_stat(sess, ksock, cmd->stream.addr);
 		break;
+	case KPASS_OP_OBJECT_STAT:
+		ret = kpass_object_stat(sess, cmd);
+		break;
+	case KPASS_OP_OBJECT_COMPACT:
+		ret = kpass_compact_start(req);
+		if (ret == -EIOCBQUEUED)
+			goto out;
+		break;
 	case KPASS_OP_CANCEL: {
 		struct kpass_request *target;
 
@@ -767,8 +805,7 @@ static void kpass_stream_issue_task(struct io_tw_req tw_req, io_tw_token_t tw)
 			    io_uring_cmd_ctx_handle(target->ioucmd) !=
 			    io_uring_cmd_ctx_handle(ioucmd))
 				continue;
-			target->canceled = true;
-			kpass_request_finish(target, -ECANCELED);
+			kpass_request_cancel(target);
 			ret = 0;
 			break;
 		}

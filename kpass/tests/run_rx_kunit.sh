@@ -63,9 +63,11 @@ timeout "${KPASS_TEST_TIMEOUT:-60}" "${QEMU:-qemu-system-x86_64}" \
 	> "$test_build/console.log" 2>&1
 
 tr -d '\r' < "$test_build/console.log" > "$test_build/results.log"
-grep -E 'kpass-(rx|stream):|TCP RX:|PASS:|KPASS_.*STATUS=' "$test_build/results.log"
+grep -E 'kpass-(rx|stream|compact):|TCP RX:|compaction:|PASS:|KPASS_.*STATUS=' \
+	"$test_build/results.log"
 grep -Eq '# kpass-rx: pass:[1-9][0-9]* fail:0 skip:0 total:' "$test_build/results.log"
 grep -Eq '# kpass-stream: pass:[1-9][0-9]* fail:0 skip:0 total:' "$test_build/results.log"
+grep -Eq '# kpass-compact: pass:[1-9][0-9]* fail:0 skip:0 total:' "$test_build/results.log"
 grep -qx 'KPASS_INSMOD_STATUS=0' "$test_build/results.log"
 grep -qx 'KPASS_RMMOD_STATUS=0' "$test_build/results.log"
 grep -qx 'KPASS_STREAM_STATUS=0' "$test_build/results.log"

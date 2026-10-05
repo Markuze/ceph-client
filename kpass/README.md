@@ -126,8 +126,9 @@ The stream/object API now passes end-to-end userspace/io_uring tests in the
 same VM. The suite checks automatic accumulation, split headers, future
 ranges, independent next-header reads, multiple objects from one receive,
 discard, stale IDs, EOF/reset, cancellation, close, budget stall/resume and
-ring teardown. It sends a 4 MiB object twice, checks every byte, releases the
-handle while TX is pending, and verifies both cumulative send results. A
+ring teardown. It compacts a 4 MiB object while a send is blocked, then sends
+it again using the new backing. It checks every byte of both copies, releases
+the handle while TX is pending, and verifies both cumulative send results. A
 pending-operation limit test drains 1,024 terminal completions through a
 smaller CQ. Accepted sockets, object lifetime after socket close, and legacy
 INIT with CQE16 are covered.
@@ -136,19 +137,30 @@ Six additional KUnit tests check the stream's page identity, reference
 sharing across splits, incomplete assembly, EOF cleanup, budget handling and
 generation retirement and callback restoration. The callback regression
 failed before the fix: accepted sockets restored inherited module callbacks
-and the listener's private pointer was cloneable. The total is 21 passing
-kernel tests plus eight
-userspace test groups. The module loads and unloads without kernel warnings
-in the test guest. Physical NIC traffic and performance have not been tested.
+and the listener's private pointer was cloneable.
+
+Six compaction KUnit tests cover packing, base-page backing, temporary memory
+limits, cancellation before/after the copy, freed/reused handles, and cleanup
+after a partial copy hits the extent cap. The packing fixture reduces 40
+extents to 2 and the backing charge from 163,840 to 81,920 bytes for an
+80,000-byte object, with identical bytes and a stable handle. The base-page
+case forces that representation; allocator failure itself is not injected.
+Userspace tests exercise the actual worker, ranged reads/sends across chunk
+boundaries, insufficient budget, repeat compaction, explicit cancellation and
+ring teardown during compaction. All temporary references drain. The total
+is 27 passing kernel tests plus ten userspace test groups. The module loads
+and unloads without kernel warnings in the test guest. Physical NIC traffic
+and performance have not been tested.
 The older buffer/POKE API retains the other limitations described in
 [KPASS.md](KPASS.md); the new object send path has its own range and cursor
 handling.
 
 ## Kernel and userspace VM tests
 
-The test module includes `kernel/ceph_kpass_test.c` only when built with
-`KPASS_KUNIT_TEST=1`. Tests call the actual actor with constructed skbs to
-check page identity, reference lifetime after skb release, cloned/slab
+The test module includes `kernel/ceph_kpass_test.c`,
+`kernel/ceph_kpass_stream_test.c` and `kernel/ceph_kpass_compact_test.c` only
+when built with `KPASS_KUNIT_TEST=1`. Tests call the actual actor with
+constructed skbs to check page identity, reference lifetime after skb release, cloned/slab
 fallbacks, cross-page heads/fragments, nested `frag_list`, mutable shared
 fragments, limits, unreadable data, and release/reuse. Copied pages are checked
 for independence from the source skb and the demo pool, balanced references,
@@ -217,8 +229,10 @@ CQE suppression is rejected so a created handle cannot lose its ready result.
 | KEEP | Socket, offset, length. Moves received extents into a private assembly and appends future extents by reference. Completes with length and a handle only when the entire range has arrived. |
 | DISCARD | Socket, offset, length. Releases buffered bytes and skips future bytes without retaining them. Completes with length once the full range has been consumed. |
 | OBJECT_READ | Handle, object offset, length, destination. Explicit copy; the operation holds the object until completion. |
-| OBJECT_FREE | Handle. Removes it from the table immediately; in-flight reads/sends retain their references. |
+| OBJECT_FREE | Handle. Removes it from the table immediately; in-flight reads/sends retain their references. A compaction still waiting to publish fails with ESTALE. |
 | OBJECT_SEND | Socket, handle, object offset, length. Queues that exact range. Each operation has an independent cursor; sends to one socket remain ordered and complete with the total length once queued to TCP. |
+| OBJECT_COMPACT (0x59) | Handle; offset, length and addr zero. Copies to packed backing on a background worker and publishes it under the same handle; completes with 0. |
+| OBJECT_STAT (0x5a) | Handle and `stream.addr` pointing to `struct kpass_object_stat`. Copies length, conservative backing charge, extent count and COMPACTED/COMPACTING flags; completes with 0. |
 | LIMIT | `stream.length` sets the session's retained-backing limit, at least PAGE_SIZE. A value below the current charge fails with EBUSY. |
 | STREAM_STAT | Socket and `stream.addr` pointing to `struct kpass_stream_stat`. Returns stream end, undecided bytes, session backing charge/limit, RX fallback copies, object/operation/extent counts, EOF and error. The pending count includes the STAT itself. |
 | CANCEL | `stream.object` is the full tag of a pending command on the same ring and session. The target completes with ECANCELED; CANCEL returns 0 or ENOENT. |
@@ -252,9 +266,10 @@ already completed. Undecided bytes beyond an object stay in the accumulator.
 
 Handles encode `generation << 32 | (slot + 1)`; zero is invalid. Reusing a
 table slot increments its generation. An exhausted generation retires the
-slot. OBJECT_READ/SEND/FREE return ESTALE for released handles. Completed
-objects outlive their source sockets; sending again uses the same pages.
-There is no new sealing step or compaction machinery.
+slot. Object commands return ESTALE for released handles. Completed objects
+outlive their source sockets; sending again uses their current backing.
+Compaction changes backing while preserving the bytes, length and handle.
+Ordinary references protect pages; there is no separate sealing step.
 
 EOF before the requested end returns ENODATA, and socket errors return their
 errno, without a partial object ID. Cancellation or a failed KEEP releases
@@ -266,8 +281,54 @@ failed send may already have queued a prefix to TCP.
 On this pinned kernel, marking a uring command cancelable supplies ring/task
 teardown cancellation; individual `IORING_OP_ASYNC_CANCEL` does not dispatch
 to this driver. Use the explicit CANCEL command for individual operations.
-Commands waiting on the network retain the session file through io_uring.
+Pending network and compaction commands retain the session file through io_uring.
 Destination memory must remain valid until its read CQE.
+
+### Background compaction
+
+Compaction is explicit per completed object. `kpass_prep_compact(&ring, sqe,
+fd, handle, tag)` prepares the command; the caller submits it and waits for
+the CQE. No replacement handle is returned. Pending assemblies cannot be
+compacted because they have no public handle.
+
+`kernel/ceph_kpass_compact.c` implements one ordered compaction workqueue per
+session, separate from the stream worker. It gathers scattered extents into
+private compound-page allocations, preferring 64 KiB physically contiguous
+chunks on the x86-64 baseline. Allocation falls back through smaller orders
+to a base page. Each allocation is one zero-offset extent. Only the final
+page has unused space; the total destination charge is the object length
+rounded up to PAGE_SIZE. Large objects use multiple contiguous chunks.
+
+The worker pins the source and reserves the full destination charge under
+the session mutex before allocating. It copies outside that mutex, checks
+cancellation between base-page copies and yields between chunks. In io_uring
+completion task work, it checks the handle again and swaps its table entry
+to the completed copy. The generation and object count stay unchanged.
+Reads and sends that already pinned the old object finish on its pages;
+later operations acquire the new backing. TCP also holds its own references
+for queued bytes. Source socket closure does not cancel compaction.
+
+Old and new backing coexist during the copy and while old operations still
+need it. Both, including reserved destination bytes, count toward
+`STREAM_STAT.backing_bytes` and LIMIT. If they cannot fit, COMPACT fails with
+ENOBUFS and leaves the original object intact. Allocation failure returns
+ENOMEM; the extent or pending-operation cap returns ENOSPC. Failure and
+cancellation release partial output and unused reservations. A freed or
+reused handle returns ESTALE at publication and cannot be resurrected.
+
+A second compaction while one is pending returns EBUSY. Compaction of an
+already compacted object succeeds without copying, even when the backing
+budget is full. COMPACTING describes the current source while the request is
+pending; COMPACTED describes the published packed backing. OBJECT_STAT sums
+that object's extent charges; it excludes the replacement under construction
+and older backing retained only by operations. STREAM_STAT includes those
+session charges. Neither statistic is a unique physical-memory census.
+
+The implementation has no automatic age/slack policy or copy-rate throttle.
+Userspace chooses the objects and submission rate. Compaction deliberately
+copies payload once in the kernel; its copies are separate from the RX
+fallback byte counter. Throughput, CPU cost, scheduling effects and physical
+NIC behavior remain to be measured.
 
 ### Backing, limits and execution
 
@@ -280,9 +341,10 @@ fallback pages as the original actor.
 The default session backing limit is 64 MiB. Each capture charges the full
 compound page it retains; capturing the same allocation several times can
 overcount it. Splits and header snapshots share that capture's charge.
-The charge follows undecided data, pending assemblies, completed objects and
-active object operations. TCP owns its own references after a send. This is a
-conservative retention budget, not an exact physical-memory measurement.
+The charge follows undecided data, pending assemblies, completed objects,
+active object operations and compaction output/reservations. TCP owns its own
+references after a send. This is a conservative retention budget, not an
+exact physical-memory measurement.
 Metadata has separate fixed caps: 65,536 extents, 4,096 published objects,
 and 1,024 pending I/O operations. Control commands remain available at the
 pending-I/O cap. A metadata allocation/cap failure can fail the operation.
@@ -293,7 +355,8 @@ Known future DISCARD ranges can still be consumed at the limit. An object
 larger than the remaining budget waits until other data is released or the
 limit is raised.
 
-This first implementation uses one session mutex and a session work item.
+This implementation uses one session mutex, a stream work item and a separate
+ordered compaction workqueue.
 Socket callbacks schedule work; all user copies and object publication run
 in io_uring task work. Each pending request owns copied command arguments,
 independent of later SQE reuse. Socket callbacks are detached under the
@@ -303,8 +366,9 @@ is marked non-copyable, and accepted sockets restore native callbacks.
 The broader [object design](https://github.com/Markuze/zc_proxy/blob/main/OBJECTS.md)
 also proposes BPF hooks, SPLIT/SPLICE between completed objects, WRITE,
 framed/vector sends, socket import/namespaces, exact accounting, notifications
-and compaction. Those remain future work. This implementation covers the
-userspace stream/assembly contract and basic object read, send and release.
+and automatic compaction policy. Those remain future work. This implementation
+covers the userspace stream/assembly contract, object read/send/release and
+explicit background compaction.
 
 ## Design references
 

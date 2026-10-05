@@ -106,6 +106,25 @@ static struct kpass_stream_stat stat_socket(uint16_t sock)
 	return stat;
 }
 
+static struct kpass_object_stat stat_object(uint64_t object)
+{
+	struct kpass_object_stat stat;
+
+	expect(range(KPASS_OP_OBJECT_STAT, 0, object, 0, 0, &stat), 0);
+	return stat;
+}
+
+static uint64_t compact_object(uint64_t object)
+{
+	struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+	uint64_t tag = ++sequence;
+
+	assert(sqe);
+	assert(!kpass_prep_compact(&ring, sqe, device, object, tag));
+	assert(io_uring_submit(&ring) >= 0);
+	return tag;
+}
+
 static struct kpass_stream_stat await_received(uint16_t sock, uint64_t end)
 {
 	struct kpass_stream_stat stat;
@@ -355,6 +374,9 @@ static void large_send_test(void)
 	id = expect(keep, len).object;
 	assert(id);
 	a = range(KPASS_OP_OBJECT_SEND, sock, id, 0, len, NULL);
+	still_pending(a);
+	expect(compact_object(id), 0);
+	assert(stat_object(id).flags & KPASS_OBJECT_COMPACTED);
 	b = range(KPASS_OP_OBJECT_SEND, sock, id, 0, len, NULL);
 	release_object(id);
 	still_pending(a);
@@ -369,7 +391,140 @@ static void large_send_test(void)
 	close_pair(sock, peer);
 	free(data);
 	free(got);
-	puts("PASS: 4 MiB object, ordered repeated TX, partial-send continuation, free during TX");
+	puts("PASS: 4 MiB compaction during TX, old/new backing, partial sends, free during TX");
+}
+
+static void compact_test(void)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	const size_t len = 2 * 65536 + page + 29;
+	const size_t packed = (len + page - 1) / page * page;
+	uint16_t sock;
+	int peer = connect_pair(&sock);
+	unsigned char *data = malloc(len), *got = malloc(len);
+	struct kpass_object_stat before, after;
+	struct kpass_stream_stat memory;
+	uint64_t keep, id, send;
+	size_t i;
+
+	assert(data && got);
+	for (i = 0; i < len; i++)
+		data[i] = (i * 31 + i / 997) & 255;
+	keep = range(KPASS_OP_KEEP, sock, 0, 0, len, NULL);
+	send_bytes(peer, data, len);
+	id = expect(keep, len).object;
+	before = stat_object(id);
+	assert(before.length == len && !before.flags);
+	memory = stat_socket(sock);
+	expect(range(KPASS_OP_LIMIT, 0, 0, 0, memory.backing_bytes, NULL), 0);
+	expect(compact_object(id), -ENOBUFS);
+	after = stat_object(id);
+	assert(!after.flags && after.extents == before.extents);
+	expect(range(KPASS_OP_OBJECT_READ, 0, id, 0, len, got), len);
+	assert(!memcmp(got, data, len));
+	expect(range(KPASS_OP_LIMIT, 0, 0, 0, memory.backing_bytes + packed, NULL), 0);
+	assert(!expect(compact_object(id), 0).object);
+	after = stat_object(id);
+	assert(after.length == len && after.flags == KPASS_OBJECT_COMPACTED);
+	assert(after.backing_bytes == packed && after.extents < before.extents);
+	assert(stat_socket(sock).backing_bytes == packed);
+	expect(range(KPASS_OP_OBJECT_READ, 0, id, 0, len, got), len);
+	assert(!memcmp(got, data, len));
+	expect(range(KPASS_OP_OBJECT_READ, 0, id, page - 5, page + 17, got), page + 17);
+	assert(!memcmp(got, data + page - 5, page + 17));
+	send = range(KPASS_OP_OBJECT_SEND, sock, id, 65531, 8000, NULL);
+	read_bytes(peer, got, 8000);
+	expect(send, 8000);
+	assert(!memcmp(got, data + 65531, 8000));
+	/* Already packed: no new allocation needed, even at the hard limit. */
+	expect(range(KPASS_OP_LIMIT, 0, 0, 0, packed, NULL), 0);
+	expect(compact_object(id), 0);
+	assert(stat_socket(sock).backing_bytes == packed);
+	release_object(id);
+	expect(compact_object(id), -ESTALE);
+	expect(range(KPASS_OP_OBJECT_STAT, 0, id, 0, 0, &after), -ESTALE);
+	assert(!stat_socket(sock).backing_bytes);
+	expect(range(KPASS_OP_LIMIT, 0, 0, 0, KPASS_DEFAULT_LIMIT, NULL), 0);
+	close_pair(sock, peer);
+	free(data);
+	free(got);
+	puts("PASS: compaction packing, unchanged ID/data, budget rollback, no-op, ranged I/O");
+}
+
+static void compact_lifetime_test(void)
+{
+	const size_t len = 4 * 1024 * 1024;
+	uint16_t sock;
+	int peer = connect_pair(&sock);
+	unsigned char *data = malloc(len), *got = malloc(len);
+	unsigned int round, tries;
+	uint64_t id, keep, compact, cancel;
+	struct result r;
+	struct kpass_object_stat stat;
+	struct io_uring other;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *cqe;
+	struct __kernel_timespec timeout = { .tv_sec = 5 };
+
+	assert(data && got);
+	memset(data, 0x6b, len);
+	for (round = 0; round < 2; round++) {
+		keep = range(KPASS_OP_KEEP, sock, 0, round * len, len, NULL);
+		send_bytes(peer, data, len);
+		id = expect(keep, len).object;
+		if (!round) {
+			command(KPASS_OP_OBJECT_COMPACT, 0, &compact)->stream.object = id;
+			command(KPASS_OP_CANCEL, 0, &cancel)->stream.object = compact;
+			r = wait_result(cancel);
+			/* Both legal outcomes of cancellation racing with completion. */
+			assert(!r.res || r.res == -ENOENT);
+			expect(compact, r.res ? 0 : -ECANCELED);
+			printf("compaction cancellation: %s\n",
+			       r.res ? "completed before cancel" : "canceled by worker");
+		} else {
+			assert(!io_uring_queue_init(8, &other,
+				IORING_SETUP_SQE128 | IORING_SETUP_CQE32));
+			sqe = io_uring_get_sqe(&other);
+			assert(!kpass_prep_compact(&other, sqe, device, id, 1));
+			sqe = io_uring_get_sqe(&other);
+			assert(!kpass_prep_range(&other, sqe, device, KPASS_OP_OBJECT_STAT,
+						 0, id, 0, 0, &stat, 2));
+			assert(io_uring_submit(&other) == 2);
+			/* The STAT completion proves the worker request was issued. */
+			for (;;) {
+				uint64_t tag;
+
+				assert(!io_uring_wait_cqe_timeout(&other, &cqe, &timeout));
+				tag = cqe->user_data;
+				assert(!cqe->res && (tag == 1 || tag == 2));
+				io_uring_cqe_seen(&other, cqe);
+				if (tag == 2)
+					break;
+			}
+			assert(stat.flags & (KPASS_OBJECT_COMPACTING | KPASS_OBJECT_COMPACTED));
+			printf("compaction ring teardown: %s\n",
+			       stat.flags & KPASS_OBJECT_COMPACTING ? "in flight" : "completed");
+			io_uring_queue_exit(&other);
+		}
+		/* Teardown can finish asynchronously; all source/copy pins must drain. */
+		for (tries = 0; tries < 3000; tries++) {
+			stat = stat_object(id);
+			if (!(stat.flags & KPASS_OBJECT_COMPACTING) &&
+			    stat_socket(sock).pending == 1)
+				break;
+			usleep(1000);
+		}
+		assert(tries < 3000);
+		assert(stat_socket(sock).backing_bytes == stat.backing_bytes);
+		expect(range(KPASS_OP_OBJECT_READ, 0, id, 0, len, got), len);
+		assert(!memcmp(got, data, len));
+		release_object(id);
+		assert(!stat_socket(sock).backing_bytes);
+	}
+	close_pair(sock, peer);
+	free(data);
+	free(got);
+	puts("PASS: compaction cancel/teardown, preserved bytes, drained references");
 }
 
 static void accept_test(void)
@@ -516,7 +671,9 @@ int main(void)
 	assembly_test();
 	cancel_test();
 	budget_test();
+	compact_test();
 	large_send_test();
+	compact_lifetime_test();
 	accept_test();
 	framing_test();
 	pending_limit_test();

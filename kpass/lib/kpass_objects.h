@@ -56,4 +56,13 @@ static inline uint64_t kpass_cqe_object(const struct io_uring_cqe *cqe)
 	return cqe->res < 0 ? KPASS_OBJECT_INVALID : cqe->big_cqe[0];
 }
 
+/* Compact the entire object asynchronously, preserving its existing handle. */
+static inline int
+kpass_prep_compact(struct io_uring *ring, struct io_uring_sqe *sqe, int fd,
+		   uint64_t object, uint64_t tag)
+{
+	return kpass_prep_range(ring, sqe, fd, KPASS_OP_OBJECT_COMPACT, 0,
+				object, 0, 0, NULL, tag);
+}
+
 #endif /* KPASS_OBJECTS_H */

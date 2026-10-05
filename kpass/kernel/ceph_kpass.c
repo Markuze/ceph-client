@@ -1133,6 +1133,13 @@ static int kpass_open(struct inode *inode, struct file *file)
 		kfree(sess);
 		return -ENOMEM;
 	}
+	sess->compact_wq = alloc_ordered_workqueue("kpass_compact_%d", 0,
+						   current->pid);
+	if (!sess->compact_wq) {
+		destroy_workqueue(sess->wq);
+		kfree(sess);
+		return -ENOMEM;
+	}
 
 	file->private_data = sess;
 	pr_debug("ceph_kpass: session opened\n");
@@ -1159,6 +1166,7 @@ static int kpass_release(struct inode *inode, struct file *file)
 		kpass_object_put(sess, sess->objects[i]);
 	mutex_unlock(&sess->stream_lock);
 
+	destroy_workqueue(sess->compact_wq);
 	destroy_workqueue(sess->wq);
 	kpass_destroy_buffer_pool(sess);
 	kfree(sess);
@@ -1423,4 +1431,5 @@ MODULE_DESCRIPTION("Kernel module for zero-copy network I/O via tcp_read_sock + 
 #ifdef KPASS_KUNIT_TEST
 #include "ceph_kpass_test.c"
 #include "ceph_kpass_stream_test.c"
+#include "ceph_kpass_compact_test.c"
 #endif

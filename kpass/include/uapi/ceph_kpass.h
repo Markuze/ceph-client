@@ -69,6 +69,8 @@ enum kpass_op {
 	KPASS_OP_LIMIT		= 0x56,
 	KPASS_OP_STREAM_STAT	= 0x57,
 	KPASS_OP_CANCEL		= 0x58,
+	KPASS_OP_OBJECT_COMPACT	= 0x59,
+	KPASS_OP_OBJECT_STAT	= 0x5a,
 };
 
 /*
@@ -152,6 +154,17 @@ struct kpass_stream_stat {
 	__s32 error;
 	__u32 extents;		/* session metadata cap: KPASS_MAX_EXTENTS */
 	__u32 reserved;
+};
+
+#define KPASS_OBJECT_COMPACTED	(1U << 0)
+#define KPASS_OBJECT_COMPACTING	(1U << 1)
+
+/* OBJECT_STAT copies this structure to stream.addr. */
+struct kpass_object_stat {
+	__u64 length;
+	__u64 backing_bytes;	/* conservative sum of extent backing charges */
+	__u32 extents;
+	__u32 flags;		/* KPASS_OBJECT_* */
 };
 
 /*

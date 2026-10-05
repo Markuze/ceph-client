@@ -151,6 +151,7 @@ struct kpass_session {
 
 	/* Async work */
 	struct workqueue_struct	*wq;
+	struct workqueue_struct	*compact_wq;
 };
 
 /* Function prototypes */

@@ -24,6 +24,7 @@ static int kpass_stream_test_init(struct kunit *test)
 	if (!ctx)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&ctx->session.requests);
+	mutex_init(&ctx->session.stream_lock);
 	ctx->session.backing_limit = KPASS_DEFAULT_LIMIT;
 	ctx->sock.session = &ctx->session;
 	INIT_LIST_HEAD(&ctx->sock.stream);
