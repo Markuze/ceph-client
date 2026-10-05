@@ -14,6 +14,8 @@ with `MSG_SPLICE_PAGES`; the application coordinates buffer handles.
 | Imported kpass patch | `59ae49afff3337936fe556422e46a610652cea72` |
 | Import on this branch | `ae376b138283` |
 | Initial Linux 7.2 port | `9c2a31ff39d7` |
+| RX capture and page ownership | `14ccd3ca674b` |
+| Independent RX fallback page lifetimes | `9f207f6ddc2e` |
 | Userspace dependency | liburing `2.15`, `d41bf9220ec39277ff235379e9089d9e0fd6c2a5` |
 
 The local `master` was fast-forwarded to `v7.2.9` before creating this
@@ -167,9 +169,23 @@ copy counts. The runner fails for failed/skipped tests, a missing completion
 marker, failed module load/unload, or kernel warning/oops/panic. Rebuild the
 normal module with the normal `KDIR` when needed.
 
+## Object interface direction
+
+The current prototype allocates buffer IDs before RECV. The next interface
+will collect each socket's TCP stream by reference, let userspace or eBPF
+inspect requested header bytes, and assemble or discard selected stream
+ranges. A range can include future bytes; its object ID is issued only when
+the full selected range is available. The next header read can be queued at
+its known stream offset while the preceding object is still being assembled.
+
+Repeated sends retain the same pages through ordinary references. Compaction
+is deferred. This stream assembly and object-ID interface is documented in
+the paper repository's [receive design](https://github.com/Markuze/zc_proxy/blob/main/OBJECTS.md#5-receive);
+it is not implemented by the current buffer API.
+
 ## Design references
 
 [KPASS.md](KPASS.md) documents the imported prototype. The detailed source
 review and proposed object/evaluation design live in the sibling
-`zc_proxy` paper repository: `KPASS.md`, `OBJECTS.md`, `KV_CACHE.md`, and
-`workplan.md`.
+[`zc_proxy` paper repository](https://github.com/Markuze/zc_proxy): `KPASS.md`,
+`OBJECTS.md`, `KV_CACHE.md`, and `workplan.md`.
