@@ -192,9 +192,12 @@ its contents, achieving zero-copy from buffer to NIC.
 
 ### io_uring Command Interface
 
-All async operations use `io_uring_cmd` with the `kpass_sqe_cmd` structure
-embedded in the SQE. Completions use 3-argument `io_uring_cmd_done(ioucmd, res,
-issue_flags)`:
+All async operations use `io_uring_cmd` with the 64-byte `kpass_sqe_cmd`
+structure embedded in an SQE128 entry. The library requests
+`IORING_SETUP_SQE128`; a standard SQE has only 16 command bytes. The
+module rejects undersized SQEs and reads the payload with
+`io_uring_sqe128_cmd`. Completions use 3-argument
+`io_uring_cmd_done(ioucmd, res, issue_flags)`:
 
 - In `kpass_uring_cmd`: uses the `issue_flags` parameter passed by io_uring
 - In workqueue context: uses `IO_URING_F_UNLOCKED`
@@ -205,17 +208,20 @@ issue_flags)`:
 
 ### Prerequisites
 
-- Linux kernel headers (matching running kernel)
-- `liburing-dev` (for userspace library)
+- A completed Linux 7.2.9 build (matching the runtime test kernel)
+- liburing 2.15 or newer (2.15 is pinned for this branch)
 - GCC with C11 support
+
+See [README.md](README.md) for the pinned revisions, local dependency
+setup, reproducible build commands, and current verification limits.
 
 ### Build
 
 ```sh
 cd kpass
 make lib demos    # userspace library and demo apps
-make module       # kernel module (requires kernel headers)
-make              # all of the above
+make module KDIR=/path/to/kernel/build
+make KDIR=/path/to/kernel/build  # all of the above
 ```
 
 ### Load Module
