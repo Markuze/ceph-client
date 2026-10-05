@@ -58,6 +58,17 @@ enum kpass_op {
     KPASS_OP_NOTIFY_ERROR     = 0x43,
     KPASS_OP_NOTIFY_CLOSED    = 0x44,
     KPASS_OP_NOTIFY_ACCEPTED  = 0x45,
+
+	/* Stream/object API: SQE128 + CQE32; user_data is the operation tag. */
+	KPASS_OP_READ_STREAM	= 0x50,
+	KPASS_OP_KEEP		= 0x51,
+	KPASS_OP_DISCARD		= 0x52,
+	KPASS_OP_OBJECT_READ	= 0x53,
+	KPASS_OP_OBJECT_FREE	= 0x54,
+	KPASS_OP_OBJECT_SEND	= 0x55,
+	KPASS_OP_LIMIT		= 0x56,
+	KPASS_OP_STREAM_STAT	= 0x57,
+	KPASS_OP_CANCEL		= 0x58,
 };
 
 /*
@@ -107,11 +118,41 @@ struct kpass_sqe_cmd {
             __u32 len;
         } recv;
 
+		struct {
+			__u64 object;
+			__u64 offset;
+			__u64 length;
+			__u64 addr;
+			__u64 reserved[2];
+		} stream;
+
         __u8 _pad[48];
     };
 } KPASS_PACKED;
 
 #undef KPASS_PACKED
+
+/* KEEP returns length in res and the complete handle in big_cqe[0]. */
+#define KPASS_OBJECT_INVALID     0ULL
+#define KPASS_DEFAULT_LIMIT      (64ULL * 1024 * 1024)
+#define KPASS_MAX_OBJECTS        4096
+#define KPASS_MAX_PENDING        1024
+#define KPASS_MAX_EXTENTS        65536
+
+/* STREAM_STAT copies this structure to stream.addr before completion. */
+struct kpass_stream_stat {
+	__u64 received;		/* socket stream end, including discarded bytes */
+	__u64 buffered;		/* undecided bytes on this socket */
+	__u64 backing_bytes;	/* session: conservative full-page charges */
+	__u64 backing_limit;
+	__u64 copied_bytes;	/* cumulative session RX fallback bytes */
+	__u32 objects;		/* published session handles */
+	__u32 pending;		/* session operations, including ready results */
+	__u32 eof;
+	__s32 error;
+	__u32 extents;		/* session metadata cap: KPASS_MAX_EXTENTS */
+	__u32 reserved;
+};
 
 /*
  * IOCTLs

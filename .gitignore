@@ -198,6 +198,7 @@ sphinx_*/
 # kpass build artifacts
 kpass/demo/echo_server
 kpass/demo/test_client
+kpass/tests/stream_objects
 kpass/lib/*.o
 kpass/lib/*.so
 kpass/lib/*.a

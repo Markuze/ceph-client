@@ -40,6 +40,7 @@ LIB_OBJ := lib/ceph_kpass.o
 ECHO_SERVER := demo/echo_server
 TEST_CLIENT := demo/test_client
 COMMAND_TEST := tests/command_layout
+STREAM_TEST := tests/stream_objects
 
 KERNEL_MODULE := kernel/ceph_kpass.ko
 
@@ -107,6 +108,9 @@ $(TEST_CLIENT): demo/test_client.c $(LIB_A) $(LIB_HDR)
 $(COMMAND_TEST): tests/command_layout.c $(LIB_SRC) $(LIB_HDR) $(UAPI_HDR) | check-liburing
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
+$(STREAM_TEST): tests/stream_objects.c lib/kpass_objects.h $(UAPI_HDR) | check-liburing
+	$(CC) $(CPPFLAGS) $(CFLAGS) -static $(LDFLAGS) -o $@ $< $(LDLIBS)
+
 check: $(COMMAND_TEST)
 	./$(COMMAND_TEST)
 
@@ -115,6 +119,7 @@ clean:
 	rm -f $(LIB_OBJ) $(LIB_SO) $(LIB_A)
 	rm -f $(ECHO_SERVER) $(TEST_CLIENT)
 	rm -f $(COMMAND_TEST)
+	rm -f $(STREAM_TEST)
 	rm -f demo/*.o lib/*.o
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel clean 2>/dev/null || true
 

@@ -18,6 +18,7 @@
 #include <linux/workqueue.h>
 #include <linux/net.h>
 #include <linux/io_uring/cmd.h>
+#include <linux/mutex.h>
 
 #include "../include/uapi/ceph_kpass.h"
 
@@ -87,6 +88,11 @@ struct kpass_sock {
 	bool			closing;
 	int			error;
 
+	/* Stream mode, protected by session->stream_lock. */
+	struct list_head	stream;
+	u64			rx_next;
+	bool			rx_eof;
+
 	/* RX queue: buffers waiting for data */
 	spinlock_t		rx_lock;
 	struct list_head	rx_queue;
@@ -112,6 +118,19 @@ struct kpass_sock {
  * Per-fd session state
  */
 struct kpass_session {
+	/* New sessions collect streams; INIT selects the legacy buffer API. */
+	bool			legacy;
+	struct mutex		stream_lock;
+	struct work_struct	stream_work;
+	struct list_head	requests;
+	struct kpass_object	*objects[KPASS_MAX_OBJECTS];
+	u32			generations[KPASS_MAX_OBJECTS];
+	u32			object_count;
+	u32			pending_count;
+	u32			extent_count;
+	u64			backing_bytes;
+	u64			backing_limit;
+	u64			copied_bytes;
 	/* Buffer pool (kernel-only, NOT mapped to userspace) */
 	struct kpass_buf	*buffers;
 	u32			num_buffers;

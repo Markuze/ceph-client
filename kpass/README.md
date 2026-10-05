@@ -1,9 +1,11 @@
 # kpass development on Linux 7.2
 
-The `opaqu_objects` branch carries the existing kpass TCP forwarding
-prototype as the starting point for opaque objects and their evaluation.
-Its kernel module captures page references with `tcp_read_sock` and sends
-with `MSG_SPLICE_PAGES`; the application coordinates buffer handles.
+The `opaqu_objects` branch implements TCP stream accumulation, header reads,
+range assembly and completed opaque objects on top of the kpass prototype.
+The module retains pages with `tcp_read_sock` and sends them with
+`MSG_SPLICE_PAGES`. Userspace chooses stream ranges and receives object IDs
+only after those ranges are complete. The original buffer API remains
+available for the older demos.
 
 ## Source baseline
 
@@ -120,13 +122,29 @@ sends a copied capture twice through the actual TX worker over loopback TCP,
 reposts the receive handle, and checks that the peer still reads both
 original payloads.
 
-Full forwarding through the userspace/io_uring API and physical NIC traffic
-have not been tested. Before evaluation, address TX ranges, partial sends,
-legacy POKE pool reuse while TCP retains pages, connect/EOF handling,
-completion context, cancellation, and teardown. There are no performance results
-yet. The new object API is not implemented here.
+The stream/object API now passes end-to-end userspace/io_uring tests in the
+same VM. The suite checks automatic accumulation, split headers, future
+ranges, independent next-header reads, multiple objects from one receive,
+discard, stale IDs, EOF/reset, cancellation, close, budget stall/resume and
+ring teardown. It sends a 4 MiB object twice, checks every byte, releases the
+handle while TX is pending, and verifies both cumulative send results. A
+pending-operation limit test drains 1,024 terminal completions through a
+smaller CQ. Accepted sockets, object lifetime after socket close, and legacy
+INIT with CQE16 are covered.
 
-## RX kernel tests
+Six additional KUnit tests check the stream's page identity, reference
+sharing across splits, incomplete assembly, EOF cleanup, budget handling and
+generation retirement and callback restoration. The callback regression
+failed before the fix: accepted sockets restored inherited module callbacks
+and the listener's private pointer was cloneable. The total is 21 passing
+kernel tests plus eight
+userspace test groups. The module loads and unloads without kernel warnings
+in the test guest. Physical NIC traffic and performance have not been tested.
+The older buffer/POKE API retains the other limitations described in
+[KPASS.md](KPASS.md); the new object send path has its own range and cursor
+handling.
+
+## Kernel and userspace VM tests
 
 The test module includes `kernel/ceph_kpass_test.c` only when built with
 `KPASS_KUNIT_TEST=1`. Tests call the actual actor with constructed skbs to
@@ -154,9 +172,11 @@ kpass/tests/run_rx_kunit.sh "$test_build"
 ```
 
 The runner requires QEMU (`qemu-system-x86_64`), a statically linked BusyBox,
-cpio, file, and timeout. Set `BUSYBOX` if the static binary is not the default.
-It builds the test module, creates a minimal initramfs, enables guest
-loopback, loads the module to run KUnit, unloads it, and powers down the VM.
+cpio, file, timeout, and the liburing 2.15 build environment above. Set
+`BUSYBOX` if the static binary is not the default. It builds the test module
+and a statically linked `tests/stream_objects` binary, creates a minimal
+initramfs, enables guest loopback, loads the module to run KUnit, exercises
+the real device through io_uring, unloads it, and powers down the VM.
 It uses unprivileged QEMU TCG by default; set `KPASS_QEMU_ACCEL=kvm` if the
 current user can access `/dev/kvm`. It never loads the module on the host.
 The first regression run used KVM; the complete 15-test run passed with
@@ -169,19 +189,122 @@ copy counts. The runner fails for failed/skipped tests, a missing completion
 marker, failed module load/unload, or kernel warning/oops/panic. Rebuild the
 normal module with the normal `KDIR` when needed.
 
-## Object interface direction
+## Stream/object API
 
-The current prototype allocates buffer IDs before RECV. The next interface
-will collect each socket's TCP stream by reference, let userspace or eBPF
-inspect requested header bytes, and assemble or discard selected stream
-ranges. A range can include future bytes; its object ID is issued only when
-the full selected range is available. The next header read can be queued at
-its known stream offset while the preceding object is still being assembled.
+Open `/dev/ceph_kpass` and create an io_uring with
+`IORING_SETUP_SQE128 | IORING_SETUP_CQE32`. New sessions use stream mode
+without an INIT command or a preallocated payload pool. The legacy INIT
+command selects the old buffer API before creating any sockets. Device info
+reports version 3. Stream and legacy buffer operations cannot share a session.
 
-Repeated sends retain the same pages through ordinary references. Compaction
-is deferred. This stream assembly and object-ID interface is documented in
-the paper repository's [receive design](https://github.com/Markuze/zc_proxy/blob/main/OBJECTS.md#5-receive);
-it is not implemented by the current buffer API.
+`include/uapi/ceph_kpass.h` defines the commands; `lib/kpass_objects.h`
+provides preparation helpers. These helpers neither submit nor wait, and do
+not consume CQEs. The caller owns the ring and supplies a full 64-bit
+`user_data` tag, unique among its pending commands. The existing
+`lib/ceph_kpass.h` API and demos continue to select legacy mode.
+
+Commands retain the existing 64-byte payload and socket ID fields.
+`cmd_op`, command flags and reserved fields are zero. The `stream` union
+contains `object`, `offset`, `length` and `addr` (a user pointer).
+The CQE's `res` holds a result or negative errno. Only successful KEEP
+returns an object ID, in `big_cqe[0]`; other new commands return zero there.
+CQE suppression is rejected so a created handle cannot lose its ready result.
+
+| Command | Arguments and completion |
+| --- | --- |
+| SOCK_CREATE / CONNECT / LISTEN / ACCEPT / CLOSE | Existing IPv4 socket fields. CONNECT waits for establishment. ACCEPT returns the new socket ID. CLOSE cancels pending commands for that socket. |
+| READ_STREAM | Socket, absolute byte offset, length, destination. Waits for the exact window, copies it before completion, leaves stream bytes available, and returns no object ID. |
+| KEEP | Socket, offset, length. Moves received extents into a private assembly and appends future extents by reference. Completes with length and a handle only when the entire range has arrived. |
+| DISCARD | Socket, offset, length. Releases buffered bytes and skips future bytes without retaining them. Completes with length once the full range has been consumed. |
+| OBJECT_READ | Handle, object offset, length, destination. Explicit copy; the operation holds the object until completion. |
+| OBJECT_FREE | Handle. Removes it from the table immediately; in-flight reads/sends retain their references. |
+| OBJECT_SEND | Socket, handle, object offset, length. Queues that exact range. Each operation has an independent cursor; sends to one socket remain ordered and complete with the total length once queued to TCP. |
+| LIMIT | `stream.length` sets the session's retained-backing limit, at least PAGE_SIZE. A value below the current charge fails with EBUSY. |
+| STREAM_STAT | Socket and `stream.addr` pointing to `struct kpass_stream_stat`. Returns stream end, undecided bytes, session backing charge/limit, RX fallback copies, object/operation/extent counts, EOF and error. The pending count includes the STAT itself. |
+| CANCEL | `stream.object` is the full tag of a pending command on the same ring and session. The target completes with ECANCELED; CANCEL returns 0 or ENOENT. |
+
+Offsets start at zero for each socket and count TCP payload bytes, including
+discarded bytes. They are independent of packet boundaries and raw TCP
+sequence numbers. Ranges are half-open; the command carries start and length.
+Stream ranges must be nonempty and at most INT_MAX bytes; overflow fails with
+EINVAL. Object reads/sends allow a zero length and check bounds by subtraction.
+
+Typical framing sequence, with H header bytes and O total object bytes:
+
+```c
+/* Preparation helpers require SQE128 + CQE32; the caller submits and waits. */
+kpass_prep_range(&ring, sqe, fd, KPASS_OP_READ_STREAM, sock,
+                0, p, H, header, header_tag);
+/* After header_tag completes: parse O, then queue both commands. */
+kpass_prep_range(&ring, keep_sqe, fd, KPASS_OP_KEEP, sock,
+                0, p, O, NULL, object_tag);
+kpass_prep_range(&ring, next_sqe, fd, KPASS_OP_READ_STREAM, sock,
+                0, p + O, H, next_header, next_header_tag);
+/* object_tag's successful CQE supplies kpass_cqe_object(cqe). */
+```
+
+For body-only objects, KEEP selects the body and DISCARD handles framing.
+Reads may overlap other reads. A consuming decision overlapping a pending
+read or another pending decision fails with EBUSY. Reading or selecting
+already consumed bytes fails with ENODATA. The usual read-header, then
+KEEP-object sequence has no overlap conflict because the header read has
+already completed. Undecided bytes beyond an object stay in the accumulator.
+
+Handles encode `generation << 32 | (slot + 1)`; zero is invalid. Reusing a
+table slot increments its generation. An exhausted generation retires the
+slot. OBJECT_READ/SEND/FREE return ESTALE for released handles. Completed
+objects outlive their source sockets; sending again uses the same pages.
+There is no new sealing step or compaction machinery.
+
+EOF before the requested end returns ENODATA, and socket errors return their
+errno, without a partial object ID. Cancellation or a failed KEEP releases
+its assembled prefix; those consumed bytes are not restored to the stream.
+Canceling DISCARD cannot restore bytes already dropped. Remaining undecided
+bytes stay available until classified or the socket closes. A canceled or
+failed send may already have queued a prefix to TCP.
+
+On this pinned kernel, marking a uring command cancelable supplies ring/task
+teardown cancellation; individual `IORING_OP_ASYNC_CANCEL` does not dispatch
+to this driver. Use the explicit CANCEL command for individual operations.
+Commands waiting on the network retain the session file through io_uring.
+Destination memory must remain valid until its read CQE.
+
+### Backing, limits and execution
+
+`kernel/ceph_kpass_stream.c` reuses the tested RX walker. It holds a page
+reference per captured extent, shares that reference when splitting extent
+metadata, and moves selected extents into pending objects. Header inspection
+copies only the requested window. Unsafe RX backing uses the same independent
+fallback pages as the original actor.
+
+The default session backing limit is 64 MiB. Each capture charges the full
+compound page it retains; capturing the same allocation several times can
+overcount it. Splits and header snapshots share that capture's charge.
+The charge follows undecided data, pending assemblies, completed objects and
+active object operations. TCP owns its own references after a send. This is a
+conservative retention budget, not an exact physical-memory measurement.
+Metadata has separate fixed caps: 65,536 extents, 4,096 published objects,
+and 1,024 pending I/O operations. Control commands remain available at the
+pending-I/O cap. A metadata allocation/cap failure can fail the operation.
+
+At the backing or capture-metadata limit, RX stops consuming TCP; freeing
+backing, discarding bytes, or raising the limit wakes collection again.
+Known future DISCARD ranges can still be consumed at the limit. An object
+larger than the remaining budget waits until other data is released or the
+limit is raised.
+
+This first implementation uses one session mutex and a session work item.
+Socket callbacks schedule work; all user copies and object publication run
+in io_uring task work. Each pending request owns copied command arguments,
+independent of later SQE reuse. Socket callbacks are detached under the
+callback lock before socket state is freed. The listener's private pointer
+is marked non-copyable, and accepted sockets restore native callbacks.
+
+The broader [object design](https://github.com/Markuze/zc_proxy/blob/main/OBJECTS.md)
+also proposes BPF hooks, SPLIT/SPLICE between completed objects, WRITE,
+framed/vector sends, socket import/namespaces, exact accounting, notifications
+and compaction. Those remain future work. This implementation covers the
+userspace stream/assembly contract and basic object read, send and release.
 
 ## Design references
 

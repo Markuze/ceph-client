@@ -209,6 +209,39 @@ static void kpass_sk_state_change(struct sock *sk);
 static void kpass_rx_work_fn(struct work_struct *work);
 static void kpass_tx_work_fn(struct work_struct *work);
 static void kpass_accept_work_fn(struct work_struct *work);
+static void kpass_stream_work_fn(struct work_struct *work);
+static void kpass_stream_close(struct kpass_sock *ksock);
+
+static void kpass_sock_hook(struct kpass_sock *ksock)
+{
+	struct sock *sk = ksock->sock->sk;
+
+	write_lock_bh(&sk->sk_callback_lock);
+	/* Accepted children inherit our listener callbacks, not native ones. */
+	if (sk->sk_data_ready != kpass_sk_data_ready)
+		ksock->saved_data_ready = sk->sk_data_ready;
+	if (sk->sk_write_space != kpass_sk_write_space)
+		ksock->saved_write_space = sk->sk_write_space;
+	if (sk->sk_state_change != kpass_sk_state_change)
+		ksock->saved_state_change = sk->sk_state_change;
+	__rcu_assign_sk_user_data_with_flags(sk, ksock, SK_USER_DATA_NOCOPY);
+	sk->sk_data_ready = kpass_sk_data_ready;
+	sk->sk_write_space = kpass_sk_write_space;
+	sk->sk_state_change = kpass_sk_state_change;
+	write_unlock_bh(&sk->sk_callback_lock);
+}
+
+static void kpass_sock_unhook(struct kpass_sock *ksock)
+{
+	struct sock *sk = ksock->sock->sk;
+
+	write_lock_bh(&sk->sk_callback_lock);
+	rcu_assign_sk_user_data(sk, NULL);
+	sk->sk_data_ready = ksock->saved_data_ready;
+	sk->sk_write_space = ksock->saved_write_space;
+	sk->sk_state_change = ksock->saved_state_change;
+	write_unlock_bh(&sk->sk_callback_lock);
+}
 
 static u16 alloc_sock_id(struct kpass_session *sess)
 {
@@ -270,19 +303,12 @@ struct kpass_sock *kpass_sock_create(struct kpass_session *sess)
 	spin_lock_init(&ksock->tx_lock);
 	INIT_LIST_HEAD(&ksock->rx_queue);
 	INIT_LIST_HEAD(&ksock->tx_queue);
+	INIT_LIST_HEAD(&ksock->stream);
 	INIT_WORK(&ksock->rx_work, kpass_rx_work_fn);
 	INIT_WORK(&ksock->tx_work, kpass_tx_work_fn);
 	INIT_WORK(&ksock->accept_work, kpass_accept_work_fn);
 
-	/* Install our callbacks */
-	ksock->saved_data_ready = sock->sk->sk_data_ready;
-	ksock->saved_write_space = sock->sk->sk_write_space;
-	ksock->saved_state_change = sock->sk->sk_state_change;
-
-	sock->sk->sk_user_data = ksock;
-	sock->sk->sk_data_ready = kpass_sk_data_ready;
-	sock->sk->sk_write_space = kpass_sk_write_space;
-	sock->sk->sk_state_change = kpass_sk_state_change;
+	kpass_sock_hook(ksock);
 
 	sess->sockets[id] = ksock;
 
@@ -344,6 +370,8 @@ void kpass_sock_destroy(struct kpass_sock *ksock)
 	unsigned long flags;
 
 	ksock->closing = true;
+	/* Detach callbacks before draining work: no late callback can requeue. */
+	kpass_sock_unhook(ksock);
 
 	/* Cancel pending work */
 	cancel_work_sync(&ksock->accept_work);
@@ -383,14 +411,9 @@ void kpass_sock_destroy(struct kpass_sock *ksock)
 		ksock->accept_ioucmd = NULL;
 	}
 
-	/* Restore original callbacks and close socket */
-	if (ksock->sock) {
-		ksock->sock->sk->sk_user_data = NULL;
-		ksock->sock->sk->sk_data_ready = ksock->saved_data_ready;
-		ksock->sock->sk->sk_write_space = ksock->saved_write_space;
-		ksock->sock->sk->sk_state_change = ksock->saved_state_change;
+	/* Callbacks have been detached; release the socket. */
+	if (ksock->sock)
 		sock_release(ksock->sock);
-	}
 
 	sess->sockets[ksock->id] = NULL;
 	free_sock_id(sess, ksock->id);
@@ -415,39 +438,61 @@ struct kpass_sock *kpass_get_sock(struct kpass_session *sess, u16 id)
 
 static void kpass_sk_data_ready(struct sock *sk)
 {
-	struct kpass_sock *ksock = sk->sk_user_data;
+	struct kpass_sock *ksock;
 
+	read_lock_bh(&sk->sk_callback_lock);
+	ksock = __locked_read_sk_user_data_with_flags(sk, 0);
 	if (!ksock || ksock->closing)
-		return;
+		goto out;
+	if (!READ_ONCE(ksock->session->legacy)) {
+		queue_work(ksock->session->wq, &ksock->session->stream_work);
+		goto out;
+	}
 
 	/* Handle accept on listening socket - defer to workqueue */
 	if (ksock->listening && ksock->accept_ioucmd) {
 		queue_work(ksock->session->wq, &ksock->accept_work);
-		return;
+		goto out;
 	}
 
 	/* Schedule RX work for connected sockets */
 	if (!list_empty(&ksock->rx_queue))
 		queue_work(ksock->session->wq, &ksock->rx_work);
+out:
+	read_unlock_bh(&sk->sk_callback_lock);
 }
 
 static void kpass_sk_write_space(struct sock *sk)
 {
-	struct kpass_sock *ksock = sk->sk_user_data;
+	struct kpass_sock *ksock;
 
+	read_lock_bh(&sk->sk_callback_lock);
+	ksock = __locked_read_sk_user_data_with_flags(sk, 0);
 	if (!ksock || ksock->closing)
-		return;
+		goto out;
+	if (!READ_ONCE(ksock->session->legacy)) {
+		queue_work(ksock->session->wq, &ksock->session->stream_work);
+		goto out;
+	}
 
 	if (!list_empty(&ksock->tx_queue))
 		queue_work(ksock->session->wq, &ksock->tx_work);
+out:
+	read_unlock_bh(&sk->sk_callback_lock);
 }
 
 static void kpass_sk_state_change(struct sock *sk)
 {
-	struct kpass_sock *ksock = sk->sk_user_data;
+	struct kpass_sock *ksock;
 
+	read_lock_bh(&sk->sk_callback_lock);
+	ksock = __locked_read_sk_user_data_with_flags(sk, 0);
 	if (!ksock)
-		return;
+		goto out;
+	if (!READ_ONCE(ksock->session->legacy)) {
+		queue_work(ksock->session->wq, &ksock->session->stream_work);
+		goto out;
+	}
 
 	switch (sk->sk_state) {
 	case TCP_ESTABLISHED:
@@ -465,6 +510,8 @@ static void kpass_sk_state_change(struct sock *sk)
 		}
 		break;
 	}
+out:
+	read_unlock_bh(&sk->sk_callback_lock);
 }
 
 /*
@@ -503,13 +550,11 @@ static void kpass_accept_work_fn(struct work_struct *work)
 	}
 
 	/* Replace auto-created socket with accepted one */
+	kpass_sock_unhook(new_ksock);
 	sock_release(new_ksock->sock);
 	new_ksock->sock = newsock;
 	new_ksock->connected = true;
-	newsock->sk->sk_user_data = new_ksock;
-	newsock->sk->sk_data_ready = kpass_sk_data_ready;
-	newsock->sk->sk_write_space = kpass_sk_write_space;
-	newsock->sk->sk_state_change = kpass_sk_state_change;
+	kpass_sock_hook(new_ksock);
 
 	io_uring_cmd_done(ksock->accept_ioucmd, new_ksock->id,
 			  IO_URING_F_UNLOCKED);
@@ -867,6 +912,8 @@ tx_error:
  * ============================================================================
  */
 
+#include "ceph_kpass_stream.c"
+
 void kpass_complete_cmd(struct io_uring_cmd *ioucmd, int res,
 			unsigned int issue_flags)
 {
@@ -885,11 +932,15 @@ static int kpass_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags
 
 	if (!sess)
 		return -EINVAL;
+	if (issue_flags & IO_URING_F_CANCEL)
+		return kpass_stream_cancel(ioucmd);
 
 	if (!(issue_flags & IO_URING_F_SQE128))
 		return -EOPNOTSUPP;
 
 	cmd = io_uring_sqe128_cmd(ioucmd->sqe, struct kpass_sqe_cmd);
+	if (!READ_ONCE(sess->legacy) || cmd->op >= KPASS_OP_READ_STREAM)
+		return kpass_stream_command(ioucmd, issue_flags);
 
 	switch (cmd->op) {
 	case KPASS_OP_INIT:
@@ -1069,6 +1120,10 @@ static int kpass_open(struct inode *inode, struct file *file)
 
 	spin_lock_init(&sess->buf_lock);
 	spin_lock_init(&sess->sock_lock);
+	mutex_init(&sess->stream_lock);
+	INIT_LIST_HEAD(&sess->requests);
+	INIT_WORK(&sess->stream_work, kpass_stream_work_fn);
+	sess->backing_limit = KPASS_DEFAULT_LIMIT;
 	INIT_LIST_HEAD(&sess->free_list);
 	bitmap_zero(sess->sock_bitmap, CEPH_KPASS_MAX_SOCKETS);
 
@@ -1093,10 +1148,16 @@ static int kpass_release(struct inode *inode, struct file *file)
 		return 0;
 
 	/* Close all sockets */
+	mutex_lock(&sess->stream_lock);
 	for (i = 0; i < CEPH_KPASS_MAX_SOCKETS; i++) {
-		if (test_bit(i, sess->sock_bitmap) && sess->sockets[i])
+		if (test_bit(i, sess->sock_bitmap) && sess->sockets[i]) {
+			kpass_stream_close(sess->sockets[i]);
 			kpass_sock_destroy(sess->sockets[i]);
+		}
 	}
+	for (i = 0; i < KPASS_MAX_OBJECTS; i++)
+		kpass_object_put(sess, sess->objects[i]);
+	mutex_unlock(&sess->stream_lock);
 
 	destroy_workqueue(sess->wq);
 	kpass_destroy_buffer_pool(sess);
@@ -1117,7 +1178,7 @@ static long kpass_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case _IOR('K', 1, struct kpass_info): /* KPASS_IOC_GET_INFO */
 	{
 		struct kpass_info info = {
-			.version = 2,
+			.version = 3,
 			.max_sockets = CEPH_KPASS_MAX_SOCKETS,
 			.max_buffers = CEPH_KPASS_MAX_BUFFERS,
 			.default_buf_size = CEPH_KPASS_BUF_SIZE,
@@ -1361,4 +1422,5 @@ MODULE_DESCRIPTION("Kernel module for zero-copy network I/O via tcp_read_sock + 
 
 #ifdef KPASS_KUNIT_TEST
 #include "ceph_kpass_test.c"
+#include "ceph_kpass_stream_test.c"
 #endif
