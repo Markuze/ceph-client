@@ -62,7 +62,8 @@ enum kpass_op {
 
 /*
  * SQE command payload for io_uring_cmd (shared with kernel).
- * Must fit into io_uring SQE cmd area (64 bytes).
+ * The 64-byte payload requires IORING_SETUP_SQE128 (80-byte cmd area).
+ * A standard 64-byte SQE has only 16 bytes available for this payload.
  */
 #ifdef __KERNEL__
 #define KPASS_PACKED __packed

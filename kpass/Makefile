@@ -18,15 +18,17 @@ KERNEL_SRC ?= $(realpath ../)
 
 # Compiler and flags for userspace
 CC := gcc
+PKG_CONFIG ?= pkg-config
 CFLAGS := -Wall -Wextra -Werror -O2 -g -fPIC
-CFLAGS += -I$(CURDIR)/lib
+CPPFLAGS += -I$(CURDIR)/lib $(shell $(PKG_CONFIG) --cflags liburing)
 
 # Link flags
-LDFLAGS := -luring
+LDLIBS += $(shell $(PKG_CONFIG) --libs liburing)
 
 # Source files
 LIB_SRC := lib/ceph_kpass.c
 LIB_HDR := lib/ceph_kpass.h
+UAPI_HDR := include/uapi/ceph_kpass.h
 
 DEMO_SRC := demo/echo_server.c demo/test_client.c
 
@@ -37,11 +39,12 @@ LIB_OBJ := lib/ceph_kpass.o
 
 ECHO_SERVER := demo/echo_server
 TEST_CLIENT := demo/test_client
+COMMAND_TEST := tests/command_layout
 
 KERNEL_MODULE := kernel/ceph_kpass.ko
 
 # Phony targets
-.PHONY: all lib demos module clean test help load unload
+.PHONY: all lib demos module clean test help load unload check check-liburing
 
 # Default target
 all: lib demos module
@@ -59,6 +62,7 @@ help:
 	@echo "  load      - Load kernel module"
 	@echo "  unload    - Unload kernel module"
 	@echo "  test      - Run functionality test"
+	@echo "  check     - Check command encoding (no module required)"
 	@echo ""
 	@echo "Variables:"
 	@echo "  KDIR      - Kernel build directory (default: /lib/modules/.../build)"
@@ -76,11 +80,17 @@ module:
 # Library targets
 lib: $(LIB_SO) $(LIB_A)
 
-$(LIB_OBJ): $(LIB_SRC) $(LIB_HDR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+check-liburing:
+	@$(PKG_CONFIG) --atleast-version=2.15 liburing || { \
+		echo "kpass requires liburing >= 2.15; set PKG_CONFIG_PATH for a local install." >&2; \
+		exit 1; \
+	}
+
+$(LIB_OBJ): $(LIB_SRC) $(LIB_HDR) $(UAPI_HDR) | check-liburing
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(LIB_SO): $(LIB_OBJ)
-	$(CC) -shared -o $@ $< $(LDFLAGS)
+	$(CC) $(LDFLAGS) -shared -o $@ $< $(LDLIBS)
 
 $(LIB_A): $(LIB_OBJ)
 	ar rcs $@ $<
@@ -89,15 +99,22 @@ $(LIB_A): $(LIB_OBJ)
 demos: $(ECHO_SERVER) $(TEST_CLIENT)
 
 $(ECHO_SERVER): demo/echo_server.c $(LIB_A) $(LIB_HDR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_A) $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_A) $(LDLIBS)
 
 $(TEST_CLIENT): demo/test_client.c $(LIB_A) $(LIB_HDR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_A) $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_A) $(LDLIBS)
+
+$(COMMAND_TEST): tests/command_layout.c $(LIB_SRC) $(LIB_HDR) $(UAPI_HDR) | check-liburing
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+check: $(COMMAND_TEST)
+	./$(COMMAND_TEST)
 
 # Clean
 clean:
 	rm -f $(LIB_OBJ) $(LIB_SO) $(LIB_A)
 	rm -f $(ECHO_SERVER) $(TEST_CLIENT)
+	rm -f $(COMMAND_TEST)
 	rm -f demo/*.o lib/*.o
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel clean 2>/dev/null || true
 

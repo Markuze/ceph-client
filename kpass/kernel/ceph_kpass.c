@@ -301,7 +301,8 @@ int kpass_sock_connect(struct kpass_sock *ksock, u16 family, const u8 *addr, u16
 	sin.sin_port = htons(port);
 	memcpy(&sin.sin_addr.s_addr, addr, 4);
 
-	ret = kernel_connect(ksock->sock, (struct sockaddr *)&sin, sizeof(sin), O_NONBLOCK);
+	ret = kernel_connect(ksock->sock, (struct sockaddr_unsized *)&sin,
+			     sizeof(sin), O_NONBLOCK);
 	if (ret < 0 && ret != -EINPROGRESS)
 		return ret;
 
@@ -320,7 +321,8 @@ int kpass_sock_listen(struct kpass_sock *ksock, u16 port, int backlog)
 	sin.sin_port = htons(port);
 	sin.sin_addr.s_addr = INADDR_ANY;
 
-	ret = kernel_bind(ksock->sock, (struct sockaddr *)&sin, sizeof(sin));
+	ret = kernel_bind(ksock->sock, (struct sockaddr_unsized *)&sin,
+			  sizeof(sin));
 	if (ret < 0)
 		return ret;
 
@@ -793,7 +795,7 @@ static int kpass_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags
 {
 	struct file *file = ioucmd->file;
 	struct kpass_session *sess = file->private_data;
-	const struct kpass_sqe_cmd *cmd = (const struct kpass_sqe_cmd *)ioucmd->cmd;
+	const struct kpass_sqe_cmd *cmd;
 	struct kpass_buf *buf;
 	struct kpass_sock *ksock;
 	unsigned long irqflags;
@@ -801,6 +803,11 @@ static int kpass_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags
 
 	if (!sess)
 		return -EINVAL;
+
+	if (!(issue_flags & IO_URING_F_SQE128))
+		return -EOPNOTSUPP;
+
+	cmd = io_uring_sqe128_cmd(ioucmd->sqe, struct kpass_sqe_cmd);
 
 	switch (cmd->op) {
 	case KPASS_OP_INIT:

@@ -176,7 +176,12 @@ static int defer_cqe(struct ceph_kpass_ctx *ctx, uint64_t user_data, int res)
 	return 0;
 }
 
-#ifdef IORING_OP_URING_CMD
+_Static_assert(sizeof(struct kpass_sqe_cmd) == 64,
+	       "kpass command ABI must remain 64 bytes");
+_Static_assert(offsetof(struct io_uring_sqe, cmd) +
+	       sizeof(struct kpass_sqe_cmd) <= 2 * sizeof(struct io_uring_sqe),
+	       "kpass command must fit an SQE128 entry");
+
 static struct kpass_sqe_cmd *prep_kpass_cmd(struct ceph_kpass_ctx *ctx,
 					    struct io_uring_sqe *sqe,
 					    uint8_t op, kpass_sock_id sock,
@@ -185,35 +190,22 @@ static struct kpass_sqe_cmd *prep_kpass_cmd(struct ceph_kpass_ctx *ctx,
 {
 	struct kpass_sqe_cmd *cmd = (struct kpass_sqe_cmd *)sqe->cmd;
 
+	if (!(ctx->ring.flags & IORING_SETUP_SQE128)) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	io_uring_prep_uring_cmd(sqe, 0, ctx->fd);
 	memset(cmd, 0, sizeof(*cmd));
 	cmd->op = op;
 	cmd->sock_id = sock;
 	cmd->buf_id = buf;
 	cmd->tag = tag;
 
-	io_uring_prep_uring_cmd(sqe, ctx->fd, 0);
 	sqe->user_data = make_udata(udata_op, sock, buf, tag);
 
 	return cmd;
 }
-#else
-static struct kpass_sqe_cmd *prep_kpass_cmd(struct ceph_kpass_ctx *ctx,
-					    struct io_uring_sqe *sqe,
-					    uint8_t op, kpass_sock_id sock,
-					    kpass_buf_id buf, uint64_t tag,
-					    uint8_t udata_op)
-{
-	(void)ctx;
-	(void)sqe;
-	(void)op;
-	(void)sock;
-	(void)buf;
-	(void)tag;
-	(void)udata_op;
-	errno = ENOSYS;
-	return NULL;
-}
-#endif
 
 static int wait_for_sync_cmd(struct ceph_kpass_ctx *ctx, uint8_t udata_opcode,
 			     uint64_t tag, int *res_out)
@@ -327,7 +319,8 @@ struct ceph_kpass_ctx *ceph_kpass_create(uint32_t num_buffers, uint32_t ring_dep
 	if (ring_depth == 0)
 		ring_depth = 128;
 
-	ret = io_uring_queue_init(ring_depth, &ctx->ring, 0);
+	ret = io_uring_queue_init(ring_depth, &ctx->ring,
+				 ctx->use_kernel_module ? IORING_SETUP_SQE128 : 0);
 	if (ret < 0) {
 		free(ctx->buf_descs);
 		if (ctx->fd >= 0)
