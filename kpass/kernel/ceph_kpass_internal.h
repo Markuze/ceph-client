@@ -21,7 +21,7 @@
 
 #include "../include/uapi/ceph_kpass.h"
 
-#define KPASS_MAX_SG_ENTRIES	128	/* enough for 128KB at any frag size */
+#define KPASS_MAX_SG_ENTRIES	128	/* a full vector completes a short RX */
 #define KPASS_MAX_BUF_SIZE	(1024 * 1024)	/* 1MB max */
 
 /*
@@ -36,7 +36,7 @@ enum kpass_buf_state {
 };
 
 /*
- * Scatter-gather entry for zero-copy RX capture
+ * RX extent: owns one page reference and never crosses a page boundary.
  */
 struct kpass_sg_entry {
 	struct page	*page;
@@ -50,7 +50,7 @@ struct kpass_sg_entry {
 struct kpass_buf {
 	u32			id;
 	enum kpass_buf_state	state;
-	bool			captured;	/* true = sgvec holds skb page refs */
+	bool			captured;	/* true = sgvec holds received data */
 
 	/* Pool pages (for origination: poke + send) */
 	struct page		**pages;
@@ -61,6 +61,7 @@ struct kpass_buf {
 	unsigned int		sg_count;	/* active entries */
 	unsigned int		sg_max;		/* allocated capacity */
 	u32			total_len;	/* total bytes across sgvec */
+	u32			copied_len;	/* RX fallback bytes in this capture */
 
 	/* Pending I/O context */
 	struct kpass_sock	*sock;

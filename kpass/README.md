@@ -96,16 +96,65 @@ require SQE128 for the 64-byte command, remove an invalid preprocessor
 test of an enum value, and correct the liburing command helper's argument
 order. The build resolves liburing through pkg-config.
 
-This is build and command-layout validation only. The kernel has not been
-booted, the module has not been loaded, and forwarding has not been tested
-on this baseline. The build host runs 5.15; the module targets the newly
-built 7.2.9 kernel. Runtime testing requires booting the matching kernel
-in a VM or test machine.
+The RX changes retain eligible page-backed linear heads using Linux splice's
+`skb_head_is_locked` rule, walk chained skbs, and copy unsafe backing. They
+also fix receive bounds, page-boundary handling, and capture reference
+release. See [KPASS.md](KPASS.md#rx-path-tcp_read_sock--actor) for the rules.
 
-Before evaluation, address the prototype's page-reference ownership,
-receive bounds, partial sends, connect/EOF completion, completion context,
-and cancellation and teardown behavior. These remain implementation work;
-there are no performance results yet. The new object API is not implemented here.
+A separate 7.2.9 kernel with KUnit and `DEBUG_VM` was booted in QEMU. The
+module loaded, all 13 RX tests passed, and the module unloaded. An initial
+regression test failed against the original actor: it copied a page-backed
+head instead of retaining its page. The complete suite includes a live
+loopback TCP test through `tcp_read_sock`; its 4,224 bytes were captured with
+zero RX fallback bytes on this x86-64 test configuration. This measures the
+actor's copies, not copies performed by the sender or other network layers.
+
+Full forwarding through the userspace/io_uring API and physical NIC traffic
+have not been tested. Before evaluation, address TX ranges, partial sends,
+pool reuse while TCP retains pages, connect/EOF completion, completion
+context, and cancellation and teardown. There are no performance results
+yet. The new object API is not implemented here.
+
+## RX kernel tests
+
+The test module includes `kernel/ceph_kpass_test.c` only when built with
+`KPASS_KUNIT_TEST=1`. Tests call the actual actor with constructed skbs to
+check page identity, reference lifetime after skb release, cloned/slab
+fallbacks, cross-page heads/fragments, nested `frag_list`, mutable shared
+fragments, limits, unreadable data, and release/reuse. A real page pool checks
+recycling behavior. A loopback TCP connection checks a short read followed
+by capture of the remaining stream and retention after socket release.
+
+Build a separate kernel so the normal build profile stays available:
+
+```sh
+research=$(cd .. && pwd)
+test_build="$research/build/opaqu_objects-rx-test"
+mkdir -p "$test_build"
+cp "$research/build/opaqu_objects-7.2.9/.config" "$test_build/.config"
+scripts/config --file "$test_build/.config" --enable KUNIT \
+    --disable KUNIT_ALL_TESTS --enable DEBUG_VM \
+    --set-str LOCALVERSION -opaqu-rx-test
+make O="$test_build" olddefconfig
+make -j16 O="$test_build" bzImage modules
+kpass/tests/run_rx_kunit.sh "$test_build"
+```
+
+The runner requires QEMU (`qemu-system-x86_64`), a statically linked BusyBox,
+cpio, file, and timeout. Set `BUSYBOX` if the static binary is not the default.
+It builds the test module, creates a minimal initramfs, enables guest
+loopback, loads the module to run KUnit, unloads it, and powers down the VM.
+It uses unprivileged QEMU TCG by default; set `KPASS_QEMU_ACCEL=kvm` if the
+current user can access `/dev/kvm`. It never loads the module on the host.
+The first regression run used KVM; the complete 13-test run also passed with
+TCG using this runner.
+
+The runner cleans generated files in `kpass/kernel` to satisfy Kbuild's
+separate-output requirement. Its module and logs are under
+`$test_build/kpass-rx-test/`; `results.log` records every case and the TCP
+copy counts. The runner fails for failed/skipped tests, a missing completion
+marker, failed module load/unload, or kernel warning/oops/panic. Rebuild the
+normal module with the normal `KDIR` when needed.
 
 ## Design references
 

@@ -3,7 +3,7 @@
 ## Overview
 
 kpass is a Linux kernel module (`ceph_kpass.ko`) and companion userspace library
-(`libceph_kpass`) that provides zero-copy network I/O for TCP forwarding
+(`libceph_kpass`) that provides page-based network I/O for TCP forwarding
 workloads. Userspace operates entirely on **handles** (buffer IDs, socket IDs)
 and **metadata** (offset, length, byte count). Data never crosses the
 kernel-user boundary except via the optional peek API.
@@ -19,11 +19,14 @@ NIC DMA --> skb frag pages
                 |
           TX skb --> NIC DMA
 
-Total kernel copies: 0
+Eligible payload: no copy during capture or TCP page splicing
 ```
 
-For data origination (poke + send), one unavoidable `copy_from_user` transfers
-data into the pool. TX still uses `MSG_SPLICE_PAGES` for zero-copy to the NIC.
+This diagram describes the eligible path. RX copies unsafe backing into pool
+pages; TX can copy when the route or device cannot transmit the page layout.
+It does not establish that the entire NIC/driver/network path is copy-free.
+For data origination (poke + send), `copy_from_user` transfers data into the
+pool before TX uses `MSG_SPLICE_PAGES`.
 
 ### Components
 
@@ -57,9 +60,13 @@ NIC DMA --> skb frag pages
 ```
 
 The RX actor uses `tcp_read_sock` with a custom callback that:
-- Captures paged skb fragments via `get_page()` into the buffer's scatter-gather
-  vector (`sgvec`) -- zero-copy
-- Copies linear skb data (rare, from `skb->data`) into pool pages as a fallback
+
+- Retains eligible linear heads and paged fragments via `get_page()` in the
+  buffer's scatter-gather vector (`sgvec`).
+- Walks chained skbs (`frag_list`), including nested chains.
+- Copies slab-backed or cloned heads and externally mutable fragments into
+  pool pages. Linear data is not inherently a copy case: a page fragment can
+  back the linear head, even when `nr_frags == 0`.
 
 The TX path uses `MSG_SPLICE_PAGES` with `bvec` iterators for both captured
 (sgvec) and pool (pages array) buffers, allowing TCP to take page references
@@ -150,8 +157,11 @@ mapped to userspace). Each buffer has:
 - **State machine**: `BUF_FREE` -> `BUF_ALLOCATED` -> `BUF_TX_QUEUED` /
   `BUF_RX_POSTED` -> `BUF_TX_INFLIGHT` -> `BUF_ALLOCATED`
 
-When a buffer is freed, any captured page references (from `get_page` in the RX
-actor) are released via `put_page`.
+Every active sgvec entry owns one page reference, including entries pointing
+to copied pool data. Entries stay within one base page so PEEK's local mapping
+and TX's bvec describe the same bytes, including higher-order source pages.
+References are released when a buffer is freed, replaced by another receive,
+or destroyed with its session. TCP can free its skb while the capture lives.
 
 ### Socket Callbacks
 
@@ -168,15 +178,40 @@ sleeping in softirq context.
 ### RX Path: `tcp_read_sock` + Actor
 
 `kpass_rx_work_fn` calls `tcp_read_sock` with `kpass_tcp_recv_actor`. The actor
-callback receives individual skbs and:
+callback receives individual skbs. It limits capture to the remaining
+descriptor count, available skb bytes, and buffer capacity before walking the
+head, `frags[]`, and `frag_list` in stream order.
 
-1. For linear data (`offset < skb_headlen`): copies into pool pages via
-   `skb_copy_bits`, then adds pool page reference to sgvec
-2. For paged fragments: calls `get_page` on the skb fragment page and records
-   it in sgvec -- true zero-copy
+| RX backing | Action | Reason |
+| --- | --- | --- |
+| Linear head with `!skb_head_is_locked(skb)` | Retain page references | Linux splice's rule: `head_frag` is set and the head is not cloned |
+| Slab-backed or cloned linear head | Copy to pool pages | A page reference alone cannot safely retain this head |
+| Ordinary readable fragments | Retain page references | The pages outlive the skb through their references |
+| Fragments marked `SKBFL_SHARED_FRAG` | Copy to pool pages | External writers may change the source after capture |
+| Children of an skb marked `SKBFL_SHARED_FRAG` | Copy their payload | Conservatively propagate the parent's sharing flag through the chain |
+| Unreadable skb fragments | Return `-EIO` | Device-memory payload cannot be mapped by this implementation |
 
-The buffer's `captured` flag is set to `true` after successful capture,
-indicating that `sgvec` entries hold page references that must be released.
+An skb's own sharing flag applies to its fragments; its eligible private
+linear head can still be retained. Page-pool pages use ordinary `get_page`:
+the extra reference prevents recycling when the skb is freed. This follows
+the existing splice ownership scheme rather than retaining the entire skb.
+
+Both copied and retained extents set `captured` and extend `total_len`.
+`copied_len` counts fallback bytes for the current capture internally; it is
+not yet exposed through the UAPI. Fallback destinations are translated from
+their actual vmalloc address, including buffers with an unaligned stride.
+`skb_copy_bits` errors are checked before recording an extent.
+
+A full vector produces a short receive, not an extra payload copy. If an
+error follows a successfully captured prefix, that prefix is returned to TCP
+as consumed; a later read reaches the remaining data/error. Zero-length RECV
+commands complete immediately. Nonzero RECV offsets still follow the
+prototype's existing behavior: they constrain validation, while captured
+bytes are indexed from zero in sgvec. Use offset zero for receive.
+
+See [README.md](README.md#rx-kernel-tests) for the reproducible KUnit and
+loopback TCP tests. These tests cover the capture layer; they do not validate
+all io_uring scheduling, cancellation, or EOF behavior.
 
 ### TX Path: `MSG_SPLICE_PAGES`
 
@@ -187,8 +222,50 @@ indicating that `sgvec` entries hold page references that must be released.
 - **Pool buffers**: iterates pages array with offset/length, same
   `MSG_SPLICE_PAGES` path
 
-`MSG_SPLICE_PAGES` tells TCP to take a reference on the page rather than copy
-its contents, achieving zero-copy from buffer to NIC.
+`MSG_SPLICE_PAGES` requests page splicing. It is not a guarantee of copy-free
+transmission through the complete network stack.
+
+#### TX review on Linux 7.2.9
+
+The current kpass TX worker builds one `bio_vec` at a time, initializes an
+`ITER_SOURCE` iterator, and calls `sock_sendmsg` with
+`MSG_SPLICE_PAGES | MSG_DONTWAIT`, adding `MSG_MORE` between extents.
+
+| Stage/condition | Behavior verified in this tree |
+| --- | --- |
+| TCP route supports `NETIF_F_SG` | `tcp_sendmsg_locked` selects `MSG_SPLICE_PAGES`; `skb_splice_from_iter` adds page references |
+| Route lacks `NETIF_F_SG` | TCP uses `skb_copy_to_page_nocache` and copies the payload |
+| TX skb reaches its fragment limit | TCP starts another segment after `-EMSGSIZE`; the limit alone does not require a payload copy |
+| An unsafe page reaches `skb_splice_from_iter` | `sendpage_ok` rejects it with a warning/error; our bvec path must supply valid non-slab pages |
+| Device cannot transmit the skb layout | `validate_xmit_skb` may linearize it, copying payload |
+| Software checksum is needed for shared fragments | `skb_checksum_help` linearizes the fragments before checksumming |
+
+Source locations: [`tcp_sendmsg_locked`](../net/ipv4/tcp.c),
+[`skb_splice_from_iter`](../net/core/skbuff.c),
+[`sendpage_ok`](../include/linux/net.h),
+[`skb_needs_linearize`](../include/linux/skbuff.h), and
+[`validate_xmit_skb` / `skb_checksum_help`](../net/core/dev.c).
+
+TCP marks these spliced fragments `SKBFL_SHARED_FRAG` unless the sender sets
+`MSG_NO_SHARED_FRAGS`. Thus a local kpass-to-kpass transfer can take our RX
+copy fallback. The flag is a possible future optimization only once payload
+immutability lasts for the entire TCP retention period. SEND completion
+means acceptance into TCP, not acknowledgment by the peer. Pool data can
+currently be changed by POKE or a later receive while TCP retains references,
+so adding `MSG_NO_SHARED_FRAGS` now would make an unsupported promise.
+
+The next TX implementation work is:
+
+1. Enforce captured-buffer offset/length bounds; the existing worker sends
+   through the end of sgvec without applying the requested length.
+2. Preserve a cumulative send count and reliable progress across partial
+   sends and `EAGAIN`; the current completion reports only the last work run.
+3. Resolve pool reuse while TCP retains pages and pool-page addressing for
+   non-page-aligned buffer strides.
+4. Batch bvec extents into fewer send calls, then evaluate safe use of
+   `MSG_NO_SHARED_FRAGS` for immutable backing.
+5. Measure copies with the target NIC and offload settings, including SG and
+   checksum fallbacks. The RX loopback test is not that measurement.
 
 ### io_uring Command Interface
 
@@ -263,8 +340,12 @@ Terminal 3 (client):
 2. **TCP only** -- no UDP or other protocol support
 3. **No mmap** -- userspace cannot directly access buffer data (by design);
    use peek/poke for data access
-4. **Linear skb data is copied** -- rare with GRO/TSO but not zero-copy for
-   small packets that stay in `skb->data`
+4. **Some RX backing requires copying** -- slab/cloned heads and externally
+   mutable fragments; unreadable fragments are unsupported
 5. **Single accept at a time** -- only one pending accept per listening socket
 6. **Buffer size capped at 1MB** -- `KPASS_MAX_BUF_SIZE`
-7. **Scatter-gather limited to 128 entries** -- `KPASS_MAX_SG_ENTRIES`
+7. **Scatter-gather limited to 128 entries** -- `KPASS_MAX_SG_ENTRIES`;
+   fragmented receives can complete short before reaching the byte limit
+8. **Prototype completion and lifetime gaps** -- TX range/progress and pool
+   reuse issues above, plus connect/EOF completion, cancellation, and teardown,
+   must be resolved before performance evaluation

@@ -6,3 +6,7 @@
 obj-m := ceph_kpass.o
 
 ccflags-y := -I$(src)
+
+ifeq ($(KPASS_KUNIT_TEST),1)
+ccflags-y += -DKPASS_KUNIT_TEST
+endif

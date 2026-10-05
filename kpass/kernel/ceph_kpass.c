@@ -6,7 +6,7 @@
  * Userspace coordinates via io_uring_cmd using handles only.
  *
  * Zero-Copy Architecture:
- * - RX: tcp_read_sock captures skb frag pages into sgvec (zero-copy)
+ * - RX: tcp_read_sock retains eligible skb heads and fragment pages
  * - TX: MSG_SPLICE_PAGES sends from sgvec or pool pages (zero-copy)
  * - No mmap - userspace cannot access buffer data directly
  * - Userspace operates on handles (buffer IDs, socket IDs) only
@@ -44,6 +44,19 @@ static struct miscdevice kpass_miscdev;
  * Buffer Pool Management
  * ============================================================================
  */
+
+/* Every sgvec entry owns a page reference, including copied pool data. */
+static void kpass_buf_release_capture(struct kpass_buf *buf)
+{
+	unsigned int i;
+
+	for (i = 0; i < buf->sg_count; i++)
+		put_page(buf->sgvec[i].page);
+	buf->sg_count = 0;
+	buf->total_len = 0;
+	buf->copied_len = 0;
+	buf->captured = false;
+}
 
 int kpass_init_buffer_pool(struct kpass_session *sess, u32 num_buffers, u32 buf_size)
 {
@@ -109,6 +122,7 @@ err_free_pages:
 		kfree(sess->buffers[j].pages);
 	}
 	kfree(sess->buffers);
+	sess->buffers = NULL;
 err_vfree:
 	vfree(sess->pool_vm);
 	sess->pool_vm = NULL;
@@ -118,15 +132,10 @@ err_vfree:
 void kpass_destroy_buffer_pool(struct kpass_session *sess)
 {
 	int i;
-	unsigned int j;
 
 	if (sess->buffers) {
 		for (i = 0; i < sess->num_buffers; i++) {
-			/* Release any captured pages */
-			if (sess->buffers[i].captured) {
-				for (j = 0; j < sess->buffers[i].sg_count; j++)
-					put_page(sess->buffers[i].sgvec[j].page);
-			}
+			kpass_buf_release_capture(&sess->buffers[i]);
 			kfree(sess->buffers[i].sgvec);
 			kfree(sess->buffers[i].pages);
 		}
@@ -154,6 +163,7 @@ struct kpass_buf *kpass_buf_alloc(struct kpass_session *sess)
 		buf->ioucmd = NULL;
 		buf->sg_count = 0;
 		buf->total_len = 0;
+		buf->copied_len = 0;
 		buf->captured = false;
 	}
 	spin_unlock_irqrestore(&sess->buf_lock, flags);
@@ -164,16 +174,8 @@ struct kpass_buf *kpass_buf_alloc(struct kpass_session *sess)
 void kpass_buf_free(struct kpass_session *sess, struct kpass_buf *buf)
 {
 	unsigned long flags;
-	unsigned int i;
 
-	/* Release captured page references */
-	if (buf->captured) {
-		for (i = 0; i < buf->sg_count; i++)
-			put_page(buf->sgvec[i].page);
-		buf->sg_count = 0;
-		buf->total_len = 0;
-		buf->captured = false;
-	}
+	kpass_buf_release_capture(buf);
 
 	spin_lock_irqsave(&sess->buf_lock, flags);
 	buf->state = BUF_FREE;
@@ -520,91 +522,172 @@ static void kpass_accept_work_fn(struct work_struct *work)
  * ============================================================================
  */
 
-/*
- * tcp_read_sock actor: capture skb fragment pages into buffer sgvec.
- * Linear data (rare) is copied into pool pages. Paged fragments are
- * captured zero-copy via get_page.
- */
+/* Callers reserve an sgvec slot before copying or retaining data. */
+static void kpass_rx_append(struct kpass_buf *buf, struct page *page,
+			    unsigned int offset, unsigned int len)
+{
+	struct kpass_sg_entry *sg = &buf->sgvec[buf->sg_count++];
+
+	get_page(page);
+	sg->page = page;
+	sg->offset = offset;
+	sg->length = len;
+	buf->total_len += len;
+	buf->captured = true;
+}
+
+static int kpass_rx_pages(struct kpass_buf *buf, struct page *page,
+			  unsigned int offset, unsigned int len)
+{
+	unsigned int consumed = 0;
+
+	page += offset / PAGE_SIZE;
+	offset = offset_in_page(offset);
+	while (len && buf->sg_count < buf->sg_max) {
+		unsigned int chunk = min_t(unsigned int, len, PAGE_SIZE - offset);
+
+		kpass_rx_append(buf, page, offset, chunk);
+		consumed += chunk;
+		len -= chunk;
+		page++;
+		offset = 0;
+	}
+	return consumed ?: -ENOSPC;
+}
+
+static int kpass_rx_copy(struct kpass_buf *buf, const struct sk_buff *skb,
+			 unsigned int offset, unsigned int len)
+{
+	struct kpass_session *sess = buf->sock->session;
+	unsigned int consumed = 0;
+
+	while (len && buf->sg_count < buf->sg_max) {
+		void *dst = kpass_buf_kaddr(sess, buf) + buf->total_len;
+		unsigned int page_off = offset_in_page(dst);
+		unsigned int chunk = min_t(unsigned int, len, PAGE_SIZE - page_off);
+		int ret;
+
+		ret = skb_copy_bits(skb, offset, dst, chunk);
+		if (ret)
+			return consumed ?: ret;
+		kpass_rx_append(buf, vmalloc_to_page(dst), page_off, chunk);
+		buf->copied_len += chunk;
+		consumed += chunk;
+		offset += chunk;
+		len -= chunk;
+	}
+	return consumed ?: -ENOSPC;
+}
+
+/* Walk the same head, frags and frag_list layout as skb_splice_bits(). */
+static int kpass_rx_skb(struct kpass_buf *buf, const struct sk_buff *skb,
+			unsigned int offset, unsigned int len, bool shared)
+{
+	unsigned int consumed = 0, start = skb_headlen(skb);
+	bool copy_frags = shared || skb_has_shared_frag(skb);
+	struct sk_buff *child;
+	unsigned int chunk;
+	int i, ret = -EFAULT;
+
+	if (!skb_frags_readable(skb))
+		return -EIO;
+
+	if (offset < start) {
+		chunk = min(start - offset, len);
+		/* Linux splice retains only unshared, page-backed heads. */
+		if (shared || skb_head_is_locked(skb)) {
+			ret = kpass_rx_copy(buf, skb, offset, chunk);
+		} else {
+			void *data = skb->data + offset;
+
+			ret = kpass_rx_pages(buf, virt_to_page(data),
+					     offset_in_page(data), chunk);
+		}
+		if (ret < 0)
+			return ret;
+		consumed += ret;
+		len -= ret;
+		if (ret < chunk || !len)
+			return consumed;
+		offset = 0;
+	} else {
+		offset -= start;
+	}
+
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		unsigned int size = skb_frag_size(frag);
+
+		if (offset >= size) {
+			offset -= size;
+			start += size;
+			continue;
+		}
+		chunk = min(size - offset, len);
+		if (!skb_frag_page(frag)) {
+			ret = -EIO;
+			goto out;
+		}
+		if (copy_frags)
+			ret = kpass_rx_copy(buf, skb, start + offset, chunk);
+		else
+			ret = kpass_rx_pages(buf, skb_frag_page(frag),
+					     skb_frag_off(frag) + offset, chunk);
+		if (ret < 0)
+			goto out;
+		consumed += ret;
+		len -= ret;
+		if (ret < chunk || !len)
+			return consumed;
+		offset = 0;
+		start += size;
+	}
+
+	skb_walk_frags(skb, child) {
+		if (offset >= child->len) {
+			offset -= child->len;
+			continue;
+		}
+		chunk = min(child->len - offset, len);
+		ret = kpass_rx_skb(buf, child, offset, chunk, copy_frags);
+		if (ret < 0)
+			goto out;
+		consumed += ret;
+		len -= ret;
+		if (ret < chunk || !len)
+			return consumed;
+		offset = 0;
+	}
+out:
+	/* TCP must consume a successfully retained prefix even on error. */
+	return consumed ?: ret;
+}
+
 static int kpass_tcp_recv_actor(read_descriptor_t *desc,
 				struct sk_buff *skb,
 				unsigned int offset, size_t len)
 {
 	struct kpass_buf *buf = desc->arg.data;
 	struct kpass_session *sess = buf->sock->session;
-	unsigned int consumed = 0;
+	int ret;
 
-	if (!skb_frags_readable(skb))
-		return -EIO;
+	/* tcp_read_sock() supplies the skb length, not the remaining budget. */
+	if (buf->total_len >= sess->buf_size)
+		return -ENOSPC;
+	if (offset > skb->len)
+		return -EINVAL;
+	len = min_t(size_t, len, desc->count);
+	len = min_t(size_t, len, sess->buf_size - buf->total_len);
+	len = min_t(size_t, len, skb->len - offset);
+	if (!len)
+		return 0;
 
-	/* Linear data (skb->data) — must copy, slab pages aren't safe to ref */
-	if (offset < skb_headlen(skb)) {
-		u32 linear_avail = skb_headlen(skb) - offset;
-		u32 linear_len = min_t(u32, linear_avail, len);
-		u32 pool_off = buf->total_len;
-		void *dst;
-
-		if (pool_off + linear_len > sess->buf_size)
-			linear_len = sess->buf_size - pool_off;
-		if (linear_len == 0 || buf->sg_count >= buf->sg_max)
-			return consumed ?: -ENOSPC;
-
-		dst = kpass_buf_kaddr(sess, buf) + pool_off;
-		skb_copy_bits(skb, offset, dst, linear_len);
-
-		/* Reference pool page in sgvec (no get_page — pool pages are stable) */
-		buf->sgvec[buf->sg_count].page = buf->pages[pool_off / PAGE_SIZE];
-		buf->sgvec[buf->sg_count].offset = pool_off % PAGE_SIZE;
-		buf->sgvec[buf->sg_count].length = linear_len;
-		buf->sg_count++;
-
-		consumed += linear_len;
-		offset += linear_len;
-		len -= linear_len;
-		buf->total_len += linear_len;
+	ret = kpass_rx_skb(buf, skb, offset, len, false);
+	if (ret > 0) {
+		desc->written += ret;
+		desc->count -= ret;
 	}
-
-	/* Paged fragments — zero-copy capture */
-	if (offset >= skb_headlen(skb) && len > 0) {
-		u32 frag_off_in_skb = offset - skb_headlen(skb);
-		int fi;
-
-		/* Find starting fragment */
-		for (fi = 0; fi < skb_shinfo(skb)->nr_frags; fi++) {
-			skb_frag_t *f = &skb_shinfo(skb)->frags[fi];
-
-			if (frag_off_in_skb < skb_frag_size(f))
-				break;
-			frag_off_in_skb -= skb_frag_size(f);
-		}
-
-		for (; fi < skb_shinfo(skb)->nr_frags && len > 0
-		       && buf->sg_count < buf->sg_max; fi++) {
-			skb_frag_t *f = &skb_shinfo(skb)->frags[fi];
-			struct page *page = skb_frag_page(f);
-			u32 foff = skb_frag_off(f) + frag_off_in_skb;
-			u32 flen = skb_frag_size(f) - frag_off_in_skb;
-
-			if (!page)
-				break;  /* net_iov / devmem — can't capture */
-
-			flen = min_t(u32, flen, len);
-			get_page(page);
-
-			buf->sgvec[buf->sg_count].page = page;
-			buf->sgvec[buf->sg_count].offset = foff;
-			buf->sgvec[buf->sg_count].length = flen;
-			buf->sg_count++;
-
-			consumed += flen;
-			len -= flen;
-			buf->total_len += flen;
-			frag_off_in_skb = 0;
-		}
-	}
-
-	desc->written += consumed;
-	desc->count -= consumed;
-	return consumed;
+	return ret;
 }
 
 static void kpass_rx_work_fn(struct work_struct *work)
@@ -625,11 +708,6 @@ static void kpass_rx_work_fn(struct work_struct *work)
 		buf = list_first_entry(&ksock->rx_queue, struct kpass_buf, list);
 		spin_unlock_irqrestore(&ksock->rx_lock, flags);
 
-		/* Reset sgvec state for this receive */
-		buf->sg_count = 0;
-		buf->total_len = 0;
-		buf->captured = false;
-
 		memset(&desc, 0, sizeof(desc));
 		desc.count = buf->length;
 		desc.arg.data = buf;
@@ -647,9 +725,6 @@ static void kpass_rx_work_fn(struct work_struct *work)
 		spin_unlock_irqrestore(&ksock->rx_lock, flags);
 
 		buf->state = BUF_ALLOCATED;
-		if (ret > 0)
-			buf->captured = true;
-
 		if (buf->ioucmd) {
 			io_uring_cmd_done(buf->ioucmd,
 					  ret > 0 ? (s32)buf->total_len : ret,
@@ -938,8 +1013,16 @@ static int kpass_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags
 			return -EIOCBQUEUED;
 		}
 		/* Bounds check */
-		if (cmd->recv.offset + cmd->recv.len > sess->buf_size) {
+		if (cmd->recv.offset > sess->buf_size ||
+		    cmd->recv.len > sess->buf_size - cmd->recv.offset) {
 			kpass_complete_cmd(ioucmd, -EINVAL, issue_flags);
+			return -EIOCBQUEUED;
+		}
+
+		/* Reposting a buffer replaces its previous capture. */
+		kpass_buf_release_capture(buf);
+		if (!cmd->recv.len) {
+			kpass_complete_cmd(ioucmd, 0, issue_flags);
 			return -EIOCBQUEUED;
 		}
 
@@ -1268,3 +1351,7 @@ module_exit(ceph_kpass_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Ceph Zero-Copy Kernel Passthrough");
 MODULE_DESCRIPTION("Kernel module for zero-copy network I/O via tcp_read_sock + MSG_SPLICE_PAGES");
+
+#ifdef KPASS_KUNIT_TEST
+#include "ceph_kpass_test.c"
+#endif
