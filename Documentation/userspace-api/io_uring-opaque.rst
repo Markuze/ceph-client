@@ -51,8 +51,18 @@ Submit ``IORING_OP_RECV_ZC`` on a connected TCP socket, selecting the store in
 32-byte CQE has result zero, ``IORING_CQE_F_MORE``, and a stream token in its
 first extra word. Stream offset zero denotes the first unread byte when
 ownership is acquired. No bytes are consumed before this CQE can be posted.
+A full completion queue rejects attachment with ENOSPC before acquiring the
+receive claim or consuming TCP bytes. Drain completions before retrying attach.
+``IORING_RECVSEND_POLL_FIRST`` waits for socket readiness before attachment.
 A terminal CQE ends the collector on EOF, error, cancellation or stream close.
 The RFC collector rejects ``IOSQE_ASYNC`` and CQE suppression.
+
+Every stream token must be released with STREAM_CLOSE, including after EOF
+or a network error. The stream holds a socket file reference: closing the
+application's descriptor alone does not release the token, receive claim or
+connection. STREAM_CLOSE ends that ownership; store teardown also releases
+all remaining streams. Disconnecting with ``connect(AF_UNSPEC)`` is rejected
+with EBUSY while a stream owns the receive sequence.
 
 The collector uses ordinary io_uring polling and ``tcp_read_sock``. TCP receive
 ownership excludes ordinary recv, splice, other actors and zerocopy mappings

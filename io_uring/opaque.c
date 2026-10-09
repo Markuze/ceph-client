@@ -1161,7 +1161,7 @@ static void io_opaque_stream_close(struct io_opaque_stream *stream)
 	lock_sock(sock->sk);
 	write_lock_bh(&sock->sk->sk_callback_lock);
 	if (sock->sk->sk_rx_owner == &stream->owner)
-		sock->sk->sk_rx_owner = NULL;
+		WRITE_ONCE(sock->sk->sk_rx_owner, NULL);
 	write_unlock_bh(&sock->sk->sk_callback_lock);
 	release_sock(sock->sk);
 	io_opaque_extents_free(stream->store, &stream->extents);
@@ -1232,7 +1232,7 @@ static int io_opaque_attach(struct io_opaque_req *op)
 			ret = -ENOSPC;
 			break;
 		}
-		sock->sk->sk_rx_owner = &stream->owner;
+		WRITE_ONCE(sock->sk->sk_rx_owner, &stream->owner);
 		write_unlock_bh(&sock->sk->sk_callback_lock);
 		slot->stream = stream;
 		refcount_inc(&stream->refs);

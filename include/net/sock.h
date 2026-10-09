@@ -633,7 +633,7 @@ static inline bool sock_rx_owner_conflict(const struct sock *sk,
 					  sk_read_actor_t actor)
 {
 #ifdef CONFIG_IO_URING_OPAQUE_OBJ
-	const struct sock_rx_owner *owner = sk->sk_rx_owner;
+	const struct sock_rx_owner *owner = READ_ONCE(sk->sk_rx_owner);
 
 	return owner && (owner->actor != actor || owner->data != desc->arg.data);
 #else

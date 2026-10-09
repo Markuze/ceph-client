@@ -204,26 +204,43 @@ static int register_store(struct ring *r, struct io_uring_opaque_config *cfg,
 	return ret < 0 ? -errno : ret;
 }
 
-static void tcp_pair(int pair[2])
+static bool tcp_pair_family(int pair[2], int family)
 {
-	struct sockaddr_in addr = {
-		.sin_family = AF_INET,
-		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-	};
-	socklen_t len = sizeof(addr);
-	int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1;
+	union {
+		struct sockaddr_in v4;
+		struct sockaddr_in6 v6;
+	} addr = {};
+	socklen_t len;
+	int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1;
 
+	if (listener < 0 && family == AF_INET6 && errno == EAFNOSUPPORT)
+		return false;
 	require(listener >= 0, "listen socket");
-	require(!bind(listener, (void *)&addr, sizeof(addr)), "bind");
+	if (family == AF_INET6) {
+		addr.v6.sin6_family = family;
+		addr.v6.sin6_addr = in6addr_loopback;
+		len = sizeof(addr.v6);
+	} else {
+		addr.v4.sin_family = family;
+		addr.v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		len = sizeof(addr.v4);
+	}
+	require(!bind(listener, (void *)&addr, len), "bind");
 	require(!getsockname(listener, (void *)&addr, &len), "getsockname");
 	require(!listen(listener, 1), "listen");
-	pair[0] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	pair[0] = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	require(pair[0] >= 0, "connect socket");
 	require(!connect(pair[0], (void *)&addr, sizeof(addr)), "connect");
 	pair[1] = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
 	require(pair[1] >= 0, "accept");
 	require(!setsockopt(pair[0], IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)), "TCP_NODELAY");
 	close(listener);
+	return true;
+}
+
+static void tcp_pair(int pair[2])
+{
+	require(tcp_pair_family(pair, AF_INET), "IPv4 socket pair");
 }
 
 static uint64_t attach(struct ring *r, uint32_t context, int fd, uint64_t tag)
@@ -958,6 +975,158 @@ static void test_budget_error(struct io_uring_opaque_config cfg)
 	}
 }
 
+static void test_disconnect(struct io_uring_opaque_config *cfg)
+{
+	int families[] = { AF_INET, AF_INET6 };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(families); i++) {
+		struct sockaddr addr = { .sa_family = AF_UNSPEC };
+		struct ring r;
+		uint32_t context;
+		uint64_t stream, discard;
+		int pair[2], alias;
+
+		if (!tcp_pair_family(pair, families[i])) {
+			ksft_test_result_skip("IPv6 disconnect ownership requires IPv6 support\n");
+			continue;
+		}
+		require(!ring_init(&r, IORING_SETUP_CQE32), "disconnect ring");
+		require(!register_store(&r, cfg, &context), "disconnect store");
+		alias = dup(pair[1]);
+		require(alias >= 0, "duplicate claimed descriptor");
+		stream = attach(&r, context, pair[1], 711);
+		require(connect(alias, &addr, sizeof(addr)) == -1 && errno == EBUSY,
+			"AF_UNSPEC cannot reset a claimed TCP connection through an alias");
+		discard = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream, 0, 4, NULL);
+		write_all(pair[0], "live", 4);
+		require(wait_tag(&r, discard).res == 4, "rejected disconnect preserves TCP");
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+			"release disconnect claim");
+		require(!connect(alias, &addr, sizeof(addr)), "disconnect after STREAM_CLOSE");
+		ring_exit(&r);
+		close(alias);
+		close(pair[0]);
+		close(pair[1]);
+		ksft_test_result_pass("IPv%d disconnect preserves ownership through aliases\n",
+				      i ? 6 : 4);
+	}
+}
+
+static void test_socket_lifetime(struct io_uring_opaque_config *cfg)
+{
+	struct io_uring_opaque_stream_stat stat;
+	struct timeval timeout = { .tv_sec = 2 };
+	struct ring r;
+	uint32_t context;
+	uint64_t stream;
+	unsigned char byte;
+	int pair[2];
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "socket lifetime ring");
+	require(!register_store(&r, cfg, &context), "socket lifetime store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], 712);
+	close(pair[1]);
+	require(recv(pair[0], &byte, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN,
+		"closing descriptor leaves the stream's connection alive");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+			 sizeof(stat), &stat).res, "token survives descriptor close");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"explicit close releases stream ownership");
+	require(wait_tag(&r, 712).res == -ECANCELED, "collector terminates after stream close");
+	require(!setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+		"lifetime peer receive timeout");
+	require(recv(pair[0], &byte, 1, 0) == 0, "stream close releases the socket file");
+	ring_exit(&r);
+	close(pair[0]);
+	ksft_test_result_pass("STREAM_CLOSE releases the connection after its descriptor closes\n");
+}
+
+static void test_poll_first(struct io_uring_opaque_config *cfg)
+{
+	struct io_uring_sqe sqe = {
+		.opcode = IORING_OP_RECV_ZC,
+		.ioprio = IORING_RECV_MULTISHOT | IORING_RECVSEND_POLL_FIRST,
+		.user_data = 713,
+	};
+	struct ring r;
+	uint32_t context;
+	struct event event;
+	uint64_t stream;
+	unsigned char byte;
+	int pair[2];
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "POLL_FIRST ring");
+	require(!register_store(&r, cfg, &context), "POLL_FIRST store");
+	tcp_pair(pair);
+	sqe.fd = pair[1];
+	sqe.zcrx_ifq_idx = context;
+	stage(&r, sqe);
+	enter(&r, 0);
+	require(!peek(&r, &event), "POLL_FIRST delays attach until readability");
+	require(recv(pair[1], &byte, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN,
+		"POLL_FIRST has not acquired an empty socket");
+	write_all(pair[0], "p", 1);
+	event = wait_tag(&r, sqe.user_data);
+	require(!event.res && event.flags & IORING_CQE_F_MORE, "POLL_FIRST attach token");
+	stream = event.extra[0];
+	require(command(&r, context, IORING_OPAQUE_READ_STREAM, stream, 0, 1, &byte).res == 1 &&
+		byte == 'p', "POLL_FIRST payload");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"POLL_FIRST close stream");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	ksft_test_result_pass("POLL_FIRST waits for readability before acquiring the stream\n");
+}
+
+static void test_full_cq(struct io_uring_opaque_config *cfg)
+{
+	struct io_uring_sqe sqe = { .opcode = IORING_OP_NOP };
+	struct ring r;
+	uint32_t context;
+	struct event event;
+	uint64_t stream;
+	unsigned int i;
+	unsigned char bytes[3];
+	int pair[2];
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "full CQ ring");
+	require(!register_store(&r, cfg, &context), "full CQ store");
+	tcp_pair(pair);
+	for (i = 0; i < r.p.cq_entries; i++) {
+		sqe.user_data = next_tag++;
+		stage(&r, sqe);
+		if ((i + 1) % r.p.sq_entries == 0)
+			enter(&r, 0);
+	}
+	enter(&r, 0);
+	sqe = (struct io_uring_sqe) {
+		.opcode = IORING_OP_RECV_ZC, .fd = pair[1],
+		.ioprio = IORING_RECV_MULTISHOT, .zcrx_ifq_idx = context,
+		.user_data = 714,
+	};
+	stage(&r, sqe);
+	write_all(pair[0], "cq!", 3);
+	enter(&r, 0);
+	require(recv(pair[1], bytes, sizeof(bytes), MSG_DONTWAIT) == 3 &&
+		!memcmp(bytes, "cq!", 3), "full CQ attach neither consumes nor claims RX");
+	for (i = 0; i < r.p.cq_entries; i++)
+		require(peek(&r, &event) && !event.res && event.tag != sqe.user_data,
+			"drain original full CQ");
+	event = wait_tag(&r, sqe.user_data);
+	require(event.res == -ENOSPC && !(event.flags & IORING_CQE_F_MORE),
+		"full CQ reports attach failure");
+	stream = attach(&r, context, pair[1], 715);
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"retry attach after CQ drain");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	ksft_test_result_pass("full CQ attach preserves TCP bytes and permits retry\n");
+}
+
 static uint64_t read_number(const char *path)
 {
 	unsigned long long value;
@@ -1032,12 +1201,14 @@ static void test_memcg(struct io_uring_opaque_config *cfg)
 		ksft_print_msg("memcg before=%llu after=%llu backing=%llu\n",
 			       (unsigned long long)before, (unsigned long long)after,
 			       (unsigned long long)object.backing_bytes);
-		require(after + (128U << 10) >= before + object.backing_bytes,
+		/* Per-CPU precharged stocks make memory.current a batched counter. */
+		require(after + (1U << 20) >= before + object.backing_bytes,
 			"retained pages are charged to the store owner's memcg");
 		require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
 			"memcg free backing");
 		released = read_number(path);
-		require(released + (1U << 20) < after, "FREE releases retained memcg charges");
+		require(released + object.backing_bytes <= after + (1U << 20),
+			"FREE releases retained memcg charges");
 		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
 			"memcg close stream");
 		ring_exit(&r);
@@ -1602,7 +1773,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(45);
+	ksft_set_plan(50);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1838,5 +2009,9 @@ int main(void)
 	test_compact_queue(&cfg);
 	test_budget_error(cfg);
 	test_memcg(&cfg);
+	test_disconnect(&cfg);
+	test_socket_lifetime(&cfg);
+	test_poll_first(&cfg);
+	test_full_cq(&cfg);
 	ksft_finished();
 }
