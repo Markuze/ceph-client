@@ -91,7 +91,7 @@ linking/cancellation retain their usual meaning. CQE suppression is rejected.
      - Copy an object subrange of at most 64 KiB to the supplied address.
    * - FREE
      - Invalidate a published object handle and release its table reference.
-       Already prepared operations and TCP page references remain valid.
+       Already pinned backing versions and TCP page references remain valid.
    * - STAT / OBJECT_STAT / STREAM_STAT
      - Copy the corresponding UAPI structure; ``len`` is its exact size.
        STAT uses a zero handle and offset.
@@ -127,11 +127,35 @@ Transmission and ownership
 ``IORING_OP_OPAQUE_OBJ_SEND`` takes an ordinary destination socket descriptor,
 the store ID in ``zcrx_ifq_idx``, an object handle in ``addr``, offset in ``off``
 and positive length in ``len``. ``MSG_MORE`` and ``MSG_DONTWAIT`` are accepted
-in ``msg_flags``. Other operation-specific fields are zero.
+in ``msg_flags``. ``ioprio`` is zero for reusable sends or contains
+``IORING_OPAQUE_SEND_LAST`` for a consuming send. Other operation-specific
+fields are zero. SEND_LAST rejects ``IOSQE_CQE_SKIP_SUCCESS`` so ownership
+transfer is always reported.
 
-Preparation pins the current immutable backing version. Issue uses its
-retained bvec array and saved iterator with ``MSG_SPLICE_PAGES``. One
-``sock_sendmsg`` call is made per issue attempt, including the whole remaining
+Ordinary SEND preparation pins the current immutable backing version, leaving
+the handle available for caching, further reads and sends to other destinations.
+SEND_LAST preparation validates the handle and range without taking a backing
+reference. At first issue, after destination validation and TX queue allocation,
+it atomically removes the handle and transfers the table reference into the
+request. It uses the version current at that point, including any compaction
+published since preparation. Admission behind an earlier send also takes
+ownership before waiting for its turn; subsequent retries retain that reference.
+
+The send CQE has ``IORING_CQE_F_OPAQUE_CONSUMED`` exactly when this request took
+ownership, independently of its byte result. Before that point, validation,
+admission failure or cancellation does not consume the object. A missing flag
+reports that this request did not consume it; another request may still have
+freed or consumed the shared handle. After that point the handle stays invalid,
+including on short sends, I/O errors and cancellation. The unsent portion is
+released with the request and is not restored. A subrange SEND_LAST consumes
+the entire object, including bytes outside the selected range. Two prepared
+SEND_LAST requests for the same handle cannot both claim it: the loser returns
+ESTALE without the consumed flag. Earlier pinned reads and ordinary sends
+continue using their version. A SEND_LAST awaiting its first issue has no pin
+and fails with ESTALE if another operation removes the handle first.
+
+Issue uses the retained bvec array and saved iterator with ``MSG_SPLICE_PAGES``.
+One ``sock_sendmsg`` call is made per issue attempt, including the whole remaining
 range. Partial progress resumes at the saved cursor. Without MSG_DONTWAIT,
 the request continues until the range is queued or an error/cancellation ends
 it. Failure before progress returns a negative errno; failure after progress
@@ -141,8 +165,18 @@ Each send has one application completion. This reports bytes queued to TCP,
 not peer delivery or acknowledgment. No user-buffer reuse notification is
 needed: the payload cannot be overwritten by userspace, and TCP owns ordinary
 page references. FREE after queued sends can invalidate the handle while TCP
-still retains those pages. An SQE awaiting preparation has not acquired its
-backing reference; users must order handle release accordingly.
+still retains those pages. SEND_LAST does this without a separate FREE SQE or
+CQE and transfers a reference rather than adding and dropping a send pin.
+An ordinary SEND awaiting preparation has not acquired its backing reference;
+users must order handle release accordingly.
+
+Caching and fanout applications use ordinary SEND and keep their handle until
+eviction or explicit FREE. Forwarders use SEND_LAST for a payload's final use,
+then inspect the single completion's byte result and consumed flag. A final
+fanout send may also use SEND_LAST once earlier sends have acquired their pins.
+Both application patterns use the same store, opcode, range fields and TCP
+send machinery. The saved SQE and CQE do not imply a saved system call: SEND
+and FREE can already be submitted together in one ``io_uring_enter``.
 
 Object sends are FIFO per shared store and destination socket. Only the queue
 head polls for write space; later requests reuse their own request state as
@@ -153,8 +187,9 @@ Backing and memory management
 
 References move from undecided stream extents into private KEEP assembly and
 then a published backing version. Reads, sends and compaction pin their
-version. FREE drops the table reference; compaction replaces that reference.
-Old versions remain charged until their store references disappear.
+version. FREE drops the table reference; SEND_LAST transfers it into the send;
+compaction replaces that reference. Old versions remain charged until their
+store references disappear.
 
 Capture combines backing and initial extent metadata in one allocation and
 coalesces adjacent compatible extents. Splits share a backing reference and
@@ -203,11 +238,18 @@ Automatic compaction is opt-in. Policy supplies minimum object age, saving,
 slack percentage and extent count, copy bytes per second, burst allowance and
 maximum temporary backing. One delayed worker per store scans at most 32
 candidates per invocation and copies at most one object, sharing the ordered
-workqueue with manual requests. FREE removes candidates; dense versions are
-removed after success; failures back off. Ordinary reception cannot consume
-configured compaction headroom. Neither policy nor manual requests bypass
+workqueue with manual requests. FREE and SEND_LAST remove candidates; dense
+versions are removed after success; failures back off. Ordinary reception
+cannot consume configured compaction headroom. Neither policy nor manual requests bypass
 the hard limit, and no objects are evicted. Objects exceeding the burst or
 temporary allowance remain ineligible until policy changes.
+
+An in-flight compaction holds its own source reference. If SEND_LAST consumes
+the handle before compaction publication, source/generation revalidation
+rejects publication and replacement backing is released. A manual COMPACT
+returns ESTALE; neither compaction path can restore the handle or overwrite
+a reused slot. If compaction publishes first, SEND_LAST claims the replacement
+under the same handle. Both send modes use the same compaction machinery.
 
 Claims and comparison boundaries
 ================================
@@ -221,6 +263,8 @@ The code supports these architectural claims:
   changes, with object-level application lifetime management.
 * One application completion per object send, without SEND_ZC's separate
   notification request and notification task work.
+* Opt-in final-send ownership transfer removes one FREE SQE, CQE and request,
+  while reusable sends retain the ordinary caching and fanout lifetime.
 * Retention of eligible ordinary RX pages instead of a bulk receive copy.
 * Reusable kernel scatter vectors and optional dense backing for cached or
   repeatedly transmitted payloads.
@@ -231,8 +275,9 @@ sent to multiple destinations while the application inspects only framing.
 For an illustrative object delivered in N receive completions and sent in S
 requests, a typical mapped receive/send-ZC flow produces N + 2S CQEs. An opaque
 flow with H bounded reads and D discards produces H + 1 KEEP + S SEND + 1 FREE
-+ D CQEs, excluding setup/terminal CQEs and failures. Refill entries are a
-separate cost, not additional CQEs. Small N or extra reads can erase this gain;
++ D CQEs, or H + 1 KEEP + S SEND + D when the final send uses SEND_LAST,
+excluding setup/terminal CQEs and failures. Refill entries are a separate cost,
+not additional CQEs. Small N or extra reads can erase this gain;
 CQE batching means the count does not predict syscall or wakeup counts.
 
 An optimized comparison must include fixed-buffer and vectored SEND_ZC.
@@ -259,8 +304,10 @@ Validation and reproduction
 without liburing. It covers fragmented framing, complete publication, ranged
 sends, shared stores, stale handles, cancellation and linked timeouts, manual
 and automatic compaction, old-version sends during replacement and FREE,
-memory-limit recovery, receive ownership, EOF, teardown and unprivileged
-registration. The tests use loopback TCP; they do not measure performance.
+SEND_LAST ownership reporting on rejection, short sends, errors and cancellation,
+competing prepared final sends across rings, cache resends, memory-limit recovery,
+receive ownership, EOF, teardown and unprivileged registration. The tests use
+loopback TCP; they do not measure performance.
 
 Build against the patched UAPI, using an already configured kernel build::
 
@@ -276,8 +323,9 @@ The capabilities test needs a root fixture and is skipped otherwise.
 ``CONFIG_IO_URING_OPAQUE_OBJ_KUNIT_TEST`` adds capture identity/ownership,
 compound allocation and oversized-copy, charge splitting, exact compaction
 reservation, version lifetime, rollback, cancellation and generation-retirement
-tests. ``CONFIG_KUNIT`` is required. Lockdep and atomic-sleep checks are useful
-for validating ownership and worker paths.
+tests, plus final-send reference transfer and compaction publication races with
+slot reuse. ``CONFIG_KUNIT`` is required. Lockdep and atomic-sleep checks are
+useful for validating ownership and worker paths.
 
 To test without replacing the host kernel, build ``bzImage`` with loopback,
 initramfs and serial-console support, build a static test, and use the optional

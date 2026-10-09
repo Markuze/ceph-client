@@ -351,6 +351,114 @@ static void opaque_generation_retirement(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, store->objects[0].generation, U32_MAX);
 }
 
+static void opaque_send_last_ownership(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct io_opaque_slot *slot = &store->objects[0];
+	struct io_opaque_req send = {
+		.store = store, .handle = 9ULL << 32 | 1,
+		.offset = 79999, .length = 2,
+	};
+	struct io_opaque_req other = { .store = store, .handle = send.handle, .length = 1 };
+	u8 actual[12], expected[12] = { 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+
+	slot->data = data;
+	slot->generation = 9;
+	slot->compacting = true;
+	list_add(&slot->candidate, &store->candidates);
+	refcount_inc(&data->refs); /* an already prepared read/send */
+	mutex_lock(&store->tables);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), -ERANGE);
+	KUNIT_EXPECT_FALSE(test, send.consumed);
+	KUNIT_EXPECT_PTR_EQ(test, slot->data, data);
+	KUNIT_EXPECT_FALSE(test, list_empty(&slot->candidate));
+	send.offset = 1997;
+	send.length = sizeof(actual);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&other), -ESTALE);
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_TRUE(test, send.consumed);
+	KUNIT_EXPECT_FALSE(test, other.consumed);
+	KUNIT_EXPECT_PTR_EQ(test, slot->data, NULL);
+	KUNIT_EXPECT_FALSE(test, slot->compacting);
+	KUNIT_EXPECT_TRUE(test, list_empty(&store->candidates));
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+	KUNIT_EXPECT_EQ(test, copy_from_iter(actual, sizeof(actual), &send.iter), sizeof(actual));
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	io_opaque_data_put(store, send.data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)40 * PAGE_SIZE);
+	io_opaque_data_put(store, data); /* the prepared read/send */
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+static void opaque_send_last_compacted(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store), *replacement;
+	struct io_opaque_req compact = {
+		.store = store, .data = data, .handle = 9ULL << 32 | 1,
+	};
+	struct io_opaque_req send = { .store = store, .handle = compact.handle, .length = 80000 };
+
+	store->objects[0].data = data;
+	store->objects[0].generation = 9;
+	refcount_inc(&data->refs); /* compaction worker */
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+	replacement = compact.replacement;
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
+	mutex_lock(&store->tables);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), 0);
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, replacement);
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&send.iter), (size_t)80000);
+	io_opaque_data_put(store, compact.data);
+	io_opaque_data_put(store, send.data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+static void opaque_send_last_compact_race(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store), *next;
+	struct io_opaque_req compact = {
+		.store = store, .data = data, .handle = 9ULL << 32 | 1,
+	};
+	struct io_opaque_req send = { .store = store, .handle = compact.handle, .length = 80000 };
+	struct io_opaque_req reuse = { .store = store };
+
+	store->objects[0].data = data;
+	store->objects[0].generation = 9;
+	refcount_inc(&data->refs); /* compaction worker */
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+	mutex_lock(&store->tables);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), 0);
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, io_opaque_compact_publish(&compact), -ESTALE);
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&reuse), 0);
+	next = opaque_sparse_data(test, store);
+	store->objects[0].data = next;
+	store->objects[0].reserved = false;
+	store->objects[0].compacting = true;
+	KUNIT_EXPECT_EQ(test, reuse.handle, 10ULL << 32 | 1);
+	KUNIT_EXPECT_EQ(test, io_opaque_compact_publish(&compact), -ESTALE);
+	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, next);
+	KUNIT_EXPECT_TRUE(test, store->objects[0].compacting);
+	io_opaque_data_put(store, compact.replacement);
+	io_opaque_data_put(store, compact.data);
+	io_opaque_data_put(store, send.data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)40 * PAGE_SIZE);
+	mutex_lock(&store->tables);
+	next = io_opaque_detach(store, &store->objects[0]);
+	mutex_unlock(&store->tables);
+	io_opaque_data_put(store, next);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_identity),
 	KUNIT_CASE(opaque_capture_clone_copy),
@@ -363,6 +471,9 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_compact_reservation),
 	KUNIT_CASE(opaque_compact_canceled),
 	KUNIT_CASE(opaque_generation_retirement),
+	KUNIT_CASE(opaque_send_last_ownership),
+	KUNIT_CASE(opaque_send_last_compacted),
+	KUNIT_CASE(opaque_send_last_compact_race),
 	{}
 };
 

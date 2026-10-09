@@ -604,6 +604,7 @@ const struct io_issue_def io_issue_defs[] = {
 	},
 	[IORING_OP_OPAQUE_OBJ_SEND] = {
 		.audit_skip		= 1,
+		.ioprio			= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollout			= 1,

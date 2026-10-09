@@ -32,6 +32,9 @@ enum io_uring_opaque_op {
 	IORING_OPAQUE_SET_POLICY,
 };
 
+/* IORING_OP_OPAQUE_OBJ_SEND: sqe->ioprio contains these flags. */
+#define IORING_OPAQUE_SEND_LAST	(1U << 0)
+
 #define IORING_OPAQUE_COMPACTED	(1U << 0)
 #define IORING_OPAQUE_COMPACTING	(1U << 1)
 #define IORING_OPAQUE_STREAM_EOF	(1U << 0)

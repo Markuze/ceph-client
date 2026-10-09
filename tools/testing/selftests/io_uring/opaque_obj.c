@@ -247,21 +247,31 @@ static void read_all(int fd, void *data, size_t length)
 	}
 }
 
-static uint64_t send_stage(struct ring *r, uint32_t context, int fd, uint64_t handle,
-			   uint64_t offset, unsigned int length)
+static uint64_t send_stage_flags(struct ring *r, uint32_t context, int fd, uint64_t handle,
+				 uint64_t offset, unsigned int length, unsigned int flags,
+				 unsigned int msg_flags, unsigned int sqe_flags)
 {
 	struct io_uring_sqe sqe = {
 		.opcode = IORING_OP_OPAQUE_OBJ_SEND,
 		.fd = fd,
+		.ioprio = flags,
+		.flags = sqe_flags,
 		.zcrx_ifq_idx = context,
 		.addr = handle,
 		.off = offset,
 		.len = length,
+		.msg_flags = msg_flags,
 		.user_data = next_tag++,
 	};
 
 	stage(r, sqe);
 	return sqe.user_data;
+}
+
+static uint64_t send_stage(struct ring *r, uint32_t context, int fd, uint64_t handle,
+			   uint64_t offset, unsigned int length)
+{
+	return send_stage_flags(r, context, fd, handle, offset, length, 0, 0, 0);
 }
 
 struct transfer {
@@ -304,6 +314,293 @@ static void *reader(void *arg)
 	return NULL;
 }
 
+static void test_send_last(struct io_uring_opaque_config *cfg)
+{
+	struct ring r, imported;
+	struct event event;
+	unsigned char buf[16];
+	uint32_t context, imported_context;
+	uint64_t stream, handle, tag, cursor = 0;
+	int source[2], target[2], udp, i;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "SEND_LAST ring");
+	require(!register_store(&r, cfg, &context), "SEND_LAST store");
+	tcp_pair(source);
+	tcp_pair(target);
+	stream = attach(&r, context, source[1], next_tag++);
+	tag = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, cursor, 8, NULL);
+	write_all(source[0], "abcdefgh", 8);
+	event = wait_tag(&r, tag);
+	require(event.res == 8 && event.extra[0], "SEND_LAST fixture object");
+	handle = event.extra[0];
+	cursor += 8;
+	udp = socket(AF_INET, SOCK_DGRAM, 0);
+	require(udp >= 0, "SEND_LAST invalid protocol fixture");
+	{
+		struct {
+			int fd;
+			uint64_t offset;
+			unsigned int length, flags, sqe_flags;
+			int error;
+		} cases[] = {
+			{ -1, 0, 8, IORING_OPAQUE_SEND_LAST, 0, -EBADF },
+			{ udp, 0, 8, IORING_OPAQUE_SEND_LAST, 0, -EOPNOTSUPP },
+			{ target[0], 0, 9, IORING_OPAQUE_SEND_LAST, 0, -ERANGE },
+			{ target[0], 0, 0, IORING_OPAQUE_SEND_LAST, 0, -EINVAL },
+			{ target[0], 0, 8, 2, 0, -EINVAL },
+			{ target[0], 0, 8, IORING_OPAQUE_SEND_LAST,
+				IOSQE_CQE_SKIP_SUCCESS, -EINVAL },
+			{ target[0], UINT64_MAX, 8, IORING_OPAQUE_SEND_LAST, 0, -EINVAL },
+		};
+
+		for (i = 0; i < (int)ARRAY_SIZE(cases); i++) {
+			tag = send_stage_flags(&r, context, cases[i].fd, handle,
+					       cases[i].offset, cases[i].length,
+					       cases[i].flags, 0, cases[i].sqe_flags);
+			event = wait_tag(&r, tag);
+			require(event.res == cases[i].error &&
+				!(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+				"rejected SEND_LAST must not report consumption");
+			event = command(&r, context, IORING_OPAQUE_READ, handle, 0, 8, buf);
+			require(event.res == 8 && !memcmp(buf, "abcdefgh", 8),
+				"rejected SEND_LAST preserves the object");
+		}
+	}
+	close(udp);
+	ksft_test_result_pass("SEND_LAST validation preserves ownership\n");
+	{
+		struct io_uring_sqe head = {
+			.opcode = IORING_OP_OPAQUE_OBJ, .fd = -1,
+			.ioprio = IORING_OPAQUE_READ_STREAM, .flags = IOSQE_IO_LINK,
+			.zcrx_ifq_idx = context, .addr = stream, .off = cursor,
+			.len = 1, .addr3 = (uintptr_t)buf, .user_data = next_tag++,
+		};
+		struct io_uring_sqe cancel = {
+			.opcode = IORING_OP_ASYNC_CANCEL, .fd = -1,
+			.addr = head.user_data, .user_data = next_tag++,
+		};
+
+		stage(&r, head);
+		tag = send_stage_flags(&r, context, target[0], handle, 0, 8,
+				       IORING_OPAQUE_SEND_LAST, 0, 0);
+		enter(&r, 0);
+		stage(&r, cancel);
+		require(!wait_tag(&r, cancel.user_data).res, "cancel SEND_LAST predecessor");
+		require(wait_tag(&r, head.user_data).res == -ECANCELED, "canceled predecessor");
+		event = wait_tag(&r, tag);
+		require(event.res == -ECANCELED && !(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"SEND_LAST cancellation before issue must not consume");
+		event = command(&r, context, IORING_OPAQUE_READ, handle, 0, 8, buf);
+		require(event.res == 8 && !memcmp(buf, "abcdefgh", 8), "unissued object survives");
+	}
+	ksft_test_result_pass("canceling an unissued SEND_LAST retains the cached object\n");
+	for (i = 0; i < 2; i++) {
+		tag = send_stage(&r, context, target[0], handle, 0, 8);
+		event = wait_tag(&r, tag);
+		require(event.res == 8 && !(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"ordinary SEND retains cache ownership");
+		read_all(target[1], buf, 8);
+		require(!memcmp(buf, "abcdefgh", 8), "repeated cached bytes");
+	}
+	tag = send_stage_flags(&r, context, target[0], handle, 2, 4,
+			       IORING_OPAQUE_SEND_LAST, 0, 0);
+	event = wait_tag(&r, tag);
+	require(event.res == 4 && (event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+		"SEND_LAST subrange completion");
+	read_all(target[1], buf, 4);
+	require(!memcmp(buf, "cdef", 4), "consuming subrange bytes");
+	require(command(&r, context, IORING_OPAQUE_READ, handle, 0, 1, buf).res == -ESTALE,
+		"SEND_LAST consumes the entire object");
+	require(command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res == -ESTALE,
+		"no FREE required after SEND_LAST");
+	ksft_test_result_pass("cached resends and consuming ranges share one send ABI\n");
+	{
+		struct zcrx_ctrl export = { .zcrx_id = context, .op = ZCRX_CTRL_EXPORT };
+		struct io_uring_zcrx_ifq_reg reg = {
+			.flags = ZCRX_REG_IMPORT | ZCRX_REG_OPAQUE_OBJ,
+		};
+		struct ring *rings[2] = { &r, &imported };
+		uint32_t contexts[2];
+		uint64_t heads[2], sends[2];
+
+		require(!syscall(__NR_io_uring_register, r.fd,
+				 IORING_REGISTER_ZCRX_CTRL, &export, 0), "SEND_LAST export");
+		require(!ring_init(&imported, IORING_SETUP_CQE32), "SEND_LAST import ring");
+		reg.if_idx = export.zc_export.zcrx_fd;
+		require(!syscall(__NR_io_uring_register, imported.fd,
+				 IORING_REGISTER_ZCRX_IFQ, &reg, 1), "SEND_LAST import");
+		imported_context = reg.zcrx_id;
+		close(export.zc_export.zcrx_fd);
+		contexts[0] = context;
+		contexts[1] = imported_context;
+		tag = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, cursor, 8, NULL);
+		write_all(source[0], "abcdefgh", 8);
+		event = wait_tag(&r, tag);
+		require(event.res == 8, "competing SEND_LAST object");
+		handle = event.extra[0];
+		cursor += 8;
+		/* Prepare both LAST requests before either can take the handle. */
+		for (i = 0; i < 2; i++) {
+			struct io_uring_sqe head = {
+				.opcode = IORING_OP_OPAQUE_OBJ, .fd = -1,
+				.ioprio = IORING_OPAQUE_READ_STREAM, .flags = IOSQE_IO_LINK,
+				.zcrx_ifq_idx = contexts[i], .addr = stream, .off = cursor,
+				.len = 1, .addr3 = (uintptr_t)&buf[i], .user_data = next_tag++,
+			};
+
+			heads[i] = head.user_data;
+			stage(rings[i], head);
+			sends[i] = send_stage_flags(rings[i], contexts[i], target[0], handle, 0, 8,
+						    IORING_OPAQUE_SEND_LAST, 0, 0);
+			enter(rings[i], 0);
+		}
+		write_all(source[0], "!", 1);
+		event = wait_tag(&r, sends[0]);
+		require(event.res == 8 && (event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"first prepared LAST wins");
+		event = wait_tag(&imported, sends[1]);
+		require(event.res == -ESTALE && !(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"second prepared LAST loses without consuming");
+		for (i = 0; i < 2; i++)
+			require(wait_tag(rings[i], heads[i]).res == 1 && buf[i] == '!',
+				"shared stream read before LAST");
+		read_all(target[1], buf, 8);
+		require(!memcmp(buf, "abcdefgh", 8), "exactly one LAST sends bytes");
+		event = command(&imported, imported_context, IORING_OPAQUE_READ,
+				handle, 0, 1, buf);
+		require(event.res == -ESTALE, "consumption spans imported rings");
+		event = command(&r, context, IORING_OPAQUE_DISCARD, stream, cursor++, 1, NULL);
+		require(event.res == 1, "discard shared framing byte");
+		ring_exit(&imported);
+	}
+	ksft_test_result_pass("prepared SEND_LAST requests have one winner across rings\n");
+	{
+		size_t length = 4U << 20, j;
+		unsigned char *data = malloc(length), *received = malloc(length);
+		struct transfer tx = { .fd = source[0], .data = data, .length = length };
+		struct transfer rx = { .fd = target[1], .data = data, .length = length };
+		pthread_t producer, consumer;
+		int small = 4096, window = 65536;
+
+		require(data && received, "SEND_LAST large payload");
+		for (j = 0; j < length; j++)
+			data[j] = j % 251;
+		require(!setsockopt(target[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)),
+			"SEND_LAST small send queue");
+		require(!setsockopt(target[1], SOL_SOCKET, SO_RCVBUF, &window, sizeof(window)),
+			"SEND_LAST receive window");
+		for (i = 0; i < 4; i++) {
+			uint64_t first = 0, last;
+
+			tag = cmd_stage(&r, context, IORING_OPAQUE_KEEP,
+					stream, cursor, length, NULL);
+			require(!pthread_create(&producer, NULL, writer, &tx), "producer thread");
+			event = wait_tag(&r, tag);
+			require(event.res == (int)length, "SEND_LAST complete large object");
+			handle = event.extra[0];
+			cursor += length;
+			pthread_join(producer, NULL);
+			if (i < 2)
+				first = send_stage(&r, context, target[0], handle, 0, length);
+			if (!i) {
+				event = command(&r, context, IORING_OPAQUE_COMPACT,
+						handle, 0, 0, NULL);
+				require(!event.res, "compact behind cached send");
+			}
+			last = send_stage_flags(&r, context, target[0], handle, 0, length,
+						IORING_OPAQUE_SEND_LAST,
+						i == 3 ? MSG_DONTWAIT : 0, 0);
+			if (i < 3) {
+				require(command(&r, context, IORING_OPAQUE_READ,
+						handle, 0, 1, buf).res == -ESTALE,
+					"queued LAST invalidates the handle before completion");
+				if (i) {
+					struct io_uring_sqe cancel = {
+						.opcode = IORING_OP_ASYNC_CANCEL, .fd = -1,
+						.addr = last, .user_data = next_tag++,
+					};
+
+					stage(&r, cancel);
+					require(!wait_tag(&r, cancel.user_data).res, "cancel LAST");
+				}
+			}
+			if (i < 2) {
+				if (i == 1) {
+					event = wait_tag(&r, last);
+					require(event.res == -ECANCELED &&
+						(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+						"canceled queued LAST reports consumption without progress");
+				}
+				rx.repeats = i ? 1 : 2;
+				require(!pthread_create(&consumer, NULL, reader, &rx),
+					"consumer thread");
+				event = wait_tag(&r, first);
+				require(event.res == (int)length &&
+					!(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+					"pinned cached send survives LAST consumption");
+				if (!i) {
+					event = wait_tag(&r, last);
+					require(event.res == (int)length &&
+						(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+						"compacted LAST completion");
+				}
+				pthread_join(consumer, NULL);
+				require(rx.ok, "SEND and SEND_LAST ordered payload bytes");
+			} else {
+				event = wait_tag(&r, last);
+				require((event.flags & IORING_CQE_F_OPAQUE_CONSUMED) &&
+					((event.res > 0 && event.res < (int)length) ||
+					 (i == 3 && event.res == -EAGAIN)),
+					"short LAST result preserves consumption status");
+				if (event.res > 0) {
+					read_all(target[1], received, event.res);
+					require(!memcmp(received, data, event.res), "prefix bytes");
+				}
+			}
+			event = command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL);
+			require(event.res == -ESTALE, "completed LAST remains consumed");
+			if (!i)
+				ksft_test_result_pass("compacted LAST follows old SEND\n");
+			else if (i == 1)
+				ksft_test_result_pass("queued LAST cancellation retains SEND\n");
+			else if (i == 2)
+				ksft_test_result_pass("poll cancellation reports consumption\n");
+			else
+				ksft_test_result_pass("MSG_DONTWAIT short LAST consumes\n");
+		}
+		free(received);
+		free(data);
+	}
+	tag = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, cursor, 8, NULL);
+	write_all(source[0], "abcdefgh", 8);
+	event = wait_tag(&r, tag);
+	require(event.res == 8, "SEND_LAST I/O error object");
+	handle = event.extra[0];
+	require(!shutdown(target[0], SHUT_WR), "SEND_LAST shutdown destination");
+	tag = send_stage_flags(&r, context, target[0], handle, 0, 8,
+			       IORING_OPAQUE_SEND_LAST, 0, IOSQE_ASYNC);
+	event = wait_tag(&r, tag);
+	require(event.res == -EPIPE && (event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+		"I/O error after claim reports consumption");
+	require(command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res == -ESTALE,
+		"failed claimed LAST is not restored");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"SEND_LAST close collector");
+	{
+		struct io_uring_opaque_stat stat;
+
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+			!stat.objects && !stat.backing_bytes && !stat.extents && !stat.streams,
+			"SEND_LAST store references drain");
+	}
+	ring_exit(&r);
+	close(source[0]);
+	close(source[1]);
+	close(target[0]);
+	close(target[1]);
+	ksft_test_result_pass("failed SEND_LAST reports ownership and drains backing\n");
+}
+
 static void test_budget(struct io_uring_opaque_config cfg)
 {
 	struct ring r;
@@ -341,6 +638,14 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
 		"STAT admitted at pending limit");
 	require(stat.backing_bytes == cfg.hard_limit, "budget full");
+	{
+		uint64_t last = send_stage_flags(&r, context, pair[0], objects[0], 0, 1,
+						 IORING_OPAQUE_SEND_LAST, 0, 0);
+
+		event = wait_tag(&r, last);
+		require(event.res == -EAGAIN && !(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"request admission rejects LAST without consuming");
+	}
 	require(!command(&r, context, IORING_OPAQUE_FREE, objects[0], 0, 0, NULL).res,
 		"FREE admitted at pending limit");
 	event = wait_tag(&r, pending);
@@ -550,7 +855,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(21);
+	ksft_set_plan(30);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -768,6 +1073,7 @@ int main(void)
 	close(target[0]);
 	close(target[1]);
 	ksft_test_result_pass("close and teardown release all store backing and metadata\n");
+	test_send_last(&cfg);
 	test_budget(cfg);
 	test_waiting_reader(&cfg);
 	test_eof(&cfg);

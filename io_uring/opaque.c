@@ -109,12 +109,13 @@ struct io_opaque_req {
 	u32 slot;
 	u32 msg_flags;
 	u16 op;
+	u16 send_flags;
 	int result;
 	enum io_opaque_phase phase;
 	bool canceled;
 	bool counted;
 	bool slot_reserved;
-	bool started;
+	bool consumed;
 };
 
 struct io_opaque_stream {
@@ -335,6 +336,22 @@ static struct io_opaque_slot *io_opaque_lookup(struct io_opaque_store *store,
 	if (store->objects[slot - 1].generation != handle >> 32)
 		return NULL;
 	return &store->objects[slot - 1];
+}
+
+/* Drop handle visibility, transferring the table reference to the caller. */
+static struct io_opaque_data *io_opaque_detach(struct io_opaque_store *store,
+					       struct io_opaque_slot *slot)
+{
+	struct io_opaque_data *data;
+
+	lockdep_assert_held(&store->tables);
+	if (!slot || !slot->data)
+		return NULL;
+	data = slot->data;
+	slot->data = NULL;
+	slot->compacting = false;
+	list_del_init(&slot->candidate);
+	return data;
 }
 
 static int io_opaque_slot_reserve(struct io_opaque_req *op)
@@ -1177,7 +1194,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (ret >= 0 && op->op == IORING_OPAQUE_KEEP)
 		io_req_set_res32(req, ret, 0, op->handle, 0);
 	else
-		io_req_set_res(req, ret, 0);
+		io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	io_req_task_complete(tw_req, tw);
 }
 
@@ -1365,15 +1382,10 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 	case IORING_OPAQUE_FREE:
 		mutex_lock(&store->tables);
 		{
-			struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
-			struct io_opaque_data *data = slot ? slot->data : NULL;
+			struct io_opaque_data *data = io_opaque_detach(store,
+						io_opaque_lookup(store, op->handle));
 
 			ret = data ? 0 : -ESTALE;
-			if (data) {
-				slot->data = NULL;
-				slot->compacting = false;
-				list_del_init(&slot->candidate);
-			}
 			mutex_unlock(&store->tables);
 			io_opaque_data_put(store, data);
 		}
@@ -1555,8 +1567,38 @@ void io_opaque_fail(struct io_kiocb *req)
 {
 	struct io_opaque_req *op = req->async_data;
 
-	if (op && req->opcode == IORING_OP_OPAQUE_OBJ_SEND && op->progress)
-		req->cqe.res = op->progress;
+	if (op && req->opcode == IORING_OP_OPAQUE_OBJ_SEND) {
+		if (op->progress)
+			req->cqe.res = op->progress;
+		if (op->consumed)
+			req->cqe.flags |= IORING_CQE_F_OPAQUE_CONSUMED;
+	}
+}
+
+static void io_opaque_send_iter(struct io_opaque_req *op)
+{
+	iov_iter_bvec(&op->iter, ITER_SOURCE, op->data->bvec, op->data->nr,
+		      op->data->length);
+	iov_iter_advance(&op->iter, op->offset);
+	iov_iter_truncate(&op->iter, op->length);
+}
+
+static int io_opaque_send_claim(struct io_opaque_req *op)
+{
+	struct io_opaque_store *store = op->store;
+	struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
+
+	if (store->dead)
+		return -ESHUTDOWN;
+	if (!slot || !slot->data)
+		return -ESTALE;
+	if (op->offset > slot->data->length ||
+	    op->length > slot->data->length - op->offset)
+		return -ERANGE;
+	op->data = io_opaque_detach(store, slot);
+	op->consumed = true;
+	io_opaque_send_iter(op);
+	return 0;
 }
 
 int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
@@ -1564,21 +1606,26 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	struct io_opaque_store *store = io_opaque_get_store(req, sqe->zcrx_ifq_idx);
 	struct io_opaque_req *op;
 	struct io_opaque_slot *slot;
+	u16 send_flags = READ_ONCE(sqe->ioprio);
+	u32 msg_flags = READ_ONCE(sqe->msg_flags);
 	u64 end;
 
 	if (!store)
 		return -ENXIO;
-	if (sqe->ioprio || sqe->buf_index || sqe->addr3 || sqe->__pad2[0] ||
-	    (sqe->msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
+	if ((send_flags & ~IORING_OPAQUE_SEND_LAST) ||
+	    ((send_flags & IORING_OPAQUE_SEND_LAST) && (req->flags & REQ_F_CQE_SKIP)) ||
+	    sqe->buf_index || sqe->addr3 || sqe->__pad2[0] ||
+	    (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
 		return -EINVAL;
 	op = io_opaque_req_alloc(req, store, false);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	op->op = U16_MAX;
+	op->send_flags = send_flags;
 	op->handle = READ_ONCE(sqe->addr);
 	op->offset = READ_ONCE(sqe->off);
 	op->length = READ_ONCE(sqe->len);
-	op->msg_flags = READ_ONCE(sqe->msg_flags);
+	op->msg_flags = msg_flags;
 	if (op->msg_flags & MSG_DONTWAIT)
 		req->flags |= REQ_F_NOWAIT;
 	if (!op->length || op->length > INT_MAX ||
@@ -1590,12 +1637,12 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -ESTALE;
 	if (end > slot->data->length)
 		return -ERANGE;
+	/* SEND_LAST takes the table reference only when first admitted for TX. */
+	if (op->send_flags & IORING_OPAQUE_SEND_LAST)
+		return 0;
 	op->data = slot->data;
 	refcount_inc(&op->data->refs);
-	iov_iter_bvec(&op->iter, ITER_SOURCE, op->data->bvec, op->data->nr,
-		      op->data->length);
-	iov_iter_advance(&op->iter, op->offset);
-	iov_iter_truncate(&op->iter, op->length);
+	io_opaque_send_iter(op);
 	return 0;
 }
 
@@ -1623,6 +1670,17 @@ static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
 				return -ENOMEM;
 			tx->sk = sk;
 			INIT_LIST_HEAD(&tx->requests);
+		}
+		if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
+			int ret = io_opaque_send_claim(op);
+
+			if (ret) {
+				if (!*link)
+					kfree(tx);
+				return ret;
+			}
+		}
+		if (!*link) {
 			rb_link_node(&tx->node, parent, link);
 			rb_insert_color(&tx->node, &store->txs);
 		}
@@ -1669,7 +1727,6 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct socket *sock = sock_from_file(req->file);
 	struct msghdr msg = {
 		.msg_flags = MSG_SPLICE_PAGES | MSG_DONTWAIT | MSG_NOSIGNAL | op->msg_flags,
-		.msg_iter = op->iter,
 	};
 	int ret;
 
@@ -1685,6 +1742,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	ret = io_opaque_tx_enter(op, sock->sk);
 	if (ret)
 		goto out;
+	msg.msg_iter = op->iter;
 	ret = sock_sendmsg(sock, &msg);
 	if (ret > 0) {
 		op->iter = msg.msg_iter;
@@ -1701,7 +1759,7 @@ finish:
 		req_set_fail(req);
 	if (op->progress)
 		ret = op->progress;
-	io_req_set_res(req, ret, 0);
+	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	ret = IOU_COMPLETE;
 out:
 	io_ring_submit_unlock(req->ctx, issue_flags);
