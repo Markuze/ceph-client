@@ -29,3 +29,13 @@ config IO_URING_BPF_OPS
 	def_bool y
 	depends on IO_URING
 	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
+
+config IO_URING_OPAQUE_OBJ_KUNIT_TEST
+	bool "KUnit tests for io_uring opaque objects" if !KUNIT_ALL_TESTS
+	depends on KUNIT && IO_URING_OPAQUE_OBJ
+	default KUNIT_ALL_TESTS
+	help
+	  Check capture page identity and independent fallback copies,
+	  backing-memory reservations, stable-handle compaction and lifetime
+	  across replacement. The suite also checks cancellation rollback
+	  and generation exhaustion. Results appear in the KUnit boot log.

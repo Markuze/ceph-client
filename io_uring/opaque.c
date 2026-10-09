@@ -1709,3 +1709,7 @@ out:
 }
 
 #include "opaque_compact.c"
+
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ_KUNIT_TEST
+#include "opaque_test.c"
+#endif
