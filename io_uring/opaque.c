@@ -117,6 +117,7 @@ struct io_opaque_req {
 	bool counted;
 	bool slot_reserved;
 	bool consumed;
+	bool resolved;
 };
 
 struct io_opaque_stream {
@@ -1231,17 +1232,16 @@ static bool io_opaque_stream_op(u16 op)
 
 int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
-	struct io_opaque_store *store = io_opaque_get_store(req, sqe->zcrx_ifq_idx);
+	struct io_opaque_store *store = io_opaque_get_store(req, READ_ONCE(sqe->zcrx_ifq_idx));
 	struct io_opaque_req *op;
-	struct io_opaque_slot *slot;
 	u64 end;
 	u16 cmd = READ_ONCE(sqe->ioprio);
 	bool control;
-	int ret = 0;
 
 	if (!store)
 		return -ENXIO;
-	if (sqe->fd != -1 || sqe->rw_flags || sqe->buf_index || sqe->__pad2[0] ||
+	if (READ_ONCE(sqe->fd) != -1 || READ_ONCE(sqe->rw_flags) ||
+	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
 	    cmd > IORING_OPAQUE_SET_POLICY ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
@@ -1280,8 +1280,20 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (cmd == IORING_OPAQUE_STAT || cmd == IORING_OPAQUE_SET_POLICY) {
 		if (op->handle || !op->addr)
 			return -EINVAL;
-		return 0;
 	}
+	return 0;
+}
+
+/* Resolve resources when links permit execution, never while preparing SQEs. */
+static int io_opaque_resolve(struct io_opaque_req *op)
+{
+	struct io_opaque_store *store = op->store;
+	struct io_opaque_slot *slot;
+	u16 cmd = op->op;
+	int ret = 0;
+
+	if (op->resolved)
+		return 0;
 	mutex_lock(&store->tables);
 	if (io_opaque_stream_op(cmd)) {
 		u32 index = (u32)op->handle;
@@ -1293,16 +1305,18 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		} else {
 			op->stream = store->streams[index - 1].stream;
 			refcount_inc(&op->stream->refs);
-			req->file = get_file(op->stream->file);
+			op->req->file = get_file(op->stream->file);
 		}
-	} else {
+	} else if (cmd == IORING_OPAQUE_READ || cmd == IORING_OPAQUE_OBJECT_STAT) {
 		slot = io_opaque_lookup(store, op->handle);
 		if (!slot || !slot->data) {
 			ret = -ESTALE;
-		} else if (cmd == IORING_OPAQUE_READ || cmd == IORING_OPAQUE_OBJECT_STAT) {
+		} else {
 			op->data = slot->data;
 			refcount_inc(&op->data->refs);
-			if (cmd == IORING_OPAQUE_READ && end > op->data->length)
+			if (cmd == IORING_OPAQUE_READ &&
+			    (op->offset > op->data->length ||
+			     op->length > op->data->length - op->offset))
 				ret = -ERANGE;
 		}
 	}
@@ -1314,8 +1328,12 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		if (!op->data)
 			return -ENOMEM;
 	}
-	if (cmd == IORING_OPAQUE_KEEP)
-		return io_opaque_slot_reserve(op);
+	if (cmd == IORING_OPAQUE_KEEP) {
+		ret = io_opaque_slot_reserve(op);
+		if (ret)
+			return ret;
+	}
+	op->resolved = true;
 	return 0;
 }
 
@@ -1387,6 +1405,9 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		ret = -ESHUTDOWN;
 		goto out;
 	}
+	ret = io_opaque_resolve(op);
+	if (ret)
+		goto out;
 	switch (op->op) {
 	case IORING_OPAQUE_READ_STREAM:
 	case IORING_OPAQUE_KEEP:
@@ -1600,7 +1621,7 @@ static void io_opaque_send_iter(struct io_opaque_req *op)
 	iov_iter_truncate(&op->iter, op->length);
 }
 
-static int io_opaque_send_claim(struct io_opaque_req *op)
+static int io_opaque_send_acquire(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
@@ -1612,17 +1633,21 @@ static int io_opaque_send_claim(struct io_opaque_req *op)
 	if (op->offset > slot->data->length ||
 	    op->length > slot->data->length - op->offset)
 		return -ERANGE;
-	op->data = io_opaque_detach(store, slot);
-	op->consumed = true;
+	if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
+		op->data = io_opaque_detach(store, slot);
+		op->consumed = true;
+	} else {
+		op->data = slot->data;
+		refcount_inc(&op->data->refs);
+	}
 	io_opaque_send_iter(op);
 	return 0;
 }
 
 int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
-	struct io_opaque_store *store = io_opaque_get_store(req, sqe->zcrx_ifq_idx);
+	struct io_opaque_store *store = io_opaque_get_store(req, READ_ONCE(sqe->zcrx_ifq_idx));
 	struct io_opaque_req *op;
-	struct io_opaque_slot *slot;
 	u16 send_flags = READ_ONCE(sqe->ioprio);
 	u32 msg_flags = READ_ONCE(sqe->msg_flags);
 	u64 end;
@@ -1631,7 +1656,7 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -ENXIO;
 	if ((send_flags & ~IORING_OPAQUE_SEND_LAST) ||
 	    ((send_flags & IORING_OPAQUE_SEND_LAST) && (req->flags & REQ_F_CQE_SKIP)) ||
-	    sqe->buf_index || sqe->addr3 || sqe->__pad2[0] ||
+	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->addr3) || READ_ONCE(sqe->__pad2[0]) ||
 	    (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
 		return -EINVAL;
 	op = io_opaque_req_alloc(req, store, false);
@@ -1648,18 +1673,6 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (!op->length || op->length > INT_MAX ||
 	    check_add_overflow(op->offset, (u64)op->length, &end))
 		return -EINVAL;
-	guard(mutex)(&store->tables);
-	slot = io_opaque_lookup(store, op->handle);
-	if (!slot || !slot->data)
-		return -ESTALE;
-	if (end > slot->data->length)
-		return -ERANGE;
-	/* SEND_LAST takes the table reference only when first admitted for TX. */
-	if (op->send_flags & IORING_OPAQUE_SEND_LAST)
-		return 0;
-	op->data = slot->data;
-	refcount_inc(&op->data->refs);
-	io_opaque_send_iter(op);
 	return 0;
 }
 
@@ -1690,8 +1703,8 @@ static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
 		}
 		if (tx->failed)
 			return -ECANCELED;
-		if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
-			int ret = io_opaque_send_claim(op);
+		{
+			int ret = io_opaque_send_acquire(op);
 
 			if (ret) {
 				if (!*link)

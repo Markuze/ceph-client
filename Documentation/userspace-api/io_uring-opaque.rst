@@ -132,10 +132,10 @@ in ``msg_flags``. ``ioprio`` is zero for reusable sends or contains
 fields are zero. SEND_LAST rejects ``IOSQE_CQE_SKIP_SUCCESS`` so ownership
 transfer is always reported.
 
-Ordinary SEND preparation pins the current immutable backing version, leaving
+Ordinary SEND first issue pins the current immutable backing version, leaving
 the handle available for caching, further reads and sends to other destinations.
-SEND_LAST preparation validates the handle and range without taking a backing
-reference. At first issue, after destination validation and TX queue allocation,
+SEND preparation validates SQE fields without resolving the handle. At first
+issue, after destination validation and TX queue allocation, SEND_LAST
 it atomically removes the handle and transfers the table reference into the
 request. It uses the version current at that point, including any compaction
 published since preparation. Admission behind an earlier send also takes
@@ -174,8 +174,13 @@ needed: the payload cannot be overwritten by userspace, and TCP owns ordinary
 page references. FREE after queued sends can invalidate the handle while TCP
 still retains those pages. SEND_LAST does this without a separate FREE SQE or
 CQE and transfers a reference rather than adding and dropping a send pin.
-An ordinary SEND awaiting preparation has not acquired its backing reference;
+An ordinary SEND awaiting first issue has not acquired its backing reference;
 users must order handle release accordingly.
+
+Control operations also resolve stream tokens and object handles at first
+issue. A READ or SEND linked after FREE observes ESTALE; one linked after a
+successful COMPACT observes the replacement backing. Already issued requests
+keep their immutable version through subsequent handle release or compaction.
 
 Caching and fanout applications use ordinary SEND and keep their handle until
 eviction or explicit FREE. Forwarders use SEND_LAST for a payload's final use,

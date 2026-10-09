@@ -625,6 +625,73 @@ static void test_send_fifo(struct io_uring_opaque_config *cfg)
 	ksft_test_result_pass("a partial SEND cancels queued followers without splicing\n");
 }
 
+static void test_link_order(struct io_uring_opaque_config *cfg)
+{
+	struct ring r;
+	struct event event;
+	unsigned char buf[8];
+	uint32_t context;
+	uint64_t stream, handle, free_tag, next;
+	int source[2], target[2], i;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "link order ring");
+	require(!register_store(&r, cfg, &context), "link order store");
+	tcp_pair(source);
+	tcp_pair(target);
+	stream = attach(&r, context, source[1], 705);
+	for (i = 0; i < 2; i++) {
+		uint64_t keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP,
+					 stream, i * sizeof(buf), sizeof(buf), NULL);
+		unsigned int index;
+
+		write_all(source[0], "abcdefgh", sizeof(buf));
+		event = wait_tag(&r, keep);
+		require(event.res == (int)sizeof(buf), "link order KEEP");
+		handle = event.extra[0];
+		free_tag = cmd_stage(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL);
+		index = (*r.sq_tail - 1) & *r.sq_mask;
+		r.sqes[index].flags |= i ? IOSQE_IO_HARDLINK : IOSQE_IO_LINK;
+		if (i)
+			next = send_stage(&r, context, target[0], handle, 0, sizeof(buf));
+		else
+			next = cmd_stage(&r, context, IORING_OPAQUE_READ,
+					 handle, 0, sizeof(buf), buf);
+		require(!wait_tag(&r, free_tag).res, "linked FREE succeeds");
+		require(wait_tag(&r, next).res == -ESTALE, "linked operation observes FREE");
+	}
+	{
+		struct io_uring_sqe gate = {
+			.opcode = IORING_OP_OPAQUE_OBJ, .fd = -1,
+			.ioprio = IORING_OPAQUE_READ_STREAM, .flags = IOSQE_IO_LINK,
+			.zcrx_ifq_idx = context, .addr = stream, .off = 24,
+			.len = 1, .addr3 = (uintptr_t)buf, .user_data = next_tag++,
+		};
+		uint64_t keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP,
+					 stream, 16, sizeof(buf), NULL);
+
+		write_all(source[0], "abcdefgh", sizeof(buf));
+		event = wait_tag(&r, keep);
+		require(event.res == (int)sizeof(buf), "gated SEND KEEP");
+		handle = event.extra[0];
+		stage(&r, gate);
+		next = send_stage(&r, context, target[0], handle, 0, sizeof(buf));
+		enter(&r, 0);
+		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"FREE before delayed SEND issues");
+		write_all(source[0], "!", 1);
+		require(wait_tag(&r, gate.user_data).res == 1, "release delayed SEND");
+		require(wait_tag(&r, next).res == -ESTALE, "unissued SEND has no backing pin");
+	}
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"link order stream close");
+	ring_exit(&r);
+	close(source[0]);
+	close(source[1]);
+	close(target[0]);
+	close(target[1]);
+	ksft_test_result_pass("linked READ and SEND resolve handles when execution starts\n");
+}
+
 static void test_send_last(struct io_uring_opaque_config *cfg)
 {
 	struct ring r, imported;
@@ -1166,7 +1233,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(36);
+	ksft_set_plan(37);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1396,5 +1463,6 @@ int main(void)
 	test_reset(&cfg);
 	test_mixed_cqe(&cfg);
 	test_send_fifo(&cfg);
+	test_link_order(&cfg);
 	ksft_finished();
 }

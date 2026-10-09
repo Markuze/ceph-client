@@ -358,25 +358,28 @@ static void opaque_send_last_ownership(struct kunit *test)
 	struct io_opaque_slot *slot = &store->objects[0];
 	struct io_opaque_req send = {
 		.store = store, .handle = 9ULL << 32 | 1,
-		.offset = 79999, .length = 2,
+		.offset = 79999, .length = 2, .send_flags = IORING_OPAQUE_SEND_LAST,
 	};
-	struct io_opaque_req other = { .store = store, .handle = send.handle, .length = 1 };
+	struct io_opaque_req other = {
+		.store = store, .handle = send.handle, .length = 1,
+		.send_flags = IORING_OPAQUE_SEND_LAST,
+	};
 	u8 actual[12], expected[12] = { 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 
 	slot->data = data;
 	slot->generation = 9;
 	slot->compacting = true;
 	list_add(&slot->candidate, &store->candidates);
-	refcount_inc(&data->refs); /* an already prepared read/send */
+	refcount_inc(&data->refs); /* an already issued read/send */
 	mutex_lock(&store->tables);
-	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), -ERANGE);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&send), -ERANGE);
 	KUNIT_EXPECT_FALSE(test, send.consumed);
 	KUNIT_EXPECT_PTR_EQ(test, slot->data, data);
 	KUNIT_EXPECT_FALSE(test, list_empty(&slot->candidate));
 	send.offset = 1997;
 	send.length = sizeof(actual);
-	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), 0);
-	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&other), -ESTALE);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&send), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&other), -ESTALE);
 	mutex_unlock(&store->tables);
 	KUNIT_EXPECT_TRUE(test, send.consumed);
 	KUNIT_EXPECT_FALSE(test, other.consumed);
@@ -388,7 +391,7 @@ static void opaque_send_last_ownership(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
 	io_opaque_data_put(store, send.data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)40 * PAGE_SIZE);
-	io_opaque_data_put(store, data); /* the prepared read/send */
+	io_opaque_data_put(store, data); /* the issued read/send */
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
@@ -400,7 +403,10 @@ static void opaque_send_last_compacted(struct kunit *test)
 	struct io_opaque_req compact = {
 		.store = store, .data = data, .handle = 9ULL << 32 | 1,
 	};
-	struct io_opaque_req send = { .store = store, .handle = compact.handle, .length = 80000 };
+	struct io_opaque_req send = {
+		.store = store, .handle = compact.handle, .length = 80000,
+		.send_flags = IORING_OPAQUE_SEND_LAST,
+	};
 
 	store->objects[0].data = data;
 	store->objects[0].generation = 9;
@@ -409,7 +415,7 @@ static void opaque_send_last_compacted(struct kunit *test)
 	replacement = compact.replacement;
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
 	mutex_lock(&store->tables);
-	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&send), 0);
 	mutex_unlock(&store->tables);
 	KUNIT_EXPECT_PTR_EQ(test, send.data, replacement);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
@@ -427,7 +433,10 @@ static void opaque_send_last_compact_race(struct kunit *test)
 	struct io_opaque_req compact = {
 		.store = store, .data = data, .handle = 9ULL << 32 | 1,
 	};
-	struct io_opaque_req send = { .store = store, .handle = compact.handle, .length = 80000 };
+	struct io_opaque_req send = {
+		.store = store, .handle = compact.handle, .length = 80000,
+		.send_flags = IORING_OPAQUE_SEND_LAST,
+	};
 	struct io_opaque_req reuse = { .store = store };
 
 	store->objects[0].data = data;
@@ -435,7 +444,7 @@ static void opaque_send_last_compact_race(struct kunit *test)
 	refcount_inc(&data->refs); /* compaction worker */
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
 	mutex_lock(&store->tables);
-	KUNIT_EXPECT_EQ(test, io_opaque_send_claim(&send), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&send), 0);
 	mutex_unlock(&store->tables);
 	KUNIT_EXPECT_EQ(test, io_opaque_compact_publish(&compact), -ESTALE);
 	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&reuse), 0);
@@ -459,6 +468,44 @@ static void opaque_send_last_compact_race(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+static void opaque_send_versions(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store), *replacement;
+	struct io_opaque_req compact = {
+		.store = store, .data = data, .handle = 9ULL << 32 | 1,
+	};
+	struct io_opaque_req first = {
+		.store = store, .handle = compact.handle, .length = 80000,
+	};
+	struct io_opaque_req second = first;
+
+	store->objects[0].data = data;
+	store->objects[0].generation = 9;
+	mutex_lock(&store->tables);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&first), 0);
+	mutex_unlock(&store->tables);
+	refcount_inc(&data->refs); /* compaction worker */
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+	replacement = compact.replacement;
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
+	mutex_lock(&store->tables);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&second), 0);
+	data = io_opaque_detach(store, &store->objects[0]);
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_PTR_EQ(test, first.data, compact.data);
+	KUNIT_EXPECT_PTR_EQ(test, second.data, replacement);
+	KUNIT_EXPECT_FALSE(test, first.consumed);
+	KUNIT_EXPECT_FALSE(test, second.consumed);
+	io_opaque_data_put(store, data);
+	io_opaque_data_put(store, compact.data);
+	io_opaque_data_put(store, first.data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)20 * PAGE_SIZE);
+	io_opaque_data_put(store, second.data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_identity),
 	KUNIT_CASE(opaque_capture_clone_copy),
@@ -474,6 +521,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_last_ownership),
 	KUNIT_CASE(opaque_send_last_compacted),
 	KUNIT_CASE(opaque_send_last_compact_race),
+	KUNIT_CASE(opaque_send_versions),
 	{}
 };
 
