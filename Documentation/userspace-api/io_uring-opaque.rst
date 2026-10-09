@@ -220,8 +220,10 @@ physical allocation more than once. A retained compound allocation is charged
 in full. Copy fallback appends into unused space in the previous owned page;
 it does not allocate a whole page for every small fragment.
 Vectors are built once at object publication and are bounded by extent limits.
-Releasing backing or metadata wakes collectors suspended on the store budget,
-without polling a readable socket repeatedly while memory remains unavailable.
+Releasing backing or metadata wakes eligible collectors suspended on the store
+budget in bounded batches. Their native multishot polls remain armed for socket
+errors and urgent data. Transient capture ENOMEM backs off for 50 milliseconds
+and retries; it does not poison the stream or discard its captured prefix.
 FREE, STAT, STREAM_CLOSE and SET_POLICY remain admitted at the request cap.
 
 The hard limit bounds store-owned backing and reserved replacement capacity.
@@ -261,12 +263,19 @@ preferred allocations produce two extents; fallback may produce more.
 Automatic compaction is opt-in. Policy supplies minimum object age, saving,
 slack percentage and extent count, copy bytes per second, burst allowance and
 maximum temporary backing. One delayed worker per store scans at most 32
-candidates per invocation and copies at most one object, sharing the ordered
-workqueue with manual requests. FREE and SEND_LAST remove candidates; dense
-versions are removed after success; failures back off. Ordinary reception
-cannot consume configured compaction headroom. Neither policy nor manual requests bypass
-the hard limit, and no objects are evicted. Objects exceeding the burst or
-temporary allowance remain ineligible until policy changes.
+candidates per invocation and copies at most one object. A store mutex
+serializes its copies with manual requests. FREE and SEND_LAST remove
+candidates; dense versions are removed after success; failures back off.
+Ordinary reception cannot consume configured compaction headroom. Neither
+policy nor manual requests bypass the hard limit, and no objects are evicted.
+Objects exceeding the burst or temporary allowance remain ineligible until
+policy changes.
+
+Manual and automatic copies use the shared unbound worker pool, with one
+active copy per store and a bounded manual dispatcher. Stores do not create
+a private rescuer thread. Disabling automatic policy prevents further
+automatic attempts without waiting under the submission lock; an already
+selected copy may finish. Store destruction waits for its own workers.
 
 An in-flight compaction holds its own source reference. If SEND_LAST consumes
 the handle before compaction publication, source/generation revalidation

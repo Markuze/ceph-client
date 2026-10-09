@@ -62,6 +62,7 @@ static int io_opaque_compact_build(struct io_opaque_req *op)
 	struct mem_cgroup *old;
 	int ret = 0;
 
+	guard(mutex)(&store->copy_lock);
 	if (READ_ONCE(op->canceled) || READ_ONCE(store->dead))
 		return -ECANCELED;
 	/* Allocated replacement bytes remain inside this reservation. */
@@ -146,11 +147,26 @@ static int io_opaque_compact_publish(struct io_opaque_req *op)
 
 static void io_opaque_compact_work(struct work_struct *work)
 {
-	struct io_opaque_req *op = container_of(work, struct io_opaque_req, work);
-	int ret = io_opaque_compact_build(op);
+	struct io_opaque_store *store = container_of(work, struct io_opaque_store, copy_work);
+	unsigned int i;
 
-	/* Cancellation cannot complete the request while this worker owns it. */
-	io_opaque_queue_ready(op, ret);
+	for (i = 0; i < 8; i++) {
+		struct io_opaque_req *op;
+		int ret;
+
+		scoped_guard(spinlock, &store->wait_lock) {
+			op = list_first_entry_or_null(&store->copies, struct io_opaque_req, wait);
+			if (!op)
+				return;
+			list_del_init(&op->wait);
+		}
+		ret = io_opaque_compact_build(op);
+		/* Cancellation cannot complete a request still owned by this worker. */
+		io_opaque_queue_ready(op, ret);
+	}
+	guard(spinlock)(&store->wait_lock);
+	if (!list_empty(&store->copies))
+		queue_work(system_unbound_wq, &store->copy_work);
 }
 
 static int io_opaque_compact_start(struct io_opaque_req *op)
@@ -159,6 +175,8 @@ static int io_opaque_compact_start(struct io_opaque_req *op)
 	struct io_opaque_slot *slot;
 
 	guard(mutex)(&store->tables);
+	if (store->dead)
+		return -ESHUTDOWN;
 	slot = io_opaque_lookup(store, op->handle);
 	if (!slot || !slot->data)
 		return -ESTALE;
@@ -169,9 +187,10 @@ static int io_opaque_compact_start(struct io_opaque_req *op)
 	op->data = slot->data;
 	refcount_inc(&op->data->refs);
 	slot->compacting = true;
-	INIT_WORK(&op->work, io_opaque_compact_work);
 	io_opaque_wait(op, IO_OPAQUE_COPY_WORK);
-	queue_work(store->wq, &op->work);
+	scoped_guard(spinlock, &store->wait_lock)
+		list_add_tail(&op->wait, &store->copies);
+	queue_work(system_unbound_wq, &store->copy_work);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
 
@@ -212,9 +231,9 @@ static int io_opaque_set_policy(struct io_opaque_req *op)
 	}
 	mutex_unlock(&store->tables);
 	if (policy.flags & IORING_OPAQUE_AUTO_COMPACT)
-		mod_delayed_work(store->wq, &store->auto_work, 1);
+		mod_delayed_work(system_unbound_wq, &store->auto_work, 1);
 	else
-		cancel_delayed_work_sync(&store->auto_work);
+		cancel_delayed_work(&store->auto_work);
 	return 0;
 }
 
@@ -291,5 +310,5 @@ unlock:
 		!list_empty(&store->candidates);
 	mutex_unlock(&store->tables);
 	if (again)
-		queue_delayed_work(store->wq, &store->auto_work, msecs_to_jiffies(100));
+		queue_delayed_work(system_unbound_wq, &store->auto_work, msecs_to_jiffies(100));
 }

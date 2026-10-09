@@ -13,6 +13,7 @@ static struct io_opaque_store *opaque_test_store(struct kunit *test)
 	store->objects = kunit_kcalloc(test, 4, sizeof(*store->objects), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, store->objects);
 	mutex_init(&store->tables);
+	mutex_init(&store->copy_lock);
 	spin_lock_init(&store->wait_lock);
 	INIT_LIST_HEAD(&store->budget_waits);
 	INIT_LIST_HEAD(&store->candidates);

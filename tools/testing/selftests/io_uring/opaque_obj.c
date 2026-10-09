@@ -847,6 +847,116 @@ static void test_interleaved(struct io_uring_opaque_config cfg)
 	}
 }
 
+static void test_compact_queue(struct io_uring_opaque_config *cfg)
+{
+	struct ring r;
+	struct event event;
+	struct io_uring_opaque_stat stat;
+	unsigned char data[65536], seen[sizeof(data)];
+	uint32_t context;
+	uint64_t stream, handles[16], copies[16], keep;
+	int pair[2], i;
+
+	memset(data, 0x73, sizeof(data));
+	require(!ring_init(&r, IORING_SETUP_CQE32), "compaction queue ring");
+	require(!register_store(&r, cfg, &context), "compaction queue store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], 708);
+	for (i = 0; i < 16; i++) {
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream,
+				 (uint64_t)i * sizeof(data), sizeof(data), NULL);
+		write_all(pair[0], data, sizeof(data));
+		event = wait_tag(&r, keep);
+		require(event.res == (int)sizeof(data), "compaction queue KEEP");
+		handles[i] = event.extra[0];
+	}
+	for (i = 0; i < 16; i++)
+		copies[i] = cmd_stage(&r, context, IORING_OPAQUE_COMPACT, handles[i], 0, 0, NULL);
+	{
+		struct io_uring_sqe cancel = {
+			.opcode = IORING_OP_ASYNC_CANCEL, .fd = -1,
+			.addr = copies[15], .user_data = next_tag++,
+		};
+
+		stage(&r, cancel);
+		require(!wait_tag(&r, cancel.user_data).res, "cancel queued compaction");
+	}
+	for (i = 0; i < 16; i++) {
+		require(wait_tag(&r, copies[i]).res == (i == 15 ? -ECANCELED : 0),
+			"shared compaction dispatcher completion");
+		require(command(&r, context, IORING_OPAQUE_READ, handles[i], 0,
+				sizeof(seen), seen).res == (int)sizeof(seen) &&
+			!memcmp(data, seen, sizeof(data)), "queued compaction preserves bytes");
+		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i], 0, 0, NULL).res,
+			"queued compaction FREE");
+	}
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"compaction queue close");
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.extents, "compaction dispatcher drains reservations");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	ksft_test_result_pass("shared compaction worker drains batches and canceled requests\n");
+}
+
+static void test_budget_error(struct io_uring_opaque_config cfg)
+{
+	int i;
+
+	cfg.hard_limit = sysconf(_SC_PAGESIZE);
+	cfg.compact_headroom = 0;
+	for (i = 0; i < 2; i++) {
+		struct ring r;
+		struct event event;
+		struct io_uring_opaque_stream_stat stat;
+		struct linger linger = { .l_onoff = 1 };
+		unsigned char byte;
+		uint32_t context;
+		uint64_t stream, handle, keep;
+		int pair[2];
+
+		require(!ring_init(&r, IORING_SETUP_CQE32), "quota error ring");
+		require(!register_store(&r, &cfg, &context), "quota error store");
+		tcp_pair(pair);
+		stream = attach(&r, context, pair[1], 709);
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, 1, NULL);
+		write_all(pair[0], "x", 1);
+		event = wait_tag(&r, keep);
+		require(event.res == 1, "fill error-test quota");
+		handle = event.extra[0];
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 1, 4, NULL);
+		write_all(pair[0], "abcd", 4);
+		enter(&r, 0);
+		require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+				 sizeof(stat), &stat).res && stat.rx_next == 1,
+			"collector is stalled by retained backing");
+		if (i) {
+			require(send(pair[0], "!", 1, MSG_OOB) == 1, "urgent data at full quota");
+		} else {
+			require(!setsockopt(pair[0], SOL_SOCKET, SO_LINGER,
+					    &linger, sizeof(linger)),
+				"quota error reset linger");
+			close(pair[0]);
+		}
+		require(wait_tag(&r, keep).res == (i ? -EOPNOTSUPP : -ECONNRESET),
+			"quota-stalled KEEP observes socket condition");
+		require(wait_tag(&r, 709).res == (i ? -EOPNOTSUPP : -ECONNRESET),
+			"quota-stalled collector observes socket condition");
+		require(command(&r, context, IORING_OPAQUE_READ, handle, 0, 1, &byte).res == 1 &&
+			byte == 'x', "cached object survives source error");
+		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"error-test object FREE");
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+			"quota error close");
+		ring_exit(&r);
+		if (i)
+			close(pair[0]);
+		close(pair[1]);
+		ksft_test_result_pass("full quota still observes %s\n", i ? "urgent data" : "RST");
+	}
+}
+
 static void test_send_last(struct io_uring_opaque_config *cfg)
 {
 	struct ring r, imported;
@@ -1393,7 +1503,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(41);
+	ksft_set_plan(44);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1626,5 +1736,7 @@ int main(void)
 	test_link_order(&cfg);
 	test_keep_restore(&cfg);
 	test_interleaved(cfg);
+	test_compact_queue(&cfg);
+	test_budget_error(cfg);
 	ksft_finished();
 }

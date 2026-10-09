@@ -24,6 +24,8 @@
 #define IO_OPAQUE_READ_MAX	SZ_64K
 #define IO_OPAQUE_RX_BATCH	SZ_256K
 #define IO_OPAQUE_MAX_ORDER	(PAGE_SHIFT < 16 ? 16 - PAGE_SHIFT : 0)
+#define IO_OPAQUE_ALLOC_RETRY_MS	50
+#define IO_OPAQUE_WAKE_BATCH	32
 
 struct io_opaque_backing {
 	refcount_t refs;
@@ -101,12 +103,13 @@ struct io_opaque_req {
 	struct list_head send;
 	struct list_head cancel;
 	struct rb_node decision;
-	struct work_struct work;
 	struct iov_iter iter;
 	u64 handle;
 	u64 offset;
 	u64 progress;
 	u64 reserved;
+	u64 need_bytes;
+	unsigned long retry_at;
 	void __user *addr;
 	u32 length;
 	u32 slot;
@@ -161,18 +164,23 @@ struct io_opaque_store {
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
 	spinlock_t wait_lock;
 	struct list_head budget_waits;
-	struct workqueue_struct *wq;
+	struct list_head copies;
+	/* Serialize manual and automatic copies outside the submission lock. */
+	struct mutex copy_lock;
+	struct work_struct copy_work;
+	struct delayed_work retry_work;
 	struct delayed_work auto_work;
 	struct list_head candidates;
 	struct io_uring_opaque_policy policy;
 	u64 tokens;
 	unsigned long token_time;
-	bool dead;
+	int dead;
 };
 
 static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_auto_work(struct work_struct *work);
+static void io_opaque_compact_work(struct work_struct *work);
 static void io_opaque_stream_close(struct io_opaque_stream *stream);
 static int io_opaque_compact_start(struct io_opaque_req *op);
 static int io_opaque_set_policy(struct io_opaque_req *op);
@@ -182,16 +190,62 @@ static void io_opaque_tx_put(struct io_opaque_req *op);
 static void io_opaque_wake_budget(struct io_opaque_store *store)
 {
 	struct io_opaque_req *op, *next;
+	unsigned long delay = MAX_JIFFY_OFFSET;
+	unsigned long now = jiffies;
+	u64 limit = store->config.hard_limit - store->config.compact_headroom;
+	u64 used = atomic64_read(&store->bytes);
+	unsigned int woken = 0;
+	bool stopped;
 
-	guard(spinlock_irqsave)(&store->wait_lock);
+	guard(spinlock)(&store->wait_lock);
+	stopped = READ_ONCE(store->dead);
 	list_for_each_entry_safe(op, next, &store->budget_waits, wait) {
 		struct socket *sock = sock_from_file(op->req->file);
 
+		if (!stopped && !READ_ONCE(op->stream->closed)) {
+			if (time_before(now, op->retry_at)) {
+				delay = min(delay, op->retry_at - now);
+				continue;
+			}
+			if (used > limit || op->need_bytes > limit - used ||
+			    atomic_read(&store->extents) >= store->config.max_extents - 2)
+				continue;
+			if (woken == IO_OPAQUE_WAKE_BATCH) {
+				delay = 1;
+				continue;
+			}
+		}
 		list_del_init(&op->wait);
 		op->phase = IO_OPAQUE_IDLE;
+		woken++;
 		/* Native multishot polling also observes FIN, RST and urgent data. */
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 	}
+	if (!stopped && delay != MAX_JIFFY_OFFSET)
+		queue_delayed_work(system_unbound_wq, &store->retry_work, delay);
+}
+
+static void io_opaque_retry_work(struct work_struct *work)
+{
+	struct io_opaque_store *store = container_of(to_delayed_work(work),
+						   struct io_opaque_store, retry_work);
+
+	io_opaque_wake_budget(store);
+}
+
+static void io_opaque_wake_stream(struct io_opaque_stream *stream)
+{
+	struct io_opaque_req *op = stream->collector;
+	struct socket *sock = sock_from_file(stream->file);
+
+	lockdep_assert_held(&stream->lock);
+	if (!op)
+		return;
+	scoped_guard(spinlock, &stream->store->wait_lock) {
+		list_del_init(&op->wait);
+		op->phase = IO_OPAQUE_IDLE;
+	}
+	wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 }
 
 static bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
@@ -436,23 +490,17 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx, u64 config)
 		mmgrab(store->mm);
 	store->memcg = get_mem_cgroup_from_mm(store->mm);
 	mutex_init(&store->tables);
+	mutex_init(&store->copy_lock);
 	spin_lock_init(&store->wait_lock);
 	INIT_LIST_HEAD(&store->budget_waits);
+	INIT_LIST_HEAD(&store->copies);
 	INIT_LIST_HEAD(&store->candidates);
 	store->txs = RB_ROOT;
 	for (i = 0; i < cfg.max_objects; i++)
 		INIT_LIST_HEAD(&store->objects[i].candidate);
 	INIT_DELAYED_WORK(&store->auto_work, io_opaque_auto_work);
-	store->wq = alloc_ordered_workqueue("iou-opaque", WQ_MEM_RECLAIM);
-	if (!store->wq) {
-		ret = -ENOMEM;
-		mem_cgroup_put(store->memcg);
-		if (store->mm)
-			mmdrop(store->mm);
-		free_uid(store->user);
-		io_unaccount_mem(ctx->user, ctx->mm_account, cfg.hard_limit >> PAGE_SHIFT);
-		goto free_store;
-	}
+	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
+	INIT_WORK(&store->copy_work, io_opaque_compact_work);
 	return store;
 free_store:
 	kvfree(store->streams);
@@ -465,9 +513,15 @@ void io_opaque_stop(struct io_opaque_store *store)
 {
 	u32 i;
 
-	if (!store || xchg(&store->dead, true))
+	if (!store)
 		return;
+	scoped_guard(spinlock, &store->wait_lock) {
+		if (store->dead)
+			return;
+		WRITE_ONCE(store->dead, 1);
+	}
 	cancel_delayed_work_sync(&store->auto_work);
+	cancel_delayed_work_sync(&store->retry_work);
 	for (i = 0; i < store->config.max_streams; i++) {
 		struct io_opaque_stream *stream;
 
@@ -498,7 +552,7 @@ void io_opaque_free(struct io_opaque_store *store)
 	if (!store)
 		return;
 	io_opaque_stop(store);
-	destroy_workqueue(store->wq);
+	flush_work(&store->copy_work);
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
 	WARN_ON_ONCE(atomic_read(&store->extents));
 	WARN_ON_ONCE(atomic_read(&store->requests));
@@ -535,6 +589,7 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 	op->req = req;
 	op->store = store;
 	op->counted = !control;
+	op->retry_at = jiffies;
 	INIT_LIST_HEAD(&op->wait);
 	INIT_LIST_HEAD(&op->read);
 	INIT_LIST_HEAD(&op->send);
@@ -551,13 +606,13 @@ static void io_opaque_wait(struct io_opaque_req *op, enum io_opaque_phase phase)
 	lockdep_assert_held(&op->req->ctx->uring_lock);
 	if (list_empty(&op->cancel))
 		list_add_tail(&op->cancel, &op->req->ctx->opaque_waits);
-	guard(spinlock_irqsave)(&op->store->wait_lock);
+	guard(spinlock)(&op->store->wait_lock);
 	op->phase = phase;
 }
 
 static void io_opaque_queue_ready(struct io_opaque_req *op, int result)
 {
-	guard(spinlock_irqsave)(&op->store->wait_lock);
+	guard(spinlock)(&op->store->wait_lock);
 	op->result = result;
 	op->phase = IO_OPAQUE_QUEUED;
 	op->req->io_task_work.func = io_opaque_ready;
@@ -1178,7 +1233,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 			goto out;
 	}
 	stream = op->stream;
-	scoped_guard(spinlock_irqsave, &op->store->wait_lock) {
+	scoped_guard(spinlock, &op->store->wait_lock) {
 		list_del_init(&op->wait);
 		op->phase = IO_OPAQUE_IDLE;
 	}
@@ -1192,6 +1247,8 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	lock_sock(sock->sk);
 	if (tcp_sk(sock->sk)->urg_data)
 		ret = -EOPNOTSUPP;
+	else if (time_before(jiffies, op->retry_at))
+		ret = -ENOMEM;
 	else
 		ret = tcp_read_sock(sock->sk, &desc, io_opaque_actor);
 	if (desc.error)
@@ -1203,7 +1260,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 		stream->eof = true;
 	release_sock(sock->sk);
 	set_active_memcg(old);
-	if (ret < 0 && ret != -ENOBUFS)
+	if (ret < 0 && ret != -ENOBUFS && ret != -ENOMEM)
 		stream->error = ret;
 	io_opaque_stream_process(stream);
 	if (ret == -ENOBUFS) {
@@ -1218,16 +1275,18 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	}
 	if (stream->error || stream->eof) {
 		ret = stream->error;
-	} else if (ret == -ENOBUFS) {
-		scoped_guard(spinlock_irqsave, &op->store->wait_lock) {
+	} else if (ret == -ENOBUFS || ret == -ENOMEM) {
+		scoped_guard(spinlock, &op->store->wait_lock) {
+			op->need_bytes = ret == -ENOMEM ? 0 : stream->need_bytes;
+			if (ret == -ENOMEM && !time_before(jiffies, op->retry_at))
+				op->retry_at = jiffies + msecs_to_jiffies(IO_OPAQUE_ALLOC_RETRY_MS);
+			else if (ret == -ENOBUFS)
+				op->retry_at = jiffies;
 			op->phase = IO_OPAQUE_BUDGET_POLL;
 			list_add_tail(&op->wait, &op->store->budget_waits);
 		}
 		/* Recheck after enrollment to close the release/enrollment race. */
-		if (atomic64_read(&op->store->bytes) + stream->need_bytes <=
-		    op->store->config.hard_limit - op->store->config.compact_headroom &&
-		    atomic_read(&op->store->extents) < op->store->config.max_extents - 2)
-			io_opaque_wake_budget(op->store);
+		io_opaque_wake_budget(op->store);
 		ret = IOU_RETRY;
 	} else if (!desc.count && (issue_flags & IO_URING_F_MULTISHOT)) {
 		/* Drain another bounded batch without waiting for a new TCP edge. */
@@ -1315,7 +1374,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 				slot->retry = jiffies;
 				if (store->policy.flags & IORING_OPAQUE_AUTO_COMPACT) {
 					list_add_tail(&slot->candidate, &store->candidates);
-					mod_delayed_work(store->wq, &store->auto_work, 1);
+					mod_delayed_work(system_unbound_wq, &store->auto_work, 1);
 				}
 				ret = op->length;
 			}
@@ -1500,7 +1559,7 @@ static int io_opaque_range_start(struct io_opaque_req *op)
 	io_opaque_stream_process(stream);
 	/* DISCARD can make progress without allocating any payload backing. */
 	if (op->op == IORING_OPAQUE_DISCARD)
-		io_opaque_wake_budget(op->store);
+		io_opaque_wake_stream(stream);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
 
@@ -1635,21 +1694,22 @@ out:
 static bool io_opaque_cancel_req(struct io_opaque_req *op)
 {
 	enum io_opaque_phase phase;
-	unsigned long flags;
 
 	if (op->stream)
 		mutex_lock(&op->stream->lock);
-	spin_lock_irqsave(&op->store->wait_lock, flags);
+	spin_lock(&op->store->wait_lock);
 	phase = op->phase;
 	if (op->canceled || phase == IO_OPAQUE_IDLE) {
-		spin_unlock_irqrestore(&op->store->wait_lock, flags);
+		spin_unlock(&op->store->wait_lock);
 		if (op->stream)
 			mutex_unlock(&op->stream->lock);
 		return false;
 	}
 	WRITE_ONCE(op->canceled, true);
-	list_del_init(&op->wait);
-	spin_unlock_irqrestore(&op->store->wait_lock, flags);
+	/* A queued copy is owned by the shared worker until it reports readiness. */
+	if (phase != IO_OPAQUE_COPY_WORK)
+		list_del_init(&op->wait);
+	spin_unlock(&op->store->wait_lock);
 	if (phase == IO_OPAQUE_RANGE_WAIT) {
 		list_del_init(&op->read);
 		if (!RB_EMPTY_NODE(&op->decision)) {
@@ -1704,7 +1764,7 @@ void io_opaque_cleanup(struct io_kiocb *req)
 		return;
 	store = op->store;
 	list_del_init(&op->cancel);
-	scoped_guard(spinlock_irqsave, &store->wait_lock)
+	scoped_guard(spinlock, &store->wait_lock)
 		list_del_init(&op->wait);
 	/* Waiters have stopped accessing this request before cleanup. */
 	if (op->stream) {
@@ -1892,7 +1952,7 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 			goto out;
 		}
 		next = list_first_entry(&tx->requests, struct io_opaque_req, send);
-		guard(spinlock_irqsave)(&store->wait_lock);
+		guard(spinlock)(&store->wait_lock);
 		if (next->phase == IO_OPAQUE_SEND_WAIT) {
 			next->phase = IO_OPAQUE_QUEUED;
 			next->req->io_task_work.func = io_opaque_resume;
