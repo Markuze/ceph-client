@@ -229,6 +229,42 @@ static void opaque_split_shared_charge(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
+static void opaque_keep_restore(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	struct page *page = alloc_page(GFP_KERNEL);
+	struct io_opaque_extent *extent;
+	struct io_opaque_req op = {
+		.store = store, .stream = &stream, .data = data,
+		.op = IORING_OPAQUE_KEEP, .length = 4,
+	};
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	opaque_test_stream(&stream, store);
+	mutex_init(&stream.lock);
+	extent = io_opaque_extent_new(store, page, 0, 8, 0, false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	list_add(&extent->list, &stream.extents);
+	stream.next = 8;
+	stream.undecided = 8;
+	mutex_lock(&stream.lock);
+	KUNIT_EXPECT_EQ(test, io_opaque_take(&op), 1);
+	KUNIT_EXPECT_EQ(test, stream.undecided, 4ULL);
+	io_opaque_restore(&op);
+	KUNIT_EXPECT_EQ(test, stream.undecided, 8ULL);
+	KUNIT_EXPECT_EQ(test, io_opaque_available(&stream, 0, 8), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&data->extents));
+	mutex_unlock(&stream.lock);
+	io_opaque_data_put(store, data);
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	mutex_destroy(&stream.lock);
+}
+
 static struct io_opaque_data *opaque_sparse_data(struct kunit *test,
 						 struct io_opaque_store *store)
 {
@@ -514,6 +550,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_oversized),
 	KUNIT_CASE(opaque_capture_budget),
 	KUNIT_CASE(opaque_split_shared_charge),
+	KUNIT_CASE(opaque_keep_restore),
 	KUNIT_CASE(opaque_compact_versions),
 	KUNIT_CASE(opaque_compact_reservation),
 	KUNIT_CASE(opaque_compact_canceled),

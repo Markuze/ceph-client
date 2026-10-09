@@ -118,8 +118,13 @@ incomplete assembly.
 
 EOF before completion produces ENODATA; network errors propagate. ASYNC_CANCEL,
 linked timeouts, stream close and ring teardown terminate pending ranges.
-Canceling a consuming operation releases its private prefix; that prefix is
-no longer an unclassified stream range and no incomplete object is published.
+An unsuccessful KEEP restores its private prefix at the original stream
+offsets before reporting completion, including cancellation, a linked timeout,
+EOF, a network error or vector allocation failure. The application can retry
+KEEP, inspect that prefix with READ_STREAM, or DISCARD it. No incomplete object
+is published. STREAM_CLOSE and store teardown explicitly release all remaining
+stream bytes instead of preserving them for retry. DISCARD remains consuming:
+bytes it already discarded are not restored if the rest of its range fails.
 
 Transmission and ownership
 ==========================

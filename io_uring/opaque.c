@@ -696,6 +696,31 @@ static int io_opaque_take(struct io_opaque_req *op)
 	return off == end;
 }
 
+/* An unsuccessful KEEP returns its private prefix to the undecided stream. */
+static void io_opaque_restore(struct io_opaque_req *op)
+{
+	struct io_opaque_stream *stream = op->stream;
+	struct io_opaque_extent *extent, *next;
+	struct list_head *before = &stream->extents;
+
+	lockdep_assert_held(&stream->lock);
+	if (!op->data || !op->data->length || stream->closed)
+		return;
+	list_for_each_entry(extent, &stream->extents, list) {
+		if (extent->start > op->offset) {
+			before = &extent->list;
+			break;
+		}
+	}
+	list_for_each_entry_safe(extent, next, &op->data->extents, list) {
+		extent->start += op->offset;
+		list_move_tail(&extent->list, before);
+	}
+	stream->undecided += op->data->length;
+	op->data->length = 0;
+	op->progress = 0;
+}
+
 static bool io_opaque_overlap(u64 a, u64 alen, u64 b, u64 blen)
 {
 	return a < b + blen && b < a + alen;
@@ -1205,6 +1230,12 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 		}
 		mutex_unlock(&store->tables);
 	}
+	if (ret < 0 && op->op == IORING_OPAQUE_KEEP) {
+		mutex_lock(&op->stream->lock);
+		io_opaque_restore(op);
+		io_opaque_stream_process(op->stream);
+		mutex_unlock(&op->stream->lock);
+	}
 	if (ret < 0)
 		req_set_fail(req);
 	if (ret < 0 && req->opcode == IORING_OP_OPAQUE_OBJ_SEND && op->progress)
@@ -1575,11 +1606,15 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	if (op->stream) {
 		mutex_lock(&op->stream->lock);
 		list_del_init(&op->read);
-		if (!RB_EMPTY_NODE(&op->decision))
+		if (!RB_EMPTY_NODE(&op->decision)) {
 			rb_erase_cached(&op->decision, &op->stream->decisions);
+			RB_CLEAR_NODE(&op->decision);
+		}
+		if (op->op == IORING_OPAQUE_KEEP)
+			io_opaque_restore(op);
 		if (op->stream->collector == op) {
 			op->stream->collector = NULL;
-			close = !op->stream->eof && !op->stream->closed;
+			close = !op->stream->eof && !op->stream->closed && !op->stream->error;
 		}
 		mutex_unlock(&op->stream->lock);
 		if (close)

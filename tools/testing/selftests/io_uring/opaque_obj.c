@@ -692,6 +692,78 @@ static void test_link_order(struct io_uring_opaque_config *cfg)
 	ksft_test_result_pass("linked READ and SEND resolve handles when execution starts\n");
 }
 
+static void test_keep_restore(struct io_uring_opaque_config *cfg)
+{
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct ring r;
+		struct event event;
+		struct io_uring_opaque_stream_stat stat;
+		struct __kernel_timespec timeout = { .tv_nsec = 200000000 };
+		struct io_uring_sqe end = {
+			.opcode = i ? IORING_OP_LINK_TIMEOUT : IORING_OP_ASYNC_CANCEL,
+			.fd = -1, .user_data = next_tag++,
+		};
+		unsigned char buf[8];
+		uint32_t context;
+		uint64_t stream, keep;
+		int pair[2], attempt;
+
+		require(!ring_init(&r, IORING_SETUP_CQE32), "KEEP restore ring");
+		require(!register_store(&r, cfg, &context), "KEEP restore store");
+		tcp_pair(pair);
+		stream = attach(&r, context, pair[1], 706);
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, sizeof(buf), NULL);
+		if (i) {
+			r.sqes[(*r.sq_tail - 1) & *r.sq_mask].flags |= IOSQE_IO_LINK;
+			end.addr = (uintptr_t)&timeout;
+			end.len = 1;
+			stage(&r, end);
+		}
+		write_all(pair[0], "abc", 3);
+		for (attempt = 0; attempt < 100; attempt++) {
+			require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+					 sizeof(stat), &stat).res, "KEEP restore stream stat");
+			if (stat.rx_next == 3)
+				break;
+			usleep(1000);
+		}
+		require(attempt < 100, "private KEEP prefix was captured");
+		if (!i) {
+			end.addr = keep;
+			stage(&r, end);
+		}
+		require(wait_tag(&r, keep).res == -ECANCELED, "partial KEEP canceled");
+		require(wait_tag(&r, end.user_data).res == (i ? -ETIME : 0),
+			"KEEP cancellation trigger");
+		require(command(&r, context, IORING_OPAQUE_READ_STREAM,
+				stream, 0, 3, buf).res == 3 && !memcmp(buf, "abc", 3),
+			"unsuccessful KEEP restores readable prefix");
+		if (i)
+			require(command(&r, context, IORING_OPAQUE_DISCARD,
+					stream, 0, 3, NULL).res == 3, "discard restored prefix");
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP,
+				 stream, i ? 3 : 0, i ? 5 : 8, NULL);
+		write_all(pair[0], "defgh", 5);
+		event = wait_tag(&r, keep);
+		require(event.res == (i ? 5 : 8), "KEEP succeeds after prefix recovery");
+		require(command(&r, context, IORING_OPAQUE_READ, event.extra[0], 0,
+				i ? 5 : 8, buf).res == (i ? 5 : 8) &&
+			!memcmp(buf, i ? "defgh" : "abcdefgh", i ? 5 : 8),
+			"recovered object bytes");
+		require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
+			"recovered object free");
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+			"KEEP restore close");
+		ring_exit(&r);
+		close(pair[0]);
+		close(pair[1]);
+		ksft_test_result_pass("partial KEEP survives %s and supports %s\n",
+				      i ? "timeout" : "cancellation", i ? "DISCARD" : "retry");
+	}
+}
+
 static void test_send_last(struct io_uring_opaque_config *cfg)
 {
 	struct ring r, imported;
@@ -1091,6 +1163,7 @@ static void test_eof(struct io_uring_opaque_config *cfg)
 	uint32_t context;
 	uint64_t stream, pending;
 	struct io_uring_opaque_stat stat;
+	unsigned char buf[3];
 	int pair[2];
 
 	require(!ring_init(&r, IORING_SETUP_CQE32), "EOF ring");
@@ -1103,13 +1176,17 @@ static void test_eof(struct io_uring_opaque_config *cfg)
 	require(wait_tag(&r, pending).res == -ENODATA, "EOF rejects incomplete object");
 	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
 		"EOF store stat");
-	require(!stat.objects && !stat.backing_bytes, "partial object references drain");
+	require(!stat.objects && stat.backing_bytes, "EOF preserves unpublished prefix");
+	require(command(&r, context, IORING_OPAQUE_READ_STREAM, stream, 0, 3, buf).res == 3 &&
+		!memcmp(buf, "abc", 3), "EOF prefix remains readable");
+	require(command(&r, context, IORING_OPAQUE_DISCARD, stream, 0, 3, NULL).res == 3,
+		"EOF prefix can be discarded");
 	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
 		"EOF stream close");
 	ring_exit(&r);
 	close(pair[0]);
 	close(pair[1]);
-	ksft_test_result_pass("EOF releases private assembly without publishing an object\n");
+	ksft_test_result_pass("EOF restores private assembly without publishing an object\n");
 }
 
 static void test_urgent(struct io_uring_opaque_config *cfg)
@@ -1233,7 +1310,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(37);
+	ksft_set_plan(39);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1464,5 +1541,6 @@ int main(void)
 	test_mixed_cqe(&cfg);
 	test_send_fifo(&cfg);
 	test_link_order(&cfg);
+	test_keep_restore(&cfg);
 	ksft_finished();
 }
