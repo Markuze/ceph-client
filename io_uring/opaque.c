@@ -75,6 +75,7 @@ struct io_opaque_tx {
 	struct rb_node node;
 	struct sock *sk;
 	struct list_head requests;
+	bool failed;
 };
 
 enum io_opaque_phase {
@@ -1687,6 +1688,8 @@ static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
 			tx->sk = sk;
 			INIT_LIST_HEAD(&tx->requests);
 		}
+		if (tx->failed)
+			return -ECANCELED;
 		if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
 			int ret = io_opaque_send_claim(op);
 
@@ -1726,6 +1729,16 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 		rb_erase(&tx->node, &store->txs);
 		kfree(tx);
 	} else if (head) {
+		/* A broken object must not splice the next queued object onto TCP. */
+		if (op->progress != op->length) {
+			tx->failed = true;
+			list_for_each_entry(next, &tx->requests, send) {
+				WRITE_ONCE(next->canceled, true);
+				if (next->phase == IO_OPAQUE_SEND_WAIT)
+					io_opaque_queue_ready(next, -ECANCELED);
+			}
+			goto out;
+		}
 		next = list_first_entry(&tx->requests, struct io_opaque_req, send);
 		guard(spinlock_irqsave)(&store->wait_lock);
 		if (next->phase == IO_OPAQUE_SEND_WAIT) {
@@ -1734,6 +1747,7 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 			io_req_task_work_add(next->req);
 		}
 	}
+out:
 	op->tx = NULL;
 }
 
@@ -1742,7 +1756,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_opaque_req *op = req->async_data;
 	struct socket *sock = sock_from_file(req->file);
 	struct msghdr msg = {
-		.msg_flags = MSG_SPLICE_PAGES | MSG_DONTWAIT | MSG_NOSIGNAL | op->msg_flags,
+		.msg_flags = MSG_SPLICE_PAGES | MSG_NOSIGNAL | op->msg_flags,
 	};
 	int ret;
 
@@ -1758,8 +1772,13 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	ret = io_opaque_tx_enter(op, sock->sk);
 	if (ret)
 		goto out;
+	if (issue_flags & IO_URING_F_NONBLOCK)
+		msg.msg_flags |= MSG_DONTWAIT;
 	msg.msg_iter = op->iter;
+	/* io-wq may block in TCP; other requests must retain access to the ring. */
+	io_ring_submit_unlock(req->ctx, issue_flags);
 	ret = sock_sendmsg(sock, &msg);
+	io_ring_submit_lock(req->ctx, issue_flags);
 	if (ret > 0) {
 		op->iter = msg.msg_iter;
 		op->progress += ret;
@@ -1767,10 +1786,13 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 			ret = -EAGAIN;
 			goto out;
 		}
-	} else if (ret == -EAGAIN && !(req->flags & REQ_F_NOWAIT)) {
+	} else if (ret == -EAGAIN && (issue_flags & IO_URING_F_NONBLOCK) &&
+		   !(req->flags & REQ_F_NOWAIT)) {
 		goto out;
 	}
 finish:
+	if (ret == -ERESTARTSYS)
+		ret = -EINTR;
 	if (ret < 0)
 		req_set_fail(req);
 	if (op->progress)

@@ -161,6 +161,13 @@ the request continues until the range is queued or an error/cancellation ends
 it. Failure before progress returns a negative errno; failure after progress
 returns the positive queued prefix. MSG_DONTWAIT permits a short result.
 
+The store serializes admitted sends to each destination socket. If the head
+ends before queuing its entire range, already admitted followers complete with
+ECANCELED rather than inserting another object's bytes after that prefix.
+A canceled follower that already claimed SEND_LAST still reports the consumed
+flag. Canceling a follower alone does not interrupt an earlier send. Blocking
+TCP retries run in io-wq without holding the ring submission lock.
+
 Each send has one application completion. This reports bytes queued to TCP,
 not peer delivery or acknowledgment. No user-buffer reuse notification is
 needed: the payload cannot be overwritten by userspace, and TCP owns ordinary

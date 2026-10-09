@@ -356,35 +356,66 @@ static void *burst_writer(void *arg)
 	return NULL;
 }
 
-static void test_collector_progress(struct io_uring_opaque_config *cfg,
-				    size_t burst, unsigned int count, unsigned int delay)
+static void test_collector_edges(struct io_uring_opaque_config *cfg)
 {
 	struct ring r;
-	struct bursts tx = { .length = burst, .count = count, .delay = delay };
 	struct event event;
+	unsigned char data[100] = {};
 	uint32_t context;
 	uint64_t stream, tag;
-	pthread_t producer;
-	int pair[2];
+	int pair[2], i;
 
 	require(!ring_init(&r, IORING_SETUP_CQE32), "collector progress ring");
 	require(!register_store(&r, cfg, &context), "collector progress store");
 	tcp_pair(pair);
 	stream = attach(&r, context, pair[1], 700);
-	tag = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream, 0, burst * count, NULL);
-	enter(&r, 0);
-	tx.fd = pair[0];
-	require(!pthread_create(&producer, NULL, burst_writer, &tx), "burst producer");
-	event = wait_tag(&r, tag);
-	require(event.res == (int)(burst * count), "collector survives all receive batches");
-	pthread_join(producer, NULL);
+	for (i = 0; i < 10000; i++) {
+		tag = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream,
+				(uint64_t)i * sizeof(data), sizeof(data), NULL);
+		enter(&r, 0);
+		write_all(pair[0], data, sizeof(data));
+		require(wait_tag(&r, tag).res == (int)sizeof(data),
+			"collector survives receive edge");
+	}
 	require(!r.nr_saved && !peek(&r, &event), "collector remains armed before EOF");
 	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
 		"collector progress close");
 	ring_exit(&r);
 	close(pair[0]);
 	close(pair[1]);
-	ksft_test_result_pass("collector drains %u bursts of %zu bytes\n", count, burst);
+	ksft_test_result_pass("collector survives 10000 separate arrival/drain cycles\n");
+}
+
+static void test_collector_bulk(struct io_uring_opaque_config *cfg)
+{
+	struct ring r;
+	struct bursts tx = { .length = 1U << 20, .count = 4096 };
+	struct event event;
+	uint32_t context;
+	uint64_t stream, tags[4];
+	pthread_t producer;
+	int pair[2], i;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "continuous collector ring");
+	require(!register_store(&r, cfg, &context), "continuous collector store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], 703);
+	for (i = 0; i < 4; i++)
+		tags[i] = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream,
+				    (uint64_t)i << 30, 1U << 30, NULL);
+	enter(&r, 0);
+	tx.fd = pair[0];
+	require(!pthread_create(&producer, NULL, burst_writer, &tx), "continuous producer");
+	for (i = 0; i < 4; i++)
+		require(wait_tag(&r, tags[i]).res == 1U << 30, "collector drains full GiB range");
+	pthread_join(producer, NULL);
+	require(!r.nr_saved && !peek(&r, &event), "continuous collector remains armed");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"continuous collector close");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	ksft_test_result_pass("collector drains 4 GiB without a new readability edge\n");
 }
 
 static void test_reset(struct io_uring_opaque_config *cfg)
@@ -456,6 +487,142 @@ static void test_mixed_cqe(struct io_uring_opaque_config *cfg)
 	close(pair[0]);
 	close(pair[1]);
 	ksft_test_result_pass("mixed CQE tokens and handles carry the 32-byte flag\n");
+}
+
+static void tcp_pair_small(int pair[2])
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t len = sizeof(addr);
+	int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int small = 4096, one = 1;
+
+	require(listener >= 0, "small-window listen socket");
+	require(!setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)),
+		"small window before SYN");
+	require(!bind(listener, (void *)&addr, sizeof(addr)), "small-window bind");
+	require(!getsockname(listener, (void *)&addr, &len), "small-window address");
+	require(!listen(listener, 1), "small-window listen");
+	pair[0] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	require(pair[0] >= 0, "small-window connect socket");
+	require(!setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)),
+		"small send queue before connect");
+	require(!connect(pair[0], (void *)&addr, sizeof(addr)), "small-window connect");
+	pair[1] = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+	require(pair[1] >= 0, "small-window accept");
+	require(!setsockopt(pair[0], IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)),
+		"small-window TCP_NODELAY");
+	close(listener);
+}
+
+struct slow_transfer {
+	int fd;
+	unsigned char *data;
+	size_t length;
+	size_t done;
+};
+
+static void *slow_reader(void *arg)
+{
+	struct slow_transfer *rx = arg;
+
+	while (rx->done < rx->length) {
+		size_t length = rx->length - rx->done;
+		ssize_t n = read(rx->fd, rx->data + rx->done, length > 4096 ? 4096 : length);
+
+		if (n <= 0)
+			break;
+		rx->done += n;
+		usleep(500);
+	}
+	return NULL;
+}
+
+static void test_send_fifo(struct io_uring_opaque_config *cfg)
+{
+	const size_t xlen = 2U << 20, ylen = 64U << 10, total = xlen + ylen;
+	struct ring r;
+	struct event event, first, second;
+	unsigned char *data = malloc(total), *seen = malloc(total);
+	struct transfer tx = { .data = data, .length = total };
+	struct slow_transfer rx = { .data = seen, .length = total };
+	uint32_t context;
+	uint64_t stream, keep[2], handles[2], sends[2];
+	pthread_t producer, consumer;
+	int source[2], target[2];
+
+	require(data && seen, "FIFO payload allocations");
+	memset(data, 'A', xlen);
+	memset(data + xlen, 'B', ylen);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "FIFO ring");
+	require(!register_store(&r, cfg, &context), "FIFO store");
+	tcp_pair(source);
+	tcp_pair_small(target);
+	stream = attach(&r, context, source[1], 704);
+	keep[0] = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, xlen, NULL);
+	keep[1] = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, xlen, ylen, NULL);
+	tx.fd = source[0];
+	require(!pthread_create(&producer, NULL, writer, &tx), "FIFO producer");
+	event = wait_tag(&r, keep[0]);
+	require(event.res == (int)xlen, "FIFO first KEEP");
+	handles[0] = event.extra[0];
+	event = wait_tag(&r, keep[1]);
+	require(event.res == (int)ylen, "FIFO second KEEP");
+	handles[1] = event.extra[0];
+	pthread_join(producer, NULL);
+	rx.fd = target[1];
+	sends[0] = send_stage(&r, context, target[0], handles[0], 0, xlen);
+	sends[1] = send_stage(&r, context, target[0], handles[1], 0, ylen);
+	require(!pthread_create(&consumer, NULL, slow_reader, &rx), "FIFO consumer");
+	require(wait_tag(&r, sends[0]).res == (int)xlen, "blocking SEND survives 128 polls");
+	require(wait_tag(&r, sends[1]).res == (int)ylen, "FIFO second SEND");
+	require(!shutdown(target[0], SHUT_WR), "FIFO peer EOF");
+	pthread_join(consumer, NULL);
+	require(rx.done == total && !memcmp(data, seen, total), "FIFO complete ordered wire bytes");
+	close(target[0]);
+	close(target[1]);
+	ksft_test_result_pass("slow 4 KiB peer window preserves full SEND and FIFO wire order\n");
+
+	tcp_pair_small(target);
+	sends[0] = send_stage(&r, context, target[0], handles[0], 0, xlen);
+	sends[1] = send_stage_flags(&r, context, target[0], handles[1], 0, ylen,
+				    IORING_OPAQUE_SEND_LAST, 0, 0);
+	enter(&r, 0);
+	{
+		struct io_uring_sqe cancel = {
+			.opcode = IORING_OP_ASYNC_CANCEL, .fd = -1,
+			.addr = sends[0], .user_data = next_tag++,
+		};
+
+		stage(&r, cancel);
+		require(!wait_tag(&r, cancel.user_data).res, "cancel FIFO head");
+	}
+	first = wait_tag(&r, sends[0]);
+	second = wait_tag(&r, sends[1]);
+	require(first.res > 0 && first.res < (int)xlen, "canceled head reports queued prefix");
+	require(second.res == -ECANCELED && (second.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+		"broken FIFO cancels claimed final-send follower");
+	require(!shutdown(target[0], SHUT_WR), "canceled FIFO peer EOF");
+	rx = (struct slow_transfer) { .fd = target[1], .data = seen, .length = total };
+	slow_reader(&rx);
+	require(rx.done == (size_t)first.res && !memcmp(data, seen, rx.done),
+		"broken FIFO emits only the head prefix");
+	require(!command(&r, context, IORING_OPAQUE_FREE, handles[0], 0, 0, NULL).res,
+		"FIFO reusable object free");
+	require(command(&r, context, IORING_OPAQUE_FREE, handles[1], 0, 0, NULL).res == -ESTALE,
+		"FIFO final-send follower stays consumed");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"FIFO stream close");
+	ring_exit(&r);
+	close(source[0]);
+	close(source[1]);
+	close(target[0]);
+	close(target[1]);
+	free(data);
+	free(seen);
+	ksft_test_result_pass("a partial SEND cancels queued followers without splicing\n");
 }
 
 static void test_send_last(struct io_uring_opaque_config *cfg)
@@ -990,7 +1157,7 @@ int main(void)
 	unsigned char buf[32];
 	int source[2], target[2], ret;
 
-	alarm(90);
+	alarm(300);
 	ksft_print_header();
 	ret = ring_init(&r, IORING_SETUP_CQE32);
 	if (ret)
@@ -999,7 +1166,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(34);
+	ksft_set_plan(36);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1224,9 +1391,10 @@ int main(void)
 	test_urgent(&cfg);
 	test_teardown(&cfg);
 	test_unprivileged(cfg);
-	test_collector_progress(&cfg, 100, 300, 3000);
-	test_collector_progress(&cfg, 1U << 20, 64, 0);
+	test_collector_edges(&cfg);
+	test_collector_bulk(&cfg);
 	test_reset(&cfg);
 	test_mixed_cqe(&cfg);
+	test_send_fifo(&cfg);
 	ksft_finished();
 }

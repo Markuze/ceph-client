@@ -37,7 +37,7 @@ chmod +x "$test_root/init"
 	cd "$test_root"
 	find . -print0 | cpio --null -o --format=newc > "$test_dir/initramfs.cpio"
 )
-timeout "${OPAQUE_VM_TIMEOUT:-120}" "${QEMU:-qemu-system-x86_64}" \
+timeout "${OPAQUE_VM_TIMEOUT:-360}" "${QEMU:-qemu-system-x86_64}" \
 	-accel "${OPAQUE_VM_ACCEL:-tcg}" -m 768M -smp 2 -nodefaults \
 	-display none -serial stdio -monitor none -no-reboot \
 	-kernel "$kernel_build/arch/x86/boot/bzImage" \
