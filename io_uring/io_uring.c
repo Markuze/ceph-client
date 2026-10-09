@@ -292,6 +292,7 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 #endif
 	INIT_WQ_LIST(&ctx->submit_state.compl_reqs);
 	INIT_HLIST_HEAD(&ctx->cancelable_uring_cmd);
+	INIT_LIST_HEAD(&ctx->opaque_waits);
 	io_napi_init(ctx);
 	mutex_init(&ctx->mmap_lock);
 	ctx->kcov_handle = kcov_common_handle();

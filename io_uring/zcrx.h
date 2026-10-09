@@ -8,9 +8,12 @@
 #include <net/page_pool/types.h>
 #include <net/net_trackers.h>
 
-#define ZCRX_SUPPORTED_REG_FLAGS	(ZCRX_REG_IMPORT | ZCRX_REG_NODEV)
+#define ZCRX_SUPPORTED_REG_FLAGS	(ZCRX_REG_IMPORT | ZCRX_REG_NODEV | \
+				 ZCRX_REG_OPAQUE_OBJ)
 #define ZCRX_FEATURES			(ZCRX_FEATURE_RX_PAGE_SIZE |\
-					 ZCRX_FEATURE_EVENT)
+					 ZCRX_FEATURE_EVENT | \
+					 (IS_ENABLED(CONFIG_IO_URING_OPAQUE_OBJ) ? \
+					  ZCRX_FEATURE_OPAQUE_OBJ : 0))
 #define ZCRX_EVENT_TYPE_MASK		((1U << ZCRX_EVENT_ALLOC_FAIL) |\
 					 (1U << ZCRX_EVENT_COPY))
 
@@ -58,6 +61,7 @@ struct zcrx_rq {
 };
 
 struct io_zcrx_ifq {
+	struct io_opaque_store		*opaque;
 	/* read-protected by any of: ->pp_lock, ->alloc_lock, ->rq.lock */
 	struct io_zcrx_area		**areas;
 	unsigned			nr_areas;

@@ -26,6 +26,7 @@
 #include "kbuf.h"
 #include "memmap.h"
 #include "zcrx.h"
+#include "opaque.h"
 #include "rsrc.h"
 
 #define ZCRX_MAX_FRAGS_PER_PAGE MAX(PAGE_SIZE / 1024, 1)
@@ -664,6 +665,7 @@ static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
 	if (WARN_ON_ONCE(ifq->master_ctx))
 		return;
 
+	io_opaque_free(ifq->opaque);
 	for (i = 0; i < ifq->nr_areas; i++)
 		io_zcrx_free_area(ifq, ifq->areas[i]);
 	if (ifq->mm_account)
@@ -741,6 +743,10 @@ static void io_zcrx_scrub(struct io_zcrx_ifq *ifq)
 {
 	int i;
 
+	if (ifq->opaque) {
+		io_opaque_stop(ifq->opaque);
+		return;
+	}
 	guard(mutex)(&ifq->pp_lock);
 	for (i = 0; i < ifq->nr_areas; i++)
 		io_zcrx_scrub_area(ifq, ifq->areas[i]);
@@ -774,7 +780,7 @@ struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 
 	lockdep_assert_held(&ctx->mmap_lock);
 
-	return ifq ? &ifq->rq_region : NULL;
+	return ifq && !ifq->opaque ? &ifq->rq_region : NULL;
 }
 
 static int zcrx_box_release(struct inode *inode, struct file *file)
@@ -846,7 +852,7 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 		return -EINVAL;
 	if (reg->event_desc)
 		return -EINVAL;
-	if (reg->flags & ~ZCRX_REG_IMPORT)
+	if (reg->flags & ~(ZCRX_REG_IMPORT | ZCRX_REG_OPAQUE_OBJ))
 		return -EINVAL;
 
 	fd = reg->if_idx;
@@ -859,6 +865,8 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 		return -EBADF;
 
 	ifq = file->private_data;
+	if (!!ifq->opaque != !!(reg->flags & ZCRX_REG_OPAQUE_OBJ))
+		return -EINVAL;
 	refcount_inc(&ifq->refs);
 	refcount_inc(&ifq->user_refs);
 
@@ -869,7 +877,8 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 	}
 
 	reg->zcrx_id = id;
-	io_fill_zcrx_offsets(&reg->offsets);
+	if (!ifq->opaque)
+		io_fill_zcrx_offsets(&reg->offsets);
 	if (copy_to_user(arg, reg, sizeof(*reg))) {
 		ret = -EFAULT;
 		goto err_xa_erase;
@@ -959,6 +968,51 @@ static int zcrx_validate_notif_stats(struct io_zcrx_ifq *ifq,
 	return 0;
 }
 
+static int io_register_opaque(struct io_ring_ctx *ctx,
+			      struct io_uring_zcrx_ifq_reg __user *arg,
+			      struct io_uring_zcrx_ifq_reg *reg)
+{
+	struct io_zcrx_ifq *ifq;
+	u32 id;
+	int ret;
+
+	if (reg->flags != ZCRX_REG_OPAQUE_OBJ || reg->if_idx || reg->if_rxq ||
+	    reg->rq_entries || reg->area_ptr || reg->region_ptr || reg->rx_buf_len ||
+	    reg->event_desc || !reg->opaque_config || reg->__resv1 ||
+	    !mem_is_zero(&reg->offsets, sizeof(reg->offsets)))
+		return -EINVAL;
+	ifq = io_zcrx_ifq_alloc(ctx);
+	if (!ifq)
+		return -ENOMEM;
+	ifq->opaque = io_opaque_alloc(ctx, reg->opaque_config);
+	if (IS_ERR(ifq->opaque)) {
+		ret = PTR_ERR(ifq->opaque);
+		ifq->opaque = NULL;
+		goto free_ifq;
+	}
+	mutex_lock(&ctx->mmap_lock);
+	ret = xa_alloc(&ctx->zcrx_ctxs, &id, NULL, xa_limit_31b, GFP_KERNEL);
+	mutex_unlock(&ctx->mmap_lock);
+	if (ret)
+		goto free_ifq;
+	reg->zcrx_id = id;
+	if (copy_to_user(arg, reg, sizeof(*reg))) {
+		ret = -EFAULT;
+		goto erase_id;
+	}
+	mutex_lock(&ctx->mmap_lock);
+	ret = xa_err(xa_store(&ctx->zcrx_ctxs, id, ifq, GFP_KERNEL));
+	mutex_unlock(&ctx->mmap_lock);
+	if (!ret)
+		return 0;
+erase_id:
+	scoped_guard(mutex, &ctx->mmap_lock)
+		xa_erase(&ctx->zcrx_ctxs, id);
+free_ifq:
+	zcrx_unregister(ifq, ctx);
+	return ret;
+}
+
 int io_register_zcrx(struct io_ring_ctx *ctx,
 		     struct io_uring_zcrx_ifq_reg __user *arg)
 {
@@ -974,9 +1028,6 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	 * 1. Interface queue allocation.
 	 * 2. It can observe data destined for sockets of other tasks.
 	 */
-	if (!capable(CAP_NET_ADMIN))
-		return -EPERM;
-
 	/* mandatory io_uring features for zc rx */
 	if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN))
 		return -EINVAL;
@@ -984,9 +1035,22 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 		return -EINVAL;
 	if (copy_from_user(&reg, arg, sizeof(reg)))
 		return -EFAULT;
-	if (!mem_is_zero(&reg.__resv, sizeof(reg.__resv)) || reg.zcrx_id)
+	if (reg.zcrx_id)
 		return -EINVAL;
 	if (reg.flags & ~ZCRX_SUPPORTED_REG_FLAGS)
+		return -EINVAL;
+	if (reg.flags & ZCRX_REG_OPAQUE_OBJ) {
+		if (reg.flags & ZCRX_REG_IMPORT) {
+			if (!mem_is_zero(reg.__resv, sizeof(reg.__resv)) || reg.rx_buf_len ||
+			    !mem_is_zero(&reg.offsets, sizeof(reg.offsets)))
+				return -EINVAL;
+			return import_zcrx(ctx, arg, &reg);
+		}
+		return io_register_opaque(ctx, arg, &reg);
+	}
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+	if (!mem_is_zero(reg.__resv, sizeof(reg.__resv)))
 		return -EINVAL;
 	if (reg.flags & ZCRX_REG_IMPORT)
 		return import_zcrx(ctx, arg, &reg);
@@ -1611,6 +1675,8 @@ int io_zcrx_ctrl(struct io_ring_ctx *ctx, void __user *arg, unsigned nr_args)
 	zcrx = xa_load(&ctx->zcrx_ctxs, ctrl.zcrx_id);
 	if (!zcrx)
 		return -ENXIO;
+	if (zcrx->opaque && ctrl.op != ZCRX_CTRL_EXPORT)
+		return -EOPNOTSUPP;
 
 	switch (ctrl.op) {
 	case ZCRX_CTRL_FLUSH_RQ:

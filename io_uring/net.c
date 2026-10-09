@@ -19,6 +19,7 @@
 #include "notif.h"
 #include "rsrc.h"
 #include "zcrx.h"
+#include "opaque.h"
 
 struct io_shutdown {
 	struct file			*file;
@@ -1313,6 +1314,11 @@ int io_recvzc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	/* multishot required */
 	if (!(zc->flags & IORING_RECV_MULTISHOT))
 		return -EINVAL;
+	if (zc->ifq->opaque) {
+		if (zc->len || (req->flags & (REQ_F_CQE_SKIP | REQ_F_FORCE_ASYNC)))
+			return -EINVAL;
+		return io_opaque_recv_prep(req, zc->ifq->opaque);
+	}
 	/* All data completions are posted as aux CQEs. */
 	req->flags |= REQ_F_APOLL_MULTISHOT;
 
@@ -1326,6 +1332,8 @@ int io_recvzc(struct io_kiocb *req, unsigned int issue_flags)
 	unsigned int len;
 	int ret;
 
+	if (zc->ifq->opaque)
+		return io_opaque_recv(req, issue_flags);
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
 		return -ENOTSOCK;

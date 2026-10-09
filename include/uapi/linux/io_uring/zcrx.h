@@ -57,6 +57,9 @@ enum zcrx_reg_flags {
 	 * consumed and need to be flushed, see ZCRX_CTRL_FLUSH_RQ.
 	 */
 	ZCRX_REG_NODEV		= 2,
+
+	/* Kernel-resident opaque objects; no device, mapping or refill ring. */
+	ZCRX_REG_OPAQUE_OBJ	= 4,
 };
 
 enum zcrx_features {
@@ -66,6 +69,7 @@ enum zcrx_features {
 	 */
 	ZCRX_FEATURE_RX_PAGE_SIZE	= 1 << 0,
 	ZCRX_FEATURE_EVENT		= 1 << 1,
+	ZCRX_FEATURE_OPAQUE_OBJ		= 1 << 2,
 };
 
 enum zcrx_event_type {
@@ -109,7 +113,13 @@ struct io_uring_zcrx_ifq_reg {
 	__u32	zcrx_id;
 	__u32	rx_buf_len;
 	__u64	event_desc; /* see struct zcrx_event_desc */
-	__u64	__resv[2];
+	union {
+		__u64	__resv[2];
+		struct {
+			__u64 opaque_config;
+			__u64 __resv1;
+		};
+	};
 };
 
 enum zcrx_ctrl_op {
