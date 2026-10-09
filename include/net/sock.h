@@ -326,6 +326,7 @@ struct sk_filter;
   *	@sk_zckey: counter to order MSG_ZEROCOPY notifications
   *	@sk_socket: Identd and reporting IO signals
   *	@sk_user_data: RPC layer private data. Write-protected by @sk_callback_lock.
+  *	@sk_rx_owner: Exclusive receive owner under socket and callback locks.
   *	@sk_frag: cached page frag
   *	@sk_peek_off: current peek_offset value
   *	@sk_send_head: front of stuff to transmit
@@ -573,6 +574,9 @@ struct sock {
 	u8			sk_bpf_cb_flags;
 
 	void			*sk_user_data;
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+	struct sock_rx_owner	*sk_rx_owner;
+#endif
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif
@@ -614,6 +618,28 @@ enum sk_pacing {
 	SK_PACING_NEEDED	= 1,
 	SK_PACING_FQ		= 2,
 };
+
+static inline bool sock_rx_owned(const struct sock *sk)
+{
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+	return unlikely(READ_ONCE(sk->sk_rx_owner));
+#else
+	return false;
+#endif
+}
+
+static inline bool sock_rx_owner_conflict(const struct sock *sk,
+					  read_descriptor_t *desc,
+					  sk_read_actor_t actor)
+{
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+	const struct sock_rx_owner *owner = sk->sk_rx_owner;
+
+	return owner && (owner->actor != actor || owner->data != desc->arg.data);
+#else
+	return false;
+#endif
+}
 
 /* flag bits in sk_user_data
  *
