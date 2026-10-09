@@ -224,7 +224,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 	}
 	if (!stopped && delay != MAX_JIFFY_OFFSET)
-		queue_delayed_work(system_unbound_wq, &store->retry_work, delay);
+		queue_delayed_work(system_dfl_wq, &store->retry_work, delay);
 }
 
 static void io_opaque_retry_work(struct work_struct *work)
@@ -1412,7 +1412,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 				slot->retry = jiffies;
 				if (store->policy.flags & IORING_OPAQUE_AUTO_COMPACT) {
 					list_add_tail(&slot->candidate, &store->candidates);
-					mod_delayed_work(system_unbound_wq, &store->auto_work, 1);
+					mod_delayed_work(system_dfl_wq, &store->auto_work, 1);
 				}
 				ret = op->length;
 			}

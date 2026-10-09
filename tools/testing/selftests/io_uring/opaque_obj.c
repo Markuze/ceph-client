@@ -1146,6 +1146,181 @@ static void write_setting(const char *path, const char *value)
 	close(fd);
 }
 
+static const char * const fault_names[] = {
+	"require-start", "require-end", "reject-start", "reject-end",
+	"stacktrace-depth", "ignore-gfp-wait", "cache-filter", "verbose",
+};
+
+struct fault_settings {
+	char saved[8][64];
+};
+
+static bool symbol_range(const char *name, uint64_t *start, uint64_t *end)
+{
+	char line[512], symbol[256], type;
+	unsigned long long address;
+	FILE *file = fopen("/proc/kallsyms", "r");
+
+	if (!file)
+		return false;
+	*start = 0;
+	*end = 0;
+	while (fgets(line, sizeof(line), file)) {
+		if (sscanf(line, "%llx %c %255s", &address, &type, symbol) != 3)
+			continue;
+		if (*start && address > *start) {
+			*end = address;
+			break;
+		}
+		if (!strncmp(symbol, name, strlen(name)) &&
+		    (!symbol[strlen(name)] || symbol[strlen(name)] == '.'))
+			*start = address;
+	}
+	fclose(file);
+	return *start && *end;
+}
+
+static bool fault_begin(struct fault_settings *settings)
+{
+	char path[128];
+	FILE *file;
+	unsigned int i;
+
+	if (geteuid() || access("/sys/kernel/debug/failslab/probability", W_OK) ||
+	    access("/proc/self/fail-nth", W_OK) ||
+	    read_number("/sys/kernel/debug/failslab/probability"))
+		return false;
+	for (i = 0; i < ARRAY_SIZE(fault_names); i++) {
+		snprintf(path, sizeof(path), "/sys/kernel/debug/failslab/%s", fault_names[i]);
+		if (access(path, W_OK))
+			return false;
+		file = fopen(path, "r");
+		require(file && fgets(settings->saved[i], sizeof(settings->saved[i]), file),
+			"save fault-injection settings");
+		fclose(file);
+	}
+	write_setting("/sys/kernel/debug/failslab/reject-start", "0");
+	write_setting("/sys/kernel/debug/failslab/reject-end", "0");
+	write_setting("/sys/kernel/debug/failslab/stacktrace-depth", "32");
+	write_setting("/sys/kernel/debug/failslab/ignore-gfp-wait", "0");
+	write_setting("/sys/kernel/debug/failslab/cache-filter", "0");
+	write_setting("/sys/kernel/debug/failslab/verbose", "0");
+	return true;
+}
+
+static void fault_arm(uint64_t start, uint64_t end)
+{
+	char value[32];
+
+	snprintf(value, sizeof(value), "0x%llx", (unsigned long long)start);
+	write_setting("/sys/kernel/debug/failslab/require-start", value);
+	snprintf(value, sizeof(value), "0x%llx", (unsigned long long)end);
+	write_setting("/sys/kernel/debug/failslab/require-end", value);
+	write_setting("/proc/self/fail-nth", "1");
+}
+
+static void fault_end(struct fault_settings *settings)
+{
+	char path[128];
+	unsigned int i;
+	bool injected;
+
+	/* A zero counter proves the requested allocation actually failed. */
+	injected = read_number("/proc/self/fail-nth") == 0;
+	write_setting("/proc/self/fail-nth", "0");
+	for (i = 0; i < ARRAY_SIZE(fault_names); i++) {
+		snprintf(path, sizeof(path), "/sys/kernel/debug/failslab/%s", fault_names[i]);
+		write_setting(path, settings->saved[i]);
+	}
+	require(injected, "targeted allocation fault was injected");
+}
+
+static void test_allocation_failure(struct io_uring_opaque_config *cfg)
+{
+	static const char * const names[] = { "io_opaque_capture", "io_opaque_ready" };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct io_uring_opaque_stream_stat stat;
+		struct fault_settings settings;
+		unsigned char payload[2048], readback[2048];
+		struct ring r;
+		struct event event;
+		uint32_t context;
+		uint64_t start, end, stream, keep, handle;
+		unsigned int attempts;
+		int pair[2], other[2];
+
+		if (!symbol_range(names[i], &start, &end) || !fault_begin(&settings)) {
+			ksft_test_result_skip("%s ENOMEM needs failslab and stack filters\n",
+					      names[i]);
+			continue;
+		}
+		memset(payload, 0x61 + i, sizeof(payload));
+		require(!ring_init(&r, IORING_SETUP_CQE32), "allocation-failure ring");
+		require(!register_store(&r, cfg, &context), "allocation-failure store");
+		tcp_pair(pair);
+		tcp_pair(other);
+		stream = attach(&r, context, pair[1], 716);
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, sizeof(payload), NULL);
+		write_all(pair[0], payload, sizeof(payload) / 2);
+		for (attempts = 0; attempts < 5000; attempts++) {
+			require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+					 sizeof(stat), &stat).res, "allocation prefix statistics");
+			if (stat.rx_next == sizeof(payload) / 2)
+				break;
+			usleep(1000);
+		}
+		require(attempts < 5000, "private prefix is captured before allocation failure");
+		/* Force a new extent rather than an allocation-free contiguous merge. */
+		write_all(other[0], payload, sizeof(payload) / 2);
+		fault_arm(start, end);
+		write_all(pair[0], payload + sizeof(payload) / 2, sizeof(payload) / 2);
+		enter(&r, 0);
+		if (!i) {
+			for (attempts = 0; attempts < 5000; attempts++) {
+				if (!read_number("/proc/self/fail-nth"))
+					break;
+				enter(&r, 0);
+				usleep(1000);
+			}
+			fault_end(&settings);
+			require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+					 sizeof(stat), &stat).res && !stat.error,
+				"capture ENOMEM does not poison the stream");
+			event = wait_tag(&r, keep);
+		} else {
+			event = wait_tag(&r, keep);
+			fault_end(&settings);
+			require(event.res == -ENOMEM, "vector allocation rejects publication");
+			require(command(&r, context, IORING_OPAQUE_READ_STREAM, stream, 0,
+					sizeof(payload), readback).res == sizeof(payload) &&
+				!memcmp(payload, readback, sizeof(payload)),
+				"vector ENOMEM restores the entire prefix");
+			event = command(&r, context, IORING_OPAQUE_KEEP, stream, 0,
+					sizeof(payload), NULL);
+		}
+		require(event.res == sizeof(payload) && event.extra[0],
+			"retry publishes complete KEEP");
+		handle = event.extra[0];
+		require(command(&r, context, IORING_OPAQUE_READ, handle, 0,
+				sizeof(payload), readback).res == sizeof(payload) &&
+			!memcmp(payload, readback, sizeof(payload)),
+			"allocation retry preserves bytes");
+		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"free allocation-failure object");
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+			"close allocation-failure stream");
+		ring_exit(&r);
+		close(pair[0]);
+		close(pair[1]);
+		close(other[0]);
+		close(other[1]);
+		ksft_test_result_pass("%s ENOMEM preserves bytes and permits KEEP retry\n",
+				      names[i]);
+	}
+}
+
 static void test_memcg(struct io_uring_opaque_config *cfg)
 {
 	const char *root = "/sys/fs/cgroup";
@@ -1773,7 +1948,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(50);
+	ksft_set_plan(52);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -2013,5 +2188,6 @@ int main(void)
 	test_socket_lifetime(&cfg);
 	test_poll_first(&cfg);
 	test_full_cq(&cfg);
+	test_allocation_failure(&cfg);
 	ksft_finished();
 }

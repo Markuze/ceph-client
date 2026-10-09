@@ -56,7 +56,8 @@ if grep -qx 'CONFIG_IO_URING_OPAQUE_OBJ_KUNIT_TEST=y' "$kernel_build/.config"; t
 	grep -Eq 'io_uring-opaque: pass:[1-9][0-9]* fail:0 skip:0 total:' \
 		"$test_dir/results.log"
 fi
-if grep -Eq 'not ok|BUG:|WARNING:|Oops:|Kernel panic|refcount_t:' "$test_dir/results.log"; then
+if grep -Eq 'not ok|BUG:|WARNING:|Oops:|Kernel panic|refcount_t:|deprecated workqueue' \
+		"$test_dir/results.log"; then
 	echo "Kernel or selftest failure: $test_dir/results.log" >&2
 	exit 1
 fi

@@ -354,7 +354,13 @@ and automatic compaction, old-version sends during replacement and FREE,
 SEND_LAST ownership reporting on rejection, short sends, errors and cancellation,
 competing prepared final sends across rings, cache resends, memory-limit recovery,
 receive ownership, EOF, teardown and unprivileged registration. The tests use
-loopback TCP; they do not measure performance.
+loopback TCP; they do not measure performance. Collector stress includes
+10,000 separate arrival/drain cycles and 4 GiB of continuous DISCARD traffic,
+crossing the TCP sequence-number wrap. Slow-window sends validate full byte
+results and peer payload order; partial head sends cancel queued followers.
+Tests also cover interleaved fragment charges, prefix restoration, batched
+compaction cancellation, socket errors at full quota, IPv4/IPv6 disconnect
+ownership, socket-file lifetime, POLL_FIRST and attach with a full CQ.
 
 Build against the patched UAPI, using an already configured kernel build::
 
@@ -366,6 +372,12 @@ Build against the patched UAPI, using an already configured kernel build::
 Run ``tools/testing/selftests/io_uring/opaque_obj`` on the patched kernel.
 Registration permission can also depend on the system's io_uring policy.
 The capabilities test needs a root fixture and is skipped otherwise.
+The retained-page memory test needs a writable cgroup2 subtree with the memory
+controller enabled. Targeted capture and publication ENOMEM tests need root,
+debugfs, visible kernel symbols, FAILSLAB and the fault-injection stack filter.
+They verify that a fault was actually injected and restore failslab settings.
+The VM helper mounts these fixtures; enable the corresponding kernel options
+to run the allocation-failure tests instead of skipping them.
 
 ``CONFIG_IO_URING_OPAQUE_OBJ_KUNIT_TEST`` adds capture identity/ownership,
 compound allocation and oversized-copy, charge splitting, exact compaction

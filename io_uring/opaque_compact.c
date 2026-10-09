@@ -166,7 +166,7 @@ static void io_opaque_compact_work(struct work_struct *work)
 	}
 	guard(spinlock)(&store->wait_lock);
 	if (!list_empty(&store->copies))
-		queue_work(system_unbound_wq, &store->copy_work);
+		queue_work(system_dfl_wq, &store->copy_work);
 }
 
 static int io_opaque_compact_start(struct io_opaque_req *op)
@@ -190,7 +190,7 @@ static int io_opaque_compact_start(struct io_opaque_req *op)
 	io_opaque_wait(op, IO_OPAQUE_COPY_WORK);
 	scoped_guard(spinlock, &store->wait_lock)
 		list_add_tail(&op->wait, &store->copies);
-	queue_work(system_unbound_wq, &store->copy_work);
+	queue_work(system_dfl_wq, &store->copy_work);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
 
@@ -231,7 +231,7 @@ static int io_opaque_set_policy(struct io_opaque_req *op)
 	}
 	mutex_unlock(&store->tables);
 	if (policy.flags & IORING_OPAQUE_AUTO_COMPACT)
-		mod_delayed_work(system_unbound_wq, &store->auto_work, 1);
+		mod_delayed_work(system_dfl_wq, &store->auto_work, 1);
 	else
 		cancel_delayed_work(&store->auto_work);
 	return 0;
@@ -310,5 +310,5 @@ unlock:
 		!list_empty(&store->candidates);
 	mutex_unlock(&store->tables);
 	if (again)
-		queue_delayed_work(system_unbound_wq, &store->auto_work, msecs_to_jiffies(100));
+		queue_delayed_work(system_dfl_wq, &store->auto_work, msecs_to_jiffies(100));
 }
