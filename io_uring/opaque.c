@@ -33,6 +33,7 @@ struct io_opaque_backing {
 	u64 charge;
 	u32 filled;
 	bool copied;
+	bool accounted;
 };
 
 struct io_opaque_extent {
@@ -155,6 +156,7 @@ struct io_opaque_store {
 	struct user_struct *user;
 	struct mm_struct *mm;
 	struct mem_cgroup *memcg;
+	struct obj_cgroup *objcg;
 	atomic64_t bytes;
 	atomic64_t copied;
 	atomic64_t compacted;
@@ -280,6 +282,24 @@ static bool io_opaque_extent_reserve(struct io_opaque_store *store)
 	return false;
 }
 
+static int io_opaque_memcg_charge(struct io_opaque_store *store, u64 bytes)
+{
+#ifdef CONFIG_MEMCG
+	if (store->objcg)
+		return obj_cgroup_charge(store->objcg,
+					GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN, bytes);
+#endif
+	return 0;
+}
+
+static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
+{
+#ifdef CONFIG_MEMCG
+	if (store->objcg)
+		obj_cgroup_uncharge(store->objcg, bytes);
+#endif
+}
+
 static struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 						     struct page *page, u32 offset,
 						  u32 length, u64 start,
@@ -292,16 +312,18 @@ static struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *sto
 		return ERR_PTR(-ENOBUFS);
 	if (!reserved && !io_opaque_charge(store, charge, true))
 		goto no_space;
+	if (!reserved && io_opaque_memcg_charge(store, charge))
+		goto no_memory;
 	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
 	if (!chunk) {
 		if (!reserved)
-			io_opaque_uncharge(store, charge);
-		atomic_dec(&store->extents);
-		return ERR_PTR(-ENOMEM);
+			io_opaque_memcg_uncharge(store, charge);
+		goto no_memory;
 	}
 	refcount_set(&chunk->backing.refs, 1);
 	chunk->backing.page = compound_head(page);
 	chunk->backing.charge = charge;
+	chunk->backing.accounted = !reserved && store->objcg;
 	chunk->extent.backing = &chunk->backing;
 	chunk->extent.start = start;
 	chunk->extent.offset = offset + (page - compound_head(page)) * PAGE_SIZE;
@@ -309,6 +331,11 @@ static struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *sto
 	chunk->extent.embedded = true;
 	INIT_LIST_HEAD(&chunk->extent.list);
 	return &chunk->extent;
+no_memory:
+	if (!reserved)
+		io_opaque_uncharge(store, charge);
+	atomic_dec(&store->extents);
+	return ERR_PTR(-ENOMEM);
 no_space:
 	atomic_dec(&store->extents);
 	return ERR_PTR(-ENOBUFS);
@@ -326,6 +353,8 @@ static void io_opaque_extent_free(struct io_opaque_store *store,
 	if (refcount_dec_and_test(&backing->refs)) {
 		u64 charge = backing->charge;
 
+		if (backing->accounted)
+			io_opaque_memcg_uncharge(store, charge);
 		put_page(backing->page);
 		kfree(container_of(backing, struct io_opaque_chunk, backing));
 		io_opaque_uncharge(store, charge);
@@ -489,6 +518,14 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx, u64 config)
 	if (store->mm)
 		mmgrab(store->mm);
 	store->memcg = get_mem_cgroup_from_mm(store->mm);
+#ifdef CONFIG_MEMCG
+	if (store->memcg && !mem_cgroup_is_root(store->memcg)) {
+		struct mem_cgroup *old = set_active_memcg(store->memcg);
+
+		store->objcg = get_obj_cgroup_from_current();
+		set_active_memcg(old);
+	}
+#endif
 	mutex_init(&store->tables);
 	mutex_init(&store->copy_lock);
 	spin_lock_init(&store->wait_lock);
@@ -558,6 +595,7 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic_read(&store->requests));
 	io_unaccount_mem(store->user, store->mm,
 			 store->config.hard_limit >> PAGE_SHIFT);
+	obj_cgroup_put(store->objcg);
 	mem_cgroup_put(store->memcg);
 	if (store->mm)
 		mmdrop(store->mm);

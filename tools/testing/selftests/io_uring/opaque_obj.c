@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -957,6 +958,104 @@ static void test_budget_error(struct io_uring_opaque_config cfg)
 	}
 }
 
+static uint64_t read_number(const char *path)
+{
+	unsigned long long value;
+	FILE *file = fopen(path, "r");
+
+	require(file && fscanf(file, "%llu", &value) == 1, "read numeric fixture");
+	fclose(file);
+	return value;
+}
+
+static void write_setting(const char *path, const char *value)
+{
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+
+	require(fd >= 0, "open fixture setting");
+	write_all(fd, value, strlen(value));
+	close(fd);
+}
+
+static void test_memcg(struct io_uring_opaque_config *cfg)
+{
+	const char *root = "/sys/fs/cgroup";
+	char directory[128], path[160], pid[32];
+	unsigned char *payload;
+	int pair[2], signal[2], status;
+	pid_t child;
+
+	snprintf(directory, sizeof(directory), "%s/opaque-test-%d", root, getpid());
+	if (geteuid() || mkdir(directory, 0755)) {
+		ksft_test_result_skip("retained RX memcg test needs a writable cgroup2 fixture\n");
+		return;
+	}
+	snprintf(path, sizeof(path), "%s/memory.current", directory);
+	if (access(path, R_OK)) {
+		rmdir(directory);
+		ksft_test_result_skip("memory controller is not enabled in the fixture\n");
+		return;
+	}
+	/* Both TCP sockets and the sending pages belong to the parent cgroup. */
+	tcp_pair(pair);
+	require(!pipe(signal), "memcg synchronization pipe");
+	payload = malloc(4U << 20);
+	require(payload, "memcg parent payload");
+	memset(payload, 0x57, 4U << 20);
+	fflush(stdout);
+	child = fork();
+	require(child >= 0, "memcg fixture fork");
+	if (!child) {
+		struct io_uring_opaque_object_stat object;
+		struct ring r;
+		struct event event;
+		uint32_t context;
+		uint64_t stream, keep, before, after, released;
+
+		close(signal[0]);
+		snprintf(path, sizeof(path), "%s/cgroup.procs", directory);
+		snprintf(pid, sizeof(pid), "%d", getpid());
+		write_setting(path, pid);
+		require(!ring_init(&r, IORING_SETUP_CQE32), "memcg ring");
+		require(!register_store(&r, cfg, &context), "memcg store");
+		stream = attach(&r, context, pair[1], 710);
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, 4U << 20, NULL);
+		enter(&r, 0);
+		snprintf(path, sizeof(path), "%s/memory.current", directory);
+		before = read_number(path);
+		write_all(signal[1], "!", 1);
+		event = wait_tag(&r, keep);
+		require(event.res == 4U << 20, "memcg retained object");
+		require(!command(&r, context, IORING_OPAQUE_OBJECT_STAT, event.extra[0], 0,
+				 sizeof(object), &object).res, "memcg object statistics");
+		after = read_number(path);
+		ksft_print_msg("memcg before=%llu after=%llu backing=%llu\n",
+			       (unsigned long long)before, (unsigned long long)after,
+			       (unsigned long long)object.backing_bytes);
+		require(after + (128U << 10) >= before + object.backing_bytes,
+			"retained pages are charged to the store owner's memcg");
+		require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
+			"memcg free backing");
+		released = read_number(path);
+		require(released + (1U << 20) < after, "FREE releases retained memcg charges");
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+			"memcg close stream");
+		ring_exit(&r);
+		_exit(0);
+	}
+	close(signal[1]);
+	read_all(signal[0], pid, 1);
+	write_all(pair[0], payload, 4U << 20);
+	require(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status),
+		"retained RX memory-cgroup accounting");
+	free(payload);
+	close(signal[0]);
+	close(pair[0]);
+	close(pair[1]);
+	require(!rmdir(directory), "remove memcg fixture");
+	ksft_test_result_pass("retained RX pages charge the store owner and uncharge on FREE\n");
+}
+
 static void test_send_last(struct io_uring_opaque_config *cfg)
 {
 	struct ring r, imported;
@@ -1503,7 +1602,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(44);
+	ksft_set_plan(45);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1738,5 +1837,6 @@ int main(void)
 	test_interleaved(cfg);
 	test_compact_queue(&cfg);
 	test_budget_error(cfg);
+	test_memcg(&cfg);
 	ksft_finished();
 }

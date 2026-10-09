@@ -17,7 +17,7 @@ file "$busybox_binary" | grep -q 'statically linked'
 mkdir -p "$test_root"/{bin,proc,sys,dev,tmp}
 cp "$test_binary" "$test_root/opaque_obj"
 cp "$busybox_binary" "$test_root/bin/busybox"
-for app in sh mount ip poweroff sleep; do
+for app in sh mount mkdir ip poweroff sleep; do
 	ln -sf busybox "$test_root/bin/$app"
 done
 cat > "$test_root/init" <<'INIT'
@@ -25,6 +25,10 @@ cat > "$test_root/init" <<'INIT'
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev
+mkdir -p /sys/kernel/debug /sys/fs/cgroup
+mount -t debugfs none /sys/kernel/debug
+mount -t cgroup2 none /sys/fs/cgroup
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control
 ip link set lo up
 /opaque_obj
 echo "OPAQUE_SELFTEST_STATUS=$?"

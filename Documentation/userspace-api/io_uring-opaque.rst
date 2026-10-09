@@ -217,7 +217,11 @@ compound allocation share its backing and charge even when another socket's
 data separates their physical offsets. Splits also share the backing reference
 and charge. Independent captures can still conservatively charge the same
 physical allocation more than once. A retained compound allocation is charged
-in full. Copy fallback appends into unused space in the previous owned page;
+in full. Retained RX allocations also carry an explicit charge to the store
+owner's memory cgroup until the final backing reference is released; the
+original network allocation's accounting is independent. Owned copy and
+compaction pages already use accounted allocation and are not charged twice.
+Copy fallback appends into unused space in the previous owned page;
 it does not allocate a whole page for every small fragment.
 Vectors are built once at object publication and are bounded by extent limits.
 Releasing backing or metadata wakes eligible collectors suspended on the store
