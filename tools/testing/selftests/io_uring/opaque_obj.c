@@ -58,7 +58,8 @@ static int ring_init(struct ring *r, unsigned int flags)
 	if (r->fd < 0)
 		return -errno;
 	r->sq_size = r->p.sq_off.array + r->p.sq_entries * sizeof(unsigned int);
-	r->cq_size = r->p.cq_off.cqes + r->p.cq_entries * sizeof(struct event);
+	r->cq_size = r->p.cq_off.cqes + r->p.cq_entries *
+		(flags & IORING_SETUP_CQE32 ? sizeof(struct event) : sizeof(struct io_uring_cqe));
 	if (r->p.features & IORING_FEAT_SINGLE_MMAP) {
 		r->sq_size = r->sq_size > r->cq_size ? r->sq_size : r->cq_size;
 		r->cq_size = r->sq_size;
@@ -115,11 +116,29 @@ static void enter(struct ring *r, unsigned int minimum)
 static bool peek(struct ring *r, struct event *event)
 {
 	unsigned int head = *r->cq_head;
+	struct io_uring_cqe *cqe;
 
+again:
 	if (head == __atomic_load_n(r->cq_tail, __ATOMIC_ACQUIRE))
 		return false;
-	*event = r->cqes[head & *r->cq_mask];
-	__atomic_store_n(r->cq_head, head + 1, __ATOMIC_RELEASE);
+	if (r->p.flags & IORING_SETUP_CQE32) {
+		*event = r->cqes[head & *r->cq_mask];
+		head++;
+	} else {
+		cqe = (void *)r->cqes + (head & *r->cq_mask) * sizeof(*cqe);
+		memset(event, 0, sizeof(*event));
+		memcpy(event, cqe, sizeof(*cqe));
+		head++;
+		if (cqe->flags & IORING_CQE_F_SKIP) {
+			__atomic_store_n(r->cq_head, head, __ATOMIC_RELEASE);
+			goto again;
+		}
+		if (cqe->flags & IORING_CQE_F_32) {
+			memcpy(event->extra, cqe + 1, sizeof(event->extra));
+			head++;
+		}
+	}
+	__atomic_store_n(r->cq_head, head, __ATOMIC_RELEASE);
 	return true;
 }
 
@@ -312,6 +331,131 @@ static void *reader(void *arg)
 		done += n;
 	}
 	return NULL;
+}
+
+struct bursts {
+	int fd;
+	size_t length;
+	unsigned int count;
+	unsigned int delay;
+};
+
+static void *burst_writer(void *arg)
+{
+	struct bursts *tx = arg;
+	unsigned char *data = calloc(1, tx->length);
+	unsigned int i;
+
+	require(data, "burst allocation");
+	for (i = 0; i < tx->count; i++) {
+		write_all(tx->fd, data, tx->length);
+		if (tx->delay)
+			usleep(tx->delay);
+	}
+	free(data);
+	return NULL;
+}
+
+static void test_collector_progress(struct io_uring_opaque_config *cfg,
+				    size_t burst, unsigned int count, unsigned int delay)
+{
+	struct ring r;
+	struct bursts tx = { .length = burst, .count = count, .delay = delay };
+	struct event event;
+	uint32_t context;
+	uint64_t stream, tag;
+	pthread_t producer;
+	int pair[2];
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "collector progress ring");
+	require(!register_store(&r, cfg, &context), "collector progress store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], 700);
+	tag = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream, 0, burst * count, NULL);
+	enter(&r, 0);
+	tx.fd = pair[0];
+	require(!pthread_create(&producer, NULL, burst_writer, &tx), "burst producer");
+	event = wait_tag(&r, tag);
+	require(event.res == (int)(burst * count), "collector survives all receive batches");
+	pthread_join(producer, NULL);
+	require(!r.nr_saved && !peek(&r, &event), "collector remains armed before EOF");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"collector progress close");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	ksft_test_result_pass("collector drains %u bursts of %zu bytes\n", count, burst);
+}
+
+static void test_reset(struct io_uring_opaque_config *cfg)
+{
+	struct ring r;
+	struct io_uring_opaque_stream_stat stream_stat;
+	struct io_uring_opaque_stat stat;
+	struct linger linger = { .l_onoff = 1 };
+	unsigned char buf[4096];
+	uint32_t context;
+	uint64_t stream, keep, read;
+	int pair[2], i;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "reset ring");
+	require(!register_store(&r, cfg, &context), "reset store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], 701);
+	keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, sizeof(buf), NULL);
+	memset(buf, 0xab, sizeof(buf));
+	read = cmd_stage(&r, context, IORING_OPAQUE_READ_STREAM, stream, 4096, 64, buf);
+	write_all(pair[0], buf, 1000);
+	for (i = 0; i < 100; i++) {
+		require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+				 sizeof(stream_stat), &stream_stat).res, "reset stream stat");
+		if (stream_stat.rx_next == 1000)
+			break;
+		usleep(1000);
+	}
+	require(i < 100, "capture prefix before reset");
+	require(!setsockopt(pair[0], SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)),
+		"reset linger");
+	close(pair[0]);
+	require(wait_tag(&r, keep).res == -ECONNRESET, "reset rejects partial KEEP");
+	require(wait_tag(&r, read).res == -ECONNRESET && buf[0] == 0xab,
+		"reset rejects unavailable read without copying");
+	require(wait_tag(&r, 701).res == -ECONNRESET, "collector reports negative socket error");
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.objects, "reset publishes no truncated object");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"reset stream close");
+	ring_exit(&r);
+	close(pair[1]);
+	ksft_test_result_pass("RST rejects partial objects and unavailable reads\n");
+}
+
+static void test_mixed_cqe(struct io_uring_opaque_config *cfg)
+{
+	struct ring r;
+	struct event event;
+	uint32_t context;
+	uint64_t stream, tag;
+	int pair[2];
+
+	require(!ring_init(&r, IORING_SETUP_CQE_MIXED), "mixed CQE ring");
+	require(!register_store(&r, cfg, &context), "mixed CQE store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], 702);
+	require(*r.cq_head == *r.cq_tail, "token consumes two mixed CQ slots");
+	tag = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, 3, NULL);
+	write_all(pair[0], "abc", 3);
+	event = wait_tag(&r, tag);
+	require(event.res == 3 && event.extra[0] && (event.flags & IORING_CQE_F_32),
+		"mixed KEEP handle completion");
+	require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
+		"mixed CQE free");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"mixed CQE close");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	ksft_test_result_pass("mixed CQE tokens and handles carry the 32-byte flag\n");
 }
 
 static void test_send_last(struct io_uring_opaque_config *cfg)
@@ -855,7 +999,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(30);
+	ksft_set_plan(34);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1080,5 +1224,9 @@ int main(void)
 	test_urgent(&cfg);
 	test_teardown(&cfg);
 	test_unprivileged(cfg);
+	test_collector_progress(&cfg, 100, 300, 3000);
+	test_collector_progress(&cfg, 1U << 20, 64, 0);
+	test_reset(&cfg);
+	test_mixed_cqe(&cfg);
 	ksft_finished();
 }

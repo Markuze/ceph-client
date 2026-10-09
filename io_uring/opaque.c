@@ -80,7 +80,7 @@ struct io_opaque_tx {
 enum io_opaque_phase {
 	IO_OPAQUE_IDLE,
 	IO_OPAQUE_RANGE_WAIT,
-	IO_OPAQUE_BUDGET_WAIT,
+	IO_OPAQUE_BUDGET_POLL,
 	IO_OPAQUE_SEND_WAIT,
 	IO_OPAQUE_COPY_WORK,
 	IO_OPAQUE_QUEUED,
@@ -181,10 +181,12 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 
 	guard(spinlock_irqsave)(&store->wait_lock);
 	list_for_each_entry_safe(op, next, &store->budget_waits, wait) {
+		struct socket *sock = sock_from_file(op->req->file);
+
 		list_del_init(&op->wait);
-		op->phase = IO_OPAQUE_QUEUED;
-		op->req->io_task_work.func = io_opaque_resume;
-		io_req_task_work_add(op->req);
+		op->phase = IO_OPAQUE_IDLE;
+		/* Native multishot polling also observes FIN, RST and urgent data. */
+		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 	}
 }
 
@@ -544,8 +546,6 @@ static void io_opaque_wait(struct io_opaque_req *op, enum io_opaque_phase phase)
 		list_add_tail(&op->cancel, &op->req->ctx->opaque_waits);
 	guard(spinlock_irqsave)(&op->store->wait_lock);
 	op->phase = phase;
-	if (phase == IO_OPAQUE_BUDGET_WAIT)
-		list_add_tail(&op->wait, &op->store->budget_waits);
 }
 
 static void io_opaque_queue_ready(struct io_opaque_req *op, int result)
@@ -739,7 +739,7 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 		list_del_init(&op->read);
 		if (!ret)
 			ret = stream->error ?: -ENODATA;
-		io_opaque_queue_ready(op, ret < 0 ? ret : op->length);
+		io_opaque_queue_ready(op, ret == 1 ? op->length : ret);
 	}
 	for (node = rb_first_cached(&stream->decisions); node; node = after) {
 		op = rb_entry(node, struct io_opaque_req, decision);
@@ -751,7 +751,7 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 		RB_CLEAR_NODE(node);
 		if (!ret)
 			ret = stream->error ?: -ENODATA;
-		io_opaque_queue_ready(op, ret < 0 ? ret : op->length);
+		io_opaque_queue_ready(op, ret == 1 ? op->length : ret);
 	}
 }
 
@@ -1013,7 +1013,7 @@ static int io_opaque_attach(struct io_opaque_req *op)
 		slot->generation++;
 		stream->token = (u64)slot->generation << 32 | (i + 1);
 		cqe[0].user_data = op->req->cqe.user_data;
-		cqe[0].flags = IORING_CQE_F_MORE;
+		cqe[0].flags = IORING_CQE_F_MORE | ctx_cqe32_flags(op->req->ctx);
 		memcpy(&cqe[1], &stream->token, sizeof(stream->token));
 		if (!io_req_post_cqe32(op->req, cqe)) {
 			write_unlock_bh(&sock->sk->sk_callback_lock);
@@ -1059,6 +1059,10 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 			goto out;
 	}
 	stream = op->stream;
+	scoped_guard(spinlock_irqsave, &op->store->wait_lock) {
+		list_del_init(&op->wait);
+		op->phase = IO_OPAQUE_IDLE;
+	}
 	mutex_lock(&stream->lock);
 	if (stream->closed || READ_ONCE(op->store->dead)) {
 		ret = -ECANCELED;
@@ -1072,7 +1076,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	else
 		ret = tcp_read_sock(sock->sk, &desc, io_opaque_actor);
 	if (sock->sk->sk_err)
-		stream->error = -sock_error(sock->sk);
+		stream->error = sock_error(sock->sk);
 	if ((sock->sk->sk_shutdown & RCV_SHUTDOWN) &&
 	    skb_queue_empty(&sock->sk->sk_receive_queue))
 		stream->eof = true;
@@ -1084,15 +1088,21 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	if (stream->error || stream->eof) {
 		ret = stream->error;
 	} else if (ret == -ENOBUFS) {
-		io_opaque_wait(op, IO_OPAQUE_BUDGET_WAIT);
+		scoped_guard(spinlock_irqsave, &op->store->wait_lock) {
+			op->phase = IO_OPAQUE_BUDGET_POLL;
+			list_add_tail(&op->wait, &op->store->budget_waits);
+		}
 		/* Recheck after enrollment to close the release/enrollment race. */
 		if (atomic64_read(&op->store->bytes) + stream->need_bytes <=
 		    op->store->config.hard_limit - op->store->config.compact_headroom &&
 		    atomic_read(&op->store->extents) < op->store->config.max_extents - 2)
 			io_opaque_wake_budget(op->store);
-		ret = IOU_ISSUE_SKIP_COMPLETE;
+		ret = IOU_RETRY;
+	} else if (!desc.count && (issue_flags & IO_URING_F_MULTISHOT)) {
+		/* Drain another bounded batch without waiting for a new TCP edge. */
+		ret = IOU_REQUEUE;
 	} else {
-		ret = -EAGAIN;
+		ret = IOU_RETRY;
 	}
 unlock_stream:
 	mutex_unlock(&stream->lock);
@@ -1109,7 +1119,10 @@ static int io_opaque_copy(struct io_opaque_data *data, u64 off, u32 length,
 			  void __user *dest)
 {
 	struct io_opaque_extent *extent;
-	u64 end = off + length;
+	u64 end = off + length, done = off;
+
+	if (end > data->length)
+		return -ENODATA;
 
 	list_for_each_entry(extent, &data->extents, list) {
 		u64 first = max(off, extent->start);
@@ -1118,6 +1131,8 @@ static int io_opaque_copy(struct io_opaque_data *data, u64 off, u32 length,
 
 		if (first >= last)
 			continue;
+		if (first != done)
+			return -ENODATA;
 		while (first < last) {
 			u32 offset = offset_in_page(pos);
 			u32 chunk = min_t(u64, last - first, PAGE_SIZE - offset);
@@ -1132,8 +1147,9 @@ static int io_opaque_copy(struct io_opaque_data *data, u64 off, u32 length,
 			pos += chunk;
 			first += chunk;
 		}
+		done = last;
 	}
-	return length;
+	return done == end ? length : -ENODATA;
 }
 
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
@@ -1151,7 +1167,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (ret >= 0 && op->op == IORING_OPAQUE_READ_STREAM)
 		ret = io_opaque_copy(op->data, 0, op->length, op->addr);
 	if (ret >= 0 && op->op == IORING_OPAQUE_KEEP) {
-		ret = io_opaque_vector(op->data);
+		ret = op->data->length == op->length ? io_opaque_vector(op->data) : -ENODATA;
 		if (!ret) {
 			struct io_opaque_slot *slot = &store->objects[op->slot];
 

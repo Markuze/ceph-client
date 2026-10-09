@@ -1317,6 +1317,7 @@ int io_recvzc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (zc->ifq->opaque) {
 		if (zc->len || (req->flags & (REQ_F_CQE_SKIP | REQ_F_FORCE_ASYNC)))
 			return -EINVAL;
+		req->flags |= REQ_F_APOLL_MULTISHOT;
 		return io_opaque_recv_prep(req, zc->ifq->opaque);
 	}
 	/* All data completions are posted as aux CQEs. */
@@ -1332,8 +1333,12 @@ int io_recvzc(struct io_kiocb *req, unsigned int issue_flags)
 	unsigned int len;
 	int ret;
 
-	if (zc->ifq->opaque)
+	if (zc->ifq->opaque) {
+		if (!(req->flags & REQ_F_POLLED) &&
+		    (zc->flags & IORING_RECVSEND_POLL_FIRST))
+			return -EAGAIN;
 		return io_opaque_recv(req, issue_flags);
+	}
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
 		return -ENOTSOCK;
