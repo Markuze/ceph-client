@@ -208,6 +208,133 @@ static void opaque_capture_budget(struct kunit *test)
 	put_page(second);
 }
 
+static void opaque_capture_gaps(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, 2);
+	struct sk_buff *skb;
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	opaque_test_stream(&stream, store);
+	for (i = 0; i < 8; i++) {
+		skb = opaque_test_frag(test, page, i * 1024, 512);
+		KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 512, false), 512);
+		stream.next += 512;
+		kfree_skb(skb);
+	}
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)4 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 8);
+	KUNIT_EXPECT_EQ(test, page_count(page), 2);
+	list_splice_init(&stream.extents, &data->extents);
+	data->length = stream.next;
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_EXPECT_EQ(test, data->charge, (u64)4 * PAGE_SIZE);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	put_page(page);
+}
+
+static void opaque_capture_copy_pack(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_extent *extent;
+	int i;
+
+	opaque_test_stream(&stream, store);
+	for (i = 0; i < 16; i++) {
+		struct sk_buff *skb = alloc_skb(32, GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, skb);
+		memset(skb_put(skb, 32), i, 32);
+		skb_get(skb);
+		KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), 32);
+		stream.next += 32;
+		kfree_skb(skb);
+		kfree_skb(skb);
+	}
+	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
+	KUNIT_EXPECT_EQ(test, extent->length, 512U);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->copied), 512LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 1);
+	for (i = 0; i < 16; i++) {
+		void *mapped = kmap_local_page(extent->backing->page);
+
+		KUNIT_EXPECT_EQ(test, ((u8 *)mapped)[i * 32], (u8)i);
+		KUNIT_EXPECT_EQ(test, ((u8 *)mapped)[i * 32 + 31], (u8)i);
+		kunmap_local(mapped);
+	}
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+}
+
+static void opaque_capture_partial_pressure(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct page *first = alloc_page(GFP_KERNEL), *second = alloc_page(GFP_KERNEL);
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+	read_descriptor_t desc = { .count = PAGE_SIZE, .arg.data = &stream };
+
+	KUNIT_ASSERT_NOT_NULL(test, first);
+	KUNIT_ASSERT_NOT_NULL(test, second);
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	store->config.hard_limit = PAGE_SIZE;
+	opaque_test_stream(&stream, store);
+	get_page(first);
+	get_page(second);
+	skb_add_rx_frag(skb, 0, first, 0, 512, PAGE_SIZE);
+	skb_add_rx_frag(skb, 1, second, 0, 512, PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, 1024), 512);
+	KUNIT_EXPECT_EQ(test, desc.error, -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, stream.next, 512ULL);
+	kfree_skb(skb);
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	put_page(first);
+	put_page(second);
+}
+
+static void opaque_capture_private_budget(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, 2);
+	struct io_opaque_req op = {
+		.store = store, .stream = &stream, .data = data,
+		.op = IORING_OPAQUE_KEEP, .length = 8 * PAGE_SIZE,
+	};
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	store->config.hard_limit = 8 * PAGE_SIZE;
+	opaque_test_stream(&stream, store);
+	KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&op), 0);
+	for (i = 0; i < 32; i++) {
+		struct sk_buff *skb = opaque_test_frag(test, page, (i % 8) * PAGE_SIZE / 2,
+						      PAGE_SIZE / 4);
+
+		KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, PAGE_SIZE / 4, false),
+				(int)PAGE_SIZE / 4);
+		stream.next += PAGE_SIZE / 4;
+		kfree_skb(skb);
+	}
+	KUNIT_EXPECT_EQ(test, data->length, (u64)8 * PAGE_SIZE);
+	KUNIT_EXPECT_LE(test, atomic64_read(&store->bytes), (s64)8 * PAGE_SIZE);
+	KUNIT_EXPECT_GT(test, atomic64_read(&store->copied), 0LL);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	put_page(page);
+}
+
 static void opaque_split_shared_charge(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
@@ -536,7 +663,7 @@ static void opaque_send_versions(struct kunit *test)
 	io_opaque_data_put(store, data);
 	io_opaque_data_put(store, compact.data);
 	io_opaque_data_put(store, first.data);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)20 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)ALIGN(80000, PAGE_SIZE));
 	io_opaque_data_put(store, second.data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
@@ -549,6 +676,10 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_compound),
 	KUNIT_CASE(opaque_capture_oversized),
 	KUNIT_CASE(opaque_capture_budget),
+	KUNIT_CASE(opaque_capture_gaps),
+	KUNIT_CASE(opaque_capture_copy_pack),
+	KUNIT_CASE(opaque_capture_partial_pressure),
+	KUNIT_CASE(opaque_capture_private_budget),
 	KUNIT_CASE(opaque_split_shared_charge),
 	KUNIT_CASE(opaque_keep_restore),
 	KUNIT_CASE(opaque_compact_versions),

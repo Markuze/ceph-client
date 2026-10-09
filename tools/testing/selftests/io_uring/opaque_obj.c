@@ -389,6 +389,7 @@ static void test_collector_edges(struct io_uring_opaque_config *cfg)
 static void test_collector_bulk(struct io_uring_opaque_config *cfg)
 {
 	struct ring r;
+	struct io_uring_opaque_stream_stat stat;
 	struct bursts tx = { .length = 1U << 20, .count = 4096 };
 	struct event event;
 	uint32_t context;
@@ -410,6 +411,9 @@ static void test_collector_bulk(struct io_uring_opaque_config *cfg)
 		require(wait_tag(&r, tags[i]).res == 1U << 30, "collector drains full GiB range");
 	pthread_join(producer, NULL);
 	require(!r.nr_saved && !peek(&r, &event), "continuous collector remains armed");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+			 sizeof(stat), &stat).res && stat.rx_next == 4ULL << 30 &&
+		!stat.undecided_bytes, "stream offset survives TCP sequence wrap");
 	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
 		"continuous collector close");
 	ring_exit(&r);
@@ -761,6 +765,85 @@ static void test_keep_restore(struct io_uring_opaque_config *cfg)
 		close(pair[1]);
 		ksft_test_result_pass("partial KEEP survives %s and supports %s\n",
 				      i ? "timeout" : "cancellation", i ? "DISCARD" : "retry");
+	}
+}
+
+struct interleaved {
+	int fd[2];
+	const unsigned char *data;
+};
+
+static void *interleaved_writer(void *arg)
+{
+	struct interleaved *tx = arg;
+	int i;
+
+	for (i = 0; i < 32; i++) {
+		write_all(tx->fd[0], tx->data + i * 1024, 1024);
+		write_all(tx->fd[1], tx->data + i * 1024, 1024);
+		usleep(1000);
+	}
+	return NULL;
+}
+
+static void test_interleaved(struct io_uring_opaque_config cfg)
+{
+	unsigned char data[32 * 1024], seen[sizeof(data)];
+	int i;
+
+	for (i = 0; i < (int)sizeof(data); i++)
+		data[i] = i % 251;
+	for (i = 0; i < 2; i++) {
+		struct ring r;
+		struct event event;
+		struct io_uring_opaque_stat stat;
+		struct __kernel_timespec timeout = { .tv_sec = 5 };
+		struct io_uring_sqe deadline = {
+			.opcode = IORING_OP_LINK_TIMEOUT, .fd = -1, .len = 1,
+			.addr = (uintptr_t)&timeout, .user_data = next_tag++,
+		};
+		struct interleaved tx = { .data = data };
+		uint32_t context;
+		uint64_t stream, keep;
+		pthread_t producer;
+		int source[2], other[2];
+
+		cfg.hard_limit = i ? sizeof(data) : 256 * 1024;
+		cfg.compact_headroom = 0;
+		require(!ring_init(&r, IORING_SETUP_CQE32), "interleaved ring");
+		require(!register_store(&r, &cfg, &context), "interleaved store");
+		tcp_pair(source);
+		tcp_pair(other);
+		stream = attach(&r, context, source[1], 707);
+		keep = cmd_stage(&r, context, IORING_OPAQUE_KEEP, stream, 0, sizeof(data), NULL);
+		r.sqes[(*r.sq_tail - 1) & *r.sq_mask].flags |= IOSQE_IO_LINK;
+		stage(&r, deadline);
+		enter(&r, 0);
+		tx.fd[0] = source[0];
+		tx.fd[1] = other[0];
+		require(!pthread_create(&producer, NULL, interleaved_writer, &tx),
+			"interleaved producer");
+		event = wait_tag(&r, keep);
+		require(event.res == (int)sizeof(data), "interleaved KEEP fits physical quota");
+		require(wait_tag(&r, deadline.user_data).res == -ECANCELED,
+			"interleaved KEEP beats deadline");
+		pthread_join(producer, NULL);
+		require(command(&r, context, IORING_OPAQUE_READ, event.extra[0], 0,
+				sizeof(seen), seen).res == (int)sizeof(seen) &&
+			!memcmp(data, seen, sizeof(data)), "interleaved complete object bytes");
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+			stat.backing_bytes <= cfg.hard_limit, "interleaved quota bound");
+		require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
+			"interleaved FREE");
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+			"interleaved close");
+		ring_exit(&r);
+		close(source[0]);
+		close(source[1]);
+		close(other[0]);
+		close(other[1]);
+		ksft_test_result_pass("32 KiB interleaved KEEP completes within %llu-byte quota\n",
+				      (unsigned long long)cfg.hard_limit);
 	}
 }
 
@@ -1310,7 +1393,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(39);
+	ksft_set_plan(41);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -1542,5 +1625,6 @@ int main(void)
 	test_send_fifo(&cfg);
 	test_link_order(&cfg);
 	test_keep_restore(&cfg);
+	test_interleaved(cfg);
 	ksft_finished();
 }

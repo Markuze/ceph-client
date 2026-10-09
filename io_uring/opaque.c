@@ -29,6 +29,8 @@ struct io_opaque_backing {
 	refcount_t refs;
 	struct page *page;
 	u64 charge;
+	u32 filled;
+	bool copied;
 };
 
 struct io_opaque_extent {
@@ -311,12 +313,15 @@ static void io_opaque_data_put(struct io_opaque_store *store,
 static int io_opaque_vector(struct io_opaque_data *data)
 {
 	struct io_opaque_extent *extent;
+	struct io_opaque_backing *previous = NULL;
 	u32 nr = 0;
 
 	data->charge = 0;
 	list_for_each_entry(extent, &data->extents, list) {
 		nr++;
-		data->charge += extent->backing->charge;
+		if (extent->backing != previous)
+			data->charge += extent->backing->charge;
+		previous = extent->backing;
 	}
 	data->bvec = kvmalloc_objs(*data->bvec, nr, GFP_KERNEL_ACCOUNT);
 	if (!data->bvec)
@@ -684,6 +689,12 @@ static int io_opaque_take(struct io_opaque_req *op)
 		}
 		stream->undecided -= last - off;
 		if (op->op == IORING_OPAQUE_KEEP) {
+			struct io_opaque_extent *tail;
+
+			tail = list_last_entry_or_null(&op->data->extents,
+						       struct io_opaque_extent, list);
+			if (!tail || tail->backing != extent->backing)
+				op->data->charge += extent->backing->charge;
 			extent->start -= op->offset;
 			list_move_tail(&extent->list, &op->data->extents);
 			op->data->length += last - off;
@@ -718,7 +729,23 @@ static void io_opaque_restore(struct io_opaque_req *op)
 	}
 	stream->undecided += op->data->length;
 	op->data->length = 0;
+	op->data->charge = 0;
 	op->progress = 0;
+}
+
+static u64 io_opaque_dense_left(struct io_opaque_req *op)
+{
+	struct io_opaque_extent *tail;
+	u64 left = op->length - op->progress;
+
+	tail = list_last_entry_or_null(&op->data->extents, struct io_opaque_extent, list);
+	if (tail && tail->backing->copied &&
+	    tail->offset + tail->length == tail->backing->filled) {
+		u32 room = PAGE_SIZE - tail->backing->filled;
+
+		left -= min_t(u64, left, room);
+	}
+	return ALIGN(left, PAGE_SIZE);
 }
 
 static bool io_opaque_overlap(u64 a, u64 alen, u64 b, u64 blen)
@@ -772,6 +799,10 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 		op = rb_entry(node, struct io_opaque_req, decision);
 		after = rb_next(node);
 		ret = stream->closed ? -ECANCELED : io_opaque_take(op);
+		if (!ret && op->op == IORING_OPAQUE_KEEP &&
+		    op->data->charge + io_opaque_dense_left(op) >
+		    op->store->config.hard_limit - op->store->config.compact_headroom)
+			ret = -ENOBUFS;
 		if (!ret && !stream->eof && !stream->closed && !stream->error)
 			continue;
 		rb_erase_cached(node, &stream->decisions);
@@ -790,48 +821,93 @@ static struct io_opaque_req *io_opaque_next_decision(struct io_opaque_stream *st
 	return node ? rb_entry(node, struct io_opaque_req, decision) : NULL;
 }
 
+static struct io_opaque_req *io_opaque_capture_keep(struct io_opaque_stream *stream)
+{
+	struct io_opaque_req *op = io_opaque_next_decision(stream);
+
+	if (op && op->op == IORING_OPAQUE_KEEP && stream->next >= op->offset &&
+	    stream->next < op->offset + op->length)
+		return op;
+	return NULL;
+}
+
+static struct io_opaque_extent *io_opaque_capture_tail(struct io_opaque_stream *stream)
+{
+	struct io_opaque_req *op = io_opaque_capture_keep(stream);
+	struct list_head *list = op ? &op->data->extents : &stream->extents;
+
+	return list_last_entry_or_null(list, struct io_opaque_extent, list);
+}
+
 static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 			    u32 offset, u32 length, bool take_ref, bool copied)
 {
-	struct io_opaque_req *op = io_opaque_next_decision(stream);
+	struct io_opaque_req *op = io_opaque_capture_keep(stream);
 	struct list_head *list = &stream->extents;
-	struct io_opaque_extent *extent;
+	struct io_opaque_extent *extent, *tail;
 	u64 start = stream->next;
+	bool new_backing = false;
 
-	if (op && start >= op->offset && start < op->offset + op->length) {
-		if (op->op == IORING_OPAQUE_DISCARD)
-			return -EINVAL;
+	if (op) {
 		list = &op->data->extents;
 		start -= op->offset;
 	}
-	if (!list_empty(list) && !copied) {
-		extent = list_last_entry(list, struct io_opaque_extent, list);
-		if (extent->backing->page == compound_head(page) &&
-		    extent->start + extent->length == start &&
-		    extent->offset + extent->length ==
-			    offset + (page - compound_head(page)) * PAGE_SIZE) {
-			extent->length += length;
+	tail = list_last_entry_or_null(list, struct io_opaque_extent, list);
+	offset += (page - compound_head(page)) * PAGE_SIZE;
+	page = compound_head(page);
+	if (tail && tail->backing->page == page) {
+		if (tail->start + tail->length == start &&
+		    tail->offset + tail->length == offset) {
+			tail->length += length;
+			extent = tail;
 			goto accounted;
 		}
 	}
-	stream->need_bytes = page_size(compound_head(page));
+	stream->need_bytes = page_size(page);
 	if (atomic_read(&stream->store->extents) >= stream->store->config.max_extents - 2)
 		return -ENOBUFS;
-	extent = io_opaque_extent_new(stream->store, page, offset, length, start, copied);
-	if (IS_ERR(extent))
-		return PTR_ERR(extent);
-	if (take_ref)
-		get_page(page);
+	if (tail && tail->backing->page == page) {
+		if (!io_opaque_extent_reserve(stream->store))
+			return -ENOBUFS;
+		extent = kmalloc_obj(*extent, GFP_KERNEL_ACCOUNT);
+		if (!extent) {
+			atomic_dec(&stream->store->extents);
+			return -ENOMEM;
+		}
+		*extent = (struct io_opaque_extent) {
+			.backing = tail->backing, .start = start,
+			.offset = offset, .length = length,
+		};
+		refcount_inc(&extent->backing->refs);
+	} else {
+		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
+
+		/* Leave room for dense copies of a private KEEP's remaining bytes. */
+		if (!copied && op && op->data->charge + stream->need_bytes + left >
+		    stream->store->config.hard_limit - stream->store->config.compact_headroom)
+			return -ENOBUFS;
+		extent = io_opaque_extent_new(stream->store, page, offset, length, start, copied);
+		if (IS_ERR(extent))
+			return PTR_ERR(extent);
+		if (take_ref)
+			get_page(page);
+		extent->backing->copied = copied;
+		new_backing = true;
+	}
 	list_add_tail(&extent->list, list);
 accounted:
-	if (op && list == &op->data->extents) {
+	if (op) {
 		op->progress += length;
 		op->data->length += length;
+		if (new_backing)
+			op->data->charge += extent->backing->charge;
 	} else {
 		stream->undecided += length;
 	}
-	if (copied)
+	if (copied) {
+		extent->backing->filled = offset + length;
 		atomic64_add(length, &stream->store->copied);
+	}
 	return length;
 }
 
@@ -865,6 +941,8 @@ static int io_opaque_capture(struct io_opaque_stream *stream,
 		} else {
 			goto copy;
 		}
+		if (ret == -ENOBUFS)
+			goto copy;
 		goto head_done;
 	}
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
@@ -880,6 +958,8 @@ static int io_opaque_capture(struct io_opaque_stream *stream,
 			goto copy;
 		ret = io_opaque_append(stream, skb_frag_page(frag),
 				       skb_frag_off(frag) + offset - start, chunk, true, false);
+		if (ret == -ENOBUFS)
+			goto copy;
 		goto head_done;
 	}
 	skb_walk_frags(skb, child) {
@@ -892,25 +972,35 @@ static int io_opaque_capture(struct io_opaque_stream *stream,
 	}
 	return -EFAULT;
 copy:
-	chunk = min_t(u32, chunk, PAGE_SIZE);
 	{
+		struct io_opaque_extent *tail = io_opaque_capture_tail(stream);
 		struct page *page;
+		u32 pos = 0;
+		bool allocated = true;
 		void *mapped;
 
-		stream->need_bytes = PAGE_SIZE;
-		if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
-			return -ENOBUFS;
-		page = alloc_page(GFP_KERNEL_ACCOUNT);
-		if (!page) {
-			io_opaque_uncharge(stream->store, PAGE_SIZE);
-			return -ENOMEM;
+		if (tail && tail->backing->copied && tail->backing->filled < PAGE_SIZE &&
+		    tail->offset + tail->length == tail->backing->filled) {
+			page = tail->backing->page;
+			pos = tail->backing->filled;
+			allocated = false;
+		} else {
+			stream->need_bytes = PAGE_SIZE;
+			if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
+				return -ENOBUFS;
+			page = alloc_page(GFP_KERNEL_ACCOUNT);
+			if (!page) {
+				io_opaque_uncharge(stream->store, PAGE_SIZE);
+				return -ENOMEM;
+			}
 		}
+		chunk = min_t(u32, chunk, PAGE_SIZE - pos);
 		mapped = kmap_local_page(page);
-		ret = skb_copy_bits(skb, offset, mapped, chunk);
+		ret = skb_copy_bits(skb, offset, mapped + pos, chunk);
 		kunmap_local(mapped);
 		if (!ret)
-			ret = io_opaque_append(stream, page, 0, chunk, false, true);
-		if (ret < 0) {
+			ret = io_opaque_append(stream, page, pos, chunk, false, true);
+		if (ret < 0 && allocated) {
 			put_page(page);
 			io_opaque_uncharge(stream->store, PAGE_SIZE);
 		}
@@ -947,8 +1037,10 @@ static int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 			}
 		}
 		ret = io_opaque_capture(stream, skb, offset, chunk, false);
-		if (ret <= 0)
+		if (ret <= 0) {
+			desc->error = ret;
 			break;
+		}
 consumed:
 		stream->next += ret;
 		consumed += ret;
@@ -1102,6 +1194,8 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 		ret = -EOPNOTSUPP;
 	else
 		ret = tcp_read_sock(sock->sk, &desc, io_opaque_actor);
+	if (desc.error)
+		ret = desc.error;
 	if (sock->sk->sk_err)
 		stream->error = sock_error(sock->sk);
 	if ((sock->sk->sk_shutdown & RCV_SHUTDOWN) &&
@@ -1112,6 +1206,16 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	if (ret < 0 && ret != -ENOBUFS)
 		stream->error = ret;
 	io_opaque_stream_process(stream);
+	if (ret == -ENOBUFS) {
+		struct io_opaque_req *keep = io_opaque_capture_keep(stream);
+
+		/* A private prefix must not pin quota indefinitely awaiting itself. */
+		if (keep && keep->progress) {
+			rb_erase_cached(&keep->decision, &stream->decisions);
+			RB_CLEAR_NODE(&keep->decision);
+			io_opaque_queue_ready(keep, -ENOBUFS);
+		}
+	}
 	if (stream->error || stream->eof) {
 		ret = stream->error;
 	} else if (ret == -ENOBUFS) {

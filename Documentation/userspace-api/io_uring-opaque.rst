@@ -111,10 +111,13 @@ requests. A following header can be read independently of a preceding KEEP.
 Object slots and private assembly are reserved before a KEEP can consume data.
 Generation exhaustion retires a slot instead of wrapping a stale handle.
 KEEP lengths exceeding either the configured object-size bound or the entire
-capture allowance are rejected with EMSGSIZE. Actual page/extent charges can
-still exhaust the budget during private assembly; use request deadlines or
-cancellation to bound waits. The RFC compacts published objects, not private
-incomplete assembly.
+capture allowance are rejected with EMSGSIZE. Capture falls back to packed
+page copies when retaining another allocation would leave no room for dense
+backing of the remaining private range. If physical backing or extent limits
+still stop a partial KEEP, it completes with ENOBUFS and restores its prefix;
+it does not indefinitely pin quota waiting for its own completion. A range
+with no captured prefix can wait for quota release. Deadlines and cancellation
+remain available. Compaction operates on published objects.
 
 EOF before completion produces ENODATA; network errors propagate. ASYNC_CANCEL,
 linked timeouts, stream close and ring teardown terminate pending ranges.
@@ -209,9 +212,13 @@ compaction replaces that reference. Old versions remain charged until their
 store references disappear.
 
 Capture combines backing and initial extent metadata in one allocation and
-coalesces adjacent compatible extents. Splits share a backing reference and
-its charge. Independent captures can conservatively charge the same physical
-allocation more than once. A retained compound allocation is charged in full.
+coalesces adjacent compatible extents. Successive captures from the same
+compound allocation share its backing and charge even when another socket's
+data separates their physical offsets. Splits also share the backing reference
+and charge. Independent captures can still conservatively charge the same
+physical allocation more than once. A retained compound allocation is charged
+in full. Copy fallback appends into unused space in the previous owned page;
+it does not allocate a whole page for every small fragment.
 Vectors are built once at object publication and are bounded by extent limits.
 Releasing backing or metadata wakes collectors suspended on the store budget,
 without polling a readable socket repeatedly while memory remains unavailable.
