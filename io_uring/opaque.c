@@ -773,7 +773,7 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	stream->need_bytes = page_size(compound_head(page));
 	if (atomic_read(&stream->store->extents) >= stream->store->config.max_extents - 2)
 		return -ENOBUFS;
-	extent = io_opaque_extent_new(stream->store, page, offset, length, start, false);
+	extent = io_opaque_extent_new(stream->store, page, offset, length, start, copied);
 	if (IS_ERR(extent))
 		return PTR_ERR(extent);
 	if (take_ref)
@@ -850,18 +850,26 @@ static int io_opaque_capture(struct io_opaque_stream *stream,
 copy:
 	chunk = min_t(u32, chunk, PAGE_SIZE);
 	{
-		struct page *page = alloc_page(GFP_KERNEL_ACCOUNT);
+		struct page *page;
 		void *mapped;
 
-		if (!page)
+		stream->need_bytes = PAGE_SIZE;
+		if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
+			return -ENOBUFS;
+		page = alloc_page(GFP_KERNEL_ACCOUNT);
+		if (!page) {
+			io_opaque_uncharge(stream->store, PAGE_SIZE);
 			return -ENOMEM;
+		}
 		mapped = kmap_local_page(page);
 		ret = skb_copy_bits(skb, offset, mapped, chunk);
 		kunmap_local(mapped);
 		if (!ret)
 			ret = io_opaque_append(stream, page, 0, chunk, false, true);
-		if (ret < 0)
+		if (ret < 0) {
 			put_page(page);
+			io_opaque_uncharge(stream->store, PAGE_SIZE);
+		}
 	}
 head_done:
 	if (ret > 0)
