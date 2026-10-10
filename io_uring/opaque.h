@@ -47,6 +47,7 @@ struct io_opaque_req {
 	bool slot_reserved;
 	bool consumed;
 	bool resolved;
+	bool budget_reported;
 	union {
 		struct {
 			struct rb_node decision;

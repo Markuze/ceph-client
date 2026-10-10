@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -1008,6 +1009,10 @@ static void test_budget_error(struct io_uring_opaque_config cfg)
 		require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
 				 sizeof(stat), &stat).res && stat.rx_next == 1,
 			"collector is stalled by retained backing");
+		event = wait_tag(&r, 709);
+		require(event.res == -ENOBUFS && (event.flags & IORING_CQE_F_MORE) &&
+			event.extra[0] == stream && event.extra[1] == 1,
+			"quota-stalled collector reports pressure before socket errors");
 		if (i) {
 			require(send(pair[0], "!", 1, MSG_OOB) == 1, "urgent data at full quota");
 		} else {
@@ -1805,6 +1810,196 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	close(pair[0]);
 	close(pair[1]);
 	ksft_test_result_pass("budget stall/resume, control admission and discard at capacity\n");
+}
+
+static void wait_unread(int fd, unsigned int length)
+{
+	unsigned int attempt;
+	int unread;
+
+	for (attempt = 0; attempt < 5000; attempt++) {
+		require(!ioctl(fd, FIONREAD, &unread), "TCP unread count");
+		if (unread == (int)length)
+			return;
+		usleep(1000);
+	}
+	require(false, "unadmitted bytes remain on TCP");
+}
+
+static void test_budget_notifications(struct io_uring_opaque_config cfg)
+{
+	static const char request[] = "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+	static const unsigned int flags[] = { IORING_SETUP_CQE32, IORING_SETUP_CQE_MIXED };
+	unsigned int i;
+
+	cfg.hard_limit = 2 * sysconf(_SC_PAGESIZE);
+	cfg.compact_headroom = sysconf(_SC_PAGESIZE);
+	for (i = 0; i < ARRAY_SIZE(flags); i++) {
+		struct ring r, release;
+		struct io_uring_opaque_stream_stat stream_stat;
+		struct io_uring_opaque_stat stat;
+		struct event event;
+		uint32_t context, released_context;
+		uint64_t cached_stream, stream, handle, tag, collector;
+		unsigned char seen[512];
+		unsigned int attempt, length = sizeof(request) - 1;
+		int cached[2], source[2], store_fd;
+
+		require(!ring_init(&r, flags[i]), "pressure notification ring");
+		require(!ring_init(&release, IORING_SETUP_CQE32), "pressure release ring");
+		require(!register_store(&r, &cfg, &context), "pressure notification store");
+		store_fd = export_store(&r, context);
+		require(store_fd >= 0 && !import_store(&release, store_fd, &released_context),
+			"pressure release shared store");
+		close(store_fd);
+		tcp_pair(cached);
+		tcp_pair(source);
+		cached_stream = attach(&r, context, cached[1], next_tag++);
+		tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT,
+				cached_stream, 0, 8, NULL);
+		write_all(cached[0], "quota123", 8);
+		event = wait_tag(&r, tag);
+		require(event.res == 8, "pressure cached object");
+		handle = event.extra[0];
+		collector = next_tag++;
+		stream = attach(&r, context, source[1], collector);
+		tag = cmd_stage(&r, context, IORING_OPAQUE_INSPECT,
+				stream, 0, sizeof(seen), seen);
+		write_all(source[0], request, length);
+		event = wait_tag(&r, collector);
+		require(event.res == -ENOBUFS && (event.flags & IORING_CQE_F_MORE) &&
+			event.extra[0] == stream && !event.extra[1],
+			"quota CQE identifies the live stream and unread offset");
+		if (flags[i] == IORING_SETUP_CQE_MIXED)
+			require(event.flags & IORING_CQE_F_32, "pressure CQE carries mixed extras");
+		wait_unread(source[1], length);
+		for (attempt = 0; attempt < 8; attempt++) {
+			write_all(source[0], "x", 1);
+			wait_unread(source[1], length + attempt + 1);
+			require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+					 sizeof(stream_stat), &stream_stat).res &&
+				!stream_stat.rx_next && !stream_stat.undecided_bytes &&
+				!stream_stat.error && !r.nr_saved,
+				"repeated arrivals do not consume bytes or duplicate quota CQEs");
+		}
+		length += attempt;
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+			stat.backing_bytes == cfg.hard_limit - cfg.compact_headroom,
+			"pressure stays within capture allowance");
+		require(!command(&release, released_context, IORING_OPAQUE_FREE,
+				 handle, 0, 0, NULL).res, "another ring releases receive capacity");
+		event = wait_tag(&r, tag);
+		require(event.res == (int)length && !memcmp(seen, request, sizeof(request) - 1),
+			"release resumes pending inspection without rearming collection");
+		for (attempt = sizeof(request) - 1; attempt < length; attempt++)
+			require(seen[attempt] == 'x', "resumed receive preserves queued bytes");
+		require(command(&r, context, IORING_OPAQUE_DISCARD,
+				stream, 0, length, NULL).res == (int)length,
+			"discard inspected request");
+		tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT,
+				cached_stream, 8, 8, NULL);
+		write_all(cached[0], "quota456", 8);
+		event = wait_tag(&r, tag);
+		require(event.res == 8, "refill after pressure recovery");
+		handle = event.extra[0];
+		tag = cmd_stage(&r, context, IORING_OPAQUE_INSPECT,
+				stream, length, sizeof(seen), seen);
+		write_all(source[0], request, sizeof(request) - 1);
+		event = wait_tag(&r, collector);
+		require(event.res == -ENOBUFS && (event.flags & IORING_CQE_F_MORE) &&
+			event.extra[0] == stream && event.extra[1] == length,
+			"new unread offset reports a new quota episode");
+		wait_unread(source[1], sizeof(request) - 1);
+		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE,
+				 stream, 0, 0, NULL).res, "close a quota-paused stream");
+		require(wait_tag(&r, tag).res == -ECANCELED, "close cancels paused inspection");
+		event = wait_tag(&r, collector);
+		require(event.res == -ECANCELED && !(event.flags & IORING_CQE_F_MORE),
+			"quota-paused collector has one terminal completion");
+		read_all(source[1], seen, sizeof(request) - 1);
+		require(!memcmp(seen, request, sizeof(request) - 1),
+			"closing the claim exposes bytes never taken from TCP");
+		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res &&
+			!command(&r, context, IORING_OPAQUE_STREAM_CLOSE,
+				 cached_stream, 0, 0, NULL).res, "pressure fixture teardown");
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+			!stat.backing_bytes && !stat.extents && !stat.objects && !stat.streams,
+			"pressure recovery drains backing and metadata");
+		ring_exit(&release);
+		ring_exit(&r);
+		close(cached[0]);
+		close(cached[1]);
+		close(source[0]);
+		close(source[1]);
+		ksft_test_result_pass("%s quota CQE retains TCP bytes and resumes after FREE\n",
+				      i ? "mixed" : "32-byte");
+	}
+}
+
+static void test_budget_full_cq(struct io_uring_opaque_config cfg)
+{
+	struct io_uring_sqe nop = { .opcode = IORING_OP_NOP };
+	struct io_uring_opaque_stream_stat stream_stat;
+	struct io_uring_opaque_stat stat;
+	struct ring r;
+	struct event event;
+	uint32_t context;
+	uint64_t cached_stream, stream, handle, tag, collector;
+	unsigned char seen[3];
+	unsigned int i;
+	int cached[2], source[2];
+
+	cfg.hard_limit = sysconf(_SC_PAGESIZE);
+	cfg.compact_headroom = 0;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "pressure full CQ ring");
+	require(!register_store(&r, &cfg, &context), "pressure full CQ store");
+	tcp_pair(cached);
+	tcp_pair(source);
+	cached_stream = attach(&r, context, cached[1], next_tag++);
+	tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, cached_stream, 0, 8, NULL);
+	write_all(cached[0], "quota123", 8);
+	event = wait_tag(&r, tag);
+	require(event.res == 8, "pressure full CQ cached object");
+	handle = event.extra[0];
+	collector = next_tag++;
+	stream = attach(&r, context, source[1], collector);
+	for (i = 0; i < r.p.cq_entries; i++) {
+		nop.user_data = next_tag++;
+		stage(&r, nop);
+		if ((i + 1) % r.p.sq_entries == 0)
+			enter(&r, 0);
+	}
+	enter(&r, 0);
+	write_all(source[0], "cq!", sizeof(seen));
+	wait_unread(source[1], sizeof(seen));
+	enter(&r, 0);
+	for (i = 0; i < r.p.cq_entries; i++)
+		require(peek(&r, &event) && !event.res && event.tag != collector,
+			"drain pressure notification full CQ");
+	event = wait_tag(&r, collector);
+	require(event.res == -ENOSPC && !(event.flags & IORING_CQE_F_MORE),
+		"pressure CQ overflow ends collection explicitly");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, stream, 0,
+			 sizeof(stream_stat), &stream_stat).res && !stream_stat.rx_next &&
+		!stream_stat.undecided_bytes && stream_stat.error == -ENOSPC,
+		"pressure CQ overflow preserves the token without consuming TCP");
+	wait_unread(source[1], sizeof(seen));
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"release pressure CQ overflow claim");
+	read_all(source[1], seen, sizeof(seen));
+	require(!memcmp(seen, "cq!", sizeof(seen)), "CQ overflow leaves socket bytes intact");
+	require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, cached_stream, 0, 0, NULL).res,
+		"pressure full CQ fixture teardown");
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.extents && !stat.objects && !stat.streams,
+		"pressure full CQ drains backing and metadata");
+	ring_exit(&r);
+	close(cached[0]);
+	close(cached[1]);
+	close(source[0]);
+	close(source[1]);
+	ksft_test_result_pass("full CQ quota failure preserves the token and unread TCP bytes\n");
 }
 
 struct blocked_read {
@@ -2674,7 +2869,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(73);
+	ksft_set_plan(76);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -2898,6 +3093,8 @@ int main(void)
 	test_framed_backpressure(&cfg);
 	test_frame_quota(&cfg);
 	test_budget(cfg);
+	test_budget_notifications(cfg);
+	test_budget_full_cq(cfg);
 	test_waiting_reader(&cfg);
 	test_eof(&cfg);
 	test_urgent(&cfg);

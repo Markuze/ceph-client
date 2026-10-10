@@ -1192,6 +1192,25 @@ unlock:
 	return ret;
 }
 
+/* Report a budget stall once per unread offset, without ending collection. */
+static int io_opaque_budget_cqe(struct io_opaque_req *op)
+{
+	struct io_opaque_stream *stream = op->stream;
+	struct io_uring_cqe cqe[2] = {};
+	u64 extra[2] = { stream->token, stream->next };
+
+	if (op->budget_reported && op->offset == stream->next)
+		return 0;
+	cqe[0].res = -ENOBUFS;
+	cqe[0].flags = IORING_CQE_F_MORE | ctx_cqe32_flags(op->req->ctx);
+	memcpy(&cqe[1], extra, sizeof(extra));
+	if (!io_req_post_cqe32(op->req, cqe))
+		return -ENOSPC;
+	op->budget_reported = true;
+	op->offset = stream->next;
+	return 0;
+}
+
 int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
@@ -1256,6 +1275,15 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 			rb_erase_cached(&keep->decision, &stream->decisions);
 			RB_CLEAR_NODE(&keep->decision);
 			io_opaque_queue_ready(keep, -ENOBUFS);
+		}
+	}
+	if (ret == -ENOBUFS && !stream->error && !stream->eof) {
+		int err = io_opaque_budget_cqe(op);
+
+		if (err) {
+			/* Retain the token and captured prefix for explicit recovery. */
+			stream->error = err;
+			io_opaque_stream_process(stream);
 		}
 	}
 	if (stream->error || stream->eof) {

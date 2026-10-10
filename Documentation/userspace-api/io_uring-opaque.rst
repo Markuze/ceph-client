@@ -73,6 +73,21 @@ ownership is acquired. No bytes are consumed before this CQE can be posted.
 A full completion queue rejects attachment with ENOSPC before acquiring the
 receive claim or consuming TCP bytes. Drain completions before retrying attach.
 ``IORING_RECVSEND_POLL_FIRST`` waits for socket readiness before attachment.
+A backing or extent quota stall produces a nonterminal 32-byte CQE with result
+``-ENOBUFS`` and ``IORING_CQE_F_MORE``. Its extra words contain the stream token
+and the absolute first unread TCP offset respectively. The notification is
+coalesced until that offset advances. The application can release objects,
+compact backing or cancel pending work to make capacity available; eligible
+collectors resume automatically after release. No replacement COLLECT is needed.
+Quota is reserved before captured bytes are consumed from TCP. A failed
+admission leaves those bytes on the socket; an already admitted prefix may
+have advanced the stream. An explicit DISCARD can still skip its declared
+range without retaining backing. Pending inspection/range requests and the
+stream token remain live during a budget pause, subject to their usual
+cancellation and incomplete-object failure rules. Network errors still end
+collection. If the pressure notification cannot fit in the CQ, collection
+ends with ``ENOSPC``; the token and captured bytes remain available for explicit
+STREAM_CLOSE/recovery and no further TCP bytes are collected.
 A terminal CQE ends the collector on EOF, error, cancellation or stream close.
 The RFC collector rejects ``IOSQE_ASYNC`` and CQE suppression.
 
@@ -178,7 +193,8 @@ page copies when retaining another allocation would leave no room for dense
 backing of the remaining private range. If physical backing or extent limits
 still stop a partial RECV_OBJECT, it completes with ENOBUFS and restores its prefix;
 it does not indefinitely pin quota waiting for its own completion. A range
-with no captured prefix can wait for quota release. Deadlines and cancellation
+with no captured prefix can wait for quota release, announced by the collector's
+nonterminal ENOBUFS CQE. Deadlines and cancellation
 remain available. Compaction operates on published objects.
 
 EOF before completion produces ENODATA; network errors propagate. ASYNC_CANCEL,
@@ -480,7 +496,9 @@ results and peer payload order; partial head sends cancel queued followers
 and linked final sends without transferring unissued object ownership.
 Tests also cover interleaved fragment charges, prefix restoration, batched
 compaction cancellation, socket errors at full quota, IPv4/IPv6 disconnect
-ownership, socket-file lifetime, POLL_FIRST and attach with a full CQ.
+ownership, socket-file lifetime, POLL_FIRST and attach with a full CQ. Quota
+notification tests check unread TCP bytes, coalescing, resumption after a
+cross-ring release, and a full CQ while reporting pressure.
 
 Build against the patched UAPI, using an already configured kernel build::
 
