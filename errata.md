@@ -13,11 +13,14 @@ them during KVS/forwarder integration and before freezing affected ABI
 semantics. Quota exhaustion can be routine for a cache near capacity, so it
 should be exercised in the application baseline work.
 
-The receive-pressure part of E01 now follows the policy accepted below. Its
-remaining efficiency work and E02-E07 remain **open, deferred follow-up work**.
+Updated 2026-10-11 for v5 preparation, tested implementation
+`2cb5da9c7cda1eb0b349030260740e4af034f9f7` on `work/opaque-obj-v5`.
+The receive-pressure part of E01 follows the accepted policy below, and small
+framing allocations now use their allocator bucket. Saturation/resource-policy
+work in E01 and E02-E07 remain **open, deferred follow-up work**.
 
 This file records observed code behavior, its application consequences and
-possible remedies. Except for E01's accepted receive-pressure follow-up,
+possible remedies. Except for E01's receive-pressure and framing-allocation fixes,
 proposed remedies and future checks remain unimplemented. It makes no
 performance claims.
 The [ABI documentation](Documentation/userspace-api/io_uring-opaque.rst)
@@ -35,14 +38,15 @@ remains the description of the implemented interface.
 
 ## E01: cache retention can prevent useful GET work
 
-**Behavior at the recorded v4 implementation.** Retained payload, undecided
+**Current behavior.** Retained payload, undecided
 receive bytes and send framing snapshots share the ordinary capture allowance:
 `hard_limit - compact_headroom`. If cached objects exhaust it, capturing a new
 GET header that needs additional backing stalls the collector until capacity
 is released. An INSPECT waiting for that header therefore remains pending.
 A framed SEND of an existing object can instead fail with `ENOBUFS`, including
-a generated-only response. A nonempty framing snapshot reserves a power-of-two
-allocation of at least `PAGE_SIZE`, even for a one-byte prefix.
+a generated-only response. V5 reserves the allocator bucket for nonempty framing
+snapshots; the former minimum `PAGE_SIZE` charge is removed. This reduces small
+reply charges but does not provide capacity when the ordinary allowance is full.
 
 **Accepted policy and implemented follow-up.** Quota exhaustion is propagated
 to the application. COLLECT posts a nonterminal `-ENOBUFS` CQE with `F_MORE`,
@@ -62,8 +66,9 @@ framing; free/evict values before exhausting it. Compaction headroom is not
 available to these operations. A future DISCARD can bypass capture allocation
 only when the application already knows the range to discard.
 
-**Deferred follow-up.** Evaluate smaller allocations for small framing and the
-application's eviction/admission policy under pressure. Any later change to
+**Deferred follow-up.** Measure the smaller framing allocation path and the
+application's eviction/admission policy under pressure. Evaluate separate receive
+and reply capacity without consuming the compaction reserve. Any later change to
 resource partitioning must preserve explicit bounds; receive progress requires
 available capacity under the accepted policy.
 
@@ -76,12 +81,23 @@ per unread offset, automatic resumption after a cross-ring release, mixed CQEs,
 close while paused and failure to report pressure into a full CQ. The KVS
 baseline should exercise its own admission/eviction response to this signal.
 
-**Follow-up validation (2026-10-10).** The updated branch passes 23 KUnit tests
-and 76 ABI groups under KASAN/lockdep. The PAGE_POOL/ZCRX-disabled debug build
-passes the same 23 KUnit tests and 74 ABI groups, with two expected fault-test
-skips. These runs include the three new pressure groups, 10,000 arrival/drain
-cycles and 4 GiB of DISCARD traffic; they are functional checks, not performance
-measurements.
+**V5 validation (2026-10-11).** The tested implementation passes 23 KUnit tests
+and 77 ABI groups under KASAN/lockdep. The PAGE_POOL/ZCRX-disabled debug build
+passes the same 23 KUnit tests and 75 ABI groups, with two expected fault-test
+skips. Both runs include pressure notifications, 10,000 arrival/drain cycles,
+4 GiB of DISCARD traffic and 10,000 cross-ring SEND races on separate CPUs.
+The races check successful and partial heads, cancellation, linked timeouts,
+wire order, LAST ownership, unique completions and final reference drain. These
+are functional checks, not performance measurements or scheduler-wakeup counts.
+
+The v5 review fixes also reject AF_UNSPEC before socket-state side effects,
+claim SEND completion under the shared waiter lock and restore failed receive
+prefixes while removing their range decisions. Blocked 16 MiB IPv4/IPv6 sends
+and same-batch cancellation/inspection are covered. Old-image runs reproduce
+blocked IPv4 send/state corruption and the same-batch prefix gap. The cross-ring
+race remains a source-inspection finding after a passing 10,000-race baseline
+run. The shared-store concurrency redesign,
+quota fail-fast policy and larger ABI proposals remain deferred.
 
 ## E02: DISCARD failure hides consumed progress
 
