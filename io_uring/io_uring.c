@@ -292,13 +292,13 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	xa_init_flags(&ctx->zcrx_ctxs, XA_FLAGS_ALLOC);
 #ifdef CONFIG_IO_URING_OPAQUE_OBJ
 	xa_init_flags(&ctx->opaque_stores, XA_FLAGS_ALLOC);
+	INIT_LIST_HEAD(&ctx->opaque_waits);
 #endif
 #ifdef CONFIG_FUTEX
 	INIT_HLIST_HEAD(&ctx->futex_list);
 #endif
 	INIT_WQ_LIST(&ctx->submit_state.compl_reqs);
 	INIT_HLIST_HEAD(&ctx->cancelable_uring_cmd);
-	INIT_LIST_HEAD(&ctx->opaque_waits);
 	io_napi_init(ctx);
 	mutex_init(&ctx->mmap_lock);
 	ctx->kcov_handle = kcov_common_handle();

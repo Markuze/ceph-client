@@ -816,6 +816,8 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 		RB_CLEAR_NODE(node);
 		if (!ret)
 			ret = stream->error ?: -ENODATA;
+		if (ret < 0 && op->op == IORING_OPAQUE_RECV_OBJECT)
+			io_opaque_restore(op);
 		io_opaque_queue_ready(op, ret == 1 ? op->length : ret);
 	}
 }
@@ -1274,6 +1276,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 		if (keep && keep->progress) {
 			rb_erase_cached(&keep->decision, &stream->decisions);
 			RB_CLEAR_NODE(&keep->decision);
+			io_opaque_restore(keep);
 			io_opaque_queue_ready(keep, -ENOBUFS);
 		}
 	}
@@ -1717,6 +1720,7 @@ out:
 static bool io_opaque_cancel_req(struct io_opaque_req *op)
 {
 	enum io_opaque_phase phase;
+	bool queue;
 
 	if (op->stream)
 		mutex_lock(&op->stream->lock);
@@ -1732,6 +1736,10 @@ static bool io_opaque_cancel_req(struct io_opaque_req *op)
 	/* A queued copy is owned by the shared worker until it reports readiness. */
 	if (phase != IO_OPAQUE_COPY_WORK)
 		list_del_init(&op->wait);
+	/* Claim task work before a remote TX head can promote this waiter. */
+	queue = phase != IO_OPAQUE_QUEUED && phase != IO_OPAQUE_COPY_WORK;
+	if (queue)
+		op->phase = IO_OPAQUE_QUEUED;
 	spin_unlock(&op->store->wait_lock);
 	if (phase == IO_OPAQUE_RANGE_WAIT) {
 		list_del_init(&op->read);
@@ -1740,9 +1748,12 @@ static bool io_opaque_cancel_req(struct io_opaque_req *op)
 			RB_CLEAR_NODE(&op->decision);
 		}
 	}
-	if (op->stream)
+	if (op->stream) {
+		if (op->op == IORING_OPAQUE_RECV_OBJECT)
+			io_opaque_restore(op);
 		mutex_unlock(&op->stream->lock);
-	if (phase != IO_OPAQUE_QUEUED && phase != IO_OPAQUE_COPY_WORK)
+	}
+	if (queue)
 		io_opaque_queue_ready(op, -ECANCELED);
 	return true;
 }
@@ -1889,7 +1900,7 @@ static int io_opaque_frame_import(struct io_opaque_req *op)
 		if (bytes) {
 			struct mem_cgroup *old;
 
-			charge = roundup_pow_of_two(max_t(u32, bytes, PAGE_SIZE));
+			charge = kmalloc_size_roundup(bytes);
 			if (!io_opaque_charge(op->store, charge, true))
 				return -ENOBUFS;
 			op->frame_charge = charge;
@@ -2048,8 +2059,15 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 		if (op->progress != op->total_length) {
 			tx->failed = true;
 			list_for_each_entry(next, &tx->requests, send) {
-				WRITE_ONCE(next->canceled, true);
-				if (next->phase == IO_OPAQUE_SEND_WAIT)
+				bool queue;
+
+				scoped_guard(spinlock, &store->wait_lock) {
+					WRITE_ONCE(next->canceled, true);
+					queue = next->phase == IO_OPAQUE_SEND_WAIT;
+					if (queue)
+						next->phase = IO_OPAQUE_QUEUED;
+				}
+				if (queue)
 					io_opaque_queue_ready(next, -ECANCELED);
 			}
 			goto out;

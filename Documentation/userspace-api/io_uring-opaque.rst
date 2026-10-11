@@ -12,10 +12,6 @@ unsafe backing is copied into independently owned pages. An allocation larger
 than the entire capture limit also uses this fallback so that small stores can
 make progress.
 
-This RFC originates from the kpass stream/object prototype, revision
-``a436cfe75e2c`` on its ``opaqu_objects`` branch. It replaces the device command
-transport with native io_uring operations and ordinary socket descriptors.
-
 Registration and sharing
 ========================
 
@@ -342,12 +338,15 @@ for operation-specific fields. Object and stream counts are maintained at
 publication/removal, so STAT does not scan either table.
 
 Framing snapshots use accounted allocations in the store owner's memory cgroup.
-Their power-of-two allocation size (at least one page) is charged under the
+Their allocator bucket size is reserved and charged under the
 ordinary capture allowance until request cleanup. Snapshot quota failure returns
 ENOBUFS before admission. STAT exposes current ``framing_bytes`` and cumulative
 ``framing_copied_bytes`` separately from retained backing and capture copies;
 ``backing_bytes`` includes the framing charge. Per-request framing and pending
 request bounds also apply to generated-only replies.
+A full capture allowance can reject framed or generated-only replies even
+when compaction headroom is free. Applications must release ordinary capacity
+before retrying; framing cannot consume the compaction reserve.
 
 The hard limit bounds store-owned backing, framing and reserved replacement capacity.
 It is not a census or bound of all physical memory retained by networking.
@@ -410,75 +409,6 @@ returns ESTALE; neither compaction path can restore the handle or overwrite
 a reused slot. If compaction publishes first, SEND_LAST claims the replacement
 under the same handle. Both send modes use the same compaction machinery.
 
-Claims and comparison boundaries
-================================
-
-The code supports these architectural claims:
-
-* Hardware-independent operation on ordinary connected TCP sockets.
-* No mapped payload area, application RX-chunk refill queue, or user-buffer
-  overwrite/reuse protocol.
-* Complete object publication and stable generation handles across backing
-  changes, with object-level application lifetime management.
-* One submission and application completion per prefix/object/suffix response,
-  including generated-only replies on the same ordered queue, without SEND_ZC's separate
-  notification request and notification task work.
-* Opt-in final-send ownership transfer removes one FREE SQE, CQE and request,
-  while reusable sends retain the ordinary caching and fanout lifetime.
-* Retention of eligible ordinary RX pages instead of a bulk receive copy.
-* Reusable kernel scatter vectors and optional dense backing for cached or
-  repeatedly transmitted payloads.
-
-These mechanisms provide performance hypotheses, not measured speedups. The
-strongest candidates are fragmented payloads that are forwarded, cached or
-sent to multiple destinations while the application inspects only framing.
-For an illustrative object delivered in N receive completions and sent in S
-requests, a typical mapped receive/send-ZC flow produces N + 2S CQEs. An opaque
-flow with H bounded reads and D discards produces H + 1 RECV_OBJECT + S SEND + 1 FREE
-+ D CQEs, or H + 1 RECV_OBJECT + S SEND + D when the final send uses SEND_LAST,
-excluding setup/terminal CQEs and failures. Refill entries are a separate cost,
-not additional CQEs. Small N or extra reads can erase this gain;
-CQE batching means the count does not predict syscall or wakeup counts.
-
-An optimized comparison must include fixed-buffer and vectored SEND_ZC.
-Fixed buffers already avoid repeated user-page pinning. Its managed fragment
-references can avoid per-fragment page refcount operations that our ordinary
-splice path performs. Vectored sends can already transmit a scattered payload
-with one submission. Hardware RECV_ZC already avoids the payload receive copy
-and uses preallocated receive resources; its ordinary-page fallback copies
-into the registered area. Mapped headers can be inspected without our copy
-operations. Objects add handle lookup, assembly, metadata, quota and compaction
-work; simpler application management does not imply a smaller whole-kernel
-implementation or universally fewer instructions.
-
-Existing alternatives must be included in the comparison. TCP-to-pipe-to-TCP
-SPLICE already forwards retained pages, and TEE can fan out pipe contents.
-The additional object contract is nonconsuming framing inspection, reusable
-range handles, long-lived caching and stable identity across compaction.
-Device-less RECV_ZC supports ordinary hardware by copying into its registered
-user area. Opaque retention saves that copy only when backing is eligible;
-packet taps, cloned/shared skbs and driver copybreak can increase copying.
-Measure actual copy fraction and retained backing per payload byte on real
-NICs, including compaction costs and packet taps.
-
-Kernel registered bvec resources provide useful direction and lifetime
-machinery. In this baseline their resource nodes use ring-local array lookup
-and ring-lock-protected references. Cloned tables can share backing, but do
-not supply a live shared generation namespace or store-wide SEND_LAST
-invalidation. A replacement backend must also preserve old-version pins,
-size-versioned queries, compaction publication and exported-descriptor-only
-lifetime after the creating ring closes. Backend reuse does not require
-changing the dedicated send ABI. Suppressing SEND_ZC notifications requires
-a replacement reference lifetime for explicitly immutable backing, rather
-than simply omitting a CQE. Such reuse remains an implementation evaluation;
-this RFC does not claim a measured advantage over it.
-
-No throughput, latency, CPU-efficiency or physical-NIC superiority is claimed
-by this RFC. Compare ordinary RECV/SEND_ZC, device-less RECV_ZC/SEND_ZC and
-hardware RECV_ZC/fixed-buffer SEND_ZC with matched batching, framing, payload
-sizes and retention. Measure copied bytes, cycles, CQEs, allocations, page
-references and actual retained memory with compaction off, manual and automatic.
-
 Validation and reproduction
 ===========================
 
@@ -499,6 +429,13 @@ compaction cancellation, socket errors at full quota, IPv4/IPv6 disconnect
 ownership, socket-file lifetime, POLL_FIRST and attach with a full CQ. Quota
 notification tests check unread TCP bytes, coalescing, resumption after a
 cross-ring release, and a full CQ while reporting pressure.
+The SMP test runs 10,000 cross-ring SEND cancellation/promotion races with
+heads and followers on different CPUs. It covers complete and partial heads,
+explicit cancellation and linked timeouts, one completion per request, LAST
+ownership, wire order and reference drain. It is skipped with fewer than two
+available CPUs. Disconnect tests verify a blocked 16 MiB send and connected
+socket state survive AF_UNSPEC rejection for IPv4 and IPv6. Same-batch
+cancellation and inspection verify immediate receive-prefix restoration.
 
 Build against the patched UAPI, using an already configured kernel build::
 

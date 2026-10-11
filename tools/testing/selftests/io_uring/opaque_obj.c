@@ -7,6 +7,7 @@
 #include <linux/io_uring/opaque.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -787,7 +788,7 @@ static void test_keep_restore(struct io_uring_opaque_config *cfg)
 		};
 		unsigned char buf[8];
 		uint32_t context;
-		uint64_t stream, keep;
+		uint64_t stream, keep, inspect = 0;
 		int pair[2], attempt;
 
 		require(!ring_init(&r, IORING_SETUP_CQE32), "KEEP restore ring");
@@ -814,7 +815,13 @@ static void test_keep_restore(struct io_uring_opaque_config *cfg)
 		if (!i) {
 			end.addr = keep;
 			stage(&r, end);
+			/* Inspect in the same batch, before the failed receive's task work. */
+			inspect = cmd_stage(&r, context, IORING_OPAQUE_INSPECT,
+					    stream, 0, 3, buf);
 		}
+		if (inspect)
+			require(wait_tag(&r, inspect).res == 3 && !memcmp(buf, "abc", 3),
+				"cancel restores prefix before the next SQE inspects it");
 		require(wait_tag(&r, keep).res == -ECANCELED, "partial KEEP canceled");
 		require(wait_tag(&r, end.user_data).res == (i ? -ETIME : 0),
 			"KEEP cancellation trigger");
@@ -1040,6 +1047,317 @@ static void test_budget_error(struct io_uring_opaque_config cfg)
 	}
 }
 
+#ifndef SEND_CANCEL_ROUNDS
+#define SEND_CANCEL_ROUNDS 10000
+#endif
+#define SEND_CANCEL_LENGTH (256 << 10)
+
+struct send_cancel_race {
+	pthread_barrier_t begin, admitted, finished, drained;
+	int store_fd, target[2], cpu;
+	uint64_t handle;
+	struct event follower;
+	unsigned char *wire;
+	size_t expected;
+	unsigned int expired;
+	bool head_done;
+};
+
+static void barrier_wait(pthread_barrier_t *barrier)
+{
+	int ret = pthread_barrier_wait(barrier);
+
+	require(!ret || ret == PTHREAD_BARRIER_SERIAL_THREAD, "race barrier");
+}
+
+static void *send_cancel_follower(void *arg)
+{
+	struct send_cancel_race *race = arg;
+	struct ring r;
+	uint32_t context;
+	cpu_set_t cpus;
+	unsigned int i;
+
+	CPU_ZERO(&cpus);
+	CPU_SET(race->cpu, &cpus);
+	require(!pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus),
+		"follower CPU");
+	require(!ring_init(&r, IORING_SETUP_CQE32), "follower ring");
+	require(!import_store(&r, race->store_fd, &context), "follower shared store");
+	for (i = 0; i < SEND_CANCEL_ROUNDS; i++) {
+		struct __kernel_timespec ts = { .tv_nsec = 1 + (i % 8) * 1000 };
+		struct io_uring_sqe end = { .fd = -1 };
+		struct event event;
+		uint64_t tag;
+		bool timeout = i % 4 >= 2;
+
+		barrier_wait(&race->begin);
+		/* Only this thread allocates tags until the admission barrier. */
+		end.user_data = next_tag++;
+		tag = send_stage_flags(&r, context, race->target[0], race->handle, 0, 8,
+				       IORING_OPAQUE_SEND_LAST, 0, timeout ? IOSQE_IO_LINK : 0);
+		if (timeout) {
+			end.opcode = IORING_OP_LINK_TIMEOUT;
+			end.addr = (uintptr_t)&ts;
+			end.len = 1;
+			stage(&r, end);
+		}
+		enter(&r, 0);
+		barrier_wait(&race->admitted);
+		if (!timeout) {
+			if (i % 8 == 4) {
+				while (!__atomic_load_n(&race->head_done, __ATOMIC_ACQUIRE))
+					sched_yield();
+				enter(&r, 0);
+			}
+			end.opcode = IORING_OP_ASYNC_CANCEL;
+			end.addr = tag;
+			stage(&r, end);
+		}
+		event = wait_tag(&r, end.user_data);
+		if (timeout) {
+			/* Remote completion/failure can win before timeout task work cancels. */
+			require(event.res == -ETIME || event.res == -ECANCELED ||
+				event.res == -ENOENT || event.res == -EALREADY,
+				"queued follower timeout completion");
+			race->expired += event.res == -ETIME;
+		} else {
+			require(!event.res || event.res == -ENOENT || event.res == -EALREADY,
+				"queued follower cancel completion");
+		}
+		race->follower = wait_tag(&r, tag);
+		require((race->follower.res == 8 || race->follower.res == -ECANCELED) &&
+			(race->follower.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"admitted follower completes once with ownership reported");
+		enter(&r, 0);
+		require(!r.nr_saved && !peek(&r, &event), "no duplicate follower CQE");
+		barrier_wait(&race->finished);
+		barrier_wait(&race->drained);
+	}
+	ring_exit(&r);
+	return NULL;
+}
+
+static void *send_cancel_drain(void *arg)
+{
+	struct send_cancel_race *race = arg;
+	unsigned int i;
+
+	for (i = 0; i < SEND_CANCEL_ROUNDS; i++) {
+		size_t done = 0;
+
+		barrier_wait(&race->begin);
+		barrier_wait(&race->admitted);
+		for (;;) {
+			size_t expected = __atomic_load_n(&race->expected, __ATOMIC_ACQUIRE);
+			ssize_t n;
+
+			if (expected != SIZE_MAX) {
+				require(done <= expected, "no unexpected follower bytes");
+				if (done == expected)
+					break;
+			}
+			if (done == SEND_CANCEL_LENGTH + 8) {
+				sched_yield();
+				continue;
+			}
+			n = recv(race->target[1], race->wire + done,
+				 SEND_CANCEL_LENGTH + 8 - done, MSG_DONTWAIT);
+			if (n > 0) {
+				int one = 1;
+
+				done += n;
+				require(!setsockopt(race->target[1], IPPROTO_TCP, TCP_QUICKACK,
+						    &one, sizeof(one)), "race immediate ACK");
+			} else {
+				require(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+					"race wire receive");
+				usleep(10);
+			}
+		}
+		barrier_wait(&race->drained);
+	}
+	return NULL;
+}
+
+static void test_send_cancel_race(struct io_uring_opaque_config *cfg)
+{
+	struct send_cancel_race race = {};
+	struct io_uring_opaque_stat stat;
+	struct sockaddr_in addr = { .sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+	socklen_t addr_length = sizeof(addr);
+	cpu_set_t original, cpus;
+	struct ring r;
+	struct event event;
+	struct transfer tx;
+	pthread_t follower, drain, producer;
+	unsigned char *data = malloc(SEND_CANCEL_LENGTH), byte;
+	uint32_t context;
+	uint64_t stream, handle, tag;
+	unsigned int i, j, complete = 0, partial = 0, canceled = 0, sent = 0;
+	int source[2], listener, small = 4096, receive = 32768, one = 1, first_cpu = -1;
+
+	require(!pthread_getaffinity_np(pthread_self(), sizeof(original), &original),
+		"race CPU set");
+	race.cpu = -1;
+	for (i = 0; i < CPU_SETSIZE; i++) {
+		if (!CPU_ISSET(i, &original))
+			continue;
+		if (first_cpu < 0) {
+			first_cpu = i;
+		} else {
+			race.cpu = i;
+			break;
+		}
+	}
+	if (race.cpu < 0) {
+		free(data);
+		ksft_test_result_skip("cross-ring SEND cancellation requires two CPUs\n");
+		return;
+	}
+	CPU_ZERO(&cpus);
+	CPU_SET(first_cpu, &cpus);
+	require(!pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus), "head CPU");
+	require(data && !ring_init(&r, IORING_SETUP_CQE32), "race head ring");
+	require(!register_store(&r, cfg, &context), "race store");
+	race.store_fd = export_store(&r, context);
+	require(race.store_fd >= 0, "race store export");
+	race.wire = malloc(SEND_CANCEL_LENGTH + 8);
+	require(race.wire, "race wire buffer");
+	tcp_pair(source);
+	/* Set the receive window before connect so the head must wait for a reader. */
+	listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	require(listener >= 0 &&
+		!setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &receive, sizeof(receive)) &&
+		!bind(listener, (void *)&addr, addr_length) &&
+		!getsockname(listener, (void *)&addr, &addr_length) && !listen(listener, 1),
+		"race listener");
+	race.target[0] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	require(race.target[0] >= 0 &&
+		!setsockopt(race.target[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) &&
+		!connect(race.target[0], (void *)&addr, addr_length), "race connect");
+	race.target[1] = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+	require(race.target[1] >= 0 &&
+		!setsockopt(race.target[0], IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)),
+		"race destination");
+	close(listener);
+	stream = attach(&r, context, source[1], next_tag++);
+	memset(data, 'A', SEND_CANCEL_LENGTH);
+	tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, 0,
+			SEND_CANCEL_LENGTH, NULL);
+	tx = (struct transfer) { .fd = source[0], .data = data,
+		.length = SEND_CANCEL_LENGTH };
+	require(!pthread_create(&producer, NULL, writer, &tx), "race object producer");
+	event = wait_tag(&r, tag);
+	pthread_join(producer, NULL);
+	require(event.res == SEND_CANCEL_LENGTH, "race head object");
+	handle = event.extra[0];
+	require(!pthread_barrier_init(&race.begin, NULL, 3) &&
+		!pthread_barrier_init(&race.admitted, NULL, 3) &&
+		!pthread_barrier_init(&race.finished, NULL, 2) &&
+		!pthread_barrier_init(&race.drained, NULL, 3), "race barriers");
+	require(!pthread_create(&follower, NULL, send_cancel_follower, &race) &&
+		!pthread_create(&drain, NULL, send_cancel_drain, &race), "race threads");
+	for (i = 0; i < SEND_CANCEL_ROUNDS; i++) {
+		struct io_uring_sqe cancel = { .opcode = IORING_OP_ASYNC_CANCEL,
+			.fd = -1, .user_data = next_tag++ };
+		int progress;
+
+		tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream,
+				SEND_CANCEL_LENGTH + (uint64_t)i * 8, 8, NULL);
+		write_all(source[0], "BBBBBBBB", 8);
+		event = wait_tag(&r, tag);
+		require(event.res == 8, "race follower object");
+		race.handle = event.extra[0];
+		__atomic_store_n(&race.expected, SIZE_MAX, __ATOMIC_RELEASE);
+		__atomic_store_n(&race.head_done, false, __ATOMIC_RELEASE);
+		tag = send_stage(&r, context, race.target[0], handle, 0, SEND_CANCEL_LENGTH);
+		enter(&r, 0);
+		require(!peek(&r, &event), "head is pending before follower admission");
+		barrier_wait(&race.begin);
+		barrier_wait(&race.admitted);
+		if (i % 2) {
+			cancel.addr = tag;
+			stage(&r, cancel);
+			event = wait_tag(&r, cancel.user_data);
+			require(!event.res || event.res == -ENOENT || event.res == -EALREADY,
+				"race head cancellation");
+		}
+		event = wait_tag(&r, tag);
+		require((event.res >= 0 && event.res <= SEND_CANCEL_LENGTH) ||
+			event.res == -ECANCELED, "race head progress");
+		progress = event.res > 0 ? event.res : 0;
+		__atomic_store_n(&race.head_done, true, __ATOMIC_RELEASE);
+		barrier_wait(&race.finished);
+		if (progress < SEND_CANCEL_LENGTH) {
+			partial++;
+			require(race.follower.res == -ECANCELED, "broken head emits no follower");
+		} else {
+			complete++;
+		}
+		canceled += race.follower.res == -ECANCELED;
+		sent += race.follower.res == 8;
+		__atomic_store_n(&race.expected, progress + (race.follower.res > 0 ? 8 : 0),
+				 __ATOMIC_RELEASE);
+		barrier_wait(&race.drained);
+		for (j = 0; j < race.expected; j++)
+			require(race.wire[j] == (j < (unsigned int)progress ? 'A' : 'B'),
+				"race wire ordering");
+		require(command(&r, context, IORING_OPAQUE_READ_OBJECT,
+				race.handle, 0, 1, &byte).res == -ESTALE,
+			"race LAST handle remains consumed");
+		enter(&r, 0);
+		require(!r.nr_saved && !peek(&r, &event), "no duplicate head CQE");
+		if (!((i + 1) % 100))
+			ksft_print_msg("SEND cancellation races completed: %u\n", i + 1);
+	}
+	pthread_join(follower, NULL);
+	pthread_join(drain, NULL);
+	require(complete && partial && canceled && sent && race.expired,
+		"all race paths exercised");
+	ksft_print_msg("SEND races: full=%u partial=%u canceled=%u sent=%u expired=%u\n",
+		       complete, partial, canceled, sent, race.expired);
+	close(race.store_fd);
+	require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.extents && !stat.objects && !stat.streams,
+		"race references drain");
+	ring_exit(&r);
+	close(source[0]);
+	close(source[1]);
+	close(race.target[0]);
+	close(race.target[1]);
+	pthread_barrier_destroy(&race.begin);
+	pthread_barrier_destroy(&race.admitted);
+	pthread_barrier_destroy(&race.finished);
+	pthread_barrier_destroy(&race.drained);
+	free(race.wire);
+	free(data);
+	require(!pthread_setaffinity_np(pthread_self(), sizeof(original), &original),
+		"restore CPU set");
+	ksft_test_result_pass("%u cross-ring SEND cancellation/promotion races on SMP\n",
+			      (unsigned int)SEND_CANCEL_ROUNDS);
+}
+
+struct disconnect_sender {
+	int fd;
+	const unsigned char *data;
+	size_t length;
+	ssize_t result;
+	bool done;
+};
+
+static void *disconnect_send(void *arg)
+{
+	struct disconnect_sender *tx = arg;
+
+	tx->result = send(tx->fd, tx->data, tx->length, MSG_NOSIGNAL);
+	__atomic_store_n(&tx->done, true, __ATOMIC_RELEASE);
+	return NULL;
+}
+
 static void test_disconnect(struct io_uring_opaque_config *cfg)
 {
 	int families[] = { AF_INET, AF_INET6 };
@@ -1047,12 +1365,20 @@ static void test_disconnect(struct io_uring_opaque_config *cfg)
 
 	for (i = 0; i < ARRAY_SIZE(families); i++) {
 		struct sockaddr addr = { .sa_family = AF_UNSPEC };
+		struct sockaddr_storage peer;
+		socklen_t peer_length = sizeof(peer);
+		const size_t length = 16U << 20;
+		unsigned char *data = calloc(1, length);
+		struct disconnect_sender tx = { .data = data, .length = length };
+		struct transfer rx = { .data = data, .length = length, .repeats = 1 };
 		struct ring r;
+		pthread_t sender, receiver;
 		uint32_t context;
 		uint64_t stream, discard;
-		int pair[2], alias;
+		int pair[2], alias, queued = 0, attempt, ret, error, small = 4096;
 
 		if (!tcp_pair_family(pair, families[i])) {
+			free(data);
 			ksft_test_result_skip("IPv6 disconnect ownership requires IPv6 support\n");
 			continue;
 		}
@@ -1061,8 +1387,35 @@ static void test_disconnect(struct io_uring_opaque_config *cfg)
 		alias = dup(pair[1]);
 		require(alias >= 0, "duplicate claimed descriptor");
 		stream = attach(&r, context, pair[1], 711);
+		require(data && !getpeername(pair[1], (void *)&peer, &peer_length),
+			"disconnect sender and peer");
+		require(!setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)),
+			"disconnect small send buffer");
+		tx.fd = pair[1];
+		rx.fd = pair[0];
+		require(!pthread_create(&sender, NULL, disconnect_send, &tx),
+			"disconnect blocked sender");
+		for (attempt = 0; attempt < 100; attempt++) {
+			require(!ioctl(pair[1], TIOCOUTQ, &queued), "disconnect queued bytes");
+			if (queued)
+				break;
+			usleep(1000);
+		}
+		usleep(100000);
+		require(queued && !__atomic_load_n(&tx.done, __ATOMIC_ACQUIRE),
+			"sender is blocked before disconnect rejection");
 		require(connect(alias, &addr, sizeof(addr)) == -1 && errno == EBUSY,
 			"AF_UNSPEC cannot reset a claimed TCP connection through an alias");
+		require(!pthread_create(&receiver, NULL, reader, &rx), "disconnect drain");
+		pthread_join(sender, NULL);
+		ret = connect(alias, (void *)&peer, peer_length);
+		error = errno;
+		require(!shutdown(pair[1], SHUT_WR), "disconnect sender EOF");
+		pthread_join(receiver, NULL);
+		ksft_print_msg("IPv%d rejected disconnect: send=%zd/%zu, connect errno=%d\n",
+			       i ? 6 : 4, tx.result, length, error);
+		require(tx.result == (ssize_t)length && rx.ok && ret == -1 && error == EISCONN,
+			"rejected disconnect preserves blocked TX and connected state");
 		discard = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream, 0, 4, NULL);
 		write_all(pair[0], "live", 4);
 		require(wait_tag(&r, discard).res == 4, "rejected disconnect preserves TCP");
@@ -1073,6 +1426,7 @@ static void test_disconnect(struct io_uring_opaque_config *cfg)
 		close(alias);
 		close(pair[0]);
 		close(pair[1]);
+		free(data);
 		ksft_test_result_pass("IPv%d disconnect preserves ownership through aliases\n",
 				      i ? 6 : 4);
 	}
@@ -2712,8 +3066,10 @@ static void test_framed_backpressure(struct io_uring_opaque_config *cfg)
 				"queued framed LAST admitted");
 			require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
 					 sizeof(stat), &stat).res &&
-				stat.framing_bytes >= 2 * IORING_OPAQUE_FRAME_MAX,
-				"pending frames consume bounded store charge");
+				stat.framing_bytes >= 2 * IORING_OPAQUE_FRAME_MAX + 5 &&
+				stat.framing_bytes < 2 * IORING_OPAQUE_FRAME_MAX +
+						     (uint64_t)sysconf(_SC_PAGESIZE),
+				"small generated follower uses a subpage framing charge");
 		}
 		if (!mode) {
 			memset(framing, 'X', IORING_OPAQUE_FRAME_MAX);
@@ -2860,7 +3216,7 @@ int main(void)
 	unsigned char buf[32];
 	int source[2], target[2], ret;
 
-	alarm(300);
+	alarm(600);
 	ksft_print_header();
 	ret = ring_init(&r, IORING_SETUP_CQE32);
 	if (ret)
@@ -2869,7 +3225,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(76);
+	ksft_set_plan(77);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -3105,6 +3461,7 @@ int main(void)
 	test_reset(&cfg);
 	test_mixed_cqe(&cfg);
 	test_send_fifo(&cfg);
+	test_send_cancel_race(&cfg);
 	test_link_order(&cfg);
 	test_keep_restore(&cfg);
 	test_interleaved(cfg);

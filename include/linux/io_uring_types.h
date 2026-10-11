@@ -421,7 +421,9 @@ struct io_ring_ctx {
 		 * ->uring_cmd() by io_uring_cmd_insert_cancelable()
 		 */
 		struct hlist_head	cancelable_uring_cmd;
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
 		struct list_head	opaque_waits;
+#endif
 		/*
 		 * For Hybrid IOPOLL, runtime in hybrid polling, without
 		 * scheduling time
