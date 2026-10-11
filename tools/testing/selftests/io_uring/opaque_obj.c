@@ -3,11 +3,14 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/opaque.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -20,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../kselftest.h"
@@ -549,7 +553,7 @@ static void test_mixed_cqe(struct io_uring_opaque_config *cfg)
 	ksft_test_result_pass("mixed CQE tokens and handles carry the 32-byte flag\n");
 }
 
-static void tcp_pair_small(int pair[2])
+static void tcp_pair_buffers(int pair[2], int sndbuf, int rcvbuf)
 {
 	struct sockaddr_in addr = {
 		.sin_family = AF_INET,
@@ -557,17 +561,17 @@ static void tcp_pair_small(int pair[2])
 	};
 	socklen_t len = sizeof(addr);
 	int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	int small = 4096, one = 1;
+	int one = 1;
 
 	require(listener >= 0, "small-window listen socket");
-	require(!setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)),
+	require(!setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)),
 		"small window before SYN");
 	require(!bind(listener, (void *)&addr, sizeof(addr)), "small-window bind");
 	require(!getsockname(listener, (void *)&addr, &len), "small-window address");
 	require(!listen(listener, 1), "small-window listen");
 	pair[0] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	require(pair[0] >= 0, "small-window connect socket");
-	require(!setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)),
+	require(!setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)),
 		"small send queue before connect");
 	require(!connect(pair[0], (void *)&addr, sizeof(addr)), "small-window connect");
 	pair[1] = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
@@ -575,6 +579,11 @@ static void tcp_pair_small(int pair[2])
 	require(!setsockopt(pair[0], IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)),
 		"small-window TCP_NODELAY");
 	close(listener);
+}
+
+static void tcp_pair_small(int pair[2])
+{
+	tcp_pair_buffers(pair, 4096, 4096);
 }
 
 struct slow_transfer {
@@ -3306,6 +3315,473 @@ static void test_frame_quota(struct io_uring_opaque_config *cfg)
 	ksft_test_result_pass("framing quota failure leaves LAST handle reusable\n");
 }
 
+static void submit_only(struct ring *r)
+{
+	unsigned int pending = *r->sq_tail - *r->sq_head;
+
+	require(syscall(__NR_io_uring_enter, r->fd, pending, 0, 0, NULL, 0) >= 0,
+		"submit without deferred task work");
+}
+
+static struct event wait_tag_ms(struct ring *r, uint64_t tag, unsigned int ms)
+{
+	struct timespec start, now;
+	struct event event;
+	unsigned int i;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		struct __kernel_timespec ts = { .tv_nsec = 10000000 };
+		struct io_uring_getevents_arg arg = { .ts = (uintptr_t)&ts };
+		unsigned int pending = *r->sq_tail - *r->sq_head;
+		int ret;
+
+		for (i = 0; i < r->nr_saved; i++) {
+			if (r->saved[i].tag == tag) {
+				event = r->saved[i];
+				r->saved[i] = r->saved[--r->nr_saved];
+				return event;
+			}
+		}
+		ret = syscall(__NR_io_uring_enter, r->fd, pending, 1,
+			      IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg, sizeof(arg));
+		require(ret >= 0 || errno == ETIME || errno == EINTR, "bounded CQ wait");
+		while (peek(r, &event)) {
+			if (event.tag == tag)
+				return event;
+			require(r->nr_saved < 64, "bounded wait completion stash");
+			r->saved[r->nr_saved++] = event;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		require((now.tv_sec - start.tv_sec) * 1000 +
+			(now.tv_nsec - start.tv_nsec) / 1000000 < ms, "CQ wait deadline");
+	}
+}
+
+static struct event receive_complete(struct ring *r, uint32_t context, uint64_t stream,
+				     int fd, uint64_t offset, const void *data, size_t length)
+{
+	struct transfer tx = { .fd = fd, .data = data, .length = length };
+	uint64_t tag = cmd_stage(r, context, IORING_OPAQUE_RECV_OBJECT,
+				stream, offset, length, NULL);
+	struct event event;
+	pthread_t producer;
+
+	submit_only(r);
+	require(!pthread_create(&producer, NULL, writer, &tx), "complete object producer");
+	event = wait_tag_ms(r, tag, 30000);
+	pthread_join(producer, NULL);
+	require(event.res == (int)length, "complete object receive");
+	return event;
+}
+
+static size_t drain_idle(int fd, unsigned char *buf, size_t cap, int idle_ms)
+{
+	size_t done = 0;
+
+	while (done < cap) {
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		ssize_t n;
+
+		if (poll(&p, 1, idle_ms) <= 0)
+			break;
+		n = recv(fd, buf + done, cap - done, MSG_DONTWAIT);
+		require(n > 0, "drain queued wire bytes");
+		done += n;
+	}
+	return done;
+}
+
+static void test_waiting_follower_cancel(struct io_uring_opaque_config *cfg)
+{
+	const size_t length = 300U << 10;
+	unsigned char *data = malloc(length), *wire = malloc(length + 16);
+	unsigned int mode, round;
+
+	require(data && wire, "two-follower buffers");
+	memset(data, 'A', length);
+	for (mode = 0; mode < 4; mode++) {
+		bool late = mode & 1, shared = mode & 2;
+
+		for (round = 0; round < 5; round++) {
+			struct ring head, other, *followers = &head;
+			struct event event, first, second;
+			uint32_t context, follower_context;
+			uint64_t stream, handles[3], tags[3];
+			struct io_uring_sqe cancel = { .opcode = IORING_OP_ASYNC_CANCEL, .fd = -1 };
+			int source[2], target[2], big = 8U << 20;
+			size_t got;
+
+			require(!ring_init(&head, IORING_SETUP_CQE32), "two-follower head ring");
+			require(!register_store(&head, cfg, &context), "two-follower store");
+			follower_context = context;
+			if (shared) {
+				int fd = export_store(&head, context);
+
+				require(fd >= 0 && !ring_init(&other, IORING_SETUP_CQE32) &&
+					!import_store(&other, fd, &follower_context),
+					"two-follower import");
+				close(fd);
+				followers = &other;
+			}
+			tcp_pair(source);
+			tcp_pair_buffers(target, 16384, 16384);
+			stream = attach(&head, context, source[1], next_tag++);
+			handles[0] = receive_complete(&head, context, stream, source[0], 0,
+						      data, length).extra[0];
+			handles[1] = receive_complete(&head, context, stream, source[0], length,
+						      "BBBBBBBB", 8).extra[0];
+			handles[2] = receive_complete(&head, context, stream, source[0], length + 8,
+						      "CCCCCCCC", 8).extra[0];
+			tags[0] = send_stage(&head, context, target[0], handles[0], 0, length);
+			if (shared)
+				submit_only(&head);
+			tags[1] = send_stage_flags(followers, follower_context, target[0],
+						   handles[1], 0, 8, IORING_OPAQUE_SEND_LAST, 0, 0);
+			tags[2] = send_stage_flags(followers, follower_context, target[0],
+						   handles[2], 0, 8, IORING_OPAQUE_SEND_LAST, 0, 0);
+			submit_only(followers);
+			usleep(50000);
+			cancel.addr = tags[1];
+			cancel.user_data = next_tag++;
+			if (!late) {
+				stage(followers, cancel);
+				require(!wait_tag_ms(followers, cancel.user_data, 5000).res,
+					"early waiting follower cancel");
+				first = wait_tag_ms(followers, tags[1], 5000);
+			}
+			if (setsockopt(target[0], SOL_SOCKET, SO_SNDBUFFORCE, &big, sizeof(big)))
+				require(!setsockopt(target[0], SOL_SOCKET, SO_SNDBUF,
+						    &big, sizeof(big)),
+					"two-follower send capacity");
+			got = drain_idle(target[1], wire, length + 16, 100);
+			usleep(50000);
+			if (late) {
+				stage(followers, cancel);
+				submit_only(followers);
+			}
+			event = wait_tag_ms(&head, tags[0], 10000);
+			require(event.res == (int)length, "two-follower complete head");
+			if (late) {
+				require(!wait_tag_ms(followers, cancel.user_data, 5000).res,
+					"late waiting follower cancel");
+				first = wait_tag_ms(followers, tags[1], 5000);
+			}
+			second = wait_tag_ms(followers, tags[2], 10000);
+			require(first.res == -ECANCELED && second.res == 8 &&
+				(first.flags & IORING_CQE_F_OPAQUE_CONSUMED) &&
+				(second.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+				"canceling a waiting follower preserves the next send");
+			got += drain_idle(target[1], wire + got, length + 16 - got, 1000);
+			require(got == length + 8 && !memcmp(data, wire, length) &&
+				!memcmp(wire + length, "CCCCCCCC", 8), "two-follower wire order");
+			require(!command(&head, context, IORING_OPAQUE_FREE,
+					 handles[0], 0, 0, NULL).res &&
+				!command(&head, context, IORING_OPAQUE_STREAM_CLOSE,
+					 stream, 0, 0, NULL).res,
+				"two-follower cleanup");
+			if (shared)
+				ring_exit(&other);
+			ring_exit(&head);
+			close(source[0]);
+			close(source[1]);
+			close(target[0]);
+			close(target[1]);
+		}
+		ksft_test_result_pass("waiting SEND cancel: %s, %s (5 rounds)\n",
+				      shared ? "shared rings" : "one ring",
+				      late ? "head cleanup first" : "cancel first");
+	}
+	free(data);
+	free(wire);
+}
+
+static void test_lowmem(struct io_uring_opaque_config cfg)
+{
+	const size_t retained = 128U << 10, discarded = 2U << 20, length = 8192;
+	static const char header[] = "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+	struct io_uring_opaque_frame frame = { .size = sizeof(frame),
+		.prefix = (uintptr_t)"HDR", .prefix_length = 3,
+		.suffix = (uintptr_t)"!", .suffix_length = 1 };
+	struct io_uring_opaque_object_stat object;
+	struct io_uring_opaque_stat stat;
+	struct ring r, imported;
+	struct event event;
+	unsigned char *data = malloc(discarded), *wire = malloc(length + 4);
+	uint32_t context, other_context;
+	uint64_t stream, cache, forward, offset = sizeof(header) - 1, tag;
+	struct transfer tx = { .data = data, .length = discarded };
+	pthread_t producer;
+	int source[2], target[2], fd;
+
+	require(data && wire, "lowmem buffers");
+	memset(data, 'D', discarded);
+	cfg.hard_limit = 512U << 10;
+	cfg.compact_headroom = 64U << 10;
+	cfg.reply_reserve = 64U << 10;
+	cfg.high_watermark = 64U << 10;
+	cfg.low_watermark = 32U << 10;
+	cfg.capture_window = sysconf(_SC_PAGESIZE);
+	require(!ring_init(&r, IORING_SETUP_CQE32) && !register_store(&r, &cfg, &context),
+		"watermark store");
+	fd = export_store(&r, context);
+	require(fd >= 0 && !ring_init(&imported, IORING_SETUP_CQE32) &&
+		!import_store(&imported, fd, &other_context), "watermark shared store");
+	close(fd);
+	tcp_pair(source);
+	tcp_pair(target);
+	stream = attach(&r, context, source[1], next_tag++);
+	event = receive_complete(&r, context, stream, source[0], 0, data, retained);
+	cache = event.extra[0];
+	require(!event.extra[1] &&
+		!command(&imported, other_context, IORING_OPAQUE_STAT,
+			 0, 0, sizeof(stat), &stat).res &&
+		stat.memory_mode == IORING_OPAQUE_MEMORY_LOWMEM, "shared lowmem transition");
+	tag = cmd_stage(&r, context, IORING_OPAQUE_INSPECT, stream, retained, 512, wire);
+	write_all(source[0], header, sizeof(header) - 1);
+	event = wait_tag_ms(&r, tag, 5000);
+	require(event.res == (int)sizeof(header) - 1 && !memcmp(wire, header, event.res),
+		"lowmem available header inspection");
+	require(command(&r, context, IORING_OPAQUE_DISCARD, stream, retained, offset, NULL).res ==
+		(int)offset, "lowmem header disposition");
+	event = receive_complete(&r, context, stream, source[0], retained + offset, data, length);
+	forward = event.extra[0];
+	offset += length;
+	require(event.extra[1] == IORING_OPAQUE_OBJECT_F_FORWARD_ONLY,
+		"lowmem object-ready reports forwarding-only ownership");
+	require(!command(&r, context, IORING_OPAQUE_OBJECT_STAT, forward, 0,
+			 sizeof(object), &object).res &&
+		(object.flags & IORING_OPAQUE_OBJECT_F_FORWARD_ONLY), "lowmem object flags");
+	tag = cmd_stage(&r, context, IORING_OPAQUE_DISCARD, stream,
+			retained + offset, discarded, NULL);
+	tx.fd = source[0];
+	require(!pthread_create(&producer, NULL, writer, &tx), "lowmem DISCARD producer");
+	require(wait_tag_ms(&r, tag, 30000).res == (int)discarded, "lowmem direct body DISCARD");
+	pthread_join(producer, NULL);
+	offset += discarded;
+	ksft_test_result_pass("lowmem parses short headers and discards a 2 MiB body\n");
+	tag = send_stage(&imported, other_context, target[0], forward, 0, length);
+	require(wait_tag_ms(&imported, tag, 5000).res == -EOPNOTSUPP,
+		"lowmem object forbids reusable SEND");
+	require(command(&r, context, IORING_OPAQUE_READ_OBJECT, cache, 0, 8, wire).res == 8,
+		"lowmem preserves existing cache entries");
+	require(!command(&r, context, IORING_OPAQUE_FREE, cache, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
+		"evict cache backing");
+	ksft_print_msg("forward-only backing after eviction: %llu bytes, mode %u\n",
+		       (unsigned long long)stat.backing_bytes, stat.memory_mode);
+	/* A short object can pin an RX allocation larger than the low watermark. */
+	require(!command(&r, context, IORING_OPAQUE_COMPACT, forward, 0, 0, NULL).res,
+		"forwarding object compaction");
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		stat.backing_bytes <= cfg.low_watermark &&
+		stat.memory_mode == IORING_OPAQUE_MEMORY_NORMAL, "low watermark resumes normal");
+	tag = send_stage(&r, context, target[0], forward, 0, length);
+	require(wait_tag_ms(&r, tag, 5000).res == -EOPNOTSUPP,
+		"forwarding restriction survives normal mode and compaction");
+	tag = frame_stage(&r, context, target[0], forward, length, &frame,
+			  IORING_OPAQUE_SEND_LAST, 0);
+	event = wait_tag_ms(&r, tag, 5000);
+	require(event.res == (int)length + 4 && (event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+		"lowmem framed final send");
+	read_all(target[1], wire, length + 4);
+	require(!memcmp(wire, "HDR", 3) && !memcmp(wire + 3, data, length) &&
+		wire[length + 3] == '!',
+		"lowmem complete reply wire bytes");
+	require(command(&r, context, IORING_OPAQUE_FREE, forward, 0, 0, NULL).res == -ESTALE,
+		"forwarding handle consumed");
+	ksft_test_result_pass("forwarding-only ownership survives mode changes and compaction\n");
+	event = receive_complete(&r, context, stream, source[0], retained + offset, "normal!!", 8);
+	require(!event.extra[1], "normal mode admits cacheable object");
+	tag = send_stage(&r, context, target[0], event.extra[0], 0, 8);
+	require(wait_tag_ms(&r, tag, 5000).res == 8, "normal reusable SEND");
+	read_all(target[1], wire, 8);
+	require(!memcmp(wire, "normal!!", 8) &&
+		!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.framing_bytes && !stat.objects && !stat.extents,
+		"normal mode and forwarding references drain");
+	ring_exit(&imported);
+	ring_exit(&r);
+	close(source[0]);
+	close(source[1]);
+	close(target[0]);
+	close(target[1]);
+	free(data);
+	free(wire);
+	ksft_test_result_pass("normal mode resumes cache retention below the low watermark\n");
+}
+
+static void test_reply_reserve(struct io_uring_opaque_config cfg, bool windowed)
+{
+	struct io_uring_opaque_frame frame = { .size = sizeof(frame),
+		.prefix = (uintptr_t)"HDR:", .prefix_length = 4 };
+	struct io_uring_opaque_stat stat;
+	struct io_uring_opaque_stream_stat before, after;
+	struct ring r;
+	struct event event;
+	uint32_t context;
+	uint64_t greedy, responder, request, cached, collector = next_tag++, tag;
+	unsigned char *flood = calloc(1, 256U << 10), wire[16];
+	unsigned int i;
+	int a[2], b[2], target[2], unread;
+	uint64_t limit;
+
+	cfg.hard_limit = 256U << 10;
+	cfg.compact_headroom = 64U << 10;
+	cfg.reply_reserve = sysconf(_SC_PAGESIZE);
+	cfg.capture_window = windowed ? sysconf(_SC_PAGESIZE) : 0;
+	cfg.high_watermark = windowed ? 64U << 10 : 0;
+	cfg.low_watermark = windowed ? 32U << 10 : 0;
+	limit = cfg.hard_limit - cfg.compact_headroom - cfg.reply_reserve;
+	require(flood && !ring_init(&r, IORING_SETUP_CQE32) && !register_store(&r, &cfg, &context),
+		"reply reserve store");
+	tcp_pair(a);
+	tcp_pair(b);
+	tcp_pair(target);
+	responder = attach(&r, context, b[1], next_tag++);
+	request = receive_complete(&r, context, responder, b[0], 0, "request!", 8).extra[0];
+	cached = receive_complete(&r, context, responder, b[0], 8, "cached!!", 8).extra[0];
+	greedy = attach(&r, context, a[1], collector);
+	write_all(a[0], flood, 256U << 10);
+	event = wait_tag_ms(&r, collector, 5000);
+	require(event.res == -ENOBUFS && (event.flags & IORING_CQE_F_MORE) &&
+		event.extra[0] == greedy, "greedy stream pressure notification");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, greedy, 0,
+			 sizeof(before), &before).res &&
+		!ioctl(a[1], FIONREAD, &unread) && unread > 0, "excess data stays on TCP");
+	if (windowed)
+		require(before.undecided_bytes == cfg.capture_window,
+			"greedy capture window bound");
+	require(!command(&r, context, IORING_OPAQUE_FREE, cached, 0, 0, NULL).res,
+		"evict cached object");
+	for (i = 0; i < 100; i++) {
+		require(!command(&r, context, IORING_OPAQUE_STREAM_STAT, greedy, 0,
+				 sizeof(after), &after).res &&
+			!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
+			"post-eviction capture accounting");
+		if (windowed || stat.backing_bytes == limit)
+			break;
+		usleep(1000);
+	}
+	if (windowed)
+		require(after.undecided_bytes == before.undecided_bytes,
+			"a window-full collector cannot recapture freed backing");
+	else
+		require(after.undecided_bytes > before.undecided_bytes &&
+			stat.backing_bytes == limit,
+			"greedy collector refills capture allowance");
+	{
+		struct io_uring_opaque_frame large = { .size = sizeof(large),
+			.prefix = (uintptr_t)flood, .prefix_length = cfg.reply_reserve + 1 };
+
+		tag = frame_stage(&r, context, target[0], request, 8, &large,
+				  IORING_OPAQUE_SEND_LAST, 0);
+		event = wait_tag_ms(&r, tag, 5000);
+		require(event.res == -ENOBUFS && !(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+			"reply reserve exhaustion preserves LAST ownership");
+	}
+	tag = frame_stage(&r, context, target[0], request, 8, &frame, IORING_OPAQUE_SEND_LAST, 0);
+	event = wait_tag_ms(&r, tag, 5000);
+	require(event.res == 12 && (event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
+		"other connection admits framed reply under capture pressure");
+	tag = frame_stage(&r, context, target[0], 0, 0, &frame, 0, 0);
+	require(wait_tag_ms(&r, tag, 5000).res == 4, "generated reply under capture pressure");
+	read_all(target[1], wire, sizeof(wire));
+	require(!memcmp(wire, "HDR:request!HDR:", sizeof(wire)) &&
+		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, greedy, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, responder, 0, 0, NULL).res &&
+		!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.framing_bytes,
+		"reserved reply wire bytes and release");
+	ring_exit(&r);
+	close(a[0]);
+	close(a[1]);
+	close(b[0]);
+	close(b[1]);
+	close(target[0]);
+	close(target[1]);
+	free(flood);
+	ksft_test_result_pass("two connections retain reply progress: %s\n",
+			      windowed ? "bounded capture" : "capture full with reserved framing");
+}
+
+static void test_watermark_config(struct io_uring_opaque_config cfg)
+{
+	struct io_uring_opaque_config bad;
+	struct ring r;
+	uint32_t context;
+	unsigned int i;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "watermark ABI ring");
+	cfg.reply_reserve = 64U << 10;
+	cfg.capture_window = sysconf(_SC_PAGESIZE);
+	cfg.high_watermark = 32U << 20;
+	cfg.low_watermark = 16U << 20;
+	for (i = 0; i < 8; i++) {
+		bad = cfg;
+		switch (i) {
+		case 0:
+			bad.low_watermark = bad.high_watermark;
+			break;
+		case 1:
+			bad.low_watermark = 1;
+			break;
+		case 2:
+			bad.high_watermark = 0;
+			break;
+		case 3:
+			bad.reply_reserve = bad.hard_limit;
+			break;
+		case 4:
+			bad.reply_reserve = 0;
+			break;
+		case 5:
+			bad.capture_window = 0;
+			break;
+		case 6:
+			bad.capture_window = 65537;
+			break;
+		case 7:
+			bad.__resv1 = 1;
+			break;
+		}
+		require(register_store(&r, &bad, &context) == -EINVAL,
+			"reject invalid watermark configuration");
+	}
+	ring_exit(&r);
+	ksft_test_result_pass("watermark, reply reserve and capture window ABI validation\n");
+}
+
+static void test_timeout(int signal_number)
+{
+	static const char message[] = "OPAQUE timeout; adjust OPAQUE_TEST_TIMEOUT\n";
+	ssize_t written;
+
+	(void)signal_number;
+	written = write(STDERR_FILENO, message, sizeof(message) - 1);
+	(void)written;
+	_exit(KSFT_FAIL);
+}
+
+static void set_test_timeout(void)
+{
+	const char *value = getenv("OPAQUE_TEST_TIMEOUT");
+	unsigned long seconds = 600;
+	char *end;
+
+	if (value) {
+		errno = 0;
+		seconds = strtoul(value, &end, 10);
+		require(!errno && *value >= '0' && *value <= '9' && !*end &&
+			seconds && seconds <= UINT_MAX,
+			"OPAQUE_TEST_TIMEOUT must be a positive number of seconds");
+	}
+	signal(SIGALRM, test_timeout);
+	alarm(seconds);
+}
+
 int main(void)
 {
 	struct ring r, imported;
@@ -3332,7 +3808,7 @@ int main(void)
 	unsigned char buf[32];
 	int source[2], target[2], ret;
 
-	alarm(600);
+	set_test_timeout();
 	ksft_print_header();
 	ret = ring_init(&r, IORING_SETUP_CQE32);
 	if (ret)
@@ -3341,7 +3817,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(80);
+	ksft_set_plan(90);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -3573,6 +4049,10 @@ int main(void)
 	test_framed_sends(&cfg);
 	test_framed_backpressure(&cfg);
 	test_frame_quota(&cfg);
+	test_watermark_config(cfg);
+	test_lowmem(cfg);
+	test_reply_reserve(cfg, false);
+	test_reply_reserve(cfg, true);
 	test_budget(cfg);
 	test_budget_notifications(cfg);
 	test_budget_full_cq(cfg);
@@ -3586,6 +4066,7 @@ int main(void)
 	test_reset(&cfg);
 	test_mixed_cqe(&cfg);
 	test_send_fifo(&cfg);
+	test_waiting_follower_cancel(&cfg);
 	test_send_cancel_race(&cfg);
 	test_link_order(&cfg);
 	test_keep_restore(&cfg);

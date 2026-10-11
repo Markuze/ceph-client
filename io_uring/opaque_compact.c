@@ -86,6 +86,7 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 		ret = -ENOMEM;
 		goto out;
 	}
+	op->replacement->forward_only = op->data->forward_only;
 	cursor.extent = list_first_entry(&op->data->extents, struct io_opaque_extent, list);
 	cursor.offset = 0;
 	while (done < length) {
@@ -164,7 +165,7 @@ void io_opaque_compact_work(struct work_struct *work)
 	unsigned long now;
 	unsigned int i;
 
-	/* Shutdown drains every accepted request, without another invocation. */
+	/* Once shutdown is observed, drain every accepted request in this run. */
 	for (i = 0; i < 8 || READ_ONCE(store->dead); i++) {
 		struct io_opaque_req *op;
 		int ret;
@@ -254,7 +255,8 @@ int io_opaque_set_policy(struct io_opaque_req *op)
 		struct io_opaque_slot *slot = &store->objects[i];
 
 		if ((policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) &&
-		    slot->data && !slot->data->dense && list_empty(&slot->candidate)) {
+		    slot->data && !slot->data->dense && !slot->data->forward_only &&
+		    list_empty(&slot->candidate)) {
 			list_add_tail(&slot->candidate, &store->candidates);
 			slot->retry = jiffies;
 		} else if (!(policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {

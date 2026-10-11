@@ -42,7 +42,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 	struct io_opaque_req *op, *next;
 	unsigned long delay = MAX_JIFFY_OFFSET;
 	unsigned long now = jiffies;
-	u64 limit = store->config.hard_limit - store->config.compact_headroom;
+	u64 limit = io_opaque_rx_limit(store);
 	u64 used = atomic64_read(&store->bytes);
 	unsigned int woken = 0;
 	bool stopped;
@@ -98,9 +98,31 @@ static void io_opaque_wake_stream(struct io_opaque_stream *stream)
 	wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 }
 
+int io_opaque_memory_mode(struct io_opaque_store *store)
+{
+	int mode, next;
+	u64 used;
+
+	if (!store->config.high_watermark)
+		return IORING_OPAQUE_MEMORY_NORMAL;
+	for (;;) {
+		mode = atomic_read(&store->memory_mode);
+		used = atomic64_read(&store->bytes);
+		next = mode;
+		if (mode == IORING_OPAQUE_MEMORY_NORMAL && used >= store->config.high_watermark)
+			next = IORING_OPAQUE_MEMORY_LOWMEM;
+		else if (mode == IORING_OPAQUE_MEMORY_LOWMEM && used <= store->config.low_watermark)
+			next = IORING_OPAQUE_MEMORY_NORMAL;
+		if (next == mode)
+			return mode;
+		/* Recheck occupancy after winning a concurrent mode transition. */
+		atomic_try_cmpxchg(&store->memory_mode, &mode, next);
+	}
+}
+
 bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
 {
-	u64 limit = store->config.hard_limit;
+	u64 limit = store->config.hard_limit - store->config.reply_reserve;
 	s64 used = atomic64_read(&store->bytes);
 
 	if (rx)
@@ -108,15 +130,44 @@ bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
 	for (;;) {
 		if (bytes > limit || used > limit - bytes)
 			return false;
-		if (atomic64_try_cmpxchg(&store->bytes, &used, used + bytes))
+		if (atomic64_try_cmpxchg(&store->bytes, &used, used + bytes)) {
+			io_opaque_memory_mode(store);
 			return true;
+		}
 	}
 }
 
 void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes)
 {
 	atomic64_sub(bytes, &store->bytes);
+	io_opaque_memory_mode(store);
 	io_opaque_wake_budget(store);
+}
+
+bool io_opaque_charge_frame(struct io_opaque_store *store, u64 bytes)
+{
+	u64 limit = store->config.reply_reserve;
+	s64 used = atomic64_read(&store->framing);
+
+	if (!limit) {
+		if (!io_opaque_charge(store, bytes, true))
+			return false;
+		atomic64_add(bytes, &store->framing);
+		return true;
+	}
+	for (;;) {
+		if (bytes > limit || used > limit - bytes)
+			return false;
+		if (atomic64_try_cmpxchg(&store->framing, &used, used + bytes))
+			return true;
+	}
+}
+
+void io_opaque_uncharge_frame(struct io_opaque_store *store, u64 bytes)
+{
+	atomic64_sub(bytes, &store->framing);
+	if (!store->config.reply_reserve)
+		io_opaque_uncharge(store, bytes);
 }
 
 static bool io_opaque_extent_reserve(struct io_opaque_store *store)
@@ -346,6 +397,9 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 	}
 	slot->reserved = true;
 	slot->generation++;
+	if (op->data)
+		op->data->forward_only =
+			io_opaque_memory_mode(store) == IORING_OPAQUE_MEMORY_LOWMEM;
 	op->slot = index;
 	op->handle = io_opaque_handle(index, slot->generation);
 	op->slot_reserved = true;
@@ -370,7 +424,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	int ret;
 	u32 i;
 
-	if (cfg.flags || !mem_is_zero(cfg.__resv, sizeof(cfg.__resv)))
+	if (cfg.flags || cfg.__resv1 || !mem_is_zero(cfg.__resv, sizeof(cfg.__resv)))
 		return ERR_PTR(-EINVAL);
 	if (!cfg.hard_limit || cfg.hard_limit > SZ_1T ||
 	    !IS_ALIGNED(cfg.hard_limit, PAGE_SIZE) ||
@@ -381,6 +435,18 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	    !cfg.max_streams || cfg.max_streams > 1024 ||
 	    cfg.max_extents < 4 || cfg.max_extents > 65536 ||
 	    !cfg.max_requests || cfg.max_requests > 4096)
+		return ERR_PTR(-EINVAL);
+	if (!IS_ALIGNED(cfg.reply_reserve, PAGE_SIZE) ||
+	    cfg.reply_reserve >= cfg.hard_limit - cfg.compact_headroom ||
+	    (cfg.capture_window && (cfg.capture_window < PAGE_SIZE ||
+				   cfg.capture_window > IO_OPAQUE_READ_MAX)) ||
+	    (!cfg.high_watermark && cfg.low_watermark) ||
+	    (cfg.high_watermark &&
+	     (!cfg.capture_window || !cfg.reply_reserve ||
+	      !IS_ALIGNED(cfg.high_watermark, PAGE_SIZE) ||
+	      !IS_ALIGNED(cfg.low_watermark, PAGE_SIZE) ||
+	      cfg.low_watermark >= cfg.high_watermark ||
+	      cfg.high_watermark > cfg.hard_limit - cfg.compact_headroom - cfg.reply_reserve)))
 		return ERR_PTR(-EINVAL);
 	store = kzalloc_obj(*store, GFP_KERNEL_ACCOUNT);
 	if (!store)
@@ -808,7 +874,7 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 		ret = stream->closed ? -ECANCELED : io_opaque_take(op);
 		if (!ret && op->op == IORING_OPAQUE_RECV_OBJECT &&
 		    op->data->charge + io_opaque_dense_left(op) >
-		    op->store->config.hard_limit - op->store->config.compact_headroom)
+		    io_opaque_rx_limit(op->store))
 			ret = -ENOBUFS;
 		if (!ret && !stream->eof && !stream->closed && !stream->error)
 			continue;
@@ -893,7 +959,7 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 
 		/* Leave room for dense copies of a private KEEP's remaining bytes. */
 		if (!copied && op && op->data->charge + stream->need_bytes + left >
-		    stream->store->config.hard_limit - stream->store->config.compact_headroom)
+		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
 		extent = io_opaque_extent_new(stream->store, page, offset, length, start, copied);
 		if (IS_ERR(extent))
@@ -925,20 +991,21 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 				       bool shared)
 {
 	u32 consumed = 0, head = skb_headlen(skb), start = head;
+	bool bounded = stream->store->config.capture_window && !io_opaque_capture_keep(stream);
 	bool copy_frags;
 	struct sk_buff *child;
-	u64 retain_limit = stream->store->config.hard_limit -
-			   stream->store->config.compact_headroom;
+	u64 retain_limit = io_opaque_rx_limit(stream->store);
 	u32 chunk;
 	int i, ret = -EFAULT;
 
 	shared |= skb_shared(skb);
-	copy_frags = shared || skb_cloned(skb) || skb_has_shared_frag(skb);
+	/* Dense lookahead prevents tiny headers from pinning entire RX allocations. */
+	copy_frags = bounded || shared || skb_cloned(skb) || skb_has_shared_frag(skb);
 	if (!skb_frags_readable(skb))
 		return -EIO;
 	if (offset < head) {
 		chunk = min(head - offset, len);
-		if (!shared && !skb_head_is_locked(skb)) {
+		if (!bounded && !shared && !skb_head_is_locked(skb)) {
 			void *data = skb->data + offset;
 			struct page *page = virt_to_page(data);
 
@@ -1044,6 +1111,18 @@ VISIBLE_IF_KUNIT int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *sk
 					goto consumed;
 				}
 			}
+		}
+		if (stream->store->config.capture_window && !io_opaque_capture_keep(stream)) {
+			u32 window = stream->store->config.capture_window;
+
+			if (stream->undecided >= window) {
+				/* Only a range decision can reopen this stream's window. */
+				stream->need_bytes = U64_MAX;
+				ret = -ENOBUFS;
+				desc->error = ret;
+				break;
+			}
+			chunk = min_t(u64, chunk, window - stream->undecided);
 		}
 		ret = io_opaque_capture(stream, skb, offset, chunk, false);
 		if (ret <= 0) {
@@ -1364,6 +1443,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	struct io_opaque_req *op = req->async_data;
 	struct io_opaque_store *store = op->store;
 	int ret = op->result;
+	u64 object_flags = 0;
 
 	io_tw_lock(req->ctx, tw);
 	list_del_init(&op->cancel);
@@ -1383,16 +1463,19 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 				ret = -ESTALE;
 			} else {
 				slot->data = op->data;
+				if (op->data->forward_only)
+					object_flags = IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
 				store->nr_objects++;
 				op->data = NULL;
 				slot->reserved = false;
 				op->slot_reserved = false;
 				slot->born = jiffies;
 				slot->retry = jiffies;
-				if (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) {
+				if (!slot->data->forward_only &&
+				    (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
 					list_add_tail(&slot->candidate, &store->candidates);
-					store->auto_at = jiffies;
-					mod_delayed_work(system_dfl_wq, &store->compact_work, 0);
+					queue_delayed_work(system_dfl_wq, &store->compact_work,
+							   msecs_to_jiffies(100));
 				}
 				ret = op->length;
 			}
@@ -1422,7 +1505,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (ret < 0 && req->opcode == IORING_OP_OPAQUE_OBJ_SEND && op->progress)
 		ret = op->progress;
 	if (ret >= 0 && op->op == IORING_OPAQUE_RECV_OBJECT)
-		io_req_set_res32(req, ret, 0, op->handle, 0);
+		io_req_set_res32(req, ret, 0, op->handle, object_flags);
 	else
 		io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	io_req_task_complete(tw_req, tw);
@@ -1481,7 +1564,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 			return -EINVAL;
 		if (cmd == IORING_OPAQUE_RECV_OBJECT &&
 		    (op->length > store->config.max_object_size ||
-		     op->length > store->config.hard_limit - store->config.compact_headroom))
+		     op->length > io_opaque_rx_limit(store)))
 			return -EMSGSIZE;
 	} else if (op->offset) {
 		return -EINVAL;
@@ -1577,8 +1660,8 @@ static int io_opaque_range_start(struct io_opaque_req *op)
 	}
 	io_opaque_wait(op, IO_OPAQUE_RANGE_WAIT);
 	io_opaque_stream_process(stream);
-	/* DISCARD can make progress without allocating any payload backing. */
-	if (op->op == IORING_OPAQUE_DISCARD)
+	/* A consuming decision reopens a bounded undecided capture window. */
+	if (op->op != IORING_OPAQUE_INSPECT)
 		io_opaque_wake_stream(stream);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
@@ -1604,8 +1687,11 @@ static int io_opaque_stat(struct io_opaque_req *op)
 		.requests = atomic_read(&store->requests),
 		.framing_bytes = atomic64_read(&store->framing),
 		.framing_copied_bytes = atomic64_read(&store->framing_copied),
+		.memory_mode = io_opaque_memory_mode(store),
 	};
 
+	if (store->config.reply_reserve)
+		stat.backing_bytes += stat.framing_bytes;
 	mutex_lock(&store->tables);
 	stat.objects = store->nr_objects;
 	stat.streams = store->nr_streams;
@@ -1661,6 +1747,8 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 			};
 			struct io_opaque_slot *slot;
 
+			if (op->data->forward_only)
+				stat.flags |= IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
 			mutex_lock(&store->tables);
 			slot = io_opaque_lookup(store, op->handle);
 			if (slot && slot->compacting)
@@ -1831,10 +1919,8 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	if (req->opcode == IORING_OP_OPAQUE_OBJ_SEND) {
 		io_opaque_tx_put(op);
 		kfree(op->framing);
-		if (op->frame_charge) {
-			atomic64_sub(op->frame_charge, &store->framing);
-			io_opaque_uncharge(store, op->frame_charge);
-		}
+		if (op->frame_charge)
+			io_opaque_uncharge_frame(store, op->frame_charge);
 	}
 	io_opaque_data_put(store, op->data);
 	if (op->op == IORING_OPAQUE_COMPACT) {
@@ -1902,10 +1988,9 @@ static int io_opaque_frame_import(struct io_opaque_req *op)
 			struct mem_cgroup *old;
 
 			charge = kmalloc_size_roundup(bytes);
-			if (!io_opaque_charge(op->store, charge, true))
+			if (!io_opaque_charge_frame(op->store, charge))
 				return -ENOBUFS;
 			op->frame_charge = charge;
-			atomic64_add(charge, &op->store->framing);
 			old = set_active_memcg(op->store->memcg);
 			op->framing = kmalloc(charge, GFP_KERNEL_ACCOUNT);
 			set_active_memcg(old);
@@ -1942,6 +2027,8 @@ VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
 		return 0;
 	if (!slot || !slot->data)
 		return -ESTALE;
+	if (slot->data->forward_only && !(op->send_flags & IORING_OPAQUE_SEND_LAST))
+		return -EOPNOTSUPP;
 	if (op->offset > slot->data->length ||
 	    op->length > slot->data->length - op->offset)
 		return -ERANGE;
@@ -2056,8 +2143,8 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 		rb_erase(&tx->node, &store->txs);
 		kfree(tx);
 	} else if (head) {
-		/* A broken object must not splice the next queued object onto TCP. */
-		if (op->progress != op->total_length) {
+		/* Only a send that attempted TCP can break the following frames. */
+		if (op->tx_started && op->progress != op->total_length) {
 			tx->failed = true;
 			list_for_each_entry(next, &tx->requests, send) {
 				bool queue;
@@ -2110,6 +2197,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	ret = io_opaque_tx_enter(op, sock->sk);
 	if (ret)
 		goto out;
+	op->tx_started = true;
 
 again:
 	memset(&msg, 0, sizeof(msg));

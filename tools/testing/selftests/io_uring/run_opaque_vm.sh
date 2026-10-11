@@ -11,12 +11,18 @@ kernel_build=$(realpath "$1")
 test_binary=$(realpath "$2")
 test_dir="$kernel_build/opaque-vm"
 test_root="$test_dir/initramfs"
+test_timeout=${OPAQUE_TEST_TIMEOUT:-600}
+if [[ ! $test_timeout =~ ^[1-9][0-9]{0,8}$ ]]; then
+	echo "OPAQUE_TEST_TIMEOUT must be a positive number of seconds" >&2
+	exit 2
+fi
 busybox_binary=${BUSYBOX:-$(command -v busybox)}
 file "$test_binary" | grep -q 'statically linked'
 file "$busybox_binary" | grep -q 'statically linked'
 mkdir -p "$test_root"/{bin,proc,sys,dev,tmp}
 cp "$test_binary" "$test_root/opaque_obj"
 cp "$busybox_binary" "$test_root/bin/busybox"
+printf 'export OPAQUE_TEST_TIMEOUT=%s\n' "$test_timeout" > "$test_root/test.env"
 for app in sh mount mkdir ip poweroff sleep; do
 	ln -sf busybox "$test_root/bin/$app"
 done
@@ -30,6 +36,7 @@ mount -t debugfs none /sys/kernel/debug
 mount -t cgroup2 none /sys/fs/cgroup
 echo +memory > /sys/fs/cgroup/cgroup.subtree_control
 ip link set lo up
+. /test.env
 /opaque_obj
 echo "OPAQUE_SELFTEST_STATUS=$?"
 sleep 2

@@ -30,6 +30,11 @@ struct io_uring_opaque_config {
 	__u32 max_requests;
 	__u32 flags;
 	__u64 __resv[2];
+	__u64 high_watermark;
+	__u64 low_watermark;
+	__u64 reply_reserve;
+	__u32 capture_window;
+	__u32 __resv1;
 };
 
 /* IORING_OP_OPAQUE_OBJ: sqe->ioprio selects the operation. */
@@ -69,8 +74,14 @@ struct io_uring_opaque_frame {
 
 #define IORING_OPAQUE_OBJECT_F_COMPACTED	(1U << 0)
 #define IORING_OPAQUE_OBJECT_F_COMPACTING	(1U << 1)
+#define IORING_OPAQUE_OBJECT_F_FORWARD_ONLY (1U << 2)
 #define IORING_OPAQUE_STREAM_F_EOF		(1U << 0)
 #define IORING_OPAQUE_POLICY_F_AUTO_COMPACT	(1U << 0)
+
+enum io_uring_opaque_memory_mode {
+	IORING_OPAQUE_MEMORY_NORMAL,
+	IORING_OPAQUE_MEMORY_LOWMEM,
+};
 
 struct io_uring_opaque_stat {
 	__u32 size;
@@ -86,6 +97,8 @@ struct io_uring_opaque_stat {
 	__u32 requests;
 	__u64 framing_bytes;
 	__u64 framing_copied_bytes;
+	__u32 memory_mode;
+	__u32 __resv1;
 };
 
 struct io_uring_opaque_object_stat {

@@ -51,6 +51,16 @@ extents and pending requests have separate bounds. Registering reserves the
 hard-limit capacity against the registration owner's locked-memory accounting.
 The payload is allocated or retained on demand.
 
+The optional ``high_watermark``, ``low_watermark``, ``reply_reserve`` and
+``capture_window`` fields define a memory-pressure policy at store creation.
+Omitted fields are zero and preserve the shared capture/framing allowance.
+Watermarks and reply reserve are page aligned. A nonzero high watermark
+requires a lower low watermark, a nonzero reply reserve and a capture window
+between one page and 64 KiB. The high watermark cannot exceed
+``hard_limit - compact_headroom - reply_reserve``. The reply reserve must be
+smaller than ``hard_limit - compact_headroom``. A reply reserve or capture
+window may also be enabled independently of watermarks.
+
 Registration IDs are ring local; stream and object handles, limits and policy
 belong to the shared store. The last ring/export-descriptor user stops
 collection and automatic work; ring references remain until requests drain
@@ -75,6 +85,11 @@ and the absolute first unread TCP offset respectively. The notification is
 coalesced until that offset advances. The application can release objects,
 compact backing or cancel pending work to make capacity available; eligible
 collectors resume automatically after release. No replacement COLLECT is needed.
+When a configured undecided capture window fills, RECV_OBJECT or DISCARD must
+classify bytes before collection can resume; unrelated FREE operations do not
+reopen that window. There is no separate resume CQE. STREAM_STAT reports
+capture and undecided offsets; the next inspection or range completion also
+provides application progress.
 Quota is reserved before captured bytes are consumed from TCP. A failed
 admission leaves those bytes on the socket; an already admitted prefix may
 have advanced the stream. An explicit DISCARD can still skip its declared
@@ -84,6 +99,10 @@ cancellation and incomplete-object failure rules. Network errors still end
 collection. If the pressure notification cannot fit in the CQ, collection
 ends with ``ENOSPC``; the token and captured bytes remain available for explicit
 STREAM_CLOSE/recovery and no further TCP bytes are collected.
+This RFC has no operation to rearm collection on that token. Drain the CQ and
+explicitly close the stream; retrying COLLECT while its claim remains held
+does not resume the old stream. Stream close releases undecided bytes, so
+applications must account for that loss when recovering their protocol state.
 A terminal CQE ends the collector on EOF, error, cancellation or stream close.
 The RFC collector rejects ``IOSQE_ASYNC`` and CQE suppression.
 
@@ -125,7 +144,8 @@ linking/cancellation retain their usual meaning. CQE suppression is rejected.
    * - RECV_OBJECT
      - Consume a selected range into private assembly. Publish an object only
        when the entire range and its vector are complete. Result is length;
-       the first extra CQE word holds the generation handle.
+       the first extra CQE word holds the generation handle and the second
+       holds ``IORING_OPAQUE_OBJECT_F_FORWARD_ONLY`` or zero.
    * - DISCARD
      - Consume unwanted buffered or future stream bytes. Future bytes can be
        skipped without allocating backing, even when the store is full.
@@ -158,7 +178,8 @@ headers, declares an object's start and length once its header defines them,
 and continues processing other CQEs while the kernel assembles that range
 privately. The RECV_OBJECT request's sole successful CQE is its object-ready
 notification: user_data identifies the request, result is the complete length,
-and the first extra word contains the handle. There is no per-fragment object
+the first extra word contains the handle, and the second reports whether
+lowmem admission made it forwarding-only. There is no per-fragment object
 ID or second success notification. READ_OBJECT inspects an already complete
 object and cannot wait for future TCP bytes.
 
@@ -264,10 +285,13 @@ even when its CQE reports a positive prefix, so a soft-linked follower is
 canceled before issue and does not claim SEND_LAST ownership.
 
 The store serializes admitted sends to each destination socket. If the head
-ends before queuing its entire frame, already admitted followers complete with
+attempted TCP transmission and ends before queuing its entire frame, already
+admitted followers complete with
 ECANCELED rather than inserting another object's bytes after that prefix.
 A canceled follower that already claimed SEND_LAST still reports the consumed
-flag. Canceling a follower alone does not interrupt an earlier send. Blocking
+flag. Canceling a waiting follower does not interrupt an earlier send or cancel
+later followers, including when head cleanup promotes it before its own
+cleanup runs. Blocking
 TCP retries run in io-wq without holding the ring submission lock.
 
 Each send has one application completion. This reports bytes queued to TCP,
@@ -327,6 +351,13 @@ original network allocation's accounting is independent. Owned copy and
 compaction pages already use accounted allocation and are not charged twice.
 Copy fallback appends into unused space in the previous owned page;
 it does not allocate a whole page for every small fragment.
+With ``capture_window`` enabled, undecided lookahead always uses packed copies
+so tiny headers cannot pin arbitrary RX allocations. Known object ranges
+remain eligible for page retention. The window bounds undecided bytes per
+stream, in both memory modes; it does not bound private object assembly.
+An unsuccessful assembly can restore more than one window of already
+admitted bytes. Collection waits for a consuming decision before adding more
+undecided bytes to that stream.
 Vectors are built once at object publication and are bounded by extent limits.
 Releasing backing or metadata wakes eligible collectors suspended on the store
 budget in bounded batches. Their native multishot polls remain armed for socket
@@ -338,15 +369,54 @@ for operation-specific fields. Object and stream counts are maintained at
 publication/removal, so STAT does not scan either table.
 
 Framing snapshots use accounted allocations in the store owner's memory cgroup.
-Their allocator bucket size is reserved and charged under the
-ordinary capture allowance until request cleanup. Snapshot quota failure returns
+Their allocator bucket size is charged until request cleanup. With a nonzero
+``reply_reserve``, framing uses that separate allowance, which payload capture
+and compaction cannot borrow. Capture may use
+``hard_limit - compact_headroom - reply_reserve``; replacement reservations
+may use ``hard_limit - reply_reserve``. Snapshot quota failure returns
 ENOBUFS before admission. STAT exposes current ``framing_bytes`` and cumulative
 ``framing_copied_bytes`` separately from retained backing and capture copies;
 ``backing_bytes`` includes the framing charge. Per-request framing and pending
 request bounds also apply to generated-only replies.
-A full capture allowance can reject framed or generated-only replies even
-when compaction headroom is free. Applications must release ordinary capacity
-before retrying; framing cannot consume the compaction reserve.
+The protected allowance permits bounded framed and generated-only replies
+even when a greedy collector refills payload capacity after an eviction.
+Concurrent snapshots can still exhaust the reply reserve, and allocation or
+request admission can fail independently. Framing cannot consume compaction
+headroom. With a zero reply reserve, snapshots share ordinary capture capacity;
+eviction alone cannot guarantee reply admission because collection can refill
+that capacity first.
+
+Watermarks and forwarding-only objects
+--------------------------------------
+
+With a nonzero high watermark, STAT reports ``memory_mode`` as
+``IORING_OPAQUE_MEMORY_NORMAL`` or ``IORING_OPAQUE_MEMORY_LOWMEM``. Payload
+backing and compaction reservations reaching the high watermark enter lowmem;
+return to normal occurs at or below the low watermark. Protected framing
+snapshots do not change the mode. Importing rings observe the same store mode.
+
+RECV_OBJECT samples the mode when reserving its object slot. Normal admission
+creates a cacheable object, even if its later assembly crosses the high
+watermark. Lowmem admission creates a forwarding-only object automatically.
+Headers remain available through INSPECT, and DISCARD can skip future bodies
+without backing. The complete-object notification reports the classification;
+OBJECT_STAT also reports ``IORING_OPAQUE_OBJECT_F_FORWARD_ONLY``.
+
+Existing cacheable objects keep their ordinary SEND behavior during lowmem.
+A forwarding-only object must use SEND_LAST for transmission, or FREE to
+discard its completed backing. Ordinary SEND returns EOPNOTSUPP without
+consuming it or transmitting bytes. READ_OBJECT remains a bounded copy;
+neither a return to normal nor manual compaction makes the handle cacheable.
+Automatic compaction excludes forwarding-only objects. No new syscall or
+application submission flag is required.
+
+Forwarding still needs temporary backing until an object is complete and its
+consuming send or discard releases it. The kernel does not expire handles or
+drop payloads automatically. Applications must promptly finish forwarding-only
+objects; outstanding assemblies and sends remain subject to the hard limit,
+and headers can encounter hard-limit backpressure when temporary capacity is
+exhausted. Watermarks control admission classification, not an absolute cap on
+cacheable bytes or a guarantee of unlimited forwarding progress.
 
 The hard limit bounds store-owned backing, framing and reserved replacement capacity.
 It is not a census or bound of all physical memory retained by networking.
@@ -393,7 +463,10 @@ selection. An automatic scan examines at most 32 candidates and copies at
 most one object, with the next scan paced independently of manual wakeups.
 The single work item serializes copying without a second worker or copy mutex.
 FREE and SEND_LAST remove
-candidates; dense versions are removed after success; failures back off.
+candidates; forwarding-only objects are excluded, dense versions are removed
+after success, and failures back off. Publication queues the next paced scan
+without resetting its deadline on every new object; manual requests can still
+wake the dispatcher immediately.
 Ordinary reception cannot consume configured compaction headroom. Neither
 policy nor manual requests bypass the hard limit, and no objects are evicted.
 Objects exceeding the burst or temporary allowance remain ineligible until
@@ -447,6 +520,10 @@ ownership, wire order and reference drain. It is skipped with fewer than two
 available CPUs. Disconnect tests verify a blocked 16 MiB send and connected
 socket state survive AF_UNSPEC rejection for IPv4 and IPv6. Same-batch
 cancellation and inspection verify immediate receive-prefix restoration.
+Additional tests cancel waiting followers before and after head cleanup, on
+one ring and shared rings. They verify lowmem hysteresis, short header
+inspection, forwarding-only ownership, stable classification through compaction,
+bounded undecided lookahead, and protected replies after greedy quota refill.
 
 Build against the patched UAPI, using an already configured kernel build::
 
@@ -478,6 +555,9 @@ compound allocation and oversized-copy, charge splitting, exact compaction
 reservation, version lifetime, rollback, cancellation and generation-retirement
 tests, plus final-send reference transfer and compaction publication races with
 slot reuse, allocation rotation/exhaustion and generations beyond 32 bits.
+Memory-policy cases cover watermark transitions, separate reply accounting,
+capture-window admission and dense lookahead from tiny fragments, and
+forwarding-only version replacement and send admission.
 ``CONFIG_KUNIT`` is required. Compaction and tests compile as separate source
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.
@@ -496,5 +576,8 @@ QEMU helper. It requires QEMU x86_64, cpio and static BusyBox::
 The helper reports userspace and enabled KUnit results and rejects kernel
 warnings. Its default TCG accelerator avoids any need for KVM permissions.
 ``BUSYBOX``, ``QEMU``, ``OPAQUE_VM_ACCEL`` and ``OPAQUE_VM_TIMEOUT`` can override
-the executable paths, accelerator and timeout. Logs remain in the kernel
+the executable paths, accelerator and host timeout. ``OPAQUE_TEST_TIMEOUT``
+sets the userspace test's alarm in seconds (default 600); the helper passes it
+into the VM. For slow SMP/KASAN emulation, increase both timeouts, for example
+``OPAQUE_TEST_TIMEOUT=7200 OPAQUE_VM_TIMEOUT=7500``. Logs remain in the kernel
 build's ``opaque-vm`` directory.

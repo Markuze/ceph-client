@@ -65,6 +65,7 @@ struct io_opaque_req {
 			u32 total_length;
 			u32 msg_flags;
 			u16 send_flags;
+			bool tx_started;
 		};
 		struct {
 			struct io_opaque_data *replacement;

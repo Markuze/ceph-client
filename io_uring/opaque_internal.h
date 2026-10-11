@@ -53,6 +53,7 @@ struct io_opaque_data {
 	u64 charge;
 	u32 nr;
 	bool dense;
+	bool forward_only;
 };
 
 struct io_opaque_slot {
@@ -124,6 +125,7 @@ struct io_opaque_store {
 	atomic64_t framing_copied;
 	atomic_t extents;
 	atomic_t requests;
+	atomic_t memory_mode;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
 	spinlock_t wait_lock;
 	struct list_head budget_waits;
@@ -141,6 +143,16 @@ struct io_opaque_store {
 
 bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx);
 void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes);
+bool io_opaque_charge_frame(struct io_opaque_store *store, u64 bytes);
+void io_opaque_uncharge_frame(struct io_opaque_store *store, u64 bytes);
+int io_opaque_memory_mode(struct io_opaque_store *store);
+
+static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
+{
+	return store->config.hard_limit - store->config.compact_headroom -
+	       store->config.reply_reserve;
+}
+
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
