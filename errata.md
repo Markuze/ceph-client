@@ -31,8 +31,8 @@ skips on the normal kernel, including policy disable, shared-ring compaction
 and queued teardown. No ABI or performance claim is added.
 
 V7 review response, 2026-10-11: source
-`89ae38096e9c22858105266d1cb9bdeb2e1b1ef4` on `upstream/opaque-obj-v7`,
-with the same tree as development `cc04808fad6b7cd8594a89c22e3310edeadd1314`.
+`e6aef56bc0f64b00261ade7985f159947b23fb1c` on `upstream/opaque-obj-v7`,
+with the same tree as development `057e2f53c3f403713bd76fb7694bb9cfe53dff34`.
 Fix Q: an unstarted canceled SEND follower cannot poison its successors when
 cleanup order changes. Fix B: the KUnit option/build rule arrive with the
 source in patch 3. Publication coalesces paced automatic-compaction wakeups.
