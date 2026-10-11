@@ -47,6 +47,7 @@ Devices and I/O
    accelerators/ocxl
    dma-buf-heaps
    dma-buf-alloc-exchange
+   io_uring-opaque
    fwctl/index
    gpio/index
    iommufd
