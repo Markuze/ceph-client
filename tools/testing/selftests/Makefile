@@ -58,6 +58,7 @@ TARGETS += gpio
 TARGETS += hid
 TARGETS += intel_pstate
 TARGETS += iommu
+TARGETS += io_uring
 TARGETS += ipc
 TARGETS += ir
 TARGETS += kcmp

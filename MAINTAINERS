@@ -13738,6 +13738,7 @@ L:	io-uring@vger.kernel.org
 S:	Maintained
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/axboe/linux.git
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/axboe/liburing.git
+F:	Documentation/userspace-api/io_uring-opaque.rst
 F:	include/linux/io_uring/
 F:	include/linux/io_uring.h
 F:	include/linux/io_uring_types.h
@@ -13745,6 +13746,7 @@ F:	include/trace/events/io_uring.h
 F:	include/uapi/linux/io_uring.h
 F:	include/uapi/linux/io_uring/
 F:	io_uring/
+F:	tools/testing/selftests/io_uring/
 
 IO_URING ZCRX
 M:	Pavel Begunkov <asml.silence@gmail.com>
