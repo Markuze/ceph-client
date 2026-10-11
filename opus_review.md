@@ -51,8 +51,8 @@ The series can't go in as is, for four reasons:
    io_uring Kconfig symbol (`default y`), plus checks in the TCP receive hot path. netdev
    has to agree to that first.
 
-The individual bugs are easy to fix; prototype fixes for A–D are in Appendix A and pass
-everything. The design concerns in §4 are what decide whether a v2 can converge.
+The individual bugs are easy to fix; prototype fixes for A–D and H1 are in Appendix A and
+pass everything. The design concerns in §4 are what decide whether a v2 can converge.
 
 ---
 
@@ -70,7 +70,7 @@ KUnit natively. On UML, `CONFIG_VETH` is only there to select `PAGE_POOL` for
 | `checkpatch.pl --strict` | clean apart from the MAINTAINERS file-path warnings |
 | KUnit `io_uring-opaque` (KASAN, PROVE_LOCKING, DEBUG_ATOMIC_SLEEP, DEBUG_LIST, DEBUG_VM) | 11/11 pass |
 | `tools/testing/selftests/io_uring/opaque_obj` (static, raw ABI) | 21/21 pass, no splats |
-| My reproducers (Appendix B), baseline | **7 of 9 cases fail** (A1, A2, B, C, D, D2, F); E and G show the questionable semantics described in §3 |
+| My reproducers (Appendix B), baseline | **8 of 10 cases fail** (A1, A2, B, C, D, D2, D3, F); E and G show the questionable semantics described in §3 |
 | Reproducers + selftest + KUnit with Appendix A applied | A–D pass; selftest 21/21; KUnit 11/11; no splats |
 
 The existing tests pass because none of them cross 128 poll cycles on a collector, reset
@@ -87,7 +87,8 @@ Reproducer results (`./repro <letters>`, one forked process per case):
 | C | attach on a `CQE_MIXED` ring | 32-byte CQE without `IORING_CQE_F_32`; phantom CQE with `user_data` = token | pass |
 | D | 2 MiB OBJ_SEND, no `MSG_DONTWAIT`, slow peer | res = 526336 (short) | 2097152 |
 | D2 | SEND X (2 MiB 'A') then SEND Y (64 KiB 'B'), same socket | **peer stream: 526336 'A', then 'B'; the rest of X is never sent** | in order |
-| E | FREE(h) → `IOSQE_IO_LINK` → READ(h) | FREE = 0, **READ = 8** | unchanged (design, §3.H4) |
+| D3 | as D2, but X uses `MSG_DONTWAIT` (a short result is allowed) | X = 6144, Y = 65536: **'B' starts at byte 6144** | X = 6144, Y = `-ECANCELED`, no 'B' on the wire |
+| E | FREE(h) → `IOSQE_IO_LINK` → READ(h) | FREE = 0, **READ = 8** | unchanged (design, §3.H3) |
 | F | 256 KiB store, 32 KiB KEEP, one sender thread interleaving 1 KiB writes to two sockets | **8 KiB captured, 262144/262144 charged, KEEP never completes** | unchanged (design, §3.H2) |
 | G | `close()` the collected socket fd | peer sees no FIN | unchanged (design, §3.M1) |
 
@@ -104,6 +105,8 @@ Appendix A resolves both.
 ---
 
 ## 3. Bugs (must fix)
+
+Letters A–D match the reproducer cases in §2. H and M items are ordered by severity.
 
 ### A. [critical] The collector dies after `APOLL_MAX_RETRY` re-arms, and its death destroys stream state
 
@@ -188,15 +191,19 @@ Appendix A resolves both.
   continues until the range is queued or an error/cancellation ends it" and
   "Object sends are FIFO".
 - **Reproduced:** In D2 the peer's byte stream is 526336 bytes of object X, then all of
-  object Y, and the rest of X never arrives.
-- **Fix (verified):** Do what `io_send()` does. Add `MSG_DONTWAIT` only when
+  object Y, and the rest of X never arrives. D3 shows the same splice without any io-wq
+  involvement: a `MSG_DONTWAIT` head is *allowed* to complete short (6144 bytes here),
+  and the queued follower is sent right after the prefix.
+- **Fix, part 1 (verified):** Do what `io_send()` does. Add `MSG_DONTWAIT` only when
   `IO_URING_F_NONBLOCK` is set, so the io-wq fallback blocks. Drop `uring_lock` around the
   blocking `sock_sendmsg()` in io-wq: `io_ring_submit_unlock()` is a no-op inline.
-- **Still needed (not prototyped):** If the head completes short or with an error for any
-  reason, fail the queued followers on that (store, socket) queue (`-ECANCELED`, like a
-  broken link chain). The causes include `MSG_DONTWAIT`, `SO_SNDTIMEO`, signals, and
-  `-EPIPE` after progress. Otherwise the FIFO guarantee is the thing corrupting the
-  stream.
+- **Fix, part 2 (verified):** When the queue head completes with anything other than its
+  full length, fail every request queued behind it on that (store, socket) queue with
+  `-ECANCELED`, like a broken link chain. Short heads come from `MSG_DONTWAIT`,
+  `SO_SNDTIMEO`, signals, cancellation and `-EPIPE` after progress. Appendix A marks the
+  queue broken in `io_opaque_tx_put()`, and `io_opaque_tx_enter()` fails a follower that
+  reaches the head of a broken queue. The mark lasts until the queue drains. Without
+  this, the FIFO guarantee is the thing corrupting the stream.
 
 ### C. [high] `CQE_MIXED`: the stream-token CQE is posted without `IORING_CQE_F_32`
 
@@ -224,9 +231,10 @@ Appendix A resolves both.
   It also lets through `MSG_ZEROCOPY`, `MSG_OOB`, `MSG_FASTOPEN` and others.
 - **Exploitability:** I didn't construct an exploit; the effects I traced are
   self-inflicted. But this is exactly what the read-once rule is for.
-- **Fix:** Read every SQE field exactly once into a local and validate the local. Do this
-  in both prep functions; `zcrx_ifq_idx`, `fd`, `rw_flags`, `buf_index` and `__pad2` are
-  all plain reads today.
+- **Fix (in Appendix A):** Read every SQE field exactly once into a local and validate the
+  local. Do this in both prep functions; `zcrx_ifq_idx`, `fd`, `rw_flags`, `buf_index` and
+  `__pad2` are all plain reads today. Appendix A does this. It is build- and
+  regression-tested; I didn't write a racing reproducer for the window itself.
 
 ### H2. [high] Accounting has no progress guarantee: one sub-page fragment can charge a whole compound page
 
@@ -245,7 +253,8 @@ Appendix A resolves both.
   unusable as a configuration knob.
 - **Suggestions:**
   1. Retain only if the compound charge fits in the *remaining* budget; otherwise copy.
-     Then any KEEP up to `hard_limit / 2` or so is guaranteed to progress.
+     Together with (3), any KEEP whose page-rounded length fits in the free budget is
+     then guaranteed to complete.
   2. Share one backing (one charge, one page ref) between all extents of the same
      compound page in a stream. A one-entry "last backing" cache already catches the
      interleaved case.
@@ -260,9 +269,11 @@ Appendix A resolves both.
     and generation bump.
   - `:1587-1598`: SEND prep pins `data` and builds the iterator.
 - **The problem:** Prep runs at submission time, so link order doesn't order effects.
-  FREE(h) → `IOSQE_IO_LINK` → READ(h) gives FREE = 0, READ = 8 (reproduced). The same
-  applies to SEND, OBJECT_STAT and COMPACT queued behind a FREE or a COMPACT. Prep-time
-  pinning also holds backing for requests sitting in deferred or linked chains.
+  FREE(h) → `IOSQE_IO_LINK` → READ(h) gives FREE = 0, READ = 8 (reproduced). SEND and
+  OBJECT_STAT linked behind a FREE behave the same way. (COMPACT and FREE re-look-up the
+  handle at issue, so they don't.) Prep-time pinning also keeps the old backing alive for
+  requests linked behind a COMPACT, and for anything sitting in a deferred or linked
+  chain. A linked KEEP reserves its object slot at submission.
 - **Precedent:** io_uring moved fixed file and fixed buffer resolution to issue time for
   exactly this reason.
 - **Fix:** Resolve at issue. The doc sentence "An SQE awaiting preparation has not
@@ -419,7 +430,7 @@ Today's surface:
 - **Five structs, three of which reuse bit 0 for unrelated flags.**
   `IORING_OPAQUE_COMPACTED`, `IORING_OPAQUE_STREAM_EOF` and `IORING_OPAQUE_AUTO_COMPACT`
   all live there; name the flags per struct.
-- **An automatic-compaction policy with eight tunables** (age, saving, slack %, extent
+- **An automatic-compaction policy with seven tunables** (age, saving, slack %, extent
   count, rate, burst, temporary bytes). That is policy, and it would be ABI forever.
 
 Suggestions:
@@ -476,8 +487,8 @@ cover letter (there isn't one; please add it) needs to answer it with numbers:
     list from the head, which is O(R×E) and O(E²) in bad cases. The doc's "capture
     consults the earliest decision rather than scanning all pending requests" is true
     for the actor but not for `stream_process()`.
-- **Allocations per op:** a several-hundred-byte `io_opaque_req` per op (union the per-op fields;
-  they're mutually exclusive), an allocation per extent, and for a split another
+- **Allocations per op:** a several-hundred-byte `io_opaque_req` per op (union the per-op
+  fields; they're mutually exclusive), an allocation per extent, and for a split another
   allocation per piece. A data mover doing millions of objects per second will see all of
   these.
 
@@ -500,8 +511,9 @@ real drivers. Show them with compaction off, manual, and automatic.
   selected by io_uring, and `default n` for anything new and experimental.
 - **Read consistency.** `sock_rx_owner_conflict()` should `READ_ONCE()` the owner like
   `sock_rx_owned()` does. Better, lockdep-assert ownership of the socket lock in both.
-- **`sk_wait_data()` change** (`sock.c:3324`). This wakes every protocol's sleepers on
-  ownership. Harmless for non-TCP today, but it belongs in the commit message.
+- **`sk_wait_data()` change** (`sock.c:3324`). This changes the wake condition for every
+  protocol that sleeps in `sk_wait_data()`. Only TCP sockets can be claimed today, so it's
+  harmless, but it belongs in the commit message.
 - **New errno.** `recv()` returning `-EBUSY` is a new user-visible errno for TCP; document
   it in the commit message and the man pages.
 - **Missing state transitions.** Nothing covers `tcp_disconnect()`, and there's no
@@ -544,8 +556,8 @@ real drivers. Show them with compaction off, manual, and automatic.
   - It takes `uring_lock` in io-wq (`io_ring_submit_lock()`), then the stream mutex, then
     `lock_sock()`, and holds them across `tcp_read_sock()`, page allocation and copies.
   - The order `uring_lock` → (`tables` or `stream->lock`, never nested) → `sk_lock` →
-    `sk_callback_lock` is consistent everywhere I looked, and lockdep agreed. Document it at the top of the
-    file.
+    `sk_callback_lock` is consistent everywhere I looked, and lockdep agreed. Document it
+    at the top of the file.
 - **`io_opaque_ready()`:** KEEP publication builds the bvec array at completion time.
   `-ENOMEM` there loses the consumed bytes (M4).
 - **`io_opaque_prep()`:**
@@ -554,9 +566,9 @@ real drivers. Show them with compaction off, manual, and automatic.
     on the stream token instead.
   - The `fd == -1` requirement is unusual for io_uring; unused fields are normally 0.
 - **`io_opaque_cancel()`** only cancels the first match. That's fine with the generic
-  `CANCEL_ALL` loop, but `io_opaque_cancel_all()` running from `io_uring_try_cancel_requests()`
-  takes every stream mutex under `uring_lock`. That's OK, but note it for v2's lock
-  documentation.
+  `CANCEL_ALL` loop. `io_opaque_cancel_all()`, run from
+  `io_uring_try_cancel_requests()`, takes every stream mutex under `uring_lock`. That's
+  OK, but note it for v2's lock documentation.
 - **`IORING_OP_OPAQUE_OBJ` with `IOSQE_ASYNC`** runs the whole issue path in io-wq,
   including `copy_to_user()` for READ and compaction start. That works, but it isn't
   covered by any test.
@@ -592,8 +604,8 @@ real drivers. Show them with compaction off, manual, and automatic.
   under UML without it.
 - **Missing coverage.** Add a regression test for each case in §2: long streams (more
   than 128 cycles, more than 32 MiB), RST mid-object, `CQE_MIXED`, throttled receivers
-  with two queued sends, interleaved fragments, `close()` of the collected fd, and
-  `IOSQE_ASYNC` on OPAQUE_OBJ.
+  with two queued sends (blocking and `MSG_DONTWAIT` heads), interleaved fragments,
+  `close()` of the collected fd, and `IOSQE_ASYNC` on OPAQUE_OBJ.
 - **Further coverage worth adding:**
   - A shared store with collectors in two rings, one ring exiting mid-KEEP
   - IPv6
@@ -656,8 +668,8 @@ real drivers. Show them with compaction off, manual, and automatic.
 
 ## 8. Suggested path to v2
 
-1. **Fix A–D, H1 and H3 now.** Appendix A has verified minimal fixes for A, B, C and D,
-   and each one needs a regression test.
+1. **Fix A–D, H1 and H3 now.** Appendix A has verified minimal fixes for A, B, C, D and
+   H1, and each one needs a regression test.
 2. **Decide on the net hook** (§4.3). Get netdev's view first, or drop it.
 3. **Lift the store out of zcrx** (§4.1). Rework the collector as a standard multishot
    whose stream outlives it, and use links for ordering (§4.2).
@@ -670,12 +682,22 @@ real drivers. Show them with compaction off, manual, and automatic.
 
 ---
 
-## Appendix A: prototype fixes for A, B, C and D (verified under UML)
+## Appendix A: prototype fixes for A, B, C, D and H1 (verified under UML)
 
 This is a direction check, not a submission-quality patch. It applies on top of
-`ce7be6c326f8`. With it, all reproducers pass except E, F and G (design issues), the
-selftest is 21/21 and KUnit is 11/11, with KASAN, lockdep and atomic-sleep clean.
-It does **not** implement the "fail queued followers" part of D, or H1–H3.
+`ce7be6c326f8` and covers:
+
+- **A:** a real multishot collector, `IOU_REQUEUE` on the batch cap, and a
+  budget wait that stays armed in poll.
+- **B:** the sign fix.
+- **C:** `IORING_CQE_F_32` on the token CQE.
+- **D:** a blocking io-wq fallback for SEND, and failing queued followers after a
+  short head.
+- **H1:** single-fetch SQE fields.
+
+With it, every reproducer passes except E, F and G (design issues, §3.H3, H2 and M1). The
+selftest is 21/21 and KUnit is 11/11, with KASAN, lockdep and atomic-sleep clean. It does
+not address H2, H3 or M1–M5.
 
 ```diff
 diff --git a/io_uring/net.c b/io_uring/net.c
@@ -691,10 +713,18 @@ index db1107b2f804..5573d2778697 100644
  	}
  	/* All data completions are posted as aux CQEs. */
 diff --git a/io_uring/opaque.c b/io_uring/opaque.c
-index 930d4747329f..ce80a2805f80 100644
+index 930d4747329f..3c607b336f84 100644
 --- a/io_uring/opaque.c
 +++ b/io_uring/opaque.c
-@@ -81,6 +81,7 @@ enum io_opaque_phase {
+@@ -75,12 +75,15 @@ struct io_opaque_tx {
+ 	struct rb_node node;
+ 	struct sock *sk;
+ 	struct list_head requests;
++	/* A head left a gap in the byte stream; fail everything queued behind it. */
++	bool broken;
+ };
+ 
+ enum io_opaque_phase {
  	IO_OPAQUE_IDLE,
  	IO_OPAQUE_RANGE_WAIT,
  	IO_OPAQUE_BUDGET_WAIT,
@@ -702,7 +732,7 @@ index 930d4747329f..ce80a2805f80 100644
  	IO_OPAQUE_SEND_WAIT,
  	IO_OPAQUE_COPY_WORK,
  	IO_OPAQUE_QUEUED,
-@@ -181,6 +182,13 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
+@@ -181,6 +184,13 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
  	guard(spinlock_irqsave)(&store->wait_lock);
  	list_for_each_entry_safe(op, next, &store->budget_waits, wait) {
  		list_del_init(&op->wait);
@@ -716,7 +746,7 @@ index 930d4747329f..ce80a2805f80 100644
  		op->phase = IO_OPAQUE_QUEUED;
  		op->req->io_task_work.func = io_opaque_resume;
  		io_req_task_work_add(op->req);
-@@ -996,7 +1004,7 @@ static int io_opaque_attach(struct io_opaque_req *op)
+@@ -996,7 +1006,7 @@ static int io_opaque_attach(struct io_opaque_req *op)
  		slot->generation++;
  		stream->token = (u64)slot->generation << 32 | (i + 1);
  		cqe[0].user_data = op->req->cqe.user_data;
@@ -725,7 +755,7 @@ index 930d4747329f..ce80a2805f80 100644
  		memcpy(&cqe[1], &stream->token, sizeof(stream->token));
  		if (!io_req_post_cqe32(op->req, cqe)) {
  			write_unlock_bh(&sock->sk->sk_callback_lock);
-@@ -1055,7 +1063,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
+@@ -1055,7 +1065,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
  	else
  		ret = tcp_read_sock(sock->sk, &desc, io_opaque_actor);
  	if (sock->sk->sk_err)
@@ -734,7 +764,7 @@ index 930d4747329f..ce80a2805f80 100644
  	if ((sock->sk->sk_shutdown & RCV_SHUTDOWN) &&
  	    skb_queue_empty(&sock->sk->sk_receive_queue))
  		stream->eof = true;
-@@ -1066,6 +1074,19 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
+@@ -1066,6 +1076,19 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
  	io_opaque_stream_process(stream);
  	if (stream->error || stream->eof) {
  		ret = stream->error;
@@ -754,7 +784,7 @@ index 930d4747329f..ce80a2805f80 100644
  	} else if (ret == -ENOBUFS) {
  		io_opaque_wait(op, IO_OPAQUE_BUDGET_WAIT);
  		/* Recheck after enrollment to close the release/enrollment race. */
-@@ -1074,8 +1095,11 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
+@@ -1074,8 +1097,11 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
  		    atomic_read(&op->store->extents) < op->store->config.max_extents - 2)
  			io_opaque_wake_budget(op->store);
  		ret = IOU_ISSUE_SKIP_COMPLETE;
@@ -767,7 +797,26 @@ index 930d4747329f..ce80a2805f80 100644
  	}
  unlock_stream:
  	mutex_unlock(&stream->lock);
-@@ -1456,7 +1480,7 @@ static bool io_opaque_cancel_req(struct io_opaque_req *op)
+@@ -1197,7 +1223,7 @@ static bool io_opaque_stream_op(u16 op)
+ 
+ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ {
+-	struct io_opaque_store *store = io_opaque_get_store(req, sqe->zcrx_ifq_idx);
++	struct io_opaque_store *store = io_opaque_get_store(req, READ_ONCE(sqe->zcrx_ifq_idx));
+ 	struct io_opaque_req *op;
+ 	struct io_opaque_slot *slot;
+ 	u64 end;
+@@ -1207,7 +1233,8 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ 
+ 	if (!store)
+ 		return -ENXIO;
+-	if (sqe->fd != -1 || sqe->rw_flags || sqe->buf_index || sqe->__pad2[0] ||
++	if (READ_ONCE(sqe->fd) != -1 || READ_ONCE(sqe->rw_flags) || READ_ONCE(sqe->buf_index) ||
++	    READ_ONCE(sqe->__pad2[0]) ||
+ 	    cmd > IORING_OPAQUE_SET_POLICY ||
+ 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
+ 		return -EINVAL;
+@@ -1456,7 +1483,7 @@ static bool io_opaque_cancel_req(struct io_opaque_req *op)
  		mutex_lock(&op->stream->lock);
  	spin_lock_irqsave(&op->store->wait_lock, flags);
  	phase = op->phase;
@@ -776,7 +825,55 @@ index 930d4747329f..ce80a2805f80 100644
  		spin_unlock_irqrestore(&op->store->wait_lock, flags);
  		if (op->stream)
  			mutex_unlock(&op->stream->lock);
-@@ -1668,11 +1692,14 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
+@@ -1561,15 +1588,17 @@ void io_opaque_fail(struct io_kiocb *req)
+ 
+ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ {
+-	struct io_opaque_store *store = io_opaque_get_store(req, sqe->zcrx_ifq_idx);
++	struct io_opaque_store *store;
+ 	struct io_opaque_req *op;
+ 	struct io_opaque_slot *slot;
++	u32 msg_flags = READ_ONCE(sqe->msg_flags);
+ 	u64 end;
+ 
++	store = io_opaque_get_store(req, READ_ONCE(sqe->zcrx_ifq_idx));
+ 	if (!store)
+ 		return -ENXIO;
+-	if (sqe->ioprio || sqe->buf_index || sqe->addr3 || sqe->__pad2[0] ||
+-	    (sqe->msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
++	if (READ_ONCE(sqe->ioprio) || READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->addr3) ||
++	    READ_ONCE(sqe->__pad2[0]) || (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
+ 		return -EINVAL;
+ 	op = io_opaque_req_alloc(req, store, false);
+ 	if (IS_ERR(op))
+@@ -1578,7 +1607,7 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ 	op->handle = READ_ONCE(sqe->addr);
+ 	op->offset = READ_ONCE(sqe->off);
+ 	op->length = READ_ONCE(sqe->len);
+-	op->msg_flags = READ_ONCE(sqe->msg_flags);
++	op->msg_flags = msg_flags;
+ 	if (op->msg_flags & MSG_DONTWAIT)
+ 		req->flags |= REQ_F_NOWAIT;
+ 	if (!op->length || op->length > INT_MAX ||
+@@ -1633,7 +1662,7 @@ static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
+ 		io_opaque_wait(op, IO_OPAQUE_SEND_WAIT);
+ 		return IOU_ISSUE_SKIP_COMPLETE;
+ 	}
+-	return 0;
++	return op->tx->broken && !op->progress ? -ECANCELED : 0;
+ }
+ 
+ static void io_opaque_tx_put(struct io_opaque_req *op)
+@@ -1647,6 +1676,8 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
+ 		return;
+ 	guard(mutex)(&store->tables);
+ 	head = list_first_entry(&tx->requests, struct io_opaque_req, send) == op;
++	if (head && op->req->cqe.res != (int)op->length)
++		tx->broken = true;
+ 	list_del_init(&op->send);
+ 	if (list_empty(&tx->requests)) {
+ 		rb_erase(&tx->node, &store->txs);
+@@ -1668,11 +1699,14 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
  	struct io_opaque_req *op = req->async_data;
  	struct socket *sock = sock_from_file(req->file);
  	struct msghdr msg = {
@@ -792,10 +889,15 @@ index 930d4747329f..ce80a2805f80 100644
  	io_ring_submit_lock(req->ctx, issue_flags);
  	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
  		ret = -EOPNOTSUPP;
-@@ -1685,7 +1712,10 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
+@@ -1683,9 +1717,14 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
+ 		goto finish;
+ 	}
  	ret = io_opaque_tx_enter(op, sock->sk);
- 	if (ret)
+-	if (ret)
++	if (ret == IOU_ISSUE_SKIP_COMPLETE)
  		goto out;
++	if (ret)
++		goto finish;
 +	/* Only drops the lock for io-wq, where the send may block. */
 +	io_ring_submit_unlock(req->ctx, issue_flags);
  	ret = sock_sendmsg(sock, &msg);
@@ -1271,6 +1373,76 @@ static void test_send_fifo_corruption(void)
 	free(seen);
 }
 
+
+/*
+ * D3: a MSG_DONTWAIT head may legitimately complete short. Anything queued
+ * behind it for the same socket must then fail, or the peer's byte stream
+ * gets the next object spliced in after the head's prefix.
+ */
+static void test_send_dontwait_follower(void)
+{
+	struct io_uring_opaque_config cfg = default_cfg();
+	size_t xlen = 2U << 20, ylen = 64U << 10, total = xlen + ylen, i, first_b = 0;
+	unsigned char *src = malloc(total), *seen = calloc(1, total);
+	struct transfer tx = { .data = src, .length = total };
+	struct collect_reader cr = { .buf = seen, .cap = total, .sleep_us = 500 };
+	struct io_uring_sqe sx_sqe;
+	struct event ev, sx, sy;
+	struct ring r;
+	uint32_t ctx;
+	uint64_t stream, kx, ky, hx, hy, tx_x, tx_y;
+	int s[2], d[2];
+	pthread_t prod, cons;
+	bool got_b = false;
+
+	memset(src, 'A', xlen);
+	memset(src + xlen, 'B', ylen);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "ring");
+	require(!register_store(&r, &cfg, &ctx), "store");
+	tcp_pair(s);
+	tcp_pair_small(d, 4096, 4096);
+	stream = attach(&r, ctx, s[1], COLLECTOR_TAG);
+	kx = cmd_stage(&r, ctx, IORING_OPAQUE_KEEP, stream, 0, xlen, NULL);
+	ky = cmd_stage(&r, ctx, IORING_OPAQUE_KEEP, stream, xlen, ylen, NULL);
+	tx.fd = s[0];
+	require(!pthread_create(&prod, NULL, writer, &tx), "producer");
+	require(wait_tag_to(&r, kx, 30000, &ev) && ev.res == (int)xlen, "KEEP X");
+	hx = ev.extra[0];
+	require(wait_tag_to(&r, ky, 30000, &ev) && ev.res == (int)ylen, "KEEP Y");
+	hy = ev.extra[0];
+	pthread_join(prod, NULL);
+	sx_sqe = (struct io_uring_sqe) {
+		.opcode = IORING_OP_OPAQUE_OBJ_SEND, .fd = d[0], .zcrx_ifq_idx = ctx,
+		.addr = hx, .off = 0, .len = xlen, .msg_flags = MSG_DONTWAIT,
+		.user_data = next_tag++,
+	};
+	stage(&r, sx_sqe);
+	tx_x = sx_sqe.user_data;
+	tx_y = send_stage(&r, ctx, d[0], hy, 0, ylen);
+	cr.fd = d[1];
+	require(!pthread_create(&cons, NULL, collect_reader, &cr), "consumer");
+	require(wait_tag_to(&r, tx_x, 120000, &sx), "SEND X");
+	require(wait_tag_to(&r, tx_y, 120000, &sy), "SEND Y");
+	shutdown(d[0], SHUT_WR);
+	pthread_join(cons, NULL);
+	for (i = 0; i < cr.done; i++)
+		if (seen[i] == 'B') {
+			first_b = i;
+			got_b = true;
+			break;
+		}
+	printf("[D3] SEND X(MSG_DONTWAIT) res=%d, queued SEND Y res=%d; peer got %zu bytes, 'B' %s%zu\n",
+	       sx.res, sy.res, cr.done, got_b ? "first at " : "never seen, ", got_b ? first_b : 0);
+	printf("[D3] RESULT: %s\n",
+	       sx.res == (int)xlen ? "ok (head was not short this time)" :
+	       !got_b && sy.res == -ECANCELED ? "ok (follower failed after short head)" :
+	       "BUG: follower sent after a short head; destination stream spliced");
+	ring_exit(&r);
+	close(s[0]); close(s[1]); close(d[0]); close(d[1]);
+	free(src);
+	free(seen);
+}
+
 /* E: handles are resolved at prep, so link order does not order FREE vs READ/SEND. */
 static void test_link_order(void)
 {
@@ -1447,6 +1619,7 @@ int main(int argc, char **argv)
 	if (!only || strchr(only, 'D')) {
 		run("D", test_send_short);
 		run("D2", test_send_fifo_corruption);
+		run("D3", test_send_dontwait_follower);
 	}
 	if (!only || strchr(only, 'E'))
 		run("E", test_link_order);
