@@ -38,6 +38,7 @@
 #include "futex.h"
 #include "truncate.h"
 #include "zcrx.h"
+#include "opaque.h"
 
 static int io_no_issue(struct io_kiocb *req, unsigned int issue_flags)
 {
@@ -591,6 +592,45 @@ const struct io_issue_def io_issue_defs[] = {
 		.prep			= io_uring_cmd_prep,
 		.issue			= io_uring_cmd,
 	},
+	[IORING_OP_OPAQUE_COLLECT] = {
+		.audit_skip		= 1,
+		.ioprio			= 1,
+		.needs_file		= 1,
+		.unbound_nonreg_file	= 1,
+		.pollin			= 1,
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+		.async_size		= sizeof(struct io_opaque_req),
+		.prep			= io_opaque_recv_prep,
+		.issue			= io_opaque_recv,
+#else
+		.prep			= io_eopnotsupp_prep,
+#endif
+	},
+	[IORING_OP_OPAQUE_OBJ] = {
+		.audit_skip		= 1,
+		.ioprio			= 1,
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+		.async_size		= sizeof(struct io_opaque_req),
+		.prep			= io_opaque_prep,
+		.issue			= io_opaque_issue,
+#else
+		.prep			= io_eopnotsupp_prep,
+#endif
+	},
+	[IORING_OP_OPAQUE_OBJ_SEND] = {
+		.audit_skip		= 1,
+		.ioprio			= 1,
+		.needs_file		= 1,
+		.unbound_nonreg_file	= 1,
+		.pollout			= 1,
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+		.async_size		= sizeof(struct io_opaque_req),
+		.prep			= io_opaque_send_prep,
+		.issue			= io_opaque_send,
+#else
+		.prep			= io_eopnotsupp_prep,
+#endif
+	},
 };
 
 const struct io_cold_def io_cold_defs[] = {
@@ -848,6 +888,21 @@ const struct io_cold_def io_cold_defs[] = {
 		.name			= "URING_CMD128",
 		.sqe_copy		= io_uring_cmd_sqe_copy,
 		.cleanup		= io_uring_cmd_cleanup,
+	},
+	[IORING_OP_OPAQUE_COLLECT] = {
+		.name			= "OPAQUE_COLLECT",
+		.cleanup		= io_opaque_cleanup,
+	},
+	[IORING_OP_OPAQUE_OBJ] = {
+		.name			= "OPAQUE_OBJ",
+		.cleanup		= io_opaque_cleanup,
+	},
+	[IORING_OP_OPAQUE_OBJ_SEND] = {
+		.name			= "OPAQUE_OBJ_SEND",
+		.cleanup		= io_opaque_cleanup,
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+		.fail			= io_opaque_fail,
+#endif
 	},
 };
 

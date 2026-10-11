@@ -88,6 +88,7 @@
 #include "msg_ring.h"
 #include "memmap.h"
 #include "zcrx.h"
+#include "opaque.h"
 #include "bpf-ops.h"
 
 #include "timeout.h"
@@ -220,6 +221,7 @@ static void io_free_alloc_caches(struct io_ring_ctx *ctx)
 	io_alloc_cache_free(&ctx->rw_cache, io_rw_cache_free);
 	io_alloc_cache_free(&ctx->cmd_cache, io_cmd_cache_free);
 	io_futex_cache_free(ctx);
+	io_opaque_cache_free(ctx);
 	io_rsrc_cache_free(ctx);
 }
 
@@ -267,6 +269,7 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 			    sizeof(struct io_async_cmd),
 			    sizeof(struct io_async_cmd));
 	ret |= io_futex_cache_init(ctx);
+	ret |= io_opaque_cache_init(ctx);
 	ret |= io_rsrc_cache_init(ctx);
 	if (ret)
 		goto free_ref;
@@ -287,6 +290,10 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	ctx->submit_state.free_list.next = NULL;
 	INIT_HLIST_HEAD(&ctx->waitid_list);
 	xa_init_flags(&ctx->zcrx_ctxs, XA_FLAGS_ALLOC);
+#ifdef CONFIG_IO_URING_OPAQUE_OBJ
+	xa_init_flags(&ctx->opaque_stores, XA_FLAGS_ALLOC);
+	INIT_LIST_HEAD(&ctx->opaque_waits);
+#endif
 #ifdef CONFIG_FUTEX
 	INIT_HLIST_HEAD(&ctx->futex_list);
 #endif
@@ -2162,6 +2169,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	io_sqe_buffers_unregister(ctx);
 	io_sqe_files_unregister(ctx);
 	io_unregister_zcrx(ctx);
+	io_unregister_opaque(ctx);
 	io_cqring_overflow_kill(ctx);
 	io_eventfd_unregister(ctx);
 	io_free_alloc_caches(ctx);
@@ -2319,6 +2327,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 
 	mutex_lock(&ctx->uring_lock);
 	io_terminate_zcrx(ctx);
+	io_terminate_opaque(ctx);
 	mutex_unlock(&ctx->uring_lock);
 
 	/*
