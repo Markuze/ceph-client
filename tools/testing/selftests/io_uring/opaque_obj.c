@@ -932,15 +932,21 @@ static void test_interleaved(struct io_uring_opaque_config cfg)
 	}
 }
 
-static void test_compact_queue(struct io_uring_opaque_config *cfg)
+static void test_compact_queue(struct io_uring_opaque_config *cfg, int mode)
 {
-	struct ring r;
+	struct ring r, imported;
 	struct event event;
 	struct io_uring_opaque_stat stat;
+	struct io_uring_opaque_policy policy = {
+		.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT,
+		.bytes_per_second = mode == 1 ? 1 : 64U << 20,
+		.burst_bytes = mode == 1 ? 1 : 8U << 20,
+		.max_temporary_bytes = mode == 1 ? sysconf(_SC_PAGESIZE) : 8U << 20,
+	};
 	unsigned char data[65536], seen[sizeof(data)];
-	uint32_t context;
-	uint64_t stream, handles[16], copies[16], keep;
-	int pair[2], i;
+	uint32_t context, other = 0;
+	uint64_t stream, handles[16], copies[16], keep, disabled = 0;
+	int pair[2], i, fd;
 
 	memset(data, 0x73, sizeof(data));
 	require(!ring_init(&r, IORING_SETUP_CQE32), "compaction queue ring");
@@ -955,9 +961,27 @@ static void test_compact_queue(struct io_uring_opaque_config *cfg)
 		require(event.res == (int)sizeof(data), "compaction queue KEEP");
 		handles[i] = event.extra[0];
 	}
-	for (i = 0; i < 16; i++)
-		copies[i] = cmd_stage(&r, context, IORING_OPAQUE_COMPACT, handles[i], 0, 0, NULL);
-	{
+	if (mode == 2) {
+		fd = export_store(&r, context);
+		require(fd >= 0 && !ring_init(&imported, IORING_SETUP_CQE32) &&
+			!import_store(&imported, fd, &other), "shared compaction queue");
+		close(fd);
+	}
+	if (mode)
+		require(!command(&r, context, IORING_OPAQUE_SET_POLICY, 0, 0,
+				 sizeof(policy), &policy).res, "compaction queue auto policy");
+	for (i = 0; i < 16; i++) {
+		bool remote = mode == 2 && (i & 1);
+
+		copies[i] = cmd_stage(remote ? &imported : &r, remote ? other : context,
+				      IORING_OPAQUE_COMPACT, handles[i], 0, 0, NULL);
+	}
+	if (mode == 1) {
+		policy.flags = 0;
+		disabled = cmd_stage(&r, context, IORING_OPAQUE_SET_POLICY, 0, 0,
+				     sizeof(policy), &policy);
+	}
+	if (mode != 2) {
 		struct io_uring_sqe cancel = {
 			.opcode = IORING_OP_ASYNC_CANCEL, .fd = -1,
 			.addr = copies[15], .user_data = next_tag++,
@@ -965,24 +989,116 @@ static void test_compact_queue(struct io_uring_opaque_config *cfg)
 
 		stage(&r, cancel);
 		require(!wait_tag(&r, cancel.user_data).res, "cancel queued compaction");
+	} else {
+		enter(&r, 0);
+		enter(&imported, 0);
 	}
+	if (disabled)
+		require(!wait_tag(&r, disabled).res, "disable auto with accepted manual copies");
 	for (i = 0; i < 16; i++) {
-		require(wait_tag(&r, copies[i]).res == (i == 15 ? -ECANCELED : 0),
+		event = wait_tag(mode == 2 && (i & 1) ? &imported : &r, copies[i]);
+		require(mode == 2 ? event.res == 0 || event.res == -EBUSY :
+			event.res == (i == 15 ? -ECANCELED : 0),
 			"shared compaction dispatcher completion");
+		if (mode == 2) {
+			struct io_uring_opaque_object_stat object;
+			int attempt;
+
+			for (attempt = 0; attempt < 300; attempt++) {
+				require(!command(&r, context, IORING_OPAQUE_OBJECT_STAT, handles[i],
+						 0, sizeof(object), &object).res,
+					"shared compact stat");
+				if (object.flags & IORING_OPAQUE_OBJECT_F_COMPACTED)
+					break;
+				usleep(10000);
+			}
+			require(attempt < 300, "manual and automatic compaction progress");
+		}
 		require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handles[i], 0,
 				sizeof(seen), seen).res == (int)sizeof(seen) &&
 			!memcmp(data, seen, sizeof(data)), "queued compaction preserves bytes");
 		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i], 0, 0, NULL).res,
 			"queued compaction FREE");
 	}
+	if (mode == 2) {
+		policy.flags = 0;
+		require(!command(&imported, other, IORING_OPAQUE_SET_POLICY, 0, 0,
+				 sizeof(policy), &policy).res, "disable shared auto compaction");
+		ring_exit(&imported);
+	}
 	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
 		"compaction queue close");
+	if (mode == 2) {
+		int attempt;
+
+		/* Automatic publication precedes release of its worker's source pin. */
+		for (attempt = 0; attempt < 300; attempt++) {
+			require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
+					 sizeof(stat), &stat).res, "automatic copy cleanup stat");
+			if (!stat.backing_bytes && !stat.extents)
+				break;
+			usleep(10000);
+		}
+		require(attempt < 300, "automatic copy releases its final source pin");
+	}
 	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
 		!stat.backing_bytes && !stat.extents, "compaction dispatcher drains reservations");
 	ring_exit(&r);
 	close(pair[0]);
 	close(pair[1]);
-	ksft_test_result_pass("shared compaction worker drains batches and canceled requests\n");
+	ksft_test_result_pass("%s\n", mode == 1 ?
+		"disabling automatic policy preserves accepted manual compactions" : mode == 2 ?
+		"shared-ring manual and automatic compaction preserves bytes and drains backing" :
+		"shared compaction worker drains batches and canceled requests");
+}
+
+static void test_compact_teardown(struct io_uring_opaque_config *cfg)
+{
+	unsigned char data[65536], byte;
+	int round;
+
+	memset(data, 0x64, sizeof(data));
+	for (round = 0; round < 8; round++) {
+		struct io_uring_opaque_policy policy = {
+			.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT,
+			.bytes_per_second = 64U << 20, .burst_bytes = 8U << 20,
+			.max_temporary_bytes = 8U << 20,
+		};
+		struct ring r;
+		uint64_t handles[16], stream, keep;
+		uint32_t context;
+		int pair[2], i;
+
+		require(!ring_init(&r, IORING_SETUP_CQE32) &&
+			!register_store(&r, cfg, &context), "compaction teardown store");
+		tcp_pair(pair);
+		stream = attach(&r, context, pair[1], 713);
+		for (i = 0; i < 16; i++) {
+			struct event event;
+
+			keep = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream,
+					 (uint64_t)i * sizeof(data), sizeof(data), NULL);
+			write_all(pair[0], data, sizeof(data));
+			event = wait_tag(&r, keep);
+			require(event.res == (int)sizeof(data), "compaction teardown capture");
+			handles[i] = event.extra[0];
+		}
+		require(!command(&r, context, IORING_OPAQUE_SET_POLICY, 0, 0,
+				 sizeof(policy), &policy).res, "compaction teardown auto timer");
+		for (i = 0; i < 16; i++)
+			cmd_stage(&r, context, IORING_OPAQUE_COMPACT, handles[i], 0, 0, NULL);
+		enter(&r, 0);
+		ring_exit(&r);
+		for (i = 0; i < 300; i++) {
+			if (recv(pair[1], &byte, 1, MSG_DONTWAIT) < 0 && errno == EAGAIN)
+				break;
+			usleep(10000);
+		}
+		require(i < 300, "compaction teardown releases the receive claim");
+		close(pair[0]);
+		close(pair[1]);
+	}
+	ksft_test_result_pass("queued compactions drain during ring teardown with auto policy\n");
 }
 
 static void test_budget_error(struct io_uring_opaque_config cfg)
@@ -3225,7 +3341,7 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(77);
+	ksft_set_plan(80);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -3344,6 +3460,15 @@ int main(void)
 		cursor += sizeof(bytes);
 		require(event.res == (int)sizeof(bytes) && handle != old_handle,
 			"new object identity");
+		policy.burst_bytes = sysconf(_SC_PAGESIZE);
+		require(!command(&r, context, IORING_OPAQUE_SET_POLICY,
+				 0, 0, sizeof(policy), &policy).res, "ineligible auto policy");
+		usleep(150000);
+		require(!command(&r, context, IORING_OPAQUE_OBJECT_STAT, handle, 0,
+				 sizeof(object_stat), &object_stat).res &&
+			!(object_stat.flags & IORING_OPAQUE_OBJECT_F_COMPACTED),
+			"automatic compaction respects the burst limit");
+		policy.burst_bytes = 8U << 20;
 		require(!command(&r, context, IORING_OPAQUE_SET_POLICY,
 				 0, 0, sizeof(policy), &policy).res,
 			"automatic compaction policy");
@@ -3366,7 +3491,7 @@ int main(void)
 		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
 			"free auto object");
 	}
-	ksft_test_result_pass("automatic compaction preserves object identity and payload bytes\n");
+	ksft_test_result_pass("auto policy re-enrolls objects and preserves bytes/identity\n");
 	{
 		size_t length = 4U << 20, i;
 		unsigned char *data = malloc(length);
@@ -3465,7 +3590,10 @@ int main(void)
 	test_link_order(&cfg);
 	test_keep_restore(&cfg);
 	test_interleaved(cfg);
-	test_compact_queue(&cfg);
+	test_compact_queue(&cfg, 0);
+	test_compact_queue(&cfg, 1);
+	test_compact_queue(&cfg, 2);
+	test_compact_teardown(&cfg);
 	test_budget_error(cfg);
 	test_memcg(&cfg);
 	test_disconnect(&cfg);

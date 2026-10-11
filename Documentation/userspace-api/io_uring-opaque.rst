@@ -387,20 +387,31 @@ Policy exposes only copy bytes per second, burst allowance and maximum
 temporary backing. Candidate age, savings and fragmentation selection are
 implementation heuristics, not ABI guarantees. The current implementation
 waits at least 100 milliseconds and favors worthwhile backing savings or
-multiple extents; these thresholds can change without changing the ABI. One delayed worker per store scans at most 32
-candidates per invocation and copies at most one object. A store mutex
-serializes its copies with manual requests. FREE and SEND_LAST remove
+multiple extents; these thresholds can change without changing the ABI. One
+delayed compaction dispatcher per store handles manual requests and automatic
+selection. An automatic scan examines at most 32 candidates and copies at
+most one object, with the next scan paced independently of manual wakeups.
+The single work item serializes copying without a second worker or copy mutex.
+FREE and SEND_LAST remove
 candidates; dense versions are removed after success; failures back off.
 Ordinary reception cannot consume configured compaction headroom. Neither
 policy nor manual requests bypass the hard limit, and no objects are evicted.
 Objects exceeding the burst or temporary allowance remain ineligible until
-policy changes.
+policy changes. Permanently ineligible candidates are removed from the scan
+list so they do not keep an idle timer running; a policy update reconsiders
+all non-dense objects. A transient token shortage or failed allocation keeps
+its candidate for a later retry.
 
-Manual and automatic copies use the shared unbound worker pool, with one
-active copy per store and a bounded manual dispatcher. Stores do not create
-a private rescuer thread. Disabling automatic policy prevents further
-automatic attempts without waiting under the submission lock; an already
-selected copy may finish. Store destruction waits for its own workers.
+The dispatcher uses the shared unbound worker pool and processes at most
+eight manual requests per invocation before checking automatic policy. Stores
+do not create a private rescuer thread. Disabling automatic policy prevents
+further automatic attempts without canceling accepted manual requests or
+waiting under the submission lock; an already selected copy may finish.
+Shutdown closes enrollment and drains every accepted manual request with
+cancellation before freeing the store. A separate delayed allocation-retry
+work item wakes receive waiters independently of long compaction copies;
+ordinary quota release wakes them directly. Store destruction waits for its
+own work items.
 
 An in-flight compaction holds its own source reference. If SEND_LAST consumes
 the handle before compaction publication, source/generation revalidation

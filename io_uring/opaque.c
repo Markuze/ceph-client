@@ -415,7 +415,6 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	}
 #endif
 	mutex_init(&store->tables);
-	mutex_init(&store->copy_lock);
 	spin_lock_init(&store->wait_lock);
 	INIT_LIST_HEAD(&store->budget_waits);
 	INIT_LIST_HEAD(&store->copies);
@@ -423,9 +422,8 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	store->txs = RB_ROOT;
 	for (i = 0; i < cfg.max_objects; i++)
 		INIT_LIST_HEAD(&store->objects[i].candidate);
-	INIT_DELAYED_WORK(&store->auto_work, io_opaque_auto_work);
 	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
-	INIT_WORK(&store->copy_work, io_opaque_compact_work);
+	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
 	return store;
 free_store:
 	bitmap_free(store->stream_used);
@@ -442,12 +440,15 @@ void io_opaque_stop(struct io_opaque_store *store)
 
 	if (!store)
 		return;
-	scoped_guard(spinlock, &store->wait_lock) {
+	/* Close enrollment before draining the compaction dispatcher. */
+	scoped_guard(mutex, &store->tables) {
+		guard(spinlock)(&store->wait_lock);
+
 		if (store->dead)
 			return;
 		WRITE_ONCE(store->dead, 1);
 	}
-	cancel_delayed_work_sync(&store->auto_work);
+	flush_delayed_work(&store->compact_work);
 	cancel_delayed_work_sync(&store->retry_work);
 	for (i = 0; i < store->config.max_streams; i++) {
 		struct io_opaque_stream *stream;
@@ -481,7 +482,6 @@ void io_opaque_free(struct io_opaque_store *store)
 	if (!store)
 		return;
 	io_opaque_stop(store);
-	flush_work(&store->copy_work);
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
 	WARN_ON_ONCE(atomic_read(&store->extents));
 	WARN_ON_ONCE(atomic_read(&store->requests));
@@ -1391,7 +1391,8 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 				slot->retry = jiffies;
 				if (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) {
 					list_add_tail(&slot->candidate, &store->candidates);
-					mod_delayed_work(system_dfl_wq, &store->auto_work, 1);
+					store->auto_at = jiffies;
+					mod_delayed_work(system_dfl_wq, &store->compact_work, 0);
 				}
 				ret = op->length;
 			}

@@ -128,15 +128,14 @@ struct io_opaque_store {
 	spinlock_t wait_lock;
 	struct list_head budget_waits;
 	struct list_head copies;
-	/* Serialize manual and automatic copies outside the submission lock. */
-	struct mutex copy_lock;
-	struct work_struct copy_work;
+	/* One dispatcher serializes manual and automatic copies. */
+	struct delayed_work compact_work;
 	struct delayed_work retry_work;
-	struct delayed_work auto_work;
 	struct list_head candidates;
 	struct io_uring_opaque_policy policy;
 	u64 tokens;
 	unsigned long token_time;
+	unsigned long auto_at;
 	int dead;
 };
 
@@ -160,7 +159,6 @@ int io_opaque_compact_publish(struct io_opaque_req *op);
 void io_opaque_compact_work(struct work_struct *work);
 int io_opaque_compact_start(struct io_opaque_req *op);
 int io_opaque_set_policy(struct io_opaque_req *op);
-void io_opaque_auto_work(struct work_struct *work);
 
 #if IS_ENABLED(CONFIG_KUNIT)
 void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation);

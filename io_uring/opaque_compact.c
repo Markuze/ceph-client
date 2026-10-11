@@ -9,6 +9,9 @@
 
 #include "io_uring.h"
 #include "opaque_internal.h"
+
+static void io_opaque_auto_compact(struct io_opaque_store *store);
+
 struct io_opaque_cursor {
 	struct io_opaque_extent *extent;
 	u32 offset;
@@ -71,7 +74,6 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 	struct mem_cgroup *old;
 	int ret = 0;
 
-	guard(mutex)(&store->copy_lock);
 	if (READ_ONCE(op->canceled) || READ_ONCE(store->dead))
 		return -ECANCELED;
 	/* Allocated replacement bytes remain inside this reservation. */
@@ -156,26 +158,40 @@ int io_opaque_compact_publish(struct io_opaque_req *op)
 
 void io_opaque_compact_work(struct work_struct *work)
 {
-	struct io_opaque_store *store = container_of(work, struct io_opaque_store, copy_work);
+	struct io_opaque_store *store = container_of(to_delayed_work(work),
+						   struct io_opaque_store, compact_work);
+	unsigned long delay = MAX_JIFFY_OFFSET;
+	unsigned long now;
 	unsigned int i;
 
-	for (i = 0; i < 8; i++) {
+	/* Shutdown drains every accepted request, without another invocation. */
+	for (i = 0; i < 8 || READ_ONCE(store->dead); i++) {
 		struct io_opaque_req *op;
 		int ret;
 
 		scoped_guard(spinlock, &store->wait_lock) {
 			op = list_first_entry_or_null(&store->copies, struct io_opaque_req, wait);
-			if (!op)
-				return;
-			list_del_init(&op->wait);
+			if (op)
+				list_del_init(&op->wait);
 		}
+		if (!op)
+			break;
 		ret = io_opaque_compact_build(op);
 		/* Cancellation cannot complete a request still owned by this worker. */
 		io_opaque_queue_ready(op, ret);
 	}
+	io_opaque_auto_compact(store);
+	/* Keep automatic scans paced even when manual requests wake us early. */
+	guard(mutex)(&store->tables);
+	now = jiffies;
+	if (!store->dead && (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) &&
+	    !list_empty(&store->candidates))
+		delay = time_before(now, store->auto_at) ? store->auto_at - now : 0;
 	guard(spinlock)(&store->wait_lock);
 	if (!list_empty(&store->copies))
-		queue_work(system_dfl_wq, &store->copy_work);
+		delay = 0;
+	if (delay != MAX_JIFFY_OFFSET)
+		queue_delayed_work(system_dfl_wq, &store->compact_work, delay);
 }
 
 int io_opaque_compact_start(struct io_opaque_req *op)
@@ -199,7 +215,7 @@ int io_opaque_compact_start(struct io_opaque_req *op)
 	io_opaque_wait(op, IO_OPAQUE_COPY_WORK);
 	scoped_guard(spinlock, &store->wait_lock)
 		list_add_tail(&op->wait, &store->copies);
-	queue_work(system_dfl_wq, &store->copy_work);
+	mod_delayed_work(system_dfl_wq, &store->compact_work, 0);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
 
@@ -226,9 +242,14 @@ int io_opaque_set_policy(struct io_opaque_req *op)
 	     policy.max_temporary_bytes < PAGE_SIZE))
 		return -EINVAL;
 	mutex_lock(&store->tables);
+	if (store->dead) {
+		mutex_unlock(&store->tables);
+		return -ESHUTDOWN;
+	}
 	store->policy = policy;
 	store->tokens = policy.burst_bytes;
 	store->token_time = jiffies;
+	store->auto_at = jiffies;
 	for (i = 0; i < store->config.max_objects; i++) {
 		struct io_opaque_slot *slot = &store->objects[i];
 
@@ -240,31 +261,34 @@ int io_opaque_set_policy(struct io_opaque_req *op)
 			list_del_init(&slot->candidate);
 		}
 	}
+	if (policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) {
+		mod_delayed_work(system_dfl_wq, &store->compact_work, 0);
+	} else {
+		guard(spinlock)(&store->wait_lock);
+		/* Policy changes cannot cancel an accepted manual request. */
+		if (list_empty(&store->copies))
+			cancel_delayed_work(&store->compact_work);
+	}
 	mutex_unlock(&store->tables);
-	if (policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)
-		mod_delayed_work(system_dfl_wq, &store->auto_work, 1);
-	else
-		cancel_delayed_work(&store->auto_work);
 	return 0;
 }
 
-/* Bounded candidate scans, one copy at a time, and a context-wide token bucket. */
-void io_opaque_auto_work(struct work_struct *work)
+/* The same dispatcher handles bounded scans and the store-wide token bucket. */
+static void io_opaque_auto_compact(struct io_opaque_store *store)
 {
-	struct io_opaque_store *store = container_of(to_delayed_work(work),
-						   struct io_opaque_store, auto_work);
 	struct io_opaque_req op = { .store = store };
 	struct io_opaque_slot *slot = NULL;
 	struct io_uring_opaque_policy policy;
 	u64 minted, elapsed;
 	unsigned int scanned = 0;
-	bool again;
 	int ret;
 
 	mutex_lock(&store->tables);
 	policy = store->policy;
-	if (store->dead || !(policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT))
+	if (store->dead || !(policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) ||
+	    time_before(jiffies, store->auto_at))
 		goto unlock;
+	store->auto_at = jiffies + msecs_to_jiffies(100);
 	elapsed = jiffies - store->token_time;
 	if (check_mul_overflow(elapsed, policy.bytes_per_second, &minted))
 		minted = policy.burst_bytes;
@@ -289,7 +313,12 @@ void io_opaque_auto_work(struct work_struct *work)
 		/* Selection heuristics are implementation details, not UAPI. */
 		if ((!saving && slot->data->nr == 1) ||
 		    (saving && saving * 100 < slot->data->charge * 25) ||
-		    dense > policy.max_temporary_bytes || slot->data->length > store->tokens)
+		    dense > policy.max_temporary_bytes || slot->data->length > policy.burst_bytes) {
+			/* Immutable backing cannot become eligible without a new policy. */
+			list_del_init(&slot->candidate);
+			continue;
+		}
+		if (slot->data->length > store->tokens)
 			continue;
 		slot->compacting = true;
 		store->tokens -= slot->data->length;
@@ -317,10 +346,4 @@ unlock:
 		if (op.reserved)
 			io_opaque_uncharge(store, op.reserved);
 	}
-	mutex_lock(&store->tables);
-	again = !store->dead && (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) &&
-		!list_empty(&store->candidates);
-	mutex_unlock(&store->tables);
-	if (again)
-		queue_delayed_work(system_dfl_wq, &store->auto_work, msecs_to_jiffies(100));
 }
