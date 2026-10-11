@@ -15,7 +15,28 @@ config IO_URING_BPF
 	depends on BPF
 	depends on NET
 
+config IO_URING_OPAQUE_OBJ
+	bool "io_uring opaque TCP payload objects"
+	default n
+	depends on IO_URING && INET
+	select SOCK_RX_OWNER
+	help
+	  Retain immutable TCP payloads as kernel-resident objects that can
+	  be inspected, transmitted and compacted through io_uring. No network
+	  device zerocopy support or mapped receive area is required.
+	  Applications manage payload lifetime through generation handles.
+
 config IO_URING_BPF_OPS
 	def_bool y
 	depends on IO_URING
 	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
+
+config IO_URING_OPAQUE_OBJ_KUNIT_TEST
+	bool "KUnit tests for io_uring opaque objects" if !KUNIT_ALL_TESTS
+	depends on KUNIT && IO_URING_OPAQUE_OBJ
+	default KUNIT_ALL_TESTS
+	help
+	  Check capture page identity and independent fallback copies,
+	  backing-memory reservations, stable-handle compaction and lifetime
+	  across replacement. The suite also checks cancellation rollback
+	  and generation exhaustion. Results appear in the KUnit boot log.
