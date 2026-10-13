@@ -14,7 +14,7 @@ Read these first, in this order:
 
 General engineering rules are in `/mnt/workspace/KERNEL_AGENTS.md`. opencode loads that file through `opencode.json` in this directory. Other agents must read it explicitly.
 
-This file, `opencode.json`, `.opencode/agents/` and the notes in the directory map live in one *notes commit* at the top of the local branch `work/opaque-obj-v9`. The notes commit must never enter the series or an `upstream/` branch.
+This file, `opencode.json`, `.opencode/agents/` and the notes in the directory map live in *auxiliary commits* on the local branch `osdi/opaque-obj`. That is the OSDI project branch, where all project results land. Every auxiliary commit's subject starts with `aux:`, and auxiliary commits sit above the series. They must never enter the series or an `upstream/` branch. `DIRMAP.md` maps the directories on this machine.
 
 ## The mechanism
 
@@ -44,20 +44,24 @@ The series is five patches on `af32da41b032` (the net-7.3-rc7 merge). Keep exact
 
 Branches. The remote `origin` is `git@github.com:Markuze/ceph-client.git`.
 
-- `work/opaque-obj-v9` (local) is the working branch. It holds the five series commits plus the notes commit on top. Keep the checkout on it, so that this file stays present.
+- `osdi/opaque-obj` (local) is the working branch and the OSDI project branch. It holds the five series commits, then the auxiliary (`aux:`) commits. Keep the checkout on it, so that this file and the results stay present.
+- `work/opaque-obj-v9` holds the series plus the earlier single notes commit. It is pushed as `origin/work/opaque-obj-v9`. Don't rewrite it.
 - `upstream/opaque-obj-v9` is the current posted version. The local branch `opaque-obj-v9-round2` tracks it.
 - Earlier posted versions: `upstream/opaque-obj` (v1) and `upstream/opaque-obj-v3` to `upstream/opaque-obj-v7`. The author's notes are on `work/opaque-obj-v5` to `work/opaque-obj-v7`.
 - Local only: `opaque-obj-v7.1`, `opaque-obj-v8-capture`, `opaque-obj-v9-round1`. v8 was never pushed.
 
 To change the series:
 
-1. Work on `work/opaque-obj-v9`, or on a new branch from it. Do not rewrite a branch that you did not create. The five commits below the notes commit are the series.
+1. Work on `osdi/opaque-obj`, or on a new branch from it. Do not rewrite a branch that you did not create. The five commits below the first `aux:` commit are the series; `git rev-list -1 --invert-grep --grep='^aux:' HEAD` prints the series tip.
 2. Commit each change as a fixup of the patch that owns the file: `git commit --fixup=<sha>`.
-3. Squash: `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash af32da41b032`. The notes commit stays on top.
+3. Squash: `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash af32da41b032`. The auxiliary commits stay on top.
 4. If a patch changes behavior, update its message with `git commit --amend --cleanup=verbatim -F <file>`. State the problem, the root cause and the fix. Wrap lines at 75 columns.
 5. Build and test every commit (see Build matrix).
 
-Notes changes go into the notes commit: use `git commit --fixup=<notes sha>` and the same autosquash. Exactly one notes commit stays on top, so `HEAD~1` is always the series tip.
+Notes and results go into auxiliary commits.
+- Commit a new result as its own commit whose subject starts with `aux:`.
+- Change an existing one with `git commit --fixup=<aux sha>` and the same autosquash.
+- Auxiliary commits always stay above the series. Never put an `aux:` commit between series commits.
 
 Trailers and pushes:
 
@@ -110,7 +114,7 @@ Build matrix. Run all of it before you call a series final:
 - **W=1** on `io_uring/` and the changed `net/` objects gives no new warnings.
 - **Feature off:** the tree builds with `CONFIG_IO_URING_OPAQUE_OBJ=n`.
 - **i386:** a native `ARCH=i386` build with `HIGHMEM4G` succeeds.
-- **checkpatch:** run `./scripts/checkpatch.pl --strict` on `git format-patch af32da41b032..HEAD~1`. The only allowed reports are the missing `Signed-off-by` errors and the MAINTAINERS file-path warnings.
+- **checkpatch:** run `./scripts/checkpatch.pl --strict` on `git format-patch af32da41b032..$(git rev-list -1 --invert-grep --grep='^aux:' HEAD)`. The only allowed reports are the missing `Signed-off-by` errors and the MAINTAINERS file-path warnings.
 
 Diagnostics:
 
@@ -234,13 +238,17 @@ Sources and environment:
 | `io_uring/opaque_test.c` | KUnit tests |
 | `include/uapi/linux/io_uring/opaque.h` | UAPI |
 | `tools/testing/selftests/io_uring/opaque_obj.c` | selftest |
-| `opus_review*.md`, `opus_*spec.md`, `opus_capture_policy_changes.md`, `glm_prompt*.md` | reviews, specifications and prompts (notes commit) |
-| `fuse_zc.md`, `fuse_zc_workplan.md` | FUSE design and its work plan (notes commit) |
-| `.opencode/agents/` | opencode roles (notes commit): `orchestrator` coordinates; `investigator` and `reviewer` are read-only; `implementer` (GLM-5.3) edits |
+| `DIRMAP.md` | map of this machine's directories: trees, branches, build and test areas, ledgers, tools (aux) |
+| `opus_review.md`, `opus_review_v4.md`, `opus_review_v6.md` … `opus_review_v8.md` | reviews of v1, v4, v6, v7 and v8 (aux) |
+| `opus_*spec.md`, `opus_capture_policy_changes.md`, `glm_prompt*.md` | specifications and the prompts that handed them to GLM (aux) |
+| `errata.md`, `optimizations.md` | the author's errata and flow-optimization notes, from `work/opaque-obj-v7` (aux) |
+| `fuse_zc.md`, `fuse_zc_workplan.md`, `fuse_zc_facts/` | FUSE design, its work plan and the verified code facts behind it (aux) |
+| `.opencode/agents/` | opencode roles (aux): `orchestrator` coordinates; `investigator` and `reviewer` are read-only; `implementer` (GLM-5.3) edits |
 | `.crush/crush.db` | transcripts of GLM sessions run through Crush (SQLite; ignored, never commit) |
 | `utils/` | non-upstream utilities (create on first use; see Working rules) |
 | `/mnt/workspace/opaque-vm/` | UML builds, roots and logs, one subdirectory per task |
 | `/mnt/workspace/current/` | task ledgers |
+| `/mnt/workspace/fuse-zc/` | zero-copy ceph-fuse work: package starter, worktrees and shared clones (see `DIRMAP.md`) |
 | `~/ceph` | Ceph source (shared with rust-mds) |
 | `/mnt/workspace/rust-mds/` | a different project; do not modify it |
 
