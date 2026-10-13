@@ -11,7 +11,7 @@ Status: **design.** No code has been written yet. 2026-10-11.
 > - only requests flagged `FUSE_URING_ENT_ZERO_COPY` have a slot;
 > - `READ_FIXED` from `/dev/zero` can complete short.
 >
-> The verified code facts are in `/mnt/workspace/fuse-zc/facts/`.
+> The verified code facts are in `/mnt/workspace/ceph-client/fuse_zc_facts/`.
 
 ## Scope and sources
 

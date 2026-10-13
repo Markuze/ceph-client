@@ -178,7 +178,7 @@ The design is `fuse_zc.md` in this directory. It is complete for implementation,
 - §6: packages K1–K4 (kernel), L1–L6 (libfuse), C1–C6 (Ceph), E1 (UML integration environment), T1 (integration tests) and B1 (benchmarks);
 - §8: owner decisions, with the defaults workers use.
 
-The verified code facts behind it are in `/mnt/workspace/fuse-zc/facts/`.
+The verified code facts behind it are in `/mnt/workspace/ceph-client/fuse_zc_facts/`.
 
 - **Goal.** READ payload from an OSD stays an opaque object from the socket until it reaches the pages of the FUSE request. One kernel copy remains, into those pages. Today's ceph-fuse copies the payload 2 to 3 times.
 - **Mechanism.** FUSE io_uring zero-copy (`43f8343858eb`, already in this base) registers the pages of each FUSE request in the server ring's buffer table. A new opcode, `IORING_OP_OPAQUE_OBJ_FILL`, copies an object into that registered buffer.

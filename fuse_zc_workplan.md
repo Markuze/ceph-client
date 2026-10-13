@@ -55,7 +55,7 @@ Wave 1 (now): K1 K2 K4 L1 L2 L5 C1 E1    Wave 2: C2 L3 L4    Wave 3: C3 C4 L6 (C
 Wave 4: C5 → C6                          Wave 5: T1           Wave 6: B1 → K3
 ```
 
-**Starting a worker.** `/mnt/workspace/fuse-zc/bin/fzc-start <WP>` creates the package's worktree and branch, and writes its brief there as `AGENTS.md`, which Codex and opencode load. Run an agent in that worktree and tell it to do the work package in `AGENTS.md`. The status board is `/mnt/workspace/current/fuse.md`.
+**Starting a worker.** `/mnt/workspace/fuse-zc/bin/fzc-start <WP>` creates the package's worktree and branch, writes its brief there as `AGENTS.md` (Codex and opencode load it), and prints the prompt to give the agent, also saved as `/mnt/workspace/fuse-zc/prompts/<wp>.txt`. `fzc-start <WP> --prompt` prints only the prompt. Start the agent in that worktree with that prompt. The status board is `/mnt/workspace/current/fuse.md`.
 
 **Waves.**
 1. **Now, in parallel (8 workers):** K1, K2, K4, L1, L2, L5, C1, E1.
@@ -444,7 +444,7 @@ int64_t Client::ll_read_zc(Fh* fh, loff_t off, loff_t len, ZcReadPlan* plan);
 
 ## 6. Work packages
 
-Line references are to v9 (`875cf36709ca`) for the kernel, libfuse master `cb2e761c7635` (master `9572e08f8a2c` adds four small commits on top, so a few `fuse_lowlevel.c` and `fuse_common.h` lines shift) and Ceph `8db74a411f9` (recent main), unless stated otherwise. Re-check them against your base; code moves. The verified fact sheets behind them, with quotes, are in `/mnt/workspace/fuse-zc/facts/` (`kernel_v9.md`, `libfuse.md`, `ceph.md`). Read the one for your project before starting.
+Line references are to v9 (`875cf36709ca`) for the kernel, libfuse master `cb2e761c7635` (master `9572e08f8a2c` adds four small commits on top, so a few `fuse_lowlevel.c` and `fuse_common.h` lines shift) and Ceph `8db74a411f9` (recent main), unless stated otherwise. Re-check them against your base; code moves. The verified fact sheets behind them, with quotes, are in `/mnt/workspace/ceph-client/fuse_zc_facts/` (`kernel_v9.md`, `libfuse.md`, `ceph.md`). Read the one for your project before starting.
 
 ### K1. `IORING_OP_OPAQUE_OBJ_FILL` (Linux, opaque series add-on)
 
