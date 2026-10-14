@@ -785,6 +785,7 @@ out:
 struct dentry *ceph_handle_snapdir(struct ceph_mds_request *req,
 				   struct dentry *dentry)
 {
+	struct ceph_quarantine_splice qsplice;
 	struct ceph_fs_client *fsc = ceph_sb_to_fs_client(dentry->d_sb);
 	struct inode *parent = d_inode(dentry->d_parent); /* we hold i_rwsem */
 	struct ceph_client *cl = ceph_inode_to_client(parent);
@@ -795,7 +796,9 @@ struct dentry *ceph_handle_snapdir(struct ceph_mds_request *req,
 		struct dentry *res;
 		struct inode *inode = ceph_get_snapdir(parent);
 
+		ceph_quarantine_splice_start(parent->i_sb, &qsplice);
 		res = d_splice_alias(inode, dentry);
+		ceph_quarantine_splice_finish(&qsplice);
 		boutc_formats(cl,
 			      "ENOENT on snapdir %p '%s', linking to snapdir %p %llx.%llx. Spliced dentry %p\n",
 			      "ENOENT on snapdir %p '%pd', linking to snapdir %p %llx.%llx. Spliced dentry %p\n",
@@ -1310,6 +1313,7 @@ out:
 static int ceph_link(struct dentry *old_dentry, struct inode *dir,
 		     struct dentry *dentry)
 {
+	struct ceph_quarantine_splice qsplice;
 	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(dir->i_sb);
 	struct ceph_fs_client *fsc = mdsc->fsc;
 	struct ceph_client *cl = mdsc->fsc->client;
@@ -1373,7 +1377,9 @@ static int ceph_link(struct dentry *old_dentry, struct inode *dir,
 		d_drop(dentry);
 	} else if (!req->r_reply_info.head->is_dentry) {
 		ihold(d_inode(old_dentry));
+		ceph_quarantine_splice_start(dir->i_sb, &qsplice);
 		d_instantiate(dentry, d_inode(old_dentry));
+		ceph_quarantine_splice_finish(&qsplice);
 	}
 	ceph_mdsc_put_request(req);
 	ceph_blog_exit(&__ji);
@@ -1623,6 +1629,7 @@ static int ceph_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		       struct dentry *old_dentry, struct inode *new_dir,
 		       struct dentry *new_dentry, unsigned int flags)
 {
+	struct ceph_mds_client *qmdsc;
 	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(old_dir->i_sb);
 	struct ceph_fs_client *fsc = mdsc->fsc;
 	struct ceph_client *cl = mdsc->fsc->client;
@@ -1701,12 +1708,17 @@ static int ceph_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	}
 	err = ceph_mdsc_do_request(mdsc, old_dir, req);
 	if (!err && !req->r_reply_info.head->is_dentry) {
+		struct inode *moved;
+
 		/*
 		 * Normally d_move() is done by fill_trace (called by
 		 * do_request, above).  If there is no trace, we need
 		 * to do it here.
 		 */
+		moved = d_inode(old_dentry);
+		qmdsc = ceph_quarantine_move_start(moved, old_dir, new_dir);
 		d_move(old_dentry, new_dentry);
+		ceph_quarantine_move_finish(qmdsc);
 	}
 	ceph_mdsc_put_request(req);
 	ceph_blog_exit(&__ji);

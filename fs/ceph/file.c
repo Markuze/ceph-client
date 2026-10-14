@@ -687,6 +687,7 @@ static int ceph_finish_async_create(struct inode *dir, struct inode *inode,
 				    struct ceph_acl_sec_ctx *as_ctx,
 				    struct ceph_file_layout *lo)
 {
+	struct ceph_quarantine_splice qsplice;
 	int ret;
 	char xattr_buf[4];
 	struct ceph_mds_reply_inode in = { };
@@ -785,7 +786,9 @@ static int ceph_finish_async_create(struct inode *dir, struct inode *inode,
 		if (d_in_lookup(dentry) || d_really_is_negative(dentry)) {
 			if (!d_unhashed(dentry))
 				d_drop(dentry);
+			ceph_quarantine_splice_start(dir->i_sb, &qsplice);
 			dn = d_splice_alias(inode, dentry);
+			ceph_quarantine_splice_finish(&qsplice);
 			WARN_ON_ONCE(dn && dn != dentry);
 		}
 		file->f_mode |= FMODE_CREATED;
