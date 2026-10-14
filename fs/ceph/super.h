@@ -381,18 +381,45 @@ struct ceph_inode_xattrs_info {
 	 * (still encoded) xattr blob. we avoid the overhead of parsing
 	 * this until someone actually calls getxattr, etc.
 	 *
-	 * blob->vec.iov_len == 4 implies there are no xattrs; blob ==
-	 * NULL means we don't know.
+	 * A valid four-byte payload represents an empty xattr set. Inode
+	 * replies do not retain that payload in blob, so NULL can mean
+	 * either an empty set or missing data.
 	*/
 	struct ceph_buffer *blob, *prealloc_blob;
 
 	struct rb_root index;
 	bool dirty;
+	bool need_refill; /* a discarded reply may have carried newer xattrs */
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	bool acl_data_known;
+#endif
 	int count;
 	int names_size;
 	int vals_size;
 	u64 version, index_version;
 };
+
+static inline bool ceph_acl_xattr_data_present(const void *data, size_t len)
+{
+	return data && len >= 4 && (len > 4 || !get_unaligned_le32(data));
+}
+
+static inline bool ceph_acl_xattr_data_known(struct ceph_inode_xattrs_info *xattrs)
+{
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	return xattrs->acl_data_known;
+#else
+	return true;
+#endif
+}
+
+static inline void ceph_acl_xattr_set_known(struct ceph_inode_xattrs_info *xattrs,
+					    bool known)
+{
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	xattrs->acl_data_known = known;
+#endif
+}
 
 /*
  * Ceph inode.
@@ -410,9 +437,13 @@ struct ceph_inode_info {
 #endif
 
 	spinlock_t i_ceph_lock;
+#ifdef CONFIG_CEPH_FS_SECURITY_LABEL
+	struct list_head i_async_labels; /* i_ceph_lock */
+#endif
 
 	u32 i_time_warp_seq;
 	u64 i_version;
+	u64 i_metadata_cap_gen;
 #ifdef CONFIG_CEPH_FS_INLINE_DATA
 	u64 i_inline_version;
 #endif
@@ -426,6 +457,8 @@ struct ceph_inode_info {
 	struct ceph_file_layout i_layout;
 	struct ceph_file_layout i_cached_layout;	// for async creates
 	char *i_symlink;
+	/* Decoded target length, independent of the MDS's encoded size. */
+	u32 i_symlink_len;
 
 	/* for dirs */
 	struct timespec64 i_rctime;
@@ -478,6 +511,12 @@ struct ceph_inode_info {
 	struct mutex i_fragtree_mutex;
 
 	struct ceph_inode_xattrs_info i_xattrs;
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	struct {
+		struct posix_acl *acl;
+		u64 version, cap_gen;
+	} i_parsed_acl[2];
+#endif
 
 	/* capabilities.  protected _both_ by i_ceph_lock and cap->session's
 	 * s_mutex. */
@@ -1268,6 +1307,8 @@ static inline void ceph_queue_flush_snaps(struct inode *inode)
 extern int ceph_try_to_choose_auth_mds(struct inode *inode, int mask);
 int __ceph_do_getattr(struct inode *inode, struct folio *locked_folio,
 		      int mask, bool force);
+int ceph_getattr_inline(struct inode *inode, struct ceph_mds_request **req,
+			bool held_write);
 static inline int ceph_do_getattr(struct inode *inode, int mask, bool force)
 {
 	return __ceph_do_getattr(inode, NULL, mask, force);
@@ -1292,6 +1333,8 @@ void ceph_inode_shutdown(struct inode *inode);
  * CEPH_Q_CLEAR: cached ancestry is clear, or the MDS confirmed read
  * access to this exact inode for the current epoch. Writers must use
  * ceph_inode_quarantine_write_state(), which ignores read receipts.
+ * With tracking enabled, cached metadata needs notification coverage or
+ * a fresh MDS decision appropriate to the operation.
  * CEPH_Q_UNDER: this inode or a cached ancestor is marked.
  * CEPH_Q_UNKNOWN: no stable ancestry answer was established. Resolve it
  * before using cached caps; it is not itself a quarantine mark.
@@ -1302,10 +1345,52 @@ enum ceph_qstate {
 	CEPH_Q_UNKNOWN,
 };
 
+/* Successful replies from a different session after a preferred route. */
+enum ceph_preferred_result {
+	CEPH_PREFERRED_MISMATCH = 1,
+	CEPH_PREFERRED_ABANDONED,
+};
+
 enum ceph_qstate ceph_inode_quarantine_state(struct inode *inode);
 enum ceph_qstate ceph_inode_quarantine_write_state(struct inode *inode);
+enum ceph_qstate ceph_inode_quarantine_write_state_slow(struct inode *inode,
+							struct inode **pending,
+							bool *can_probe);
 bool ceph_inode_quarantine_direct(struct inode *inode);
 int ceph_quarantine_revalidate(struct inode *inode);
+int ceph_quarantine_wait(struct inode *inode);
+int ceph_quarantine_backoff(struct inode *inode);
+int ceph_quarantine_refresh(struct inode *inode);
+int ceph_quarantine_refresh_request(struct inode *inode,
+				    struct ceph_mds_request **result,
+				    u64 epoch, u64 negs);
+int ceph_quarantine_refresh_auth(struct inode *inode,
+				 struct ceph_mds_session *session,
+				 bool *same_session);
+int ceph_quarantine_refresh_session(struct inode *inode,
+				    struct ceph_mds_session *session,
+				    u32 session_gen);
+int ceph_quarantine_recover_direct(struct inode *inode);
+int ceph_head_stat_authorize(struct inode *inode);
+int ceph_head_stat_authorize_caps(struct inode *inode, int mask);
+bool ceph_snapshot_needs_revalidate(struct inode *inode);
+bool ceph_quarantine_head_cap_valid(struct inode *inode);
+bool __ceph_quarantine_head_cap_valid(struct ceph_inode_info *ci);
+bool ceph_quarantine_head_needs_revalidate(struct inode *inode);
+
+enum ceph_getattr_cache_result {
+	CEPH_GETATTR_CACHE_FALLBACK,
+	CEPH_GETATTR_CACHE_HIT,
+	CEPH_GETATTR_CACHE_MISS,
+	CEPH_GETATTR_CACHE_NO_HEAD,
+	CEPH_GETATTR_CACHE_UNSTABLE,
+};
+
+enum ceph_getattr_cache_result
+ceph_quarantine_getattr_cache(struct inode *inode, int mask, u64 epoch,
+			      u64 negs, bool checked_state);
+
+void ceph_quarantine_enable(struct ceph_mds_client *mdsc);
 int ceph_snapshot_read_auth(struct inode *inode);
 void ceph_quarantine_set(struct ceph_inode_info *ci);
 bool ceph_quarantine_clear(struct ceph_inode_info *ci);
@@ -1337,9 +1422,11 @@ static inline bool ceph_inode_is_shutdown(const struct inode *inode)
 }
 
 /* xattr.c */
+struct ceph_acl_read_ctx;
 int __ceph_setxattr(struct inode *, const char *, const void *, size_t, int);
 int ceph_do_getvxattr(struct inode *inode, const char *name, void *value, size_t size);
-ssize_t __ceph_getxattr(struct inode *, const char *, void *, size_t);
+ssize_t __ceph_getxattr(struct inode *inode, const char *name, void *value,
+			size_t size, bool for_acl);
 extern ssize_t ceph_listxattr(struct dentry *, char *, size_t);
 extern struct ceph_buffer *__ceph_build_xattrs_blob(struct ceph_inode_info *ci);
 extern void __ceph_destroy_xattrs(struct ceph_inode_info *ci);
@@ -1352,11 +1439,26 @@ struct ceph_acl_sec_ctx {
 #endif
 #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
 	struct lsm_context lsmctx;
+	const struct cred *lsm_cred;
+	size_t lsm_name_off, lsm_name_len;
+	size_t lsm_value_off, lsm_value_len;
+	bool lsm_encoded;
 #endif
 #ifdef CONFIG_FS_ENCRYPTION
 	struct ceph_fscrypt_auth *fscrypt_auth;
 #endif
 	struct ceph_pagelist *pagelist;
+};
+
+struct ceph_async_label {
+	struct list_head item;
+	struct task_struct *task;
+	const struct cred *cred;
+	struct dentry *dentry;
+	const char *name;
+	const void *value;
+	size_t name_len, value_len;
+	bool valid;
 };
 
 #ifdef CONFIG_SECURITY
@@ -1376,16 +1478,45 @@ static inline bool ceph_security_xattr_wanted(struct inode *in)
 #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
 extern int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
 				     struct ceph_acl_sec_ctx *ctx);
+bool ceph_async_label_prepared(struct ceph_acl_sec_ctx *ctx);
+void ceph_async_label_start(struct ceph_async_label *label, struct inode *inode,
+			    struct dentry *dentry, struct ceph_mds_request *req,
+			    struct ceph_acl_sec_ctx *ctx);
+void ceph_async_label_finish(struct ceph_async_label *label, struct inode *inode);
+bool ceph_async_label_own_scope(struct inode *inode);
 static inline void ceph_security_invalidate_secctx(struct inode *inode)
 {
 	security_inode_invalidate_secctx(inode);
 }
 #else
+static inline bool ceph_async_label_prepared(struct ceph_acl_sec_ctx *ctx)
+{
+	return false;
+}
+
+static inline void ceph_async_label_start(struct ceph_async_label *label,
+					  struct inode *inode, struct dentry *dentry,
+					  struct ceph_mds_request *req,
+					  struct ceph_acl_sec_ctx *ctx)
+{
+}
+
+static inline void ceph_async_label_finish(struct ceph_async_label *label,
+					   struct inode *inode)
+{
+}
+
+static inline bool ceph_async_label_own_scope(struct inode *inode)
+{
+	return false;
+}
+
 static inline int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
 					    struct ceph_acl_sec_ctx *ctx)
 {
 	return 0;
 }
+
 static inline void ceph_security_invalidate_secctx(struct inode *inode)
 {
 }
@@ -1396,17 +1527,39 @@ void ceph_release_acl_sec_ctx(struct ceph_acl_sec_ctx *as_ctx);
 /* acl.c */
 #ifdef CONFIG_CEPH_FS_POSIX_ACL
 
+struct ceph_acl_read_ctx {
+	const struct cred *cred;
+	struct posix_acl *hit;
+	u64 epoch, negs, version, cap_gen;
+	int type;
+	bool supported, stable, armed, copied, view_changed;
+};
+
 struct posix_acl *ceph_get_acl(struct inode *, int, bool);
 int ceph_set_acl(struct mnt_idmap *idmap,
 		 struct dentry *dentry, struct posix_acl *acl, int type);
+int ceph_acl_chmod(struct mnt_idmap *idmap, struct dentry *dentry,
+		   umode_t mode);
 int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
 		       struct ceph_acl_sec_ctx *as_ctx);
-void ceph_init_inode_acls(struct inode *inode,
-			  struct ceph_acl_sec_ctx *as_ctx);
+void ceph_init_inode_acl_cache(struct inode *inode);
+ssize_t ceph_get_acl_xattr(struct inode *inode, const char *name,
+			   void *value, size_t size, bool for_acl,
+			   struct ceph_acl_read_ctx *ctx);
+bool __ceph_acl_cache_valid(struct inode *inode, struct ceph_acl_read_ctx *ctx);
+int __ceph_acl_view_check(struct inode *inode, struct ceph_acl_read_ctx *ctx);
 
 static inline void ceph_forget_all_cached_acls(struct inode *inode)
 {
-       forget_all_cached_acls(inode);
+	struct ceph_inode_info *ci = ceph_inode(inode);
+
+	lockdep_assert_held(&ci->i_ceph_lock);
+	ci->i_metadata_cap_gen++;
+	posix_acl_release(ci->i_parsed_acl[0].acl);
+	posix_acl_release(ci->i_parsed_acl[1].acl);
+	ci->i_parsed_acl[0].acl = NULL;
+	ci->i_parsed_acl[1].acl = NULL;
+	forget_all_cached_acls(inode);
 }
 
 #else
@@ -1414,18 +1567,28 @@ static inline void ceph_forget_all_cached_acls(struct inode *inode)
 #define ceph_get_acl NULL
 #define ceph_set_acl NULL
 
+static inline int ceph_acl_chmod(struct mnt_idmap *idmap, struct dentry *dentry,
+				 umode_t mode)
+{
+	return posix_acl_chmod(idmap, dentry, mode);
+}
+
 static inline int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
 				     struct ceph_acl_sec_ctx *as_ctx)
 {
 	return 0;
 }
-static inline void ceph_init_inode_acls(struct inode *inode,
-					struct ceph_acl_sec_ctx *as_ctx)
+
+static inline void ceph_init_inode_acl_cache(struct inode *inode)
 {
 }
 
 static inline void ceph_forget_all_cached_acls(struct inode *inode)
 {
+	struct ceph_inode_info *ci = ceph_inode(inode);
+
+	lockdep_assert_held(&ci->i_ceph_lock);
+	ci->i_metadata_cap_gen++;
 }
 
 #endif
@@ -1507,6 +1670,11 @@ extern int __ceph_get_caps(struct inode *inode, struct ceph_file_info *fi,
 			   int need, int want, loff_t endoff, int *got);
 extern int ceph_get_caps(struct file *filp, int need, int want,
 			 loff_t endoff, int *got);
+typedef int (*ceph_write_cap_check_t)(struct inode *inode, void *arg,
+				      loff_t *endoff);
+int ceph_get_caps_checked(struct file *filp, int need, int want,
+			  loff_t endoff, int *got,
+			  ceph_write_cap_check_t check, void *arg);
 extern int ceph_try_get_caps(struct inode *inode,
 			     int need, int want, bool nonblock, int *got);
 
@@ -1585,7 +1753,8 @@ static inline bool ceph_has_inline_data(const struct ceph_inode_info *ci)
 /* file.c */
 extern const struct file_operations ceph_file_fops;
 
-extern int ceph_renew_caps(struct inode *inode, int fmode);
+int ceph_renew_caps(struct inode *inode, int fmode, bool force, int need,
+		    bool timedout, struct ceph_mds_session *session, u32 session_gen);
 extern int ceph_open(struct inode *inode, struct file *file);
 extern int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
 			    struct file *file, unsigned flags, umode_t mode);

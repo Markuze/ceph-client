@@ -10,6 +10,8 @@
 #include <linux/xattr.h>
 #include <linux/security.h>
 #include <linux/posix_acl_xattr.h>
+#include <linux/cred.h>
+#include <linux/limits.h>
 #include <linux/slab.h>
 #include <linux/overflow.h>
 
@@ -808,7 +810,7 @@ static int __build_xattrs(struct inode *inode)
 	u32 len;
 	const char *name, *val;
 	struct ceph_inode_info *ci = ceph_inode(inode);
-	u64 xattr_version;
+	u64 xattr_version, cap_gen;
 	struct ceph_inode_xattr **xattrs = NULL;
 	int err = 0;
 	int i;
@@ -828,6 +830,7 @@ start:
 		end = p + ci->i_xattrs.blob->vec.iov_len;
 		ceph_decode_32_safe(&p, end, numattr, bad);
 		xattr_version = ci->i_xattrs.version;
+		cap_gen = ci->i_metadata_cap_gen;
 		spin_unlock(&ci->i_ceph_lock);
 
 		xattrs = kzalloc_objs(struct ceph_inode_xattr *, numattr,
@@ -844,8 +847,9 @@ start:
 		}
 
 		spin_lock(&ci->i_ceph_lock);
-		if (ci->i_xattrs.version != xattr_version) {
-			/* lost a race, retry */
+		if (ci->i_xattrs.version != xattr_version ||
+		    ci->i_metadata_cap_gen != cap_gen) {
+			/* The blob can be refilled at the same version. */
 			for (i = 0; i < numattr; i++)
 				kfree(xattrs[i]);
 			kfree(xattrs);
@@ -853,9 +857,10 @@ start:
 			goto start;
 		}
 		err = -EIO;
-		while (numattr--) {
+		while (numattr) {
 			int names_size, vals_size;
 
+			err = -EIO;
 			ceph_decode_32_safe(&p, end, len, bad);
 			namelen = len;
 			name = p;
@@ -873,10 +878,11 @@ start:
 				goto bad;
 
 			err = __set_xattr(ci, name, namelen, val, len,
-					  0, 0, &xattrs[numattr]);
+					  0, 0, &xattrs[numattr - 1]);
 
 			if (err < 0)
 				goto bad;
+			numattr--;
 		}
 		kfree(xattrs);
 	}
@@ -988,15 +994,24 @@ static inline int __get_request_mask(struct inode *in) {
 	return mask;
 }
 
-ssize_t __ceph_getxattr(struct inode *inode, const char *name, void *value,
-		      size_t size)
+static ssize_t ceph_getxattr_internal(struct inode *inode, const char *name,
+				      void *value, size_t size, bool for_acl,
+				      struct ceph_acl_read_ctx *ctx)
 {
 	struct ceph_client *cl = ceph_inode_to_client(inode);
 	struct ceph_inode_info *ci = ceph_inode(inode);
+	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(inode->i_sb);
+	const struct cred *acl_cred = NULL;
 	struct ceph_inode_xattr *xattr;
 	struct ceph_vxattr *vxattr;
+	u64 acl_epoch = 0, acl_negs = 0;
+	int acl_caps = CEPH_CAP_AUTH_SHARED | CEPH_CAP_XATTR_SHARED;
 	int req_mask;
 	ssize_t err;
+	bool ask_mds = false;
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	bool cache_path = false, fetched = false;
+#endif
 
 	if (strncmp(name, XATTR_CEPH_PREFIX, XATTR_CEPH_PREFIX_LEN))
 		goto handle_non_vxattrs;
@@ -1034,7 +1049,72 @@ handle_non_vxattrs:
 	      ceph_vinop(inode), name, ci->i_xattrs.version,
 	      ci->i_xattrs.index_version);
 
-	if (ci->i_xattrs.version == 0 ||
+	/*
+	 * A shared cap would answer from the cache. The state check may
+	 * schedule, so drop i_ceph_lock first. A reply reading the blob
+	 * it just installed must still use that cache.
+	 */
+	if (!ceph_current_fill_trace_request()) {
+		bool cached = false;
+
+		spin_unlock(&ci->i_ceph_lock);
+		ask_mds = ceph_snapshot_needs_revalidate(inode) ||
+			  ceph_inode_quarantine_state(inode) != CEPH_Q_CLEAR ||
+			  ceph_quarantine_head_needs_revalidate(inode);
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+		cache_path = !!ctx;
+#endif
+		if (for_acl && !ceph_in_snap(inode) &&
+		    S_ISDIR(inode->i_mode) &&
+		    !strcmp(name, XATTR_NAME_POSIX_ACL_ACCESS)) {
+			bool have_xattrs, need_refill;
+
+			spin_lock(&ci->i_ceph_lock);
+			have_xattrs = ci->i_xattrs.version != 0;
+			need_refill = ci->i_xattrs.need_refill;
+			cached = ask_mds && have_xattrs &&
+				 __ceph_caps_issued_mask_metric(ci, acl_caps, 1);
+			spin_unlock(&ci->i_ceph_lock);
+			/* A cached ACL needs valid metadata before reuse. */
+			if ((need_refill || (ask_mds && have_xattrs && !cached)) &&
+			    READ_ONCE(mdsc->quarantine_supported))
+				return -EAGAIN;
+		}
+		if (cached) {
+			bool stable;
+
+			acl_cred = get_current_cred();
+			err = ceph_quarantine_wait(inode);
+			if (err)
+				goto out_unlocked;
+			spin_lock(&mdsc->quarantine_lock);
+			acl_epoch = atomic64_read(&mdsc->quarantine_epoch);
+			acl_negs = atomic64_read(&mdsc->quarantine_negs);
+			stable = !(acl_epoch & 1) &&
+				 !atomic_read(&mdsc->quarantine_splices);
+			spin_unlock(&mdsc->quarantine_lock);
+			if (!stable) {
+				err = -EAGAIN;
+				goto out_unlocked;
+			}
+			/* ACL retrieval is not a target-read authorization. */
+			err = ceph_head_stat_authorize(inode);
+			if (err)
+				goto out_unlocked;
+			ask_mds = false;
+		}
+		spin_lock(&ci->i_ceph_lock);
+	}
+
+	if (acl_cred &&
+	    (!ci->i_xattrs.version ||
+	     !__ceph_caps_issued_mask_metric(ci, acl_caps, 1))) {
+		err = -EAGAIN;
+		goto out;
+	}
+
+	if (ask_mds || ci->i_xattrs.version == 0 ||
+	    (ctx && ci->i_xattrs.need_refill) ||
 	    !((req_mask & CEPH_CAP_XATTR_SHARED) ||
 	      __ceph_caps_issued_mask_metric(ci, CEPH_CAP_XATTR_SHARED, 1))) {
 		spin_unlock(&ci->i_ceph_lock);
@@ -1050,13 +1130,66 @@ handle_non_vxattrs:
 		/* get xattrs from mds (if we don't already have them) */
 		err = ceph_do_getattr(inode, CEPH_STAT_CAP_XATTR, true);
 		if (err)
-			return err;
+			goto out_unlocked;
 		spin_lock(&ci->i_ceph_lock);
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+		fetched = true;
+#endif
 	}
 
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	if (ctx && (!ci->i_xattrs.version || ci->i_xattrs.need_refill ||
+		    !ceph_acl_xattr_data_known(&ci->i_xattrs))) {
+		if (!fetched && !ceph_current_fill_trace_request()) {
+			spin_unlock(&ci->i_ceph_lock);
+			err = ceph_do_getattr(inode, CEPH_STAT_CAP_XATTR, true);
+			if (err)
+				goto out_unlocked;
+			spin_lock(&ci->i_ceph_lock);
+		}
+		if (!ci->i_xattrs.version || ci->i_xattrs.need_refill ||
+		    !ceph_acl_xattr_data_known(&ci->i_xattrs)) {
+			err = -EIO;
+			goto out;
+		}
+	}
+	if (ctx && ctx->armed &&
+	    (!cache_path || !__ceph_acl_cache_valid(inode, ctx))) {
+		err = -EAGAIN;
+		goto out;
+	}
+	if (cache_path && __ceph_acl_cache_valid(inode, ctx)) {
+		ctx->armed = true;
+		if (ci->i_parsed_acl[ctx->type].acl &&
+		    ci->i_parsed_acl[ctx->type].version == ci->i_xattrs.version &&
+		    ci->i_parsed_acl[ctx->type].cap_gen == ci->i_metadata_cap_gen) {
+			ctx->hit = posix_acl_dup(ci->i_parsed_acl[ctx->type].acl);
+			err = 0;
+			goto out;
+		}
+	}
+#endif
 	err = __build_xattrs(inode);
 	if (err < 0)
 		goto out;
+	if (ci->i_xattrs.need_refill) {
+		err = -EAGAIN;
+		goto out;
+	}
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	if (ctx && (!ci->i_xattrs.version ||
+		    !ceph_acl_xattr_data_known(&ci->i_xattrs))) {
+		err = -EAGAIN;
+		goto out;
+	}
+#endif
+	/* __build_xattrs() can drop i_ceph_lock while allocating. */
+	if (acl_cred &&
+	    (!ci->i_xattrs.version ||
+	     !__ceph_caps_issued_mask_metric(ci, acl_caps, 1))) {
+		err = -EAGAIN;
+		goto out;
+	}
 
 	err = -ENODATA;  /* == ENOATTR */
 	xattr = __get_xattr(ci, name);
@@ -1072,15 +1205,71 @@ handle_non_vxattrs:
 		goto out;
 
 	memcpy(value, xattr->val, xattr->val_len);
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	if (ctx && err > 0) {
+		ctx->version = ci->i_xattrs.version;
+		ctx->cap_gen = ci->i_metadata_cap_gen;
+		ctx->copied = true;
+	}
+#endif
 
 	if (ceph_current_fill_trace_request() &&
 	    !strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN) &&
 	    security_ismaclabel(name + XATTR_SECURITY_PREFIX_LEN))
 		set_bit(CEPH_I_SEC_INITED_BIT, &ci->i_ceph_flags);
 out:
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	if (ctx && (err >= 0 || err == -ENODATA)) {
+		int view_err = __ceph_acl_view_check(inode, ctx);
+
+		if (view_err == -EAGAIN)
+			ctx->view_changed = true;
+		if (view_err)
+			err = view_err;
+		else if (ctx->armed && !__ceph_acl_cache_valid(inode, ctx))
+			err = -EAGAIN;
+	}
+#endif
+	if (acl_cred) {
+		spin_lock(&mdsc->quarantine_lock);
+		if (ceph_inode_is_shutdown(inode))
+			err = -ESTALE;
+		else if (current_cred() != acl_cred ||
+			 ceph_inode_quarantine_direct(inode))
+			err = -EACCES;
+		else if (acl_epoch != (u64)atomic64_read(&mdsc->quarantine_epoch) ||
+			 acl_negs != (u64)atomic64_read(&mdsc->quarantine_negs) ||
+			 atomic_read(&mdsc->quarantine_splices))
+			err = -EAGAIN;
+		spin_unlock(&mdsc->quarantine_lock);
+	}
 	spin_unlock(&ci->i_ceph_lock);
+out_unlocked:
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+	if (ctx && ctx->hit && err < 0) {
+		posix_acl_release(ctx->hit);
+		ctx->hit = NULL;
+	}
+#endif
+	if (acl_cred)
+		put_cred(acl_cred);
 	return err;
 }
+
+ssize_t __ceph_getxattr(struct inode *inode, const char *name, void *value,
+			size_t size, bool for_acl)
+{
+	return ceph_getxattr_internal(inode, name, value, size, for_acl, NULL);
+}
+
+#ifdef CONFIG_CEPH_FS_POSIX_ACL
+ssize_t ceph_get_acl_xattr(struct inode *inode, const char *name,
+			   void *value, size_t size, bool for_acl,
+			   struct ceph_acl_read_ctx *ctx)
+{
+	return ceph_getxattr_internal(inode, name, value, size, for_acl, ctx);
+}
+#endif
 
 ssize_t ceph_listxattr(struct dentry *dentry, char *names, size_t size)
 {
@@ -1089,6 +1278,7 @@ ssize_t ceph_listxattr(struct dentry *dentry, char *names, size_t size)
 	struct ceph_client *cl = ceph_inode_to_client(inode);
 	struct ceph_inode_info *ci = ceph_inode(inode);
 	bool len_only = (size == 0);
+	bool ask_mds = false;
 	u32 namelen;
 	int err;
 	struct ceph_journal_info __ji;
@@ -1100,7 +1290,16 @@ ssize_t ceph_listxattr(struct dentry *dentry, char *names, size_t size)
 	      ceph_vinop(inode), ci->i_xattrs.version,
 	      ci->i_xattrs.index_version);
 
-	if (ci->i_xattrs.version == 0 ||
+	/* Same as __ceph_getxattr(): do not serve a shared cap hit. */
+	if (!ceph_current_fill_trace_request()) {
+		spin_unlock(&ci->i_ceph_lock);
+		ask_mds = ceph_snapshot_needs_revalidate(inode) ||
+			  ceph_inode_quarantine_state(inode) != CEPH_Q_CLEAR ||
+			  ceph_quarantine_head_needs_revalidate(inode);
+		spin_lock(&ci->i_ceph_lock);
+	}
+
+	if (ask_mds || ci->i_xattrs.version == 0 ||
 	    !__ceph_caps_issued_mask_metric(ci, CEPH_CAP_XATTR_SHARED, 1)) {
 		spin_unlock(&ci->i_ceph_lock);
 		err = ceph_do_getattr(inode, CEPH_STAT_CAP_XATTR, true);
@@ -1114,6 +1313,10 @@ ssize_t ceph_listxattr(struct dentry *dentry, char *names, size_t size)
 	err = __build_xattrs(inode);
 	if (err < 0)
 		goto out;
+	if (ci->i_xattrs.need_refill) {
+		err = -EAGAIN;
+		goto out;
+	}
 
 	/* add 1 byte for each xattr due to the null termination */
 	namelen = ci->i_xattrs.names_size + ci->i_xattrs.count;
@@ -1222,9 +1425,17 @@ int __ceph_setxattr(struct inode *inode, const char *name,
 	int required_blob_size;
 	bool check_realm = false;
 	bool lock_snap_rwsem = false;
+	bool checked_quarantine = false;
+	bool direct_refreshed = false;
 
 	if (ceph_in_snap(inode))
 		return -EROFS;
+	if (ceph_inode_quarantine_direct(inode)) {
+		direct_refreshed = true;
+		err = ceph_quarantine_recover_direct(inode);
+		if (err)
+			return err;
+	}
 
 	vxattr = ceph_match_vxattr(inode, name);
 	if (vxattr) {
@@ -1282,7 +1493,10 @@ retry:
 
 	boutc(cl, "%p %llx.%llx name '%s' issued %s\n", inode,
 	      ceph_vinop(inode), name, ceph_cap_string(issued));
-	__build_xattrs(inode);
+	err = __build_xattrs(inode);
+	if (err < 0 || ci->i_xattrs.need_refill ||
+	    !ceph_acl_xattr_data_known(&ci->i_xattrs))
+		goto do_sync;
 
 	/*
 	 * __build_xattrs() may have released and reacquired i_ceph_lock,
@@ -1305,7 +1519,8 @@ retry:
 		struct ceph_buffer *blob;
 
 		spin_unlock(&ci->i_ceph_lock);
-		ceph_buffer_put(old_blob); /* Shouldn't be required */
+		ceph_buffer_put(old_blob);
+		old_blob = NULL;
 		boutc(cl, " pre-allocating new blob size=%d\n",
 		      required_blob_size);
 		blob = ceph_buffer_new(required_blob_size, GFP_NOFS);
@@ -1319,6 +1534,37 @@ retry:
 		goto retry;
 	}
 
+	/*
+	 * XATTR_EXCL applies the new blob with no MDS round trip.
+	 * The state check may schedule, so drop i_ceph_lock first.
+	 */
+	if (!checked_quarantine) {
+		enum ceph_qstate qstate;
+
+		spin_unlock(&ci->i_ceph_lock);
+		qstate = ceph_inode_quarantine_write_state(inode);
+		if (qstate == CEPH_Q_UNDER &&
+		    ceph_inode_quarantine_direct(inode))
+			goto direct_mark;
+		/*
+		 * The MDS xattr xlock recalls XATTR_EXCL and waits for dirty
+		 * xattr updates before applying the mutation. We need not drop
+		 * EXCL or flush dirty xattrs before sending this request.
+		 */
+		if (qstate != CEPH_Q_CLEAR) {
+			ceph_buffer_put(old_blob);
+			old_blob = NULL;
+			goto do_sync_unlocked;
+		}
+		checked_quarantine = true;
+		spin_lock(&ci->i_ceph_lock);
+		goto retry;
+	}
+	if (ceph_inode_quarantine_direct(inode)) {
+		spin_unlock(&ci->i_ceph_lock);
+		goto direct_mark;
+	}
+
 	err = __set_xattr(ci, newname, name_len, newval, val_len,
 			  flags, value ? 1 : -1, &xattr);
 
@@ -1326,11 +1572,13 @@ retry:
 		dirty = __ceph_mark_dirty_caps(ci, CEPH_CAP_XATTR_EXCL,
 					       &prealloc_cf);
 		ci->i_xattrs.dirty = true;
+		ceph_forget_all_cached_acls(inode);
 		inode_set_ctime_current(inode);
 	}
 
 	spin_unlock(&ci->i_ceph_lock);
 	ceph_buffer_put(old_blob);
+	old_blob = NULL;
 	if (lock_snap_rwsem)
 		up_read(&mdsc->snap_rwsem);
 	if (dirty)
@@ -1338,9 +1586,29 @@ retry:
 	ceph_free_cap_flush(prealloc_cf);
 	return err;
 
+direct_mark:
+	ceph_buffer_put(old_blob);
+	old_blob = NULL;
+	if (lock_snap_rwsem) {
+		up_read(&mdsc->snap_rwsem);
+		lock_snap_rwsem = false;
+	}
+	if (direct_refreshed) {
+		err = -EACCES;
+		goto out;
+	}
+	direct_refreshed = true;
+	err = ceph_quarantine_recover_direct(inode);
+	if (err)
+		goto out;
+	checked_quarantine = false;
+	spin_lock(&ci->i_ceph_lock);
+	goto retry;
+
 do_sync:
 	spin_unlock(&ci->i_ceph_lock);
 	ceph_buffer_put(old_blob);
+	old_blob = NULL;
 do_sync_unlocked:
 	if (lock_snap_rwsem)
 		up_read(&mdsc->snap_rwsem);
@@ -1371,6 +1639,121 @@ out:
 	return err;
 }
 
+#ifdef CONFIG_CEPH_FS_SECURITY_LABEL
+static bool ceph_async_label_in_pagelist(struct ceph_acl_sec_ctx *ctx,
+					 struct ceph_pagelist *pl)
+{
+	if (!ctx->lsm_encoded || !ctx->lsm_cred || !pl ||
+	    !list_is_singular(&pl->head) || !pl->mapped_tail ||
+	    pl->length > PAGE_SIZE ||
+	    ctx->lsm_name_off > pl->length ||
+	    ctx->lsm_name_len > pl->length - ctx->lsm_name_off ||
+	    ctx->lsm_value_off > pl->length ||
+	    ctx->lsm_value_len > pl->length - ctx->lsm_value_off ||
+	    ctx->lsm_name_len <= XATTR_SECURITY_PREFIX_LEN ||
+	    ctx->lsm_name_len > XATTR_NAME_MAX || !ctx->lsm_value_len)
+		return false;
+	return !memcmp(pl->mapped_tail + ctx->lsm_name_off,
+		       XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN);
+}
+
+bool ceph_async_label_prepared(struct ceph_acl_sec_ctx *ctx)
+{
+	return ctx->lsm_cred == current_cred() &&
+	       ceph_async_label_in_pagelist(ctx, ctx->pagelist);
+}
+
+void ceph_async_label_start(struct ceph_async_label *label, struct inode *inode,
+			    struct dentry *dentry, struct ceph_mds_request *req,
+			    struct ceph_acl_sec_ctx *ctx)
+{
+	struct ceph_inode_info *ci = ceph_inode(inode);
+	struct ceph_pagelist *pl = req->r_pagelist;
+
+	label->task = current;
+	label->cred = ctx->lsm_cred;
+	label->dentry = dentry;
+	label->valid = req->r_cred == ctx->lsm_cred &&
+		       ceph_async_label_in_pagelist(ctx, pl);
+	if (label->valid) {
+		/* These are the bytes in the CREATE request, not the xattr cache. */
+		label->name = pl->mapped_tail + ctx->lsm_name_off;
+		label->name_len = ctx->lsm_name_len;
+		label->value = pl->mapped_tail + ctx->lsm_value_off;
+		label->value_len = ctx->lsm_value_len;
+	}
+	ihold(inode);
+	spin_lock(&ci->i_ceph_lock);
+	list_add(&label->item, &ci->i_async_labels);
+	spin_unlock(&ci->i_ceph_lock);
+}
+
+void ceph_async_label_finish(struct ceph_async_label *label, struct inode *inode)
+{
+	struct ceph_inode_info *ci = ceph_inode(inode);
+
+	spin_lock(&ci->i_ceph_lock);
+	list_del(&label->item);
+	spin_unlock(&ci->i_ceph_lock);
+	iput(inode);
+}
+
+bool ceph_async_label_own_scope(struct inode *inode)
+{
+	struct ceph_inode_info *ci = ceph_inode(inode);
+	struct ceph_async_label *label;
+	bool found = false;
+
+	spin_lock(&ci->i_ceph_lock);
+	list_for_each_entry(label, &ci->i_async_labels, item) {
+		if (label->task == current) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&ci->i_ceph_lock);
+	return found;
+}
+
+static bool ceph_async_label_get(struct inode *inode, struct dentry *dentry,
+				 const char *name, void *value, size_t size,
+				 int *ret)
+{
+	struct ceph_inode_info *ci = ceph_inode(inode);
+	struct ceph_async_label *label;
+	bool handled = false;
+
+	spin_lock(&ci->i_ceph_lock);
+	list_for_each_entry(label, &ci->i_async_labels, item) {
+		if (label->task != current)
+			continue;
+		handled = true;
+		*ret = -EBUSY;
+		if (!label->valid || label->cred != current_cred() ||
+		    label->dentry != dentry || strlen(name) != label->name_len ||
+		    memcmp(name, label->name, label->name_len))
+			break;
+		if (size && size < label->value_len) {
+			*ret = -ERANGE;
+			break;
+		}
+		if (size)
+			memcpy(value, label->value, label->value_len);
+		*ret = label->value_len;
+		break;
+	}
+	spin_unlock(&ci->i_ceph_lock);
+	return handled;
+}
+#else
+static bool ceph_async_label_get(struct inode *inode, struct dentry *dentry,
+				 const char *name, void *value, size_t size,
+				 int *ret)
+{
+	return false;
+}
+#endif
+
 static int ceph_get_xattr_handler(const struct xattr_handler *handler,
 				  struct dentry *dentry, struct inode *inode,
 				  const char *name, void *value, size_t size)
@@ -1382,7 +1765,8 @@ static int ceph_get_xattr_handler(const struct xattr_handler *handler,
 	if (!ceph_is_valid_xattr(name))
 		return -EOPNOTSUPP;
 	ceph_blog_enter(fsc, &__ji);
-	ret = __ceph_getxattr(inode, name, value, size);
+	if (!ceph_async_label_get(inode, dentry, name, value, size, &ret))
+		ret = __ceph_getxattr(inode, name, value, size, false);
 	ceph_blog_exit(&__ji);
 	return ret;
 }
@@ -1441,6 +1825,7 @@ int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
 	size_t name_len;
 	int err;
 
+	as_ctx->lsm_cred = get_current_cred();
 	err = security_dentry_init_security(dentry, mode, &dentry->d_name,
 					    &name, &as_ctx->lsmctx);
 	if (err < 0) {
@@ -1487,12 +1872,17 @@ int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
 		as_ctx->pagelist = pagelist;
 	}
 
+	as_ctx->lsm_name_off = pagelist->length + sizeof(__le32);
+	as_ctx->lsm_name_len = name_len;
 	ceph_pagelist_encode_32(pagelist, name_len);
 	ceph_pagelist_append(pagelist, name, name_len);
 
+	as_ctx->lsm_value_off = pagelist->length + sizeof(__le32);
+	as_ctx->lsm_value_len = as_ctx->lsmctx.len;
 	ceph_pagelist_encode_32(pagelist, as_ctx->lsmctx.len);
 	ceph_pagelist_append(pagelist, as_ctx->lsmctx.context,
 			     as_ctx->lsmctx.len);
+	as_ctx->lsm_encoded = true;
 
 	err = 0;
 out:
@@ -1511,6 +1901,8 @@ void ceph_release_acl_sec_ctx(struct ceph_acl_sec_ctx *as_ctx)
 #endif
 #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
 	security_release_secctx(&as_ctx->lsmctx);
+	if (as_ctx->lsm_cred)
+		put_cred(as_ctx->lsm_cred);
 #endif
 #ifdef CONFIG_FS_ENCRYPTION
 	kfree(as_ctx->fscrypt_auth);

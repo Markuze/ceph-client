@@ -39,7 +39,14 @@ enum ceph_feature_type {
 	CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK,
 	CEPHFS_FEATURE_SUBVOLUME_METRICS,
 
-	CEPHFS_FEATURE_MAX = CEPHFS_FEATURE_SUBVOLUME_METRICS,
+	/*
+	 * Bit 23 is CEPHFS_FEATURE_BLOCKDIFF on the MDS and is not
+	 * advertised here. Bit 24 is subvolume quarantine; it must stay
+	 * aligned with the userspace client.
+	 */
+	CEPHFS_FEATURE_QUARANTINE = 24,
+
+	CEPHFS_FEATURE_MAX = CEPHFS_FEATURE_QUARANTINE,
 };
 
 #define CEPHFS_FEATURES_CLIENT_SUPPORTED {	\
@@ -57,6 +64,7 @@ enum ceph_feature_type {
 	CEPHFS_FEATURE_HAS_OWNER_UIDGID,	\
 	CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK,	\
 	CEPHFS_FEATURE_SUBVOLUME_METRICS,	\
+	CEPHFS_FEATURE_QUARANTINE,		\
 }
 
 /*
@@ -379,6 +387,11 @@ struct ceph_mds_request {
 	int r_request_release_offset;
 	const struct cred *r_cred;
 	u64 r_quarantine_negs; /* quarantine_negs value at request creation */
+	bool r_head_stat; /* exact-head metadata request */
+	bool r_quarantine_refresh; /* zero-mask exact-head recovery */
+	bool r_quarantine_held_write; /* per-acquisition path check */
+	bool r_held_write_unsuitable; /* reply cannot be used for held caps */
+	bool r_stat_reply_aware; /* responding session supports quarantine */
 	struct mnt_idmap *r_mnt_idmap;
 	struct timespec64 r_stamp;
 
@@ -425,6 +438,10 @@ struct ceph_mds_request {
 	int               r_attempts;   /* resend attempts */
 	int               r_num_fwd;    /* number of forward attempts */
 	int               r_resend_mds; /* mds to resend to next, if any*/
+	/* Optional initial route; owns a reference until selection or release. */
+	struct ceph_mds_session *r_prefer_session;
+	u32               r_prefer_session_gen;
+	bool              r_prefer_abandoned;
 	u32               r_sent_on_mseq; /* cap mseq request was sent at*/
 	u64		  r_deleg_ino;
 
@@ -432,6 +449,13 @@ struct ceph_mds_request {
 	struct completion r_completion;
 	struct completion r_safe_completion;
 	ceph_mds_request_callback_t r_callback;
+	/* Local instantiation of a CREATE carrying a prepared security label. */
+	spinlock_t r_async_label_lock;
+	bool r_async_label;
+	bool r_async_label_local;
+	bool r_async_label_done;
+	bool r_async_label_accepted;
+	struct ceph_mds_session *r_async_label_session;
 	struct list_head  r_unsafe_item;  /* per-session unsafe list item */
 
 	long long	  r_dir_release_cnt;
@@ -510,6 +534,10 @@ struct ceph_mds_client {
 	spinlock_t              stopping_lock;  /* protect snap_empty */
 	int                     stopping;      /* the stage of shutting down */
 	atomic_t                stopping_blockers;
+	/* Once negotiated, keep tracking across reconnects and mixed ranks. */
+	bool			quarantine_supported;
+	wait_queue_head_t	quarantine_waitq;
+	struct list_head	quarantine_splice_owners; /* quarantine_lock */
 	/*
 	 * Inodes with CEPH_I_QUARANTINE set. Hot paths skip the
 	 * ancestor walk while this is zero.
@@ -717,6 +745,7 @@ struct ceph_path_info {
 	int pathlen;
 	struct ceph_vino vino;
 	bool freepath;
+	bool has_head_base;
 };
 
 static inline void ceph_mdsc_free_path_info(const struct ceph_path_info *path_info)
@@ -750,6 +779,9 @@ static inline int ceph_wait_on_async_create(struct inode *inode)
 {
 	struct ceph_inode_info *ci = ceph_inode(inode);
 
+	if (test_bit(CEPH_I_ASYNC_CREATE_BIT, &ci->i_ceph_flags) &&
+	    ceph_async_label_own_scope(inode))
+		return -EBUSY;
 	return wait_on_bit(&ci->i_ceph_flags, CEPH_I_ASYNC_CREATE_BIT,
 			   TASK_KILLABLE);
 }
