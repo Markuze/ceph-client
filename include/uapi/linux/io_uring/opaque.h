@@ -53,6 +53,8 @@ enum io_uring_opaque_op {
 	IORING_OPAQUE_STREAM_CLOSE,
 	IORING_OPAQUE_COMPACT,
 	IORING_OPAQUE_SET_POLICY,
+	/* Copy userspace bytes into a new complete immutable object. */
+	IORING_OPAQUE_CREATE,
 };
 
 /* IORING_OP_OPAQUE_OBJ_SEND: sqe->ioprio contains these flags. */

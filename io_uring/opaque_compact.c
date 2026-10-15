@@ -52,7 +52,7 @@ static int io_opaque_compact_copy(struct io_opaque_req *op,
 	return 0;
 }
 
-static struct page *io_opaque_compact_page(unsigned int *order)
+struct page *io_opaque_owned_page(unsigned int *order)
 {
 	struct page *page;
 
@@ -104,7 +104,7 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 			ret = -ECANCELED;
 			goto out;
 		}
-		page = io_opaque_compact_page(&order);
+		page = io_opaque_owned_page(&order);
 		if (!page) {
 			ret = -ENOMEM;
 			goto out;

@@ -1491,6 +1491,35 @@ static int io_opaque_copy(struct io_opaque_data *data, u64 off, u32 length,
 	return done == end ? length : -ENODATA;
 }
 
+VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_flags)
+{
+	struct io_opaque_store *store = op->store;
+	struct io_opaque_slot *slot = &store->objects[op->slot];
+
+	guard(mutex)(&store->tables);
+	if (store->dead || READ_ONCE(op->canceled))
+		return -ECANCELED;
+	if (!slot->reserved ||
+	    slot->generation != op->handle >> IO_OPAQUE_INDEX_BITS)
+		return -ESTALE;
+	slot->data = op->data;
+	if (op->data->forward_only)
+		*object_flags = IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
+	store->nr_objects++;
+	op->data = NULL;
+	slot->reserved = false;
+	op->slot_reserved = false;
+	slot->born = jiffies;
+	slot->retry = jiffies;
+	if (!slot->data->dense && !slot->data->forward_only &&
+	    (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
+		list_add_tail(&slot->candidate, &store->candidates);
+		queue_delayed_work(system_dfl_wq, &store->compact_work,
+				   msecs_to_jiffies(100));
+	}
+	return op->length;
+}
+
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 {
 	struct io_kiocb *req = tw_req.req;
@@ -1507,34 +1536,10 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (ret >= 0 && op->op == IORING_OPAQUE_INSPECT)
 		ret = io_opaque_copy(op->data, 0, op->data->length, op->addr);
 	if (ret >= 0 && op->op == IORING_OPAQUE_RECV_OBJECT) {
-		ret = op->data->length == op->length ? io_opaque_vector(op->data) : -ENODATA;
-		if (!ret) {
-			struct io_opaque_slot *slot = &store->objects[op->slot];
-
-			mutex_lock(&store->tables);
-			if (store->dead || !slot->reserved ||
-			    slot->generation != op->handle >> IO_OPAQUE_INDEX_BITS) {
-				ret = -ESTALE;
-			} else {
-				slot->data = op->data;
-				if (op->data->forward_only)
-					object_flags = IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
-				store->nr_objects++;
-				op->data = NULL;
-				slot->reserved = false;
-				op->slot_reserved = false;
-				slot->born = jiffies;
-				slot->retry = jiffies;
-				if (!slot->data->forward_only &&
-				    (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
-					list_add_tail(&slot->candidate, &store->candidates);
-					queue_delayed_work(system_dfl_wq, &store->compact_work,
-							   msecs_to_jiffies(100));
-				}
-				ret = op->length;
-			}
-			mutex_unlock(&store->tables);
-		}
+		ret = op->data->length == op->length ?
+			io_opaque_vector(op->data) : -ENODATA;
+		if (!ret)
+			ret = io_opaque_publish(op, &object_flags);
 	}
 	if (op->op == IORING_OPAQUE_COMPACT) {
 		if (ret >= 0)
@@ -1589,7 +1594,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -ENXIO;
 	if (READ_ONCE(sqe->fd) != -1 || READ_ONCE(sqe->rw_flags) ||
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
-	    cmd > IORING_OPAQUE_SET_POLICY ||
+	    cmd > IORING_OPAQUE_CREATE ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
 	control = cmd == IORING_OPAQUE_FREE || cmd == IORING_OPAQUE_STAT ||
@@ -1606,6 +1611,21 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	op->offset = READ_ONCE(sqe->off);
 	op->length = READ_ONCE(sqe->len);
 	op->addr = u64_to_user_ptr(READ_ONCE(sqe->addr3));
+	if (cmd == IORING_OPAQUE_CREATE) {
+		u64 pointer = READ_ONCE(sqe->addr3);
+
+		if (op->handle || op->offset || !op->length ||
+		    op->length > INT_MAX || !pointer)
+			return -EINVAL;
+		if (op->length > store->config.max_object_size ||
+		    ALIGN((u64)op->length, PAGE_SIZE) > io_opaque_rx_limit(store))
+			return -EMSGSIZE;
+		if (check_add_overflow(pointer, (u64)op->length, &end) ||
+		    pointer > ULONG_MAX || end > ULONG_MAX ||
+		    !access_ok(op->addr, op->length))
+			return -EFAULT;
+		return 0;
+	}
 	if (check_add_overflow(op->offset, (u64)op->length, &end))
 		return -EOVERFLOW;
 	if (cmd <= IORING_OPAQUE_READ_OBJECT) {
@@ -1753,12 +1773,111 @@ static int io_opaque_stat(struct io_opaque_req *op)
 	return io_opaque_stat_copy(op, &stat, sizeof(stat));
 }
 
+/* Construction is synchronous under the ring lock, like READ_OBJECT copies. */
+static int io_opaque_create_build(struct io_opaque_req *op)
+{
+	struct io_opaque_store *store = op->store;
+	struct mem_cgroup *old = set_active_memcg(store->memcg);
+	u64 done = 0;
+	int ret = 0;
+
+	while (done < op->length) {
+		u64 pages_left = DIV_ROUND_UP_ULL(op->length - done, PAGE_SIZE);
+		unsigned int order = min_t(unsigned int, IO_OPAQUE_MAX_ORDER,
+					   ilog2(pages_left));
+		struct io_opaque_extent *extent;
+		struct page *page;
+		u32 chunk, written = 0;
+
+		page = io_opaque_owned_page(&order);
+		if (!page) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		chunk = min_t(u64, op->length - done, PAGE_SIZE << order);
+		extent = io_opaque_extent_new(store, page, 0, chunk, done, true);
+		if (IS_ERR(extent)) {
+			put_page(page);
+			ret = PTR_ERR(extent);
+			goto out;
+		}
+		op->create_reserved -= page_size(page);
+		extent->backing->copied = true;
+		list_add_tail(&extent->list, &op->data->extents);
+		while (written < chunk) {
+			u32 bytes = min_t(u32, chunk - written, PAGE_SIZE);
+			unsigned long left;
+			void *mapped;
+
+			mapped = kmap_local_page(page + (written >> PAGE_SHIFT));
+			left = copy_from_user(mapped, op->addr + done + written, bytes);
+			kunmap_local(mapped);
+			atomic64_add(bytes - left, &store->copied);
+			if (left) {
+				ret = -EFAULT;
+				goto out;
+			}
+			written += bytes;
+		}
+		done += chunk;
+		op->data->length = done;
+		cond_resched();
+	}
+	ret = io_opaque_vector(op->data);
+	if (!ret)
+		op->data->dense = true;
+out:
+	set_active_memcg(old);
+	return ret;
+}
+
+static int io_opaque_create(struct io_opaque_req *op, unsigned int issue_flags)
+{
+	struct io_ring_ctx *ctx = op->req->ctx;
+	u64 charge = ALIGN((u64)op->length, PAGE_SIZE);
+	u64 object_flags = 0;
+	struct mem_cgroup *old;
+	int ret;
+
+	io_ring_submit_lock(ctx, issue_flags);
+	if (READ_ONCE(op->store->dead)) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
+	old = set_active_memcg(op->store->memcg);
+	op->data = io_opaque_data_alloc();
+	set_active_memcg(old);
+	if (!op->data) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	ret = io_opaque_slot_reserve(op);
+	if (ret)
+		goto unlock;
+	if (!io_opaque_charge(op->store, charge, true)) {
+		ret = -ENOBUFS;
+		goto unlock;
+	}
+	op->create_reserved = charge;
+	ret = io_opaque_create_build(op);
+	if (!ret)
+		ret = io_opaque_publish(op, &object_flags);
+unlock:
+	io_req_set_res32(op->req, ret, 0, ret >= 0 ? op->handle : 0, object_flags);
+	if (ret < 0)
+		req_set_fail(op->req);
+	io_ring_submit_unlock(ctx, issue_flags);
+	return IOU_COMPLETE;
+}
+
 int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
 	struct io_opaque_store *store = op->store;
 	int ret;
 
+	if (op->op == IORING_OPAQUE_CREATE)
+		return io_opaque_create(op, issue_flags);
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (READ_ONCE(store->dead)) {
 		ret = -ESHUTDOWN;
@@ -1931,6 +2050,16 @@ bool io_opaque_cancel_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
 	return found;
 }
 
+VISIBLE_IF_KUNIT void io_opaque_create_release(struct io_opaque_req *op)
+{
+	io_opaque_data_put(op->store, op->data);
+	op->data = NULL;
+	if (op->create_reserved) {
+		io_opaque_uncharge(op->store, op->create_reserved);
+		op->create_reserved = 0;
+	}
+}
+
 void io_opaque_cleanup(struct io_kiocb *req)
 {
 	struct io_opaque_req *op = req->async_data;
@@ -1976,7 +2105,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
 		if (op->frame_charge)
 			io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
 	}
-	io_opaque_data_put(store, op->data);
+	if (op->op == IORING_OPAQUE_CREATE)
+		io_opaque_create_release(op);
+	else
+		io_opaque_data_put(store, op->data);
 	if (op->op == IORING_OPAQUE_COMPACT) {
 		io_opaque_data_put(store, op->replacement);
 		io_opaque_compact_end(op);

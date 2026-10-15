@@ -35,6 +35,8 @@ struct io_opaque_req {
 	u64 offset;
 	u64 progress;
 	u64 need_bytes;
+	/* Unallocated CREATE charge; must coexist with the reserved slot. */
+	u64 create_reserved;
 	unsigned long retry_at;
 	void __user *addr;
 	u32 length;

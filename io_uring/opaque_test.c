@@ -937,7 +937,112 @@ static void opaque_forward_only_versions(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+static void opaque_create_reservation_unwind(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store, .op = IORING_OPAQUE_CREATE };
+	struct io_opaque_extent *extent;
+	struct page *page;
+
+	op.data = io_opaque_data_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, op.data);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, 2 * PAGE_SIZE, true));
+	op.create_reserved = 2 * PAGE_SIZE;
+	store->config.max_extents = 1;
+	page = alloc_page(GFP_KERNEL_ACCOUNT);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	extent = io_opaque_extent_new(store, page, 0, PAGE_SIZE, 0, true);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	list_add_tail(&extent->list, &op.data->extents);
+	op.create_reserved -= page_size(page);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)2 * PAGE_SIZE);
+	page = alloc_page(GFP_KERNEL_ACCOUNT);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	extent = io_opaque_extent_new(store, page, 0, 1, PAGE_SIZE, true);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(extent), -ENOBUFS);
+	put_page(page);
+	io_opaque_create_release(&op);
+	KUNIT_EXPECT_EQ(test, op.create_reserved, 0ULL);
+	KUNIT_EXPECT_PTR_EQ(test, op.data, NULL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+static void opaque_create_publish_revalidate(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_kiocb *req = kunit_kzalloc(test, sizeof(*req), GFP_KERNEL);
+	struct io_opaque_req op = {
+		.store = store, .req = req, .op = IORING_OPAQUE_CREATE, .length = 1,
+	};
+	u64 flags = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, req);
+	op.data = io_opaque_data_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, op.data);
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	store->objects[op.slot].generation++;
+	KUNIT_EXPECT_EQ(test, io_opaque_publish(&op, &flags), -ESTALE);
+	store->objects[op.slot].generation--;
+	store->dead = true;
+	KUNIT_EXPECT_EQ(test, io_opaque_publish(&op, &flags), -ECANCELED);
+	KUNIT_EXPECT_PTR_EQ(test, store->objects[op.slot].data, NULL);
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+	KUNIT_EXPECT_EQ(test, flags, 0ULL);
+	io_opaque_create_release(&op);
+}
+
+static void opaque_create_dense_classification(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_kiocb *req = kunit_kzalloc(test, sizeof(*req), GFP_KERNEL);
+	struct io_opaque_req op = {
+		.store = store, .req = req, .op = IORING_OPAQUE_CREATE, .length = 1,
+	};
+	struct io_opaque_extent *extent;
+	struct io_opaque_data *data;
+	struct page *page;
+	u64 flags = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, req);
+	store->config.high_watermark = PAGE_SIZE;
+	store->config.low_watermark = 0;
+	store->objects[0].generation = IO_OPAQUE_GENERATION_MAX;
+	op.data = io_opaque_data_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, op.data);
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_NE(test, op.slot, 0U);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, PAGE_SIZE, true));
+	op.create_reserved = PAGE_SIZE;
+	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_LOWMEM);
+	KUNIT_EXPECT_FALSE(test, op.data->forward_only);
+	page = alloc_page(GFP_KERNEL_ACCOUNT);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	extent = io_opaque_extent_new(store, page, 0, 1, 0, true);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	op.create_reserved -= page_size(page);
+	list_add_tail(&extent->list, &op.data->extents);
+	op.data->length = 1;
+	op.data->dense = true;
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(op.data), 0);
+	store->policy.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
+	KUNIT_ASSERT_EQ(test, io_opaque_publish(&op, &flags), 1);
+	KUNIT_EXPECT_EQ(test, flags, 0ULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&store->candidates));
+	KUNIT_EXPECT_FALSE(test, op.slot_reserved);
+	mutex_lock(&store->tables);
+	data = io_opaque_detach(store, &store->objects[op.slot]);
+	mutex_unlock(&store->tables);
+	io_opaque_data_put(store, data);
+	io_opaque_create_release(&op);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
 static struct kunit_case opaque_cases[] = {
+	KUNIT_CASE(opaque_create_reservation_unwind),
+	KUNIT_CASE(opaque_create_publish_revalidate),
+	KUNIT_CASE(opaque_create_dense_classification),
 	KUNIT_CASE(opaque_memory_watermarks),
 	KUNIT_CASE(opaque_reply_reserve),
 	KUNIT_CASE(opaque_collect_gate),

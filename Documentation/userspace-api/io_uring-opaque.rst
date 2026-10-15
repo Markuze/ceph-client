@@ -182,6 +182,50 @@ linking/cancellation retain their usual meaning. CQE suppression is rejected.
    * - SET_POLICY
      - Replace automatic compaction policy from the supplied UAPI structure.
        Handle and offset are zero; ``len`` supplies the size-versioned input size.
+   * - CREATE
+     - Copy userspace bytes into a new complete immutable object without TCP.
+       Handle and offset are zero; ``addr3`` names the source and ``len``
+       supplies its positive length, at most INT_MAX. Result is length;
+       the extra CQE words report the generation handle and forwarding-only
+       classification, as for RECV_OBJECT.
+
+CREATE copies synchronously at execution, not preparation, like READ_OBJECT.
+It holds the ring submission mutex while allocating, copying and publishing.
+The copy may fault or sleep; even a chunk-boundary yield keeps that mutex held.
+A large object, up to the configured bound and INT_MAX, can therefore delay
+other submissions on the same ring. ``IOSQE_ASYNC`` remains an optional ordinary
+io_uring worker dispatch; it does not release the mutex during construction.
+Cancellation before issue retains normal io_uring semantics. Once copying
+begins, cancellation does not guarantee interruption of the copy.
+Resolve source userfaultfd faults independently, not through operations that
+need the same ring mutex. Keep the source readable and unchanged until
+completion. Concurrent source writes do not provide an atomic snapshot.
+After success the kernel owns independent immutable pages. It retains no
+source page pins or user buffers. CREATE has one CQE, without MORE or
+OPAQUE_CONSUMED. Failed completions expose no handle and zero extra words.
+Normal linking, personality and cancellation apply; CQE suppression is rejected.
+
+CREATE rejects a zero length, null source, nonzero handle/offset or unused
+operation fields with EINVAL. Lengths beyond the configured object bound or
+page-rounded capture allowance return EMSGSIZE. An inaccessible source or
+pointer overflow returns EFAULT. Current payload or extent quota exhaustion
+returns ENOBUFS immediately; CREATE never joins a TCP budget wait list.
+Slot exhaustion returns ENOSPC, allocation failure returns ENOMEM, and
+cancellation returns ECANCELED. CREATE counts against the pending request
+limit and receives EAGAIN at that limit, like other nonadministrative controls.
+Failures release the reserved slot, partial pages and unused reservation.
+
+CREATE reserves page-rounded ordinary payload capacity before copying.
+It cannot use compaction headroom or the protected reply reserve. The
+reservation counts toward payload watermarks. Forwarding-only classification
+is sampled at slot reservation, before the payload charge, and stays stable.
+Owned backing uses chunks of at most 64 KiB with smaller-order fallback.
+CREATE produces dense objects, excludes them from automatic compaction, and
+makes manual COMPACT a no-op. OBJECT_STAT reports the existing COMPACTED flag
+for dense backing; this flag does not prove that a compaction copy ran.
+STAT's cumulative ``copied_bytes`` counts actual CREATE copy work, including
+copied prefixes of failed requests, together with capture fallback copies.
+Framing and compaction copies retain their separate counters.
 
 Each statistics structure begins with ``size``, reporting the kernel's known
 size. Statistics accept output buffers from four bytes through one page;
@@ -578,6 +622,17 @@ They verify that a fault was actually injected and restore failslab settings.
 The VM helper mounts these fixtures; enable the corresponding kernel options
 to run the allocation-failure tests instead of skipping them.
 
+CREATE allocation tests also require ``CONFIG_FAIL_PAGE_ALLOC``. Stack-filtered
+failslab/page-allocation injection targets data allocation, owned pages,
+extent metadata and the final vector. Counter changes prove that failures
+occurred. Data allocation fails before admission; owned pages and extent
+metadata fail after a copied prefix; vector allocation fails after the entire
+payload copy. Each failure exposes no handle, releases all reservations and
+permits slot reuse. These tests need root and debugfs, but not userfaultfd.
+Tests also cover successful ordinary and ``IOSQE_ASYNC`` submissions and
+cancellation races that either cancel before issue or leave a complete,
+releasable object.
+
 The raw ABI tests also exercise short and extended registration/configuration,
 zero and nonzero unknown extensions, versioned statistics and policy,
 read-only registration output rollback, descriptor-only store lifetime, and
@@ -596,6 +651,8 @@ from the watermarks, framing that takes the reply reserve only after capture
 capacity, the collection gate (retained undecided bytes, held passes and
 decided bytes through a held gate), and forwarding-only version replacement
 with advisory send admission.
+CREATE cases cover private reservation and extent-failure unwind, publication
+generation/shutdown checks, and dense admission with generation retirement.
 ``CONFIG_KUNIT`` is required. Compaction and tests compile as separate source
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.

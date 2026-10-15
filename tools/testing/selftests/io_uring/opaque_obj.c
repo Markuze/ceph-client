@@ -3325,7 +3325,7 @@ static void submit_only(struct ring *r)
 
 static struct event wait_tag_ms(struct ring *r, uint64_t tag, unsigned int ms)
 {
-	struct timespec start, now;
+		struct timespec start, now;
 	struct event event;
 	unsigned int i;
 
@@ -4136,6 +4136,570 @@ static void test_watermark_config(struct io_uring_opaque_config cfg)
 	ksft_test_result_pass("watermark and reply reserve ABI validation\n");
 }
 
+static void create_error(struct ring *r, uint32_t context, uint64_t handle,
+			 uint64_t off, unsigned int length, void *ptr, int error)
+{
+	struct event event = command(r, context, IORING_OPAQUE_CREATE,
+				     handle, off, length, ptr);
+
+	require(event.res == error && !event.extra[0] && !event.extra[1] &&
+		!event.flags, "CREATE error has no handle or ownership flags");
+}
+
+static void create_drained(struct ring *r, uint32_t context)
+{
+	struct io_uring_opaque_stat stat;
+	unsigned int i;
+
+	for (i = 0; i < 1000; i++) {
+		require(!command(r, context, IORING_OPAQUE_STAT, 0, 0,
+				 sizeof(stat), &stat).res, "CREATE drain STAT");
+		if (!stat.backing_bytes && !stat.extents && !stat.objects && !stat.requests)
+			return;
+		usleep(1000);
+	}
+	require(false, "CREATE backing, extents, objects and requests drain");
+}
+
+static void test_create(struct io_uring_opaque_config cfg)
+{
+	struct ring r;
+	struct event event;
+	uint32_t context;
+	unsigned char source[3] = { 1, 2, 3 }, dest[3];
+	uint64_t handle;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE ring");
+	require(!register_store(&r, &cfg, &context), "CREATE store");
+	event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, sizeof(source), source);
+	ksft_print_msg("CREATE result=%d handle=%llu\n", event.res,
+		       (unsigned long long)event.extra[0]);
+	require(event.res == sizeof(source) && event.extra[0] && !event.flags &&
+		!event.extra[1], "CREATE complete object without TCP");
+	handle = event.extra[0];
+	memset(source, 9, sizeof(source));
+	require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handle, 0,
+			sizeof(dest), dest).res == sizeof(dest) &&
+		dest[0] == 1 && dest[1] == 2 && dest[2] == 3,
+		"CREATE source mutation does not change object");
+	require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+		"CREATE FREE");
+	create_drained(&r, context);
+	{
+		struct io_uring_sqe sqe = {
+			.opcode = IORING_OP_OPAQUE_OBJ, .fd = -1,
+			.ioprio = IORING_OPAQUE_CREATE, .opaque_store_id = context,
+			.len = sizeof(source), .addr3 = (uintptr_t)source,
+			.flags = IOSQE_ASYNC, .user_data = next_tag++,
+		};
+
+		stage(&r, sqe);
+		event = wait_tag_ms(&r, sqe.user_data, 5000);
+		require(event.res == sizeof(source) && event.extra[0] && !event.flags,
+			"CREATE explicit ASYNC succeeds");
+		require(command(&r, context, IORING_OPAQUE_READ_OBJECT, event.extra[0],
+				0, sizeof(dest), dest).res == sizeof(dest) &&
+			!memcmp(source, dest, sizeof(dest)), "CREATE ASYNC owns copied bytes");
+		require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0],
+				 0, 0, NULL).res, "CREATE ASYNC FREE");
+		create_drained(&r, context);
+	}
+	ksft_test_result_pass("CREATE owns immutable copied bytes without TCP\n");
+	{
+		size_t page = sysconf(_SC_PAGESIZE), i, j;
+		unsigned int lengths[] = { 1, page - 1, page, page + 1 };
+		unsigned char *input = malloc(3 * page), *output = malloc(2 * page);
+		struct io_uring_opaque_object_stat stat;
+
+		require(input && output, "CREATE boundary buffers");
+		for (j = 0; j < 3 * page; j++)
+			input[j] = j % 251;
+		for (i = 0; i < ARRAY_SIZE(lengths); i++) {
+			event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0,
+					lengths[i], input + page - 1);
+			require(event.res == (int)lengths[i] && event.extra[0],
+				"CREATE unaligned cross-page source");
+			handle = event.extra[0];
+			require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handle,
+					0, lengths[i], output).res == (int)lengths[i] &&
+				!memcmp(output, input + page - 1, lengths[i]),
+				"CREATE boundary bytes");
+			require(!command(&r, context, IORING_OPAQUE_OBJECT_STAT, handle,
+					 0, sizeof(stat), &stat).res &&
+				stat.backing_bytes == (lengths[i] + page - 1) / page * page &&
+				(stat.flags & IORING_OPAQUE_OBJECT_F_COMPACTED),
+				"CREATE dense page-rounded backing");
+			require(!command(&r, context, IORING_OPAQUE_COMPACT, handle,
+					 0, 0, NULL).res, "CREATE dense COMPACT no-op");
+			require(!command(&r, context, IORING_OPAQUE_FREE, handle,
+					 0, 0, NULL).res, "CREATE boundary FREE");
+		}
+		free(input);
+		free(output);
+		create_drained(&r, context);
+	}
+	ksft_test_result_pass("CREATE boundary lengths, unaligned pages and dense backing\n");
+	{
+		size_t page = sysconf(_SC_PAGESIZE);
+		void *input = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		struct io_uring_opaque_stat before, after;
+
+		require(input != MAP_FAILED, "CREATE fault mapping");
+		memset(input, 0x67, page);
+		require(!mprotect(input + page, page, PROT_NONE), "CREATE protected page");
+		create_error(&r, context, 0, 0, 0, input, -EINVAL);
+		create_error(&r, context, 0, 0, 1, NULL, -EINVAL);
+		create_error(&r, context, 1, 0, 1, input, -EINVAL);
+		create_error(&r, context, 0, 1, 1, input, -EINVAL);
+		create_error(&r, context, 0, 0, UINT_MAX, input, -EINVAL);
+		create_error(&r, context, 0, 0, INT_MAX, input, -EMSGSIZE);
+		create_error(&r, context, 0, 0, cfg.max_object_size + 1, input, -EMSGSIZE);
+		create_error(&r, context, 0, 0, 2, (void *)(uintptr_t)UINT64_MAX, -EFAULT);
+		for (unsigned int i = 0; i < 6; i++) {
+			struct io_uring_sqe sqe = {
+				.opcode = IORING_OP_OPAQUE_OBJ, .fd = -1,
+				.ioprio = IORING_OPAQUE_CREATE, .opaque_store_id = context,
+				.len = 1, .addr3 = (uintptr_t)input, .user_data = next_tag++,
+			};
+
+			switch (i) {
+			case 0:
+				sqe.fd = 0;
+				break;
+			case 1:
+				sqe.rw_flags = 1;
+				break;
+			case 2:
+				sqe.buf_index = 1;
+				break;
+			case 3:
+				sqe.__pad2[0] = 1;
+				break;
+			case 4:
+				sqe.flags = IOSQE_FIXED_FILE;
+				break;
+			case 5:
+				sqe.flags = IOSQE_CQE_SKIP_SUCCESS;
+				break;
+			}
+			stage(&r, sqe);
+			event = wait_tag(&r, sqe.user_data);
+			require(event.res == -EINVAL && !event.extra[0] && !event.extra[1],
+				"CREATE rejects unused fields and CQE suppression");
+		}
+		create_error(&r, context, 0, 0, 1, input + page, -EFAULT);
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
+				 sizeof(before), &before).res, "CREATE copied before fault");
+		create_error(&r, context, 0, 0, page + 1, input, -EFAULT);
+		create_drained(&r, context);
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
+				 sizeof(after), &after).res &&
+			after.copied_bytes - before.copied_bytes == page,
+			"CREATE counts copied prefix on failed input");
+		munmap(input, 2 * page);
+	}
+	ksft_test_result_pass("CREATE validates inputs and unwinds partial user faults\n");
+	{
+		struct ring imported;
+		uint32_t imported_context;
+		int fd = export_store(&r, context), target[2], i;
+		uint64_t tag;
+		unsigned char expected[3] = { 9, 9, 9 };
+
+		require(fd >= 0 && !ring_init(&imported, IORING_SETUP_CQE32),
+			"CREATE shared ring");
+		require(!import_store(&imported, fd, &imported_context), "CREATE import");
+		close(fd);
+		event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 3, source);
+		require(event.res == 3 && event.extra[0], "CREATE send object");
+		handle = event.extra[0];
+		for (i = 0; i < 3; i++) {
+			/* Separate destinations exercise the shared store's send path. */
+			tcp_pair(target);
+			tag = send_stage_flags(&imported, imported_context, target[0], handle,
+					       0, 3, i == 2 ? IORING_OPAQUE_SEND_LAST : 0, 0, 0);
+			event = wait_tag(&imported, tag);
+			require(event.res == 3 &&
+				!!(event.flags & IORING_CQE_F_OPAQUE_CONSUMED) == (i == 2),
+				"CREATE reusable sends then consuming LAST");
+			require(recv(target[1], dest, 3, MSG_WAITALL) == 3 &&
+				!memcmp(dest, expected, 3), "CREATE send wire bytes");
+			close(target[0]);
+			close(target[1]);
+		}
+		require(command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res ==
+			-ESTALE, "CREATE LAST invalidates shared handle");
+		ring_exit(&imported);
+		create_drained(&r, context);
+	}
+	ksft_test_result_pass("CREATE shared imports, repeated sends and LAST ownership\n");
+	ring_exit(&r);
+}
+
+static void test_create_quota(struct io_uring_opaque_config cfg)
+{
+	struct ring r;
+	struct event event;
+	struct io_uring_opaque_stat stat;
+	uint32_t context;
+	uint64_t handles[4];
+	unsigned char source = 42;
+	unsigned int i;
+	size_t page = sysconf(_SC_PAGESIZE);
+
+	cfg.hard_limit = 6 * page;
+	cfg.compact_headroom = page;
+	cfg.reply_reserve = page;
+	cfg.high_watermark = 2 * page;
+	cfg.low_watermark = page;
+	cfg.max_object_size = 8 * page;
+	cfg.max_objects = 8;
+	cfg.max_extents = 4;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE quota ring");
+	require(!register_store(&r, &cfg, &context), "CREATE quota store");
+	create_error(&r, context, 0, 0, 4 * page + 1, &source, -EMSGSIZE);
+	for (i = 0; i < 4; i++) {
+		event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
+		require(event.res == 1 && event.extra[0] &&
+			event.extra[1] == (i >= 2 ? IORING_OPAQUE_OBJECT_F_FORWARD_ONLY : 0),
+			"CREATE samples lowmem before charging payload");
+		handles[i] = event.extra[0];
+	}
+	create_error(&r, context, 0, 0, 1, &source, -ENOBUFS);
+	{
+		struct io_uring_opaque_frame frame = {
+			.size = sizeof(frame), .prefix = (uintptr_t)&source, .prefix_length = 1,
+		};
+		int target[2];
+		unsigned char received;
+
+		tcp_pair(target);
+		event = wait_tag(&r, frame_stage(&r, context, target[0], 0, 0, &frame, 0, 0));
+		require(event.res == 1 && recv(target[1], &received, 1, MSG_WAITALL) == 1 &&
+			received == source, "CREATE cannot consume protected reply reserve");
+		close(target[0]);
+		close(target[1]);
+		for (i = 0; i < 1000; i++) {
+			require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
+					 sizeof(stat), &stat).res, "CREATE framing drain");
+			if (!stat.framing_bytes)
+				break;
+			usleep(1000);
+		}
+		require(!stat.framing_bytes, "CREATE protected reply charge drains");
+	}
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
+			 sizeof(stat), &stat).res && stat.backing_bytes == 4 * page &&
+		stat.copied_bytes == 4 && stat.memory_mode == IORING_OPAQUE_MEMORY_LOWMEM,
+		"CREATE payload quota and copied counter");
+	for (i = 0; i < 4; i++)
+		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i],
+				 0, 0, NULL).res, "CREATE quota FREE");
+	create_drained(&r, context);
+	ring_exit(&r);
+	ksft_test_result_pass("CREATE capture allowance, lowmem classification and quota unwind\n");
+
+	cfg.hard_limit = 32 * page;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE extent ring");
+	require(!register_store(&r, &cfg, &context), "CREATE extent store");
+	for (i = 0; i < 4; i++) {
+		event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
+		require(event.res == 1 && event.extra[0], "CREATE extent fixture");
+		handles[i] = event.extra[0];
+	}
+	create_error(&r, context, 0, 0, 1, &source, -ENOBUFS);
+	for (i = 0; i < 4; i++)
+		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i],
+				 0, 0, NULL).res, "CREATE extent FREE");
+	create_drained(&r, context);
+	ring_exit(&r);
+
+	cfg.max_objects = 1;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE slot ring");
+	require(!register_store(&r, &cfg, &context), "CREATE slot store");
+	event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
+	require(event.res == 1, "CREATE slot object");
+	handles[0] = event.extra[0];
+	create_error(&r, context, 0, 0, 1, &source, -ENOSPC);
+	require(!command(&r, context, IORING_OPAQUE_FREE, handles[0], 0, 0, NULL).res,
+		"CREATE slot release");
+	create_drained(&r, context);
+	ring_exit(&r);
+
+	cfg.max_objects = 8;
+	cfg.max_requests = 1;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE request cap ring");
+	require(!register_store(&r, &cfg, &context), "CREATE request cap store");
+	handles[0] = cmd_stage(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
+	handles[1] = cmd_stage(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
+	event = wait_tag(&r, handles[1]);
+	require(event.res == -EAGAIN && !event.extra[0] && !event.extra[1],
+		"CREATE counts against request cap");
+	event = wait_tag(&r, handles[0]);
+	require(event.res == 1 && event.extra[0], "CREATE admitted request completes");
+	require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
+		"CREATE request cap FREE");
+	create_drained(&r, context);
+	ring_exit(&r);
+	ksft_test_result_pass("CREATE slot exhaustion and counted request admission\n");
+}
+
+static void test_create_cancel(struct io_uring_opaque_config cfg)
+{
+	struct ring r;
+	uint32_t context;
+	unsigned int i, canceled = 0;
+	unsigned char *source = malloc(cfg.max_object_size);
+
+	require(source, "CREATE cancel source");
+	memset(source, 0x53, cfg.max_object_size);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE cancel ring");
+	require(!register_store(&r, &cfg, &context), "CREATE cancel store");
+	for (i = 0; i < 64; i++) {
+		struct io_uring_sqe create = {
+			.opcode = IORING_OP_OPAQUE_OBJ, .fd = -1,
+			.ioprio = IORING_OPAQUE_CREATE, .opaque_store_id = context,
+			.len = cfg.max_object_size, .addr3 = (uintptr_t)source,
+			.flags = (i & 1 ? IOSQE_ASYNC : 0) | IOSQE_IO_LINK,
+			.user_data = next_tag++,
+		};
+		struct io_uring_sqe successor = {
+			.opcode = IORING_OP_NOP, .fd = -1, .user_data = next_tag++,
+		};
+		struct io_uring_sqe cancel = {
+			.opcode = IORING_OP_ASYNC_CANCEL, .fd = -1,
+			.addr = create.user_data, .user_data = next_tag++,
+		};
+		struct event done, canceled_event, next;
+
+		stage(&r, create);
+		stage(&r, successor);
+		stage(&r, cancel);
+		canceled_event = wait_tag(&r, cancel.user_data);
+		require(canceled_event.res == 0 || canceled_event.res == -ENOENT ||
+			canceled_event.res == -EALREADY, "CREATE cancellation arbitration");
+		done = wait_tag(&r, create.user_data);
+		next = wait_tag(&r, successor.user_data);
+		if (done.res == -ECANCELED) {
+			canceled++;
+			require(!done.extra[0] && !done.extra[1] && !done.flags &&
+				next.res == -ECANCELED,
+				"CREATE canceled without publication or successor");
+		} else {
+			require(done.res == (int)cfg.max_object_size && done.extra[0] &&
+				!done.flags && canceled_event.res != 0 && !next.res,
+				"CREATE completion wins cancellation race");
+			require(!command(&r, context, IORING_OPAQUE_FREE, done.extra[0],
+					 0, 0, NULL).res, "CREATE race FREE");
+		}
+		create_drained(&r, context);
+		enter(&r, 0);
+		require(!r.nr_saved && !peek(&r, &done), "CREATE exactly one CQE per request");
+	}
+	ksft_print_msg("CREATE races: canceled=%u completed=%u\n", canceled, 64 - canceled);
+	ring_exit(&r);
+	for (i = 0; i < 8; i++) {
+		pid_t pid = fork();
+		int status;
+
+		require(pid >= 0, "CREATE teardown fork");
+		if (!pid) {
+			require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE teardown ring");
+			require(!register_store(&r, &cfg, &context), "CREATE teardown store");
+			for (unsigned int j = 0; j < 32; j++)
+				cmd_stage(&r, context, IORING_OPAQUE_CREATE, 0, 0,
+					  cfg.max_object_size, source);
+			enter(&r, 0);
+			ring_exit(&r);
+			/* Keep the source mapped through task/io-wq teardown. */
+			_exit(0);
+		}
+		require(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+			!WEXITSTATUS(status), "CREATE teardown child drains");
+	}
+	free(source);
+	ksft_test_result_pass("CREATE inline/ASYNC completion, pre-issue cancel and drain\n");
+}
+
+static void create_slot_reuse(struct ring *r, uint32_t context)
+{
+	unsigned char source = 0x63;
+	struct event event;
+
+	create_drained(r, context);
+	event = command(r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
+	require(event.res == 1 && event.extra[0], "CREATE failed request's only slot is reusable");
+	require(!command(r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
+		"CREATE reused slot FREE");
+	create_drained(r, context);
+}
+
+static const char * const create_fault_names[] = {
+	"probability", "interval", "times", "space", "task-filter", "require-start",
+	"require-end", "reject-start", "reject-end", "stacktrace-depth",
+	"ignore-gfp-wait", "verbose",
+};
+
+struct create_fault_settings {
+	const char *kind;
+	char saved[ARRAY_SIZE(create_fault_names)][64];
+	char extra[2][64];
+};
+
+static const char *create_fault_extra(const char *kind, unsigned int index)
+{
+	if (!strcmp(kind, "failslab"))
+		return index ? NULL : "cache-filter";
+	return index ? "min-order" : "ignore-gfp-highmem";
+}
+
+static bool create_fault_save(struct create_fault_settings *s, const char *kind)
+{
+	char path[128];
+	FILE *file;
+	unsigned int i;
+
+	s->kind = kind;
+	if (geteuid())
+		return false;
+	for (i = 0; i < ARRAY_SIZE(create_fault_names) + 2; i++) {
+		const char *name = i < ARRAY_SIZE(create_fault_names) ? create_fault_names[i] :
+			create_fault_extra(kind, i - ARRAY_SIZE(create_fault_names));
+		char *saved = i < ARRAY_SIZE(create_fault_names) ? s->saved[i] :
+			s->extra[i - ARRAY_SIZE(create_fault_names)];
+
+		if (!name)
+			continue;
+		snprintf(path, sizeof(path), "/sys/kernel/debug/%s/%s", kind, name);
+		if (access(path, W_OK))
+			return false;
+		file = fopen(path, "r");
+		require(file && fgets(saved, 64, file), "save CREATE fault settings");
+		fclose(file);
+	}
+	return strtoul(s->saved[0], NULL, 10) == 0;
+}
+
+static void create_fault_setting(struct create_fault_settings *s,
+				 const char *name, const char *value)
+{
+	char path[128];
+
+	snprintf(path, sizeof(path), "/sys/kernel/debug/%s/%s", s->kind, name);
+	write_setting(path, value);
+}
+
+/* Stack filters limit faults to the requested allocation stage. */
+static void create_fault_arm(struct create_fault_settings *s, uint64_t start,
+			     uint64_t end, unsigned int times,
+			     unsigned int interval, unsigned int space)
+{
+	char value[64];
+
+	create_fault_setting(s, "probability", "0");
+	snprintf(value, sizeof(value), "%u", interval);
+	create_fault_setting(s, "interval", value);
+	snprintf(value, sizeof(value), "%u", space);
+	create_fault_setting(s, "space", value);
+	create_fault_setting(s, "task-filter", "0");
+	create_fault_setting(s, "reject-start", "0");
+	create_fault_setting(s, "reject-end", "0");
+	create_fault_setting(s, "stacktrace-depth", "32");
+	create_fault_setting(s, "ignore-gfp-wait", "0");
+	create_fault_setting(s, "verbose", "2");
+	create_fault_setting(s, create_fault_extra(s->kind, 0), "0");
+	if (create_fault_extra(s->kind, 1))
+		create_fault_setting(s, create_fault_extra(s->kind, 1), "0");
+	snprintf(value, sizeof(value), "0x%llx", (unsigned long long)start);
+	create_fault_setting(s, "require-start", value);
+	snprintf(value, sizeof(value), "0x%llx", (unsigned long long)end);
+	create_fault_setting(s, "require-end", value);
+	snprintf(value, sizeof(value), "%u", times);
+	create_fault_setting(s, "times", value);
+	create_fault_setting(s, "probability", "100");
+}
+
+static unsigned int create_fault_restore(struct create_fault_settings *s, unsigned int times)
+{
+	char path[128];
+	unsigned int i, remaining;
+
+	create_fault_setting(s, "probability", "0");
+	snprintf(path, sizeof(path), "/sys/kernel/debug/%s/times", s->kind);
+	remaining = read_number(path);
+	for (i = 1; i < ARRAY_SIZE(create_fault_names) + 2; i++) {
+		const char *name = i < ARRAY_SIZE(create_fault_names) ? create_fault_names[i] :
+			create_fault_extra(s->kind, i - ARRAY_SIZE(create_fault_names));
+		const char *saved = i < ARRAY_SIZE(create_fault_names) ? s->saved[i] :
+			s->extra[i - ARRAY_SIZE(create_fault_names)];
+
+		if (name)
+			create_fault_setting(s, name, saved);
+	}
+	create_fault_setting(s, "probability", s->saved[0]);
+	return remaining < times ? times - remaining : 0;
+}
+
+static void test_create_allocation_faults(struct io_uring_opaque_config cfg)
+{
+	static const char * const names[] = {
+		"io_opaque_data_alloc", "io_opaque_owned_page",
+		"io_opaque_extent_new", "io_opaque_vector",
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct create_fault_settings settings;
+		size_t page = sysconf(_SC_PAGESIZE), length = 65536 + page;
+		unsigned char *source;
+		struct io_uring_opaque_stat stat;
+		struct ring r;
+		struct event event;
+		uint32_t context;
+		uint64_t start, end, tag;
+		unsigned int times = i == 1 ? 5 : 1, injected;
+
+		if (!symbol_range(names[i], &start, &end) ||
+		    !create_fault_save(&settings, i == 1 ? "fail_page_alloc" : "failslab")) {
+			ksft_test_result_skip("CREATE %s needs allocation fault filters\n",
+					      names[i]);
+			continue;
+		}
+		cfg.max_objects = 1;
+		require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE allocation fault ring");
+		require(!register_store(&r, &cfg, &context), "CREATE allocation fault store");
+		source = malloc(length);
+		require(source, "CREATE allocation fault source");
+		memset(source, 0x51, length);
+		/* Leave one initial chunk/extent intact, then reject its successor. */
+		create_fault_arm(&settings, start, end, times, i == 2 ? 2 : 1,
+				 i == 1 ? 65536 / page + 1 : 0);
+		tag = cmd_stage(&r, context, IORING_OPAQUE_CREATE, 0, 0, length, source);
+		event = wait_tag_ms(&r, tag, 5000);
+		injected = create_fault_restore(&settings, times);
+		if (event.res >= 0 && event.extra[0])
+			command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL);
+		create_drained(&r, context);
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
+				 sizeof(stat), &stat).res, "CREATE allocation fault copy counter");
+		create_slot_reuse(&r, context);
+		ring_exit(&r);
+		free(source);
+		require(injected, "CREATE fault was actually injected");
+		require(event.res == -ENOMEM && !event.flags && !event.extra[0] && !event.extra[1],
+			"CREATE allocation ENOMEM publishes no handle");
+		require(!i ? !stat.copied_bytes :
+			(i == 3 ? stat.copied_bytes == length :
+			 stat.copied_bytes >= page && stat.copied_bytes < length),
+			"CREATE allocation failed-prefix counter is cumulative");
+		ksft_print_msg("CREATE fault: %s injected=%u copied=%llu\n", names[i],
+			       injected, (unsigned long long)stat.copied_bytes);
+		ksft_test_result_pass("CREATE %s ENOMEM, reservation drain and slot reuse\n",
+				      names[i]);
+	}
+}
+
 static void test_timeout(int signal_number)
 {
 	static const char message[] = "OPAQUE timeout; adjust OPAQUE_TEST_TIMEOUT\n";
@@ -4199,8 +4763,12 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(97);
+	ksft_set_plan(108);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
+	test_create(cfg);
+	test_create_quota(cfg);
+	test_create_cancel(cfg);
+	test_create_allocation_faults(cfg);
 	tcp_pair(source);
 	tcp_pair(target);
 	stream = attach(&r, context, source[1], 100);
