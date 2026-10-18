@@ -1439,10 +1439,10 @@ static void test_send_cancel_race(struct io_uring_opaque_config *cfg)
 	}
 	pthread_join(follower, NULL);
 	pthread_join(drain, NULL);
-	require(complete && partial && canceled && sent && race.expired,
-		"all race paths exercised");
 	ksft_print_msg("SEND races: full=%u partial=%u canceled=%u sent=%u expired=%u\n",
 		       complete, partial, canceled, sent, race.expired);
+	require(complete && partial && canceled && sent && race.expired,
+		"all race paths exercised");
 	close(race.store_fd);
 	require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res &&
 		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res &&
