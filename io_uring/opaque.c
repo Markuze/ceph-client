@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Kernel-resident immutable TCP payloads. See userspace-api/io_uring-opaque. */
+#include <kunit/static_stub.h>
 #include <linux/bitmap.h>
 #include <linux/bvec.h>
 #include <linux/file.h>
@@ -179,10 +180,15 @@ bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
 	}
 }
 
-void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes)
+static void io_opaque_uncharge_bytes(struct io_opaque_store *store, u64 bytes)
 {
 	atomic64_sub(bytes, &store->bytes);
 	io_opaque_memory_mode(store);
+}
+
+void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes)
+{
+	io_opaque_uncharge_bytes(store, bytes);
 	io_opaque_wake_budget(store);
 }
 
@@ -284,6 +290,12 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 #endif
 }
 
+VISIBLE_IF_KUNIT struct io_opaque_chunk *io_opaque_chunk_alloc(void)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_chunk_alloc);
+	return kzalloc_obj(struct io_opaque_chunk, GFP_KERNEL_ACCOUNT);
+}
+
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
@@ -298,7 +310,7 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 		goto no_space;
 	if (!reserved && io_opaque_memcg_charge(store, charge))
 		goto no_memory;
-	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
+	chunk = io_opaque_chunk_alloc();
 	if (!chunk) {
 		if (!reserved)
 			io_opaque_memcg_uncharge(store, charge);
@@ -325,15 +337,19 @@ no_space:
 	return ERR_PTR(-ENOBUFS);
 }
 
-VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
-					    struct io_opaque_extent *extent)
+static struct io_opaque_backing *io_opaque_extent_unlink(struct io_opaque_extent *extent)
 {
 	struct io_opaque_backing *backing = extent->backing;
 
 	list_del(&extent->list);
 	if (!extent->embedded)
 		kfree(extent);
-	atomic_dec(&store->extents);
+	return backing;
+}
+
+static void io_opaque_backing_put(struct io_opaque_store *store,
+				 struct io_opaque_backing *backing)
+{
 	if (refcount_dec_and_test(&backing->refs)) {
 		u64 charge = backing->charge;
 
@@ -341,10 +357,18 @@ VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
 			io_opaque_memcg_uncharge(store, charge);
 		put_page(backing->page);
 		kfree(container_of(backing, struct io_opaque_chunk, backing));
-		io_opaque_uncharge(store, charge);
-	} else {
-		io_opaque_wake_budget(store);
+		io_opaque_uncharge_bytes(store, charge);
 	}
+}
+
+VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
+					    struct io_opaque_extent *extent)
+{
+	struct io_opaque_backing *backing = io_opaque_extent_unlink(extent);
+
+	atomic_dec(&store->extents);
+	io_opaque_backing_put(store, backing);
+	io_opaque_wake_budget(store);
 }
 
 VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
@@ -367,11 +391,51 @@ struct io_opaque_data *io_opaque_data_alloc(void)
 	return data;
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/* Observation only: tests never replace retirement, accounting or budget wakes. */
+void io_opaque_release_observe(struct io_opaque_store *store,
+			       struct io_opaque_data *data, unsigned int retired,
+			       bool flushed)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_release_observe, store, data, retired, flushed);
+}
+#else
+static inline void io_opaque_release_observe(struct io_opaque_store *store,
+					    struct io_opaque_data *data,
+					    unsigned int retired, bool flushed)
+{
+}
+#endif
+
+static void io_opaque_release_batch(struct io_opaque_store *store,
+				   struct io_opaque_data *data, unsigned int retired)
+{
+	atomic_sub(retired, &store->extents);
+	/* Extent-only batches must notify too, even if no backing was last. */
+	io_opaque_wake_budget(store);
+	io_opaque_release_observe(store, data, retired, true);
+}
+
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data)
 {
 	if (data && refcount_dec_and_test(&data->refs)) {
-		io_opaque_extents_free(store, &data->extents);
+		struct io_opaque_extent *extent, *next;
+		unsigned int retired = 0;
+
+		list_for_each_entry_safe(extent, next, &data->extents, list) {
+			io_opaque_backing_put(store, io_opaque_extent_unlink(extent));
+			/* Publish only after retirement, never credit live/reserved extents. */
+			retired++;
+			io_opaque_release_observe(store, data, retired, false);
+			if (retired == IO_OPAQUE_RELEASE_BATCH) {
+				io_opaque_release_batch(store, data, retired);
+				retired = 0;
+			}
+		}
+		/* Each destructor withholds <= one batch, not a preemption-time bound. */
+		if (retired)
+			io_opaque_release_batch(store, data, retired);
 		kvfree(data->bvec);
 		kfree(data);
 	}

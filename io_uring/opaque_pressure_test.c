@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Exercise the real range/collector paths with a full store and a TCP peer. */
 #include <kunit/test.h>
+#include <kunit/static_stub.h>
 #include <linux/file.h>
 #include <linux/highmem.h>
 #include <linux/inet.h>
@@ -649,7 +650,432 @@ static void pressure_release_before_enrollment(struct kunit *test)
 	pressure_expect_object(test, op);
 }
 
+/* Extend the real full-store fixture with a final data version spanning 32+1. */
+static struct io_opaque_data *pressure_batch_data(struct kunit *test, bool extent_limit)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	f->store.config.hard_limit = 128 * PAGE_SIZE;
+	f->store.config.max_extents = 256;
+	list_splice_init(&f->held, &data->extents);
+	for (i = 0; i < 32; i++) {
+		struct page *page = alloc_page(GFP_KERNEL);
+		struct io_opaque_extent *extent;
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		extent = io_opaque_extent_new(&f->store, page, 0, 1, i, false);
+		if (IS_ERR(extent))
+			put_page(page);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+		list_add_tail(&extent->list, &data->extents);
+	}
+	if (extent_limit)
+		f->store.config.max_extents = 38;
+	else
+		f->store.config.hard_limit = 36 * PAGE_SIZE;
+	return data;
+}
+
+static void pressure_batch_observe(struct io_opaque_store *store,
+				   struct io_opaque_data *data, unsigned int retired,
+				   bool flushed)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pressure_fixture *f = test->priv;
+
+	if (retired == IO_OPAQUE_RELEASE_BATCH && !flushed) {
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 36);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)4 * PAGE_SIZE);
+		KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+		KUNIT_EXPECT_FALSE(test, list_empty(&f->collector.wait));
+	}
+	if (retired == IO_OPAQUE_RELEASE_BATCH && flushed) {
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 4);
+		KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+		KUNIT_EXPECT_TRUE(test, list_empty(&f->collector.wait));
+	}
+}
+
+static void pressure_batch_release(struct kunit *test, bool extent_limit)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	struct io_opaque_data *data;
+
+	pressure_fill(test, extent_limit);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	data = pressure_batch_data(test, extent_limit);
+	kunit_activate_static_stub(test, io_opaque_release_observe, pressure_batch_observe);
+	io_opaque_data_put(&f->store, data);
+	kunit_deactivate_static_stub(test, io_opaque_release_observe);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), 3);
+	KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	pressure_expect_object(test, op);
+}
+
+static void pressure_batch_release_bytes(struct kunit *test)
+{
+	pressure_batch_release(test, false);
+}
+
+static void pressure_batch_release_extents(struct kunit *test)
+{
+	pressure_batch_release(test, true);
+}
+
+static void pressure_batch_enroll_before(struct io_opaque_store *store,
+					struct io_opaque_data *data, unsigned int retired,
+					bool flushed)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pressure_fixture *f = test->priv;
+
+	if (retired != 31 || flushed)
+		return;
+	mutex_lock(&f->stream.lock);
+	io_opaque_budget_wait(&f->collector, -ENOBUFS);
+	mutex_unlock(&f->stream.lock);
+	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+	KUNIT_EXPECT_FALSE(test, list_empty(&f->collector.wait));
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 36);
+}
+
+static void pressure_batch_enroll_after(struct io_opaque_store *store,
+				       struct io_opaque_data *data, unsigned int retired,
+				       bool flushed)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pressure_fixture *f = test->priv;
+
+	if (retired != IO_OPAQUE_RELEASE_BATCH || !flushed)
+		return;
+	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+	mutex_lock(&f->stream.lock);
+	io_opaque_budget_wait(&f->collector, -ENOBUFS);
+	mutex_unlock(&f->stream.lock);
+	KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->collector.wait));
+}
+
+static void pressure_batch_enrollment(struct kunit *test, bool after)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	struct io_opaque_data *data;
+
+	pressure_fill(test, true);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	data = pressure_batch_data(test, true);
+	/* Failed collection preceded enrollment; no waiter exists when release starts. */
+	scoped_guard(spinlock, &f->store.wait_lock)
+		list_del_init(&f->collector.wait);
+	if (after)
+		kunit_activate_static_stub(test, io_opaque_release_observe,
+					   pressure_batch_enroll_after);
+	else
+		kunit_activate_static_stub(test, io_opaque_release_observe,
+					   pressure_batch_enroll_before);
+	io_opaque_data_put(&f->store, data);
+	kunit_deactivate_static_stub(test, io_opaque_release_observe);
+	KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	pressure_expect_object(test, op);
+}
+
+static void pressure_batch_before_flush(struct kunit *test)
+{
+	pressure_batch_enrollment(test, false);
+}
+
+static void pressure_batch_after_flush(struct kunit *test)
+{
+	pressure_batch_enrollment(test, true);
+}
+
+static void pressure_batch_stolen_capacity(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	struct io_opaque_data *data;
+
+	pressure_fill(test, false);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	data = pressure_batch_data(test, false);
+	io_opaque_data_put(&f->store, data);
+	KUNIT_ASSERT_EQ(test, f->wakes, 1U);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(&f->store, 33 * PAGE_SIZE, true));
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	KUNIT_EXPECT_EQ(test, op->progress, 0ULL);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_RANGE_WAIT);
+	KUNIT_EXPECT_FALSE(test, list_empty(&f->collector.wait));
+	io_opaque_uncharge(&f->store, 33 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, f->wakes, 2U);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	pressure_expect_object(test, op);
+}
+
+static void pressure_batch_backoff(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	struct io_opaque_data *data;
+	unsigned long deadline = jiffies + 5 * HZ;
+
+	pressure_fill(test, false);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	data = pressure_batch_data(test, false);
+	/* Existing allocator backoff must survive both the full and remainder flush. */
+	f->collector.retry_at = deadline;
+	f->collector.need_bytes = 0;
+	io_opaque_data_put(&f->store, data);
+	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+	KUNIT_EXPECT_FALSE(test, list_empty(&f->collector.wait));
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	KUNIT_EXPECT_EQ(test, f->collector.retry_at, deadline);
+	cancel_delayed_work_sync(&f->store.retry_work);
+	f->collector.retry_at = jiffies - 1;
+	queue_delayed_work(system_dfl_wq, &f->store.retry_work, 0);
+	flush_delayed_work(&f->store.retry_work);
+	KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	pressure_expect_object(test, op);
+}
+
+#define PRESSURE_BATCH_WAITERS (2 * IO_OPAQUE_WAKE_BATCH + 1)
+
+struct pressure_batch_waiter {
+	struct io_opaque_stream stream;
+	struct io_opaque_req op;
+	struct io_kiocb req;
+};
+
+static void pressure_batch_waiters_cleanup(void *arg)
+{
+	struct pressure_batch_waiter *waiters = arg;
+	unsigned int i;
+
+	cancel_delayed_work_sync(&waiters[0].op.store->retry_work);
+	for (i = 0; i < PRESSURE_BATCH_WAITERS; i++) {
+		list_del_init(&waiters[i].op.wait);
+		mutex_destroy(&waiters[i].stream.lock);
+	}
+}
+
+static bool pressure_batch_waiting(struct io_opaque_store *store)
+{
+	guard(spinlock)(&store->wait_lock);
+	return !list_empty(&store->budget_waits);
+}
+
+static void pressure_batch_fairness(struct kunit *test, bool terminal, bool closed)
+{
+	struct pressure_fixture *f = test->priv;
+	struct pressure_batch_waiter *waiters;
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	struct io_opaque_extent *extent, *right;
+	struct page *page = alloc_page(GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	/* A full batch with no last backing: only count capacity can wake these waiters. */
+	get_page(page);
+	extent = io_opaque_extent_new(&f->store, page, 0, 33, 0, false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	list_add(&extent->list, &data->extents);
+	for (i = 1; i < 33; i++) {
+		right = io_opaque_extent_split(&f->store, extent, i);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(right));
+		extent = right;
+	}
+	/* Keep the last backing reference outside the destructor's 32-entry list. */
+	list_move_tail(&extent->list, &f->held);
+	f->store.config.max_extents = 35;
+	waiters = kunit_kcalloc(test, PRESSURE_BATCH_WAITERS, sizeof(*waiters), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, waiters);
+	for (i = 0; i < PRESSURE_BATCH_WAITERS; i++) {
+		struct pressure_batch_waiter *w = &waiters[i];
+
+		mutex_init(&w->stream.lock);
+		w->stream.store = &f->store;
+		w->stream.need_bytes = PAGE_SIZE;
+		w->op.store = &f->store;
+		w->op.stream = &w->stream;
+		w->op.req = &w->req;
+		w->req.file = f->file;
+		INIT_LIST_HEAD(&w->op.wait);
+	}
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, pressure_batch_waiters_cleanup,
+						      waiters), 0);
+	for (i = 0; i < PRESSURE_BATCH_WAITERS; i++) {
+		struct pressure_batch_waiter *w = &waiters[i];
+
+		mutex_lock(&w->stream.lock);
+		io_opaque_budget_wait(&w->op, -ENOBUFS);
+		mutex_unlock(&w->stream.lock);
+		if (terminal) {
+			w->op.retry_at = jiffies + 5 * HZ;
+			w->op.need_bytes = f->store.config.hard_limit;
+		}
+	}
+	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+	if (terminal) {
+		if (closed) {
+			for (i = 0; i < PRESSURE_BATCH_WAITERS; i++)
+				waiters[i].stream.closed = true;
+		} else {
+			scoped_guard(spinlock, &f->store.wait_lock)
+				WRITE_ONCE(f->store.dead, 1);
+		}
+	}
+	io_opaque_data_put(&f->store, data);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), (s64)PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, page_count(page), 2);
+	/* A delayed retry can run before this thread resumes; do not assume one wake/extent. */
+	KUNIT_EXPECT_GE(test, f->wakes, (unsigned int)IO_OPAQUE_WAKE_BATCH);
+	for (i = 0; i < PRESSURE_BATCH_WAITERS && pressure_batch_waiting(&f->store); i++)
+		flush_delayed_work(&f->store.retry_work);
+	KUNIT_EXPECT_FALSE(test, pressure_batch_waiting(&f->store));
+	KUNIT_EXPECT_EQ(test, f->wakes, (unsigned int)PRESSURE_BATCH_WAITERS);
+	for (i = 0; i < PRESSURE_BATCH_WAITERS; i++)
+		KUNIT_EXPECT_TRUE(test, list_empty(&waiters[i].op.wait));
+	io_opaque_retry_work(&f->store.retry_work.work);
+	KUNIT_EXPECT_EQ(test, f->wakes, (unsigned int)PRESSURE_BATCH_WAITERS);
+	io_opaque_extents_free(&f->store, &f->held);
+	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+	put_page(page);
+}
+
+static void pressure_batch_many_waiters(struct kunit *test)
+{
+	pressure_batch_fairness(test, false, false);
+}
+
+static void pressure_batch_dead_store(struct kunit *test)
+{
+	pressure_batch_fairness(test, true, false);
+}
+
+static void pressure_batch_closed_streams(struct kunit *test)
+{
+	pressure_batch_fairness(test, true, true);
+}
+
+static void pressure_batch_remainder(struct kunit *test, unsigned int nr)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op, *retiring;
+	struct io_opaque_extent *extent;
+	struct io_opaque_backing *backing;
+	unsigned int i;
+
+	pressure_fill(test, true);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	retiring = pressure_range(test, IORING_OPAQUE_INSPECT, 0, nr);
+	f->store.config.max_extents = 256;
+	extent = list_first_entry(&f->held, struct io_opaque_extent, list);
+	backing = extent->backing;
+	for (i = 0; i < nr; i++) {
+		extent = io_opaque_extent_split(&f->store, extent, extent->start + 1);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	}
+	for (i = 0; i < nr; i++) {
+		extent = list_first_entry(&f->held, struct io_opaque_extent, list);
+		list_move_tail(&extent->list, &retiring->data->extents);
+	}
+	retiring->data->length = nr;
+	/* Three stream entries plus the held backing's last extent stay live. */
+	f->store.config.max_extents = nr + 6;
+	KUNIT_ASSERT_LT(test, nr, (unsigned int)IO_OPAQUE_RELEASE_BATCH);
+	KUNIT_ASSERT_TRUE(test, list_is_singular(&f->held));
+	KUNIT_ASSERT_EQ(test, refcount_read(&backing->refs), nr + 1);
+	KUNIT_ASSERT_EQ(test, atomic_read(&f->store.extents), (int)nr + 4);
+	KUNIT_ASSERT_EQ(test, atomic64_read(&f->store.bytes), (s64)4 * PAGE_SIZE);
+	KUNIT_ASSERT_FALSE(test, list_empty(&f->collector.wait));
+	KUNIT_ASSERT_FALSE(test, delayed_work_pending(&f->store.retry_work));
+	KUNIT_ASSERT_EQ(test, f->wakes, 0U);
+
+	io_opaque_data_put(&f->store, retiring->data);
+	retiring->data = NULL;
+	/* No recv, retry, other release or enrollment recheck may rescue this wake. */
+	KUNIT_ASSERT_EQ_MSG(test, f->wakes, 1U, "%u-entry remainder must notify", nr);
+	KUNIT_ASSERT_TRUE(test, list_empty(&f->collector.wait));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), 4);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), (s64)4 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, refcount_read(&backing->refs), 1);
+	KUNIT_EXPECT_EQ(test, page_count(backing->page), 1);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->store.retry_work));
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	pressure_expect_object(test, op);
+}
+
+static void pressure_batch_remainder_one(struct kunit *test)
+{
+	pressure_batch_remainder(test, 1);
+}
+
+static void pressure_batch_remainder_31(struct kunit *test)
+{
+	pressure_batch_remainder(test, 31);
+}
+
+static void pressure_batch_cancel_and_discard(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op, *discard;
+	struct io_opaque_data *data;
+	struct io_cancel_data cd = { .ctx = f->ctx };
+
+	pressure_fill(test, true);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	data = pressure_batch_data(test, true);
+	cd.data = op->req->cqe.user_data;
+	KUNIT_EXPECT_EQ(test, io_opaque_cancel(f->ctx, &cd, IO_URING_F_UNLOCKED), 0);
+	KUNIT_EXPECT_EQ(test, op->result, -ECANCELED);
+	KUNIT_EXPECT_TRUE(test, RB_EMPTY_NODE(&op->decision));
+	KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&f->ctx->work_list, &f->ctx->work_head),
+			   &op->req->io_task_work.node);
+	io_opaque_data_put(&f->store, data);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	KUNIT_EXPECT_EQ(test, op->result, -ECANCELED);
+	KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&f->ctx->work_list, &f->ctx->work_head), NULL);
+	KUNIT_EXPECT_EQ(test, io_opaque_cancel(f->ctx, &cd, IO_URING_F_UNLOCKED), -ENOENT);
+	discard = pressure_range(test, IORING_OPAQUE_DISCARD, 0, 128);
+	pressure_start(test, discard);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	KUNIT_EXPECT_EQ(test, discard->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, discard->result, 128);
+	KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&f->ctx->work_list, &f->ctx->work_head),
+			   &discard->req->io_task_work.node);
+	KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&f->ctx->work_list, &f->ctx->work_head), NULL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), 0);
+}
+
 static struct kunit_case pressure_cases[] = {
+	KUNIT_CASE(pressure_batch_remainder_one),
+	KUNIT_CASE(pressure_batch_remainder_31),
+	KUNIT_CASE(pressure_batch_cancel_and_discard),
+	KUNIT_CASE(pressure_batch_release_bytes),
+	KUNIT_CASE(pressure_batch_release_extents),
+	KUNIT_CASE(pressure_batch_before_flush),
+	KUNIT_CASE(pressure_batch_after_flush),
+	KUNIT_CASE(pressure_batch_stolen_capacity),
+	KUNIT_CASE(pressure_batch_backoff),
+	KUNIT_CASE(pressure_batch_many_waiters),
+	KUNIT_CASE(pressure_batch_dead_store),
+	KUNIT_CASE(pressure_batch_closed_streams),
 	KUNIT_CASE(pressure_retry_bytes),
 	KUNIT_CASE(pressure_retry_extents),
 	KUNIT_CASE(pressure_release_bytes),

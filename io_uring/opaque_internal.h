@@ -17,6 +17,8 @@
 #define IO_OPAQUE_MAX_ORDER	(PAGE_SHIFT < 16 ? 16 - PAGE_SHIFT : 0)
 #define IO_OPAQUE_ALLOC_RETRY_MS	50
 #define IO_OPAQUE_WAKE_BATCH	32
+/* Final-data credits, independent of the budget waiter's fairness bound. */
+#define IO_OPAQUE_RELEASE_BATCH	32
 #define IO_OPAQUE_INDEX_BITS	14
 #define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
 #define IO_OPAQUE_GENERATION_MAX	(U64_MAX >> IO_OPAQUE_INDEX_BITS)
@@ -191,6 +193,10 @@ int io_opaque_compact_start(struct io_opaque_req *op);
 int io_opaque_set_policy(struct io_opaque_req *op);
 
 #if IS_ENABLED(CONFIG_KUNIT)
+struct io_opaque_chunk *io_opaque_chunk_alloc(void);
+void io_opaque_release_observe(struct io_opaque_store *store,
+			       struct io_opaque_data *data, unsigned int retired,
+			       bool flushed);
 void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation);
 void io_opaque_extent_free(struct io_opaque_store *store,
 			   struct io_opaque_extent *extent);
