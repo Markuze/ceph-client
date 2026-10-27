@@ -278,6 +278,16 @@ with no captured prefix can wait for quota release, announced by the collector's
 nonterminal ENOBUFS CQE. Deadlines and cancellation
 remain available. Compaction operates on published objects.
 
+Retrying an incomplete range while the collector remains budget-blocked leaves
+its retained prefix in the stream and waits for capacity. It does not repeatedly
+move that prefix into private assembly and return ENOBUFS at unchanged capacity.
+On resumption the retained prefix is assembled before new TCP bytes. A consumed
+gap or a prefix whose backing plus a densely packed suffix cannot fit still
+fails immediately. Ranges already fully buffered can complete, and DISCARD at
+the current capture offset can advance without allocating capture backing.
+Socket notifications do not bypass the budget or allocation-backoff checks;
+terminal socket conditions and cancellation remain observable while waiting.
+
 EOF before completion produces ENODATA; network errors propagate. ASYNC_CANCEL,
 linked timeouts, stream close and ring teardown terminate pending ranges.
 An unsuccessful RECV_OBJECT restores its private prefix at the original stream

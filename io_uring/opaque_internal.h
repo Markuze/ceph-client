@@ -209,6 +209,10 @@ int io_opaque_available(struct io_opaque_stream *stream, u64 off, u64 len);
 int io_opaque_take(struct io_opaque_req *op);
 void io_opaque_restore(struct io_opaque_req *op);
 int io_opaque_range_insert(struct io_opaque_req *op);
+int io_opaque_range_start(struct io_opaque_req *op);
+void io_opaque_retry_work(struct work_struct *work);
+void io_opaque_budget_wait(struct io_opaque_req *op, int error);
+void io_opaque_stream_close(struct io_opaque_stream *stream);
 int io_opaque_capture(struct io_opaque_stream *stream,
 		      const struct sk_buff *skb, u32 offset, u32 len,
 		      bool shared);

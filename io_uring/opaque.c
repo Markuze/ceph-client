@@ -34,16 +34,50 @@ void io_opaque_cache_free(struct io_ring_ctx *ctx)
 
 static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
-static void io_opaque_stream_close(struct io_opaque_stream *stream);
+VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream);
 static void io_opaque_tx_put(struct io_opaque_req *op);
+
+static bool io_opaque_budget_ready(struct io_opaque_req *op, unsigned long now)
+{
+	struct io_opaque_store *store = op->store;
+	u64 limit = io_opaque_rx_limit(store);
+	u64 used = atomic64_read(&store->bytes);
+
+	lockdep_assert_held(&store->wait_lock);
+	return !time_before(now, op->retry_at) && used <= limit &&
+	       op->need_bytes <= limit - used &&
+	       atomic_read(&store->extents) < store->config.max_extents - 2;
+}
+
+/* A DISCARD at the capture cursor consumes TCP bytes without allocating. */
+static bool io_opaque_discard_ready(struct io_opaque_stream *stream)
+{
+	struct rb_node *node = rb_first_cached(&stream->decisions);
+	struct io_opaque_req *op;
+
+	lockdep_assert_held(&stream->lock);
+	if (!node)
+		return false;
+	op = rb_entry(node, struct io_opaque_req, decision);
+	return op->op == IORING_OPAQUE_DISCARD &&
+	       op->offset + op->progress == stream->next &&
+	       op->progress < op->length;
+}
+
+static bool io_opaque_collect_blocked(struct io_opaque_req *op)
+{
+	lockdep_assert_held(&op->stream->lock);
+	lockdep_assert_held(&op->store->wait_lock);
+	return op->phase == IO_OPAQUE_BUDGET_POLL &&
+	       !io_opaque_budget_ready(op, jiffies) &&
+	       !io_opaque_discard_ready(op->stream);
+}
 
 static void io_opaque_wake_budget(struct io_opaque_store *store)
 {
 	struct io_opaque_req *op, *next;
 	unsigned long delay = MAX_JIFFY_OFFSET;
 	unsigned long now = jiffies;
-	u64 limit = io_opaque_rx_limit(store);
-	u64 used = atomic64_read(&store->bytes);
 	unsigned int woken = 0;
 	bool stopped;
 
@@ -57,8 +91,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 				delay = min(delay, op->retry_at - now);
 				continue;
 			}
-			if (used > limit || op->need_bytes > limit - used ||
-			    atomic_read(&store->extents) >= store->config.max_extents - 2)
+			if (!io_opaque_budget_ready(op, now))
 				continue;
 			if (woken == IO_OPAQUE_WAKE_BATCH) {
 				delay = 1;
@@ -66,7 +99,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 			}
 		}
 		list_del_init(&op->wait);
-		op->phase = IO_OPAQUE_IDLE;
+		/* A wake is not a reservation; the collector rechecks on entry. */
 		woken++;
 		/* Native multishot polling also observes FIN, RST and urgent data. */
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
@@ -75,7 +108,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 		queue_delayed_work(system_dfl_wq, &store->retry_work, delay);
 }
 
-static void io_opaque_retry_work(struct work_struct *work)
+VISIBLE_IF_KUNIT void io_opaque_retry_work(struct work_struct *work)
 {
 	struct io_opaque_store *store = container_of(to_delayed_work(work),
 						   struct io_opaque_store, retry_work);
@@ -92,8 +125,10 @@ static void io_opaque_wake_stream(struct io_opaque_stream *stream)
 	if (!op)
 		return;
 	scoped_guard(spinlock, &stream->store->wait_lock) {
+		if (!stream->closed && !READ_ONCE(stream->store->dead) &&
+		    io_opaque_collect_blocked(op))
+			return;
 		list_del_init(&op->wait);
-		op->phase = IO_OPAQUE_IDLE;
 	}
 	wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 }
@@ -904,6 +939,39 @@ VISIBLE_IF_KUNIT int io_opaque_range_insert(struct io_opaque_req *op)
 	return 0;
 }
 
+/* Validate a blocked TAKE without taking and restoring its retained prefix. */
+static int io_opaque_defer_take(struct io_opaque_req *op)
+{
+	struct io_opaque_stream *stream = op->stream;
+	struct io_opaque_extent *extent, *tail = NULL;
+	u64 off = op->offset, end = min(off + op->length, stream->next);
+	u64 charge = 0, left;
+
+	/* Allocation backoff can leave an already private prefix in place. */
+	if (op->progress)
+		return 0;
+	list_for_each_entry(extent, &stream->extents, list) {
+		if (extent->start + extent->length <= off)
+			continue;
+		if (extent->start > off)
+			break;
+		if (!tail || tail->backing != extent->backing)
+			charge += extent->backing->charge;
+		tail = extent;
+		off = min(end, extent->start + extent->length);
+		if (off == end)
+			break;
+	}
+	if (off < end)
+		return -ENODATA;
+	left = op->length - (off - op->offset);
+	if (tail && tail->backing->copied &&
+	    tail->offset + tail->length == tail->backing->filled)
+		left -= min_t(u64, left, PAGE_SIZE - tail->backing->filled);
+	return charge + ALIGN(left, PAGE_SIZE) > io_opaque_rx_limit(op->store) ?
+		-ENOBUFS : 0;
+}
+
 static void io_opaque_stream_process(struct io_opaque_stream *stream)
 {
 	struct io_opaque_req *op, *next;
@@ -922,7 +990,14 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 	for (node = rb_first_cached(&stream->decisions); node; node = after) {
 		op = rb_entry(node, struct io_opaque_req, decision);
 		after = rb_next(node);
-		ret = stream->closed ? -ECANCELED : io_opaque_take(op);
+		if (op->op == IORING_OPAQUE_RECV_OBJECT &&
+		    op->offset + op->length > stream->next &&
+		    stream->collector &&
+		    stream->collector->phase == IO_OPAQUE_BUDGET_POLL &&
+		    !stream->closed && !stream->eof && !stream->error)
+			ret = io_opaque_defer_take(op);
+		else
+			ret = stream->closed ? -ECANCELED : io_opaque_take(op);
 		if (!ret && op->op == IORING_OPAQUE_RECV_OBJECT &&
 		    op->data->charge + io_opaque_dense_left(op) >
 		    io_opaque_rx_limit(op->store))
@@ -1199,7 +1274,7 @@ consumed:
 	return consumed ?: ret;
 }
 
-static void io_opaque_stream_close(struct io_opaque_stream *stream)
+VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream)
 {
 	struct socket *sock = sock_from_file(stream->file);
 
@@ -1345,6 +1420,22 @@ static int io_opaque_budget_cqe(struct io_opaque_req *op)
 	return 0;
 }
 
+VISIBLE_IF_KUNIT void io_opaque_budget_wait(struct io_opaque_req *op, int error)
+{
+	lockdep_assert_held(&op->stream->lock);
+	scoped_guard(spinlock, &op->store->wait_lock) {
+		op->need_bytes = error == -ENOMEM ? 0 : op->stream->need_bytes;
+		if (error == -ENOMEM && !time_before(jiffies, op->retry_at))
+			op->retry_at = jiffies + msecs_to_jiffies(IO_OPAQUE_ALLOC_RETRY_MS);
+		else if (error == -ENOBUFS)
+			op->retry_at = jiffies;
+		op->phase = IO_OPAQUE_BUDGET_POLL;
+		list_add_tail(&op->wait, &op->store->budget_waits);
+	}
+	/* Recheck after enrollment to close the release/enrollment race. */
+	io_opaque_wake_budget(op->store);
+}
+
 int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
@@ -1352,6 +1443,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	struct socket *sock = sock_from_file(req->file);
 	read_descriptor_t desc = { .count = IO_OPAQUE_RX_BATCH };
 	struct mem_cgroup *old;
+	bool blocked;
 	int ret;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
@@ -1371,24 +1463,40 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 			goto out;
 	}
 	stream = op->stream;
-	scoped_guard(spinlock, &op->store->wait_lock) {
-		list_del_init(&op->wait);
-		op->phase = IO_OPAQUE_IDLE;
-	}
 	mutex_lock(&stream->lock);
 	if (stream->closed || READ_ONCE(op->store->dead)) {
 		ret = -ECANCELED;
 		goto unlock_stream;
 	}
+	scoped_guard(spinlock, &op->store->wait_lock) {
+		blocked = io_opaque_collect_blocked(op);
+		if (blocked) {
+			/* Capacity may have been taken since the wake removed us. */
+			if (list_empty(&op->wait))
+				list_add_tail(&op->wait, &op->store->budget_waits);
+		} else {
+			list_del_init(&op->wait);
+			op->phase = IO_OPAQUE_IDLE;
+		}
+	}
 	desc.arg.data = stream;
-	stream->hold_undecided = !io_opaque_collect_demand(stream);
 	old = set_active_memcg(op->store->memcg);
+	if (!blocked) {
+		/* Retained prefixes precede bytes captured directly into a TAKE. */
+		io_opaque_stream_process(stream);
+		stream->hold_undecided = !io_opaque_collect_demand(stream);
+	}
 	lock_sock(sock->sk);
 	if (tcp_sk(sock->sk)->urg_data)
 		ret = -EOPNOTSUPP;
-	else if (time_before(jiffies, op->retry_at))
-		ret = -ENOMEM;
-	else
+	else if (blocked) {
+		ret = 0;
+		if (sock->sk->sk_shutdown & RCV_SHUTDOWN) {
+			/* Consume a FIN-only skb, never payload, while out of budget. */
+			desc.count = 0;
+			ret = tcp_read_sock(sock->sk, &desc, io_opaque_actor);
+		}
+	} else
 		ret = tcp_read_sock(sock->sk, &desc, io_opaque_actor);
 	if (desc.error)
 		ret = desc.error;
@@ -1401,6 +1509,18 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	set_active_memcg(old);
 	if (ret < 0 && ret != -ENOBUFS && ret != -ENOMEM)
 		stream->error = ret;
+	if (blocked && !stream->error && !stream->eof) {
+		/* Close release/reenrollment races without retrying TCP capture. */
+		io_opaque_wake_budget(op->store);
+		ret = IOU_RETRY;
+		goto unlock_stream;
+	}
+	if (blocked) {
+		guard(spinlock)(&op->store->wait_lock);
+
+		list_del_init(&op->wait);
+		op->phase = IO_OPAQUE_IDLE;
+	}
 	io_opaque_stream_process(stream);
 	if (ret == -ENOBUFS) {
 		struct io_opaque_req *keep = io_opaque_capture_keep(stream);
@@ -1425,17 +1545,7 @@ int io_opaque_recv(struct io_kiocb *req, unsigned int issue_flags)
 	if (stream->error || stream->eof) {
 		ret = stream->error;
 	} else if (ret == -ENOBUFS || ret == -ENOMEM) {
-		scoped_guard(spinlock, &op->store->wait_lock) {
-			op->need_bytes = ret == -ENOMEM ? 0 : stream->need_bytes;
-			if (ret == -ENOMEM && !time_before(jiffies, op->retry_at))
-				op->retry_at = jiffies + msecs_to_jiffies(IO_OPAQUE_ALLOC_RETRY_MS);
-			else if (ret == -ENOBUFS)
-				op->retry_at = jiffies;
-			op->phase = IO_OPAQUE_BUDGET_POLL;
-			list_add_tail(&op->wait, &op->store->budget_waits);
-		}
-		/* Recheck after enrollment to close the release/enrollment race. */
-		io_opaque_wake_budget(op->store);
+		io_opaque_budget_wait(op, ret);
 		ret = IOU_RETRY;
 	} else if (!desc.count && (issue_flags & IO_URING_F_MULTISHOT)) {
 		/* Drain another bounded batch without waiting for a new TCP edge. */
@@ -1708,7 +1818,7 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 	return 0;
 }
 
-static int io_opaque_range_start(struct io_opaque_req *op)
+VISIBLE_IF_KUNIT int io_opaque_range_start(struct io_opaque_req *op)
 {
 	struct io_opaque_stream *stream = op->stream;
 	struct rb_node *node;
