@@ -1246,11 +1246,13 @@ void ceph_mdsc_release_request(struct kref *kref)
 	if (req->r_reply)
 		ceph_msg_put(req->r_reply);
 	if (req->r_inode) {
-		ceph_put_cap_refs(ceph_inode(req->r_inode), CEPH_CAP_PIN);
+		if (test_bit(CEPH_MDS_R_INODE_PIN, &req->r_req_flags))
+			ceph_put_cap_refs(ceph_inode(req->r_inode), CEPH_CAP_PIN);
 		iput(req->r_inode);
 	}
 	if (req->r_parent) {
-		ceph_put_cap_refs(ceph_inode(req->r_parent), CEPH_CAP_PIN);
+		if (test_bit(CEPH_MDS_R_PARENT_PIN, &req->r_req_flags))
+			ceph_put_cap_refs(ceph_inode(req->r_parent), CEPH_CAP_PIN);
 		iput(req->r_parent);
 	}
 	iput(req->r_target_inode);
@@ -1266,8 +1268,9 @@ void ceph_mdsc_release_request(struct kref *kref)
 		 * changed between the dir mutex being dropped and
 		 * this request being freed.
 		 */
-		ceph_put_cap_refs(ceph_inode(req->r_old_dentry_dir),
-				  CEPH_CAP_PIN);
+		if (test_bit(CEPH_MDS_R_OLD_DENTRY_DIR_PIN, &req->r_req_flags))
+			ceph_put_cap_refs(ceph_inode(req->r_old_dentry_dir),
+					  CEPH_CAP_PIN);
 		iput(req->r_old_dentry_dir);
 	}
 	kfree(req->r_path1);
@@ -4010,8 +4013,10 @@ int ceph_mdsc_submit_request(struct ceph_mds_client *mdsc, struct inode *dir,
 	}
 
 	/* take CAP_PIN refs for r_inode, r_parent, r_old_dentry */
-	if (req->r_inode)
+	if (req->r_inode) {
 		ceph_get_cap_refs(ceph_inode(req->r_inode), CEPH_CAP_PIN);
+		set_bit(CEPH_MDS_R_INODE_PIN, &req->r_req_flags);
+	}
 	if (req->r_parent) {
 		struct ceph_inode_info *ci = ceph_inode(req->r_parent);
 		int fmode = (req->r_op & CEPH_MDS_OP_WRITE) ?
@@ -4020,10 +4025,13 @@ int ceph_mdsc_submit_request(struct ceph_mds_client *mdsc, struct inode *dir,
 		ceph_take_cap_refs(ci, CEPH_CAP_PIN, false);
 		__ceph_touch_fmode(ci, mdsc, fmode);
 		spin_unlock(&ci->i_ceph_lock);
+		set_bit(CEPH_MDS_R_PARENT_PIN, &req->r_req_flags);
 	}
-	if (req->r_old_dentry_dir)
+	if (req->r_old_dentry_dir) {
 		ceph_get_cap_refs(ceph_inode(req->r_old_dentry_dir),
 				  CEPH_CAP_PIN);
+		set_bit(CEPH_MDS_R_OLD_DENTRY_DIR_PIN, &req->r_req_flags);
+	}
 
 	if (req->r_inode) {
 		err = ceph_wait_on_async_create(req->r_inode);
