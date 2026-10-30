@@ -35,7 +35,8 @@
  */
 #define ZCRX_REFILL_CAP MIN(64 * ZCRX_MAX_FRAGS_PER_PAGE, 1024)
 
-#define IO_ZCRX_AREA_SUPPORTED_FLAGS	(IORING_ZCRX_AREA_DMABUF)
+#define IO_ZCRX_AREA_SUPPORTED_FLAGS	(IORING_ZCRX_AREA_DMABUF |\
+					 IORING_ZCRX_AREA_KERNEL)
 #define ZCRX_MAX_AREAS			1024
 
 #define IO_DMA_ATTR (DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
@@ -48,6 +49,12 @@ static inline u32 zcrx_next_area_id(struct io_zcrx_ifq *zcrx)
 static inline u64 zcrx_area_id_to_token(u32 area_id)
 {
 	return (u64)area_id << IORING_ZCRX_AREA_SHIFT;
+}
+
+/* The offset that maps the area of a MAIO instance, for this ring's zcrx id. */
+static inline u64 zcrx_area_mmap_offset(u32 zcrx_id)
+{
+	return IORING_MAP_OFF_ZCRX_AREA + ((u64)zcrx_id << IORING_OFF_ZCRX_SHIFT);
 }
 
 static inline struct io_zcrx_ifq *io_pp_to_ifq(struct page_pool *pp)
@@ -94,6 +101,8 @@ static inline struct io_zcrx_slot io_zcrx_niov_slot(const struct net_iov *niov)
 
 static inline netmem_ref io_zcrx_slot_netmem(struct io_zcrx_slot slot)
 {
+	if (slot.area->mem.is_kernel)
+		return page_to_netmem(slot.area->mem.pages[slot.idx]);
 	return net_iov_to_netmem(&slot.area->nia.niovs[slot.idx]);
 }
 
@@ -297,6 +306,8 @@ static void io_release_area_mem(struct io_zcrx_mem *mem)
 {
 	if (mem->is_dmabuf) {
 		io_release_dmabuf(mem);
+	} else if (mem->is_kernel) {
+		io_zcrx_kmem_release(mem);
 	} else if (mem->pages) {
 		unpin_user_pages(mem->pages, mem->nr_folios);
 		sg_free_table(mem->sgt);
@@ -316,8 +327,23 @@ static int io_import_area(struct io_zcrx_ifq *ifq,
 		return -EINVAL;
 	if (area_reg->rq_area_token)
 		return -EINVAL;
-	if (area_reg->__resv2[0] || area_reg->__resv2[1])
+	if (area_reg->mmap_offset || area_reg->__resv2)
 		return -EINVAL;
+
+	/* A MAIO instance has a kernel area, and only a MAIO instance has one. */
+	if (!!(area_reg->flags & IORING_ZCRX_AREA_KERNEL) != ifq->maio)
+		return -EINVAL;
+	if (ifq->maio) {
+		if ((area_reg->flags & IORING_ZCRX_AREA_DMABUF) ||
+		    area_reg->addr || area_reg->dmabuf_fd)
+			return -EINVAL;
+		ret = io_validate_user_buf_range(0, area_reg->len);
+		if (ret)
+			return ret;
+		if (area_reg->len & ~PAGE_MASK)
+			return -EINVAL;
+		return io_zcrx_kmem_import(ifq, mem, area_reg);
+	}
 
 	ret = io_validate_user_buf_range(area_reg->addr, area_reg->len);
 	if (ret)
@@ -535,6 +561,9 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 	}
 	if (ifq->niov_shift && ifq->niov_shift != buf_size_shift)
 		return -EINVAL;
+	/* A slot of a kernel area is one page. */
+	if (ifq->maio && buf_size_shift != PAGE_SHIFT)
+		return -EINVAL;
 	if (!ifq->dev && buf_size_shift != PAGE_SHIFT)
 		return -EOPNOTSUPP;
 
@@ -560,10 +589,13 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 	area->nia.num_niovs = nr_iovs;
 
 	ret = -ENOMEM;
-	area->nia.niovs = kvmalloc_objs(area->nia.niovs[0], nr_iovs,
-					GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-	if (!area->nia.niovs)
-		goto err;
+	/* The slots of a kernel area are the pages of the area. */
+	if (!area->mem.is_kernel) {
+		area->nia.niovs = kvmalloc_objs(area->nia.niovs[0], nr_iovs,
+						GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!area->nia.niovs)
+			goto err;
+	}
 
 	area->freelist = kvmalloc_array(nr_iovs, sizeof(area->freelist[0]),
 					GFP_KERNEL_ACCOUNT | __GFP_ZERO);
@@ -576,9 +608,9 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 		goto err;
 
 	for (i = 0; i < nr_iovs; i++) {
-		struct net_iov *niov = &area->nia.niovs[i];
-
-		net_iov_init(niov, &area->nia, NET_IOV_IOURING);
+		if (!area->mem.is_kernel)
+			net_iov_init(&area->nia.niovs[i], &area->nia,
+				     NET_IOV_IOURING);
 		area->freelist[i] = i;
 		atomic_set(&area->user_refs[i], 0);
 	}
@@ -799,6 +831,16 @@ struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 	return ifq ? &ifq->rq_region : NULL;
 }
 
+struct io_mapped_region *io_zcrx_get_area_region(struct io_ring_ctx *ctx,
+						 unsigned int id)
+{
+	struct io_zcrx_ifq *ifq = xa_load(&ctx->zcrx_ctxs, id);
+
+	lockdep_assert_held(&ctx->mmap_lock);
+
+	return ifq && ifq->maio ? &ifq->area_region : NULL;
+}
+
 static int zcrx_box_release(struct inode *inode, struct file *file)
 {
 	struct io_zcrx_ifq *ifq = file->private_data;
@@ -864,7 +906,7 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 		return -EINVAL;
 	if (!(ctx->flags & (IORING_SETUP_CQE32|IORING_SETUP_CQE_MIXED)))
 		return -EINVAL;
-	if (reg->if_rxq || reg->rq_entries || reg->area_ptr || reg->region_ptr)
+	if (reg->if_rxq || reg->rq_entries || reg->region_ptr)
 		return -EINVAL;
 	if (reg->event_desc)
 		return -EINVAL;
@@ -881,6 +923,9 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 		return -EBADF;
 
 	ifq = file->private_data;
+	/* For a MAIO instance, the area pointer is an output buffer. */
+	if (reg->area_ptr && !ifq->maio)
+		return -EINVAL;
 	refcount_inc(&ifq->refs);
 	refcount_inc(&ifq->user_refs);
 
@@ -895,6 +940,23 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 	if (copy_to_user(arg, reg, sizeof(*reg))) {
 		ret = -EFAULT;
 		goto err_xa_erase;
+	}
+	if (reg->area_ptr) {
+		/*
+		 * Tell the importer what to map. The mmap offset depends on
+		 * the zcrx id of this ring.
+		 */
+		struct io_uring_zcrx_area_reg area = {
+			.len		= ifq->areas[0]->mem.size,
+			.flags		= IORING_ZCRX_AREA_KERNEL,
+			.mmap_offset	= zcrx_area_mmap_offset(id),
+		};
+
+		if (copy_to_user(u64_to_user_ptr(reg->area_ptr), &area,
+				 sizeof(area))) {
+			ret = -EFAULT;
+			goto err_xa_erase;
+		}
 	}
 
 	scoped_guard(mutex, &ctx->mmap_lock) {
@@ -1018,6 +1080,12 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 		return -EINVAL;
 	if ((reg.if_rxq || reg.if_idx) && (reg.flags & ZCRX_REG_NODEV))
 		return -EINVAL;
+	/* A MAIO instance covers every receive queue, so no queue is named. */
+	if ((reg.flags & ZCRX_REG_MAIO) && reg.if_rxq)
+		return -EINVAL;
+	/* The device case needs the provider of readable pages. */
+	if ((reg.flags & ZCRX_REG_MAIO) && !(reg.flags & ZCRX_REG_NODEV))
+		return -EOPNOTSUPP;
 	if (reg.rq_entries > IO_RQ_MAX_ENTRIES) {
 		if (!(ctx->flags & IORING_SETUP_CLAMP))
 			return -EINVAL;
@@ -1049,6 +1117,7 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	if (!ifq)
 		return -ENOMEM;
 
+	ifq->maio = !!(reg.flags & ZCRX_REG_MAIO);
 	ifq->notif_data = notif.user_data;
 	ifq->allowed_notif_mask = notif.type_mask;
 
@@ -1094,6 +1163,15 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	WARN_ON_ONCE(!ifq->niov_shift);
 
 	reg.zcrx_id = id;
+
+	if (ifq->maio) {
+		struct io_zcrx_area *kern_area = ifq->areas[0];
+
+		/* Filled before the ifq is published, so mmap sees it whole. */
+		ifq->area_region.pages = kern_area->mem.pages;
+		ifq->area_region.nr_pages = kern_area->nia.num_niovs;
+		area.mmap_offset = zcrx_area_mmap_offset(id);
+	}
 
 	scoped_guard(mutex, &ctx->mmap_lock) {
 		/* publish ifq */
@@ -1593,6 +1671,10 @@ static int zcrx_ctrl_add_area(struct io_ring_ctx *ctx, struct io_zcrx_ifq *ifq,
 	struct io_uring_zcrx_area_reg __user *area_uptr;
 	struct io_uring_zcrx_area_reg area_reg;
 
+	/* A MAIO instance has exactly one area. */
+	if (ifq->maio)
+		return -EOPNOTSUPP;
+
 	area_uptr = u64_to_user_ptr(ctrl_add->area_ptr);
 	if (copy_from_user(&area_reg, area_uptr, sizeof(area_reg)))
 		return -EFAULT;
@@ -1983,6 +2065,9 @@ int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	struct sock *sk = sock->sk;
 	const struct proto *prot = READ_ONCE(sk->sk_prot);
 
+	/* The receive path does not handle the page slots of a MAIO area yet. */
+	if (ifq->maio)
+		return -EOPNOTSUPP;
 	if (prot->recvmsg != tcp_recvmsg)
 		return -EPROTONOSUPPORT;
 

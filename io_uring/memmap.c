@@ -274,6 +274,9 @@ static struct io_mapped_region *io_mmap_get_region(struct io_ring_ctx *ctx,
 	case IORING_MAP_OFF_ZCRX_REGION:
 		id = (offset & ~IORING_OFF_MMAP_MASK) >> IORING_OFF_ZCRX_SHIFT;
 		return io_zcrx_get_region(ctx, id);
+	case IORING_MAP_OFF_ZCRX_AREA:
+		id = (offset & ~IORING_OFF_MMAP_MASK) >> IORING_OFF_ZCRX_SHIFT;
+		return io_zcrx_get_area_region(ctx, id);
 	}
 	return NULL;
 }
@@ -334,6 +337,17 @@ __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
 	case IORING_OFF_SQ_RING:
 	case IORING_OFF_CQ_RING:
 		page_limit = (sz + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		break;
+	case IORING_MAP_OFF_ZCRX_AREA:
+		/*
+		 * The pages belong to the kernel and the area. A private
+		 * mapping would copy a page on the first write. Mappings
+		 * must not be inherited by a child and must stay out of
+		 * core dumps.
+		 */
+		if (!(vma->vm_flags & VM_SHARED))
+			return -EINVAL;
+		vm_flags_set(vma, VM_DONTDUMP | VM_DONTCOPY);
 		break;
 	}
 

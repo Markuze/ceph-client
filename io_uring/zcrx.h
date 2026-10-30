@@ -8,7 +8,8 @@
 #include <net/page_pool/types.h>
 #include <net/net_trackers.h>
 
-#define ZCRX_SUPPORTED_REG_FLAGS	(ZCRX_REG_IMPORT | ZCRX_REG_NODEV)
+#define ZCRX_SUPPORTED_REG_FLAGS	(ZCRX_REG_IMPORT | ZCRX_REG_NODEV |\
+					 ZCRX_REG_MAIO)
 #define ZCRX_FEATURES			(ZCRX_FEATURE_RX_PAGE_SIZE |\
 					 ZCRX_FEATURE_EVENT)
 #define ZCRX_EVENT_TYPE_MASK		((1U << ZCRX_EVENT_ALLOC_FAIL) |\
@@ -17,6 +18,8 @@
 struct io_zcrx_mem {
 	unsigned long			size;
 	bool				is_dmabuf;
+	/* order-0 pages that the kernel allocated, see IORING_ZCRX_AREA_KERNEL */
+	bool				is_kernel;
 
 	struct page			**pages;
 	unsigned long			nr_folios;
@@ -75,6 +78,13 @@ struct io_zcrx_ifq {
 	struct user_struct		*user;
 	struct mm_struct		*mm_account;
 	bool				kern_readable;
+	/*
+	 * MAIO instance: one area of kernel pages. A slot of the area is a
+	 * page, not a net_iov.
+	 */
+	bool				maio;
+	/* the process maps the area of a MAIO instance through this region */
+	struct io_mapped_region		area_region;
 
 	struct zcrx_rq			rq ____cacheline_aligned_in_smp;
 	spinlock_t			alloc_lock ____cacheline_aligned_in_smp;
@@ -113,6 +123,13 @@ int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 		 unsigned issue_flags, unsigned int *len);
 struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 					    unsigned int id);
+struct io_mapped_region *io_zcrx_get_area_region(struct io_ring_ctx *ctx,
+						 unsigned int id);
+
+/* zcrx_maio.c */
+int io_zcrx_kmem_import(struct io_zcrx_ifq *ifq, struct io_zcrx_mem *mem,
+			const struct io_uring_zcrx_area_reg *area_reg);
+void io_zcrx_kmem_release(struct io_zcrx_mem *mem);
 #else
 static inline int io_register_zcrx(struct io_ring_ctx *ctx,
 				   struct io_uring_zcrx_ifq_reg __user *arg)
@@ -133,6 +150,12 @@ static inline int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 }
 static inline struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 							  unsigned int id)
+{
+	return NULL;
+}
+
+static inline struct io_mapped_region *io_zcrx_get_area_region(struct io_ring_ctx *ctx,
+							       unsigned int id)
 {
 	return NULL;
 }

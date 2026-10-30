@@ -37,6 +37,15 @@ struct io_uring_zcrx_offsets {
 
 enum io_uring_zcrx_area_flags {
 	IORING_ZCRX_AREA_DMABUF		= 1,
+
+	/*
+	 * The kernel allocates the area. The area is a set of order-0 pages
+	 * that the process maps read-write. @addr and @dmabuf_fd must be 0.
+	 * @len is the size in bytes, a multiple of the page size. The kernel
+	 * returns the mmap offset in @mmap_offset. Valid only with
+	 * ZCRX_REG_MAIO, and required by it.
+	 */
+	IORING_ZCRX_AREA_KERNEL		= 2,
 };
 
 struct io_uring_zcrx_area_reg {
@@ -45,7 +54,12 @@ struct io_uring_zcrx_area_reg {
 	__u64	rq_area_token;
 	__u32	flags;
 	__u32	dmabuf_fd;
-	__u64	__resv2[2];
+	/*
+	 * Output for IORING_ZCRX_AREA_KERNEL: the offset to pass to mmap() on
+	 * the ring file descriptor to map the area. Must be 0 on input.
+	 */
+	__u64	mmap_offset;
+	__u64	__resv2;
 };
 
 enum zcrx_reg_flags {
@@ -57,6 +71,17 @@ enum zcrx_reg_flags {
 	 * consumed and need to be flushed, see ZCRX_CTRL_FLUSH_RQ.
 	 */
 	ZCRX_REG_NODEV		= 2,
+
+	/*
+	 * Register a MAIO zcrx instance: the area is kernel memory, see
+	 * IORING_ZCRX_AREA_KERNEL, and the kernel installs a provider of
+	 * readable pages on every receive queue of the device @if_idx.
+	 * @if_rxq must be 0. The kernel receives into the area and into
+	 * ordinary pages when the area has no free page. Needs CAP_NET_ADMIN.
+	 * May be combined with ZCRX_REG_NODEV. All data is then copied and
+	 * the area serves as a test buffer.
+	 */
+	ZCRX_REG_MAIO		= 4,
 };
 
 enum zcrx_features {
