@@ -427,7 +427,6 @@ struct io_zcrx_args {
 };
 
 static const struct memory_provider_ops io_uring_pp_zc_ops;
-static const struct memory_provider_ops io_uring_pp_maio_ops;
 
 static bool io_zcrx_put_uref(struct io_zcrx_slot slot, unsigned int refs)
 {
@@ -1682,7 +1681,7 @@ static const struct memory_provider_ops io_uring_pp_zc_ops = {
  * area, and ordinary pages when the area has no free page. The pages are
  * readable, so the page pools of the device need no header split.
  */
-static const struct memory_provider_ops io_uring_pp_maio_ops = {
+const struct memory_provider_ops io_uring_pp_maio_ops = {
 	.alloc_netmems		= io_pp_maio_alloc_netmems,
 	.release_netmem		= io_pp_maio_release_netmem,
 	.init			= io_pp_maio_init,
@@ -2015,34 +2014,40 @@ static int io_zcrx_copy_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	return ret;
 }
 
-/*
- * Tell whether the bytes [@page_off, @page_off + @len) of @page can pass by
- * reference: a page pool of this MAIO instance owns the page as a slot of the
- * area, and the bytes lie in this one page. Return the slot if so. A fallback
- * page of such a pool is an ordinary page and no slot. A page that no pool
- * owns, for example a page of the area that the process sent with SEND_ZC, is
- * no slot either.
+/**
+ * io_zcrx_maio_page_slot() - find the slot of bytes that can pass by reference
+ * @ifq:	a MAIO instance
+ * @page:	the page that holds the bytes
+ * @page_off:	the offset of the first byte in @page
+ * @len:	the number of bytes
+ * @recycle:	the skb that carries @page is marked for page pool recycling
+ * @slot:	the slot of @page, set if the function returns true
  *
- * @recycle tells that the skb is marked for recycling. Such an skb holds one
- * pool reference to each page of a pool that it carries. The reference keeps
- * the page with its pool: the pool fields of the page do not change, and the
- * pool does not go away. An skb without the mark can hold a pool page by a
- * plain reference only, for example after a splice. The pool may release such
- * a page at any time, so the function does not trust it.
+ * Tell whether the bytes [@page_off, @page_off + @len) of @page can pass by
+ * reference. They can if a page pool of @ifq owns @page as a slot of the area
+ * and the bytes lie in this one page. A fallback page of such a pool is an
+ * ordinary page and no slot. A page that no pool owns, for example a page of
+ * the area that the process sent with SEND_ZC, is no slot either.
+ *
+ * Only an skb marked for recycling (skb->pp_recycle) holds one pool reference
+ * to each pool page that it carries. The reference pins the pool fields of
+ * the page, so io_zcrx_maio_page_owned() reads them safely, and the pool does
+ * not go away. An skb without the mark holds a pool page by a plain reference
+ * at most, for example after a splice. The pool may release such a page at any
+ * time, so the function does not trust it.
+ *
+ * Return: true if the bytes can pass by reference. Then @slot names the slot.
+ * False if the caller must copy the bytes.
  */
 static bool io_zcrx_maio_page_slot(struct io_zcrx_ifq *ifq, struct page *page,
 				   unsigned int page_off, size_t len,
 				   bool recycle, struct io_zcrx_slot *slot)
 {
 	struct io_zcrx_area *area = ifq->areas[0];
-	struct page_pool *pp;
 
 	if (page_off + len > PAGE_SIZE)
 		return false;
-	if (!recycle || !page_pool_page_is_pp(page))
-		return false;
-	pp = pp_page_to_nmdesc(page)->pp;
-	if (pp->mp_ops != &io_uring_pp_maio_ops || io_pp_to_ifq(pp) != ifq)
+	if (!recycle || !io_zcrx_maio_page_owned(ifq, page))
 		return false;
 	if (!io_zcrx_kmem_lookup(area, page, &slot->idx))
 		return false;

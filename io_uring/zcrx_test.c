@@ -531,6 +531,62 @@ static void zcrx_maio_copy_page(struct kunit *test)
 	io_put_zcrx_ifq(ifq);
 }
 
+/* An instance owns a page when a page pool that uses its provider owns the page. */
+static void zcrx_maio_owned(struct kunit *test)
+{
+	struct page *held[ZT_BATCH], *own, *copy, *fallback, *plain, *pooled;
+	struct io_zcrx_ifq *other = zt_ifq(test, 16);
+	struct page_pool *ordinary;
+	struct zt_env env;
+	unsigned int n;
+	u64 off;
+
+	/* One batch for the pool and one page for a copy page. */
+	zt_env_init(test, &env, ZT_BATCH + 1, 1);
+	own = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, own);
+	copy = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	n = zt_drain_cache(test, env.pp[0], held, ARRAY_SIZE(held));
+
+	/* An area page of the pool. Another instance does not own it. */
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(env.ifq, own, &off));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_owned(env.ifq, own));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_owned(other, own));
+
+	/* A copy page has no pool. */
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(env.ifq, copy, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_owned(env.ifq, copy));
+
+	/* The area is empty, so the pool gets a page that is not in the area. */
+	fallback = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, fallback);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(env.ifq, fallback, &off));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_owned(env.ifq, fallback));
+
+	/* A page that no pool owns, and a page of a pool without the provider. */
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_owned(env.ifq, plain));
+	ordinary = zt_pool(test, env.dev, 1, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_EXPECT_NULL(test, ordinary->mp_ops);
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	KUNIT_EXPECT_TRUE(test, page_pool_page_is_pp(pooled));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_owned(env.ifq, pooled));
+
+	zt_free(ordinary, pooled);
+	page_pool_destroy(ordinary);
+	__free_page(plain);
+	zt_free(env.pp[0], fallback);
+	io_zcrx_maio_page_put(env.ifq, copy);
+	while (n--)
+		zt_free(env.pp[0], held[n]);
+	zt_free(env.pp[0], own);
+	zt_env_exit(test, &env);
+	io_put_zcrx_ifq(other);
+}
+
 /*
  * A PTE of a user mapping holds one page reference and one map count. The
  * test imitates a PTE by hand. A page with only PTE references is ready, and
@@ -1462,6 +1518,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_states),
 	KUNIT_CASE(zcrx_maio_refill_ring),
 	KUNIT_CASE(zcrx_maio_copy_page),
+	KUNIT_CASE(zcrx_maio_owned),
 	KUNIT_CASE(zcrx_maio_mapped),
 	KUNIT_CASE(zcrx_maio_teardown),
 	KUNIT_CASE(zcrx_maio_get_put),

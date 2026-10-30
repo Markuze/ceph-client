@@ -830,3 +830,37 @@ struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq, u64 *area_off)
 	*area_off = zcrx_area_id_to_token(area->area_id) + ((u64)idx << PAGE_SHIFT);
 	return page;
 }
+
+/**
+ * io_zcrx_maio_page_owned() - tell if a page pool of an instance owns a page
+ * @ifq:	a MAIO instance
+ * @page:	any page
+ *
+ * Tell whether @page belongs to a page pool that uses the provider of @ifq.
+ * Two kinds of page qualify: an area page that a pool owns, and a fallback
+ * page. Use io_zcrx_maio_page_off() to tell them apart. A page that no pool
+ * owns does not qualify. Neither does a page of a pool without the provider of
+ * @ifq. A copy page is not owned by a pool. Neither is an area page that a
+ * process passed as user memory.
+ *
+ * The caller must hold a pool reference of the page. Only an skb marked for
+ * page pool recycling (skb->pp_recycle) holds one, for each pool page that it
+ * carries. An skb without the mark holds a plain page reference, which does
+ * not pin the pool fields of the page. Without a pool reference, the pool can
+ * release the page, and even free itself, while the function reads the page
+ * and the pool. With one, the answer does not change, and
+ * io_zcrx_maio_page_get() is valid. The function takes no lock and runs in
+ * any context.
+ *
+ * Return: true if a page pool that uses the provider of @ifq owns @page,
+ * false otherwise.
+ */
+bool io_zcrx_maio_page_owned(struct io_zcrx_ifq *ifq, struct page *page)
+{
+	struct page_pool *pp;
+
+	if (!page_pool_page_is_pp(page))
+		return false;
+	pp = netmem_get_pp(page_to_netmem(page));
+	return pp->mp_ops == &io_uring_pp_maio_ops && io_pp_to_ifq(pp) == ifq;
+}

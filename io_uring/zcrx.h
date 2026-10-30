@@ -184,6 +184,7 @@ unsigned int io_zcrx_ring_refill(struct page_pool *pp, struct io_zcrx_ifq *ifq,
 				 netmem_ref *netmems, unsigned int to_alloc);
 void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned int type);
 void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq);
+extern const struct memory_provider_ops io_uring_pp_maio_ops;
 
 /* zcrx_maio.c */
 int io_zcrx_kmem_import(struct io_zcrx_ifq *ifq, struct io_zcrx_mem *mem,
@@ -211,6 +212,7 @@ bool io_zcrx_maio_page_off(struct io_zcrx_ifq *ifq, struct page *page,
 void io_zcrx_maio_page_get(struct io_zcrx_ifq *ifq, struct page *page);
 void io_zcrx_maio_page_put(struct io_zcrx_ifq *ifq, struct page *page);
 struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq, u64 *area_off);
+bool io_zcrx_maio_page_owned(struct io_zcrx_ifq *ifq, struct page *page);
 #else
 static inline struct io_zcrx_ifq *io_zcrx_maio_get(struct io_ring_ctx *ctx,
 						   u32 zcrx_id)
@@ -242,6 +244,12 @@ static inline struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq,
 						  u64 *area_off)
 {
 	return NULL;
+}
+
+static inline bool io_zcrx_maio_page_owned(struct io_zcrx_ifq *ifq,
+					   struct page *page)
+{
+	return false;
 }
 
 static inline int io_register_zcrx(struct io_ring_ctx *ctx,
