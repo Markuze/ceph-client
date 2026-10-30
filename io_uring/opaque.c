@@ -581,6 +581,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	INIT_LIST_HEAD(&store->copies);
 	INIT_LIST_HEAD(&store->candidates);
 	store->txs = RB_ROOT;
+	INIT_LIST_HEAD(&store->txs_idle);
 	for (i = 0; i < cfg.max_objects; i++)
 		INIT_LIST_HEAD(&store->objects[i].candidate);
 	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
@@ -640,6 +641,21 @@ void io_opaque_stop(struct io_opaque_store *store)
 	io_opaque_wake_budget(store);
 }
 
+/* Free every queue; no request may be left on one. */
+VISIBLE_IF_KUNIT void io_opaque_txs_free(struct io_opaque_store *store)
+{
+	struct io_opaque_tx *tx, *next;
+
+	guard(spinlock)(&store->tx_lock);
+	rbtree_postorder_for_each_entry_safe(tx, next, &store->txs, node) {
+		WARN_ON_ONCE(!list_empty(&tx->requests) || tx->admitting);
+		kfree(tx);
+	}
+	store->txs = RB_ROOT;
+	INIT_LIST_HEAD(&store->txs_idle);
+	store->nr_txs_idle = 0;
+}
+
 void io_opaque_free(struct io_opaque_store *store)
 {
 	if (!store)
@@ -649,6 +665,7 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic_read(&store->extents));
 	WARN_ON_ONCE(atomic_read(&store->requests));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
+	io_opaque_txs_free(store);
 	io_unaccount_mem(store->user, store->mm,
 			 (store->config.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
 	obj_cgroup_put(store->objcg);
@@ -2452,14 +2469,32 @@ static struct io_opaque_tx *io_opaque_tx_find(struct io_opaque_store *store,
 	return *link ? tx : NULL;
 }
 
-/* A queue with no request and none arriving is dropped. */
+/* A queue nobody uses stays for the next frame on its socket, up to a cap. */
 static void io_opaque_tx_unused(struct io_opaque_store *store, struct io_opaque_tx *tx)
 {
 	lockdep_assert_held(&store->tx_lock);
 	if (!list_empty(&tx->requests) || tx->admitting)
 		return;
+	/* A failed queue starts clean: the followers it canceled are gone. */
+	tx->failed = false;
+	list_add_tail(&tx->idle, &store->txs_idle);
+	if (++store->nr_txs_idle <= IO_OPAQUE_TX_IDLE_MAX)
+		return;
+	tx = list_first_entry(&store->txs_idle, struct io_opaque_tx, idle);
+	list_del(&tx->idle);
+	store->nr_txs_idle--;
 	rb_erase(&tx->node, &store->txs);
 	kfree(tx);
+}
+
+static void io_opaque_tx_claim(struct io_opaque_store *store, struct io_opaque_tx *tx)
+{
+	lockdep_assert_held(&store->tx_lock);
+	if (!list_empty(&tx->idle)) {
+		list_del_init(&tx->idle);
+		store->nr_txs_idle--;
+	}
+	tx->admitting++;
 }
 
 /*
@@ -2495,6 +2530,7 @@ VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *s
 			return -ENOMEM;
 		spare->sk = sk;
 		INIT_LIST_HEAD(&spare->requests);
+		INIT_LIST_HEAD(&spare->idle);
 		spin_lock(&store->tx_lock);
 		/* A ring sharing the store may have created it meanwhile. */
 		tx = io_opaque_tx_find(store, sk, &link, &parent);
@@ -2508,7 +2544,7 @@ VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *s
 	if (tx->failed)
 		ret = -ECANCELED;
 	else
-		tx->admitting++;
+		io_opaque_tx_claim(store, tx);
 	spin_unlock(&store->tx_lock);
 	kfree(spare);
 	if (ret)

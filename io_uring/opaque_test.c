@@ -15,6 +15,11 @@
 #include "io_uring.h"
 #include "opaque_internal.h"
 
+static void opaque_test_txs_free(void *store)
+{
+	io_opaque_txs_free(store);
+}
+
 static struct io_opaque_store *opaque_test_store(struct kunit *test)
 {
 	struct io_opaque_store *store = kunit_kzalloc(test, sizeof(*store), GFP_KERNEL);
@@ -36,8 +41,11 @@ static struct io_opaque_store *opaque_test_store(struct kunit *test)
 	seqcount_spinlock_init(&store->transient_seq, &store->transient_lock);
 	INIT_LIST_HEAD(&store->budget_waits);
 	INIT_LIST_HEAD(&store->candidates);
+	INIT_LIST_HEAD(&store->txs_idle);
 	for (i = 0; i < 4; i++)
 		INIT_LIST_HEAD(&store->objects[i].candidate);
+	/* Idle TX queues are separate allocations; free them before the store goes. */
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_txs_free, store), 0);
 	return store;
 }
 
@@ -789,6 +797,34 @@ static void opaque_test_tx_done(struct io_opaque_req *op, bool whole)
 	op->progress = whole ? op->total_length : 1;
 }
 
+/* Queues in the tree, for socket @key or (NULL) for any socket. */
+static unsigned int opaque_test_txs(struct io_opaque_store *store, struct sock *key)
+{
+	struct rb_node *node;
+	unsigned int nr = 0;
+
+	for (node = rb_first(&store->txs); node; node = rb_next(node))
+		if (!key || rb_entry(node, struct io_opaque_tx, node)->sk == key)
+			nr++;
+	return nr;
+}
+
+/* Queues that hold or expect a request, or are not on the idle list. */
+static unsigned int opaque_test_txs_busy(struct io_opaque_store *store)
+{
+	struct rb_node *node;
+	unsigned int busy = 0;
+
+	for (node = rb_first(&store->txs); node; node = rb_next(node)) {
+		struct io_opaque_tx *tx = rb_entry(node, struct io_opaque_tx, node);
+
+		if (!list_empty(&tx->requests) || tx->admitting || tx->failed ||
+		    list_empty(&tx->idle))
+			busy++;
+	}
+	return busy;
+}
+
 #define OPAQUE_TEST_WOKEN	4
 
 static struct {
@@ -845,7 +881,7 @@ static void opaque_tx_order(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&b), NULL);
 	opaque_test_tx_done(&c, true);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), NULL);
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 
 	/* A head that stopped short cancels everything admitted behind it. */
 	opaque_test_wakeups(test);
@@ -873,11 +909,11 @@ static void opaque_tx_order(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), NULL);
 	KUNIT_EXPECT_EQ(test, opaque_woken.nr, 2U);
 	/* The drained queue forgets the failure. */
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&d, &sk[0]), 1);
 	opaque_test_tx_done(&d, true);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&d), NULL);
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 }
 
 /* One published object in slot 0 under handle generation 9. */
@@ -932,7 +968,7 @@ static void opaque_tx_inline_admission(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&d), NULL);
 	opaque_test_tx_done(&c, true);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), NULL);
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 }
 
 static struct io_opaque_req *opaque_race_head;
@@ -992,7 +1028,7 @@ static void opaque_tx_failed_head(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&b), NULL);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), NULL);
 	KUNIT_EXPECT_EQ(test, opaque_woken.nr, 2U);
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&d, &sk[0]), 1);
 	opaque_test_tx_done(&d, true);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&d), NULL);
@@ -1027,7 +1063,67 @@ static void opaque_tx_failed_head(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, a.tx->admitting, 0U);
 	opaque_test_tx_done(&a, false);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&a), NULL);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+}
+
+/* A drained queue stays for the next frame on its socket, up to a cap. */
+static void opaque_tx_idle_cache(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct sock *sk = kunit_kcalloc(test, IO_OPAQUE_TX_IDLE_MAX + 2, sizeof(*sk),
+					GFP_KERNEL);
+	struct io_opaque_req a, b, held;
+	struct io_opaque_tx *tx;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, sk);
+	opaque_test_tx_op(&a, store);
+	opaque_test_tx_op(&b, store);
+	opaque_test_tx_op(&held, store);
+	/* Draining keeps the queue in the tree, idle and clean. */
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&a, &sk[0]), 1);
+	tx = a.tx;
+	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, 0U);
+	opaque_test_tx_done(&a, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&a), NULL);
+	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, &sk[0]), 1U);
+	KUNIT_EXPECT_PTR_EQ(test, rb_entry(store->txs.rb_node, struct io_opaque_tx, node), tx);
+	KUNIT_EXPECT_FALSE(test, tx->failed);
+	/* The next frame on the same key takes that queue; nothing is allocated. */
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&b, &sk[0]), 1);
+	KUNIT_EXPECT_PTR_EQ(test, b.tx, tx);
+	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, NULL), 1U);
+	opaque_test_tx_done(&b, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&b), NULL);
+	/* A queue in use is never trimmed, however many others drain. */
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&held, &sk[IO_OPAQUE_TX_IDLE_MAX + 1]), 1);
+	for (i = 1; i <= IO_OPAQUE_TX_IDLE_MAX; i++) {
+		opaque_test_tx_op(&a, store);
+		KUNIT_ASSERT_EQ(test, io_opaque_tx_admit(&a, &sk[i]), 1);
+		opaque_test_tx_done(&a, true);
+		KUNIT_ASSERT_PTR_EQ(test, io_opaque_tx_release(&a), NULL);
+	}
+	/* One more idle queue than the cap: the oldest, key 0, went. */
+	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, (u32)IO_OPAQUE_TX_IDLE_MAX);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, &sk[0]), 0U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, &sk[1]), 1U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, &sk[IO_OPAQUE_TX_IDLE_MAX]), 1U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, &sk[IO_OPAQUE_TX_IDLE_MAX + 1]), 1U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, NULL),
+			(unsigned int)IO_OPAQUE_TX_IDLE_MAX + 1);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 1U);
+	opaque_test_tx_done(&held, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&held), NULL);
+	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, (u32)IO_OPAQUE_TX_IDLE_MAX);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, NULL), (unsigned int)IO_OPAQUE_TX_IDLE_MAX);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs(store, &sk[1]), 0U);
+	/* Store teardown frees every idle queue. */
+	io_opaque_txs_free(store);
 	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, 0U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&store->txs_idle));
 }
 
 /* Lock order: tables alone around the handle; tx_lock before wait_lock to park and wake. */
@@ -2108,6 +2204,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_tx_order),
 	KUNIT_CASE(opaque_tx_inline_admission),
 	KUNIT_CASE(opaque_tx_failed_head),
+	KUNIT_CASE(opaque_tx_idle_cache),
 	KUNIT_CASE(opaque_tx_lock_order),
 	KUNIT_CASE(opaque_cache_miss_then_hit),
 	KUNIT_CASE(opaque_cache_cooling_probe),

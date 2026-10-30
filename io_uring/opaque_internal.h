@@ -27,6 +27,8 @@
 #define IO_OPAQUE_UNIT_PROBES	4
 /* A cooling unit still referenced after this long is released, not reused. */
 #define IO_OPAQUE_UNIT_COOL_MAX	HZ
+/* Unused per-socket TX queues kept per store; the oldest is freed beyond this. */
+#define IO_OPAQUE_TX_IDLE_MAX	64
 
 struct io_opaque_backing {
 	refcount_t refs;
@@ -85,6 +87,8 @@ struct io_opaque_tx {
 	struct sock *sk;
 	/* Admitted requests that have not queued their whole frame; the head sends. */
 	struct list_head requests;
+	/* On store->txs_idle while no request is queued or arriving. */
+	struct list_head idle;
 	/* Requests between lookup and enqueue; the queue stays while any. */
 	unsigned int admitting;
 	bool failed;
@@ -195,6 +199,8 @@ struct io_opaque_store {
 	u32 nr_objects;
 	u32 nr_streams;
 	struct rb_root txs;
+	struct list_head txs_idle;
+	u32 nr_txs_idle;
 	struct user_struct *user;
 	struct mm_struct *mm;
 	struct mem_cgroup *memcg;
@@ -317,6 +323,7 @@ bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 int io_opaque_send_acquire(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
+void io_opaque_txs_free(struct io_opaque_store *store);
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);
