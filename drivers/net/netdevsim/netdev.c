@@ -362,6 +362,73 @@ static int nsim_get_iflink(const struct net_device *dev)
 	return iflink;
 }
 
+/*
+ * Test aid for a memory provider of readable pages.
+ *
+ * A driver that sets PP_FLAG_PRIVATE_HEADERS puts the headers of a frame into
+ * the head of the skb and the payload into pages of its page pool. The
+ * receive path of netdevsim does not. It passes the transmit skb of the peer
+ * to the stack and never uses a pool page, so a provider on the queue would
+ * see no data.
+ *
+ * If the pool of the queue has a readable provider, move the payload of the
+ * skb into pages of the pool, as such a driver does. The head keeps the
+ * headers up to the payload, as eth_get_headlen() reports them. The length
+ * and the offload state of the skb do not change. The skb keeps its form
+ * when it is not linear, when it has no L3 header or no payload, when the
+ * payload needs more than MAX_SKB_FRAGS pages, or when the pool has no page.
+ */
+static void nsim_rx_to_pool(struct net_device *dev, struct nsim_rq *rq,
+			    struct sk_buff *skb)
+{
+	struct page_pool *pool = rq->page_pool;
+	struct page *pages[MAX_SKB_FRAGS];
+	unsigned int hlen, plen, nr, i;
+
+	if (!pool->mp_readable || skb_is_nonlinear(skb))
+		return;
+
+	/* eth_type_trans() pulled the Ethernet header, and it is still there. */
+	hlen = eth_get_headlen(dev, skb_mac_header(skb), skb->len + ETH_HLEN);
+	hlen = min(hlen - ETH_HLEN, skb->len);
+	plen = skb->len - hlen;
+	if (!hlen || !plen || plen > MAX_SKB_FRAGS * PAGE_SIZE)
+		return;
+
+	/*
+	 * The skb belongs to the socket of the peer, and the destructor of the
+	 * socket subtracts the truesize of the skb. The pages below raise the
+	 * truesize, so run the destructor first. The stack does the same at
+	 * ip_rcv_core(). A driver delivers an skb without an owner.
+	 */
+	skb_orphan(skb);
+
+	/* The skb of the peer can be a clone of its retransmit skb. */
+	if (skb_unclone(skb, GFP_ATOMIC))
+		return;
+
+	nr = DIV_ROUND_UP(plen, PAGE_SIZE);
+	for (i = 0; i < nr; i++) {
+		pages[i] = page_pool_dev_alloc_pages(pool);
+		if (!pages[i])
+			goto err_put;
+		memcpy(page_address(pages[i]), skb->data + hlen + i * PAGE_SIZE,
+		       min_t(unsigned int, plen - i * PAGE_SIZE, PAGE_SIZE));
+	}
+
+	__skb_trim(skb, hlen);
+	for (i = 0; i < nr; i++)
+		skb_add_rx_frag(skb, i, pages[i], 0,
+				min_t(unsigned int, plen - i * PAGE_SIZE, PAGE_SIZE),
+				PAGE_SIZE);
+	skb_mark_for_recycle(skb);
+	return;
+
+err_put:
+	while (i--)
+		page_pool_put_full_page(pool, pages[i], true);
+}
+
 static int nsim_rcv(struct nsim_rq *rq, int budget)
 {
 	struct net_device *dev = rq->napi.dev;
@@ -395,6 +462,7 @@ static int nsim_rcv(struct nsim_rq *rq, int budget)
 
 		/* skb might be discard at netif_receive_skb, save the len */
 		dev_dstats_rx_add(dev, skb->len);
+		nsim_rx_to_pool(dev, rq, skb);
 		napi_gro_receive(&rq->napi, skb);
 	}
 
@@ -426,7 +494,7 @@ static int nsim_create_page_pool(struct page_pool **p, struct net_device *dev,
 		.dma_dir = DMA_BIDIRECTIONAL,
 		.netdev = dev,
 		.queue_idx = queue_idx,
-		/* The receive path never puts packet data into a pool page. */
+		/* No header sits in a pool page, see nsim_rx_to_pool(). */
 		.flags = PP_FLAG_PRIVATE_HEADERS,
 	};
 	struct page_pool *pool;
