@@ -790,7 +790,11 @@ static void page_pool_return_netmem(struct page_pool *pool, netmem_ref netmem)
 	put = true;
 	if (static_branch_unlikely(&page_pool_mem_providers) && pool->mp_ops)
 		put = pool->mp_ops->release_netmem(pool, netmem);
-	else
+	/* A provider that returns true leaves the netmem to the pool. It was
+	 * allocated by the pool, see net_mp_alloc_fallback(), and the pool
+	 * unmaps it.
+	 */
+	if (put)
 		__page_pool_release_netmem_dma(pool, netmem);
 
 	/* This may be the last page returned, releasing the pool, so
@@ -1380,6 +1384,22 @@ void net_mp_niov_clear_page_pool(struct net_iov *niov)
 	netmem_ref netmem = net_iov_to_netmem(niov);
 
 	page_pool_clear_pp_info(netmem);
+}
+
+/* Allocate netmem for a provider of readable pages that has none left. The
+ * pool allocates an ordinary page as it does without a provider: it maps the
+ * page for DMA if the pool maps DMA, stamps the page and counts it as held.
+ * It may fill the alloc cache with more pages of the same kind. Only the
+ * allocation side of the pool may call it, from ->alloc_netmems() with an
+ * empty alloc cache. The provider returns true from ->release_netmem() for
+ * such a page, so that the pool unmaps and frees it.
+ */
+netmem_ref net_mp_alloc_fallback(struct page_pool *pool, gfp_t gfp)
+{
+	if (WARN_ON_ONCE(!pool->mp_readable || pool->alloc.count))
+		return 0;
+
+	return __page_pool_alloc_netmems_slow(pool, gfp);
 }
 
 bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr)
