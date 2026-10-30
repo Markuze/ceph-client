@@ -84,6 +84,24 @@ static inline struct page *io_zcrx_iov_page(const struct net_iov *niov)
 	return area->mem.pages[net_iov_idx(niov) << niov_pages_shift];
 }
 
+static inline struct io_zcrx_slot io_zcrx_niov_slot(const struct net_iov *niov)
+{
+	return (struct io_zcrx_slot){
+		.area	= io_zcrx_iov_to_area(niov),
+		.idx	= net_iov_idx(niov),
+	};
+}
+
+static inline netmem_ref io_zcrx_slot_netmem(struct io_zcrx_slot slot)
+{
+	return net_iov_to_netmem(&slot.area->nia.niovs[slot.idx]);
+}
+
+static inline atomic_t *io_zcrx_slot_uref(struct io_zcrx_slot slot)
+{
+	return &slot.area->user_refs[slot.idx];
+}
+
 static int io_area_max_shift(struct io_zcrx_mem *mem)
 {
 	struct sg_table *sgt = mem->sgt;
@@ -379,16 +397,9 @@ struct io_zcrx_args {
 
 static const struct memory_provider_ops io_uring_pp_zc_ops;
 
-static inline atomic_t *io_get_user_counter(struct net_iov *niov)
+static bool io_zcrx_put_uref(struct io_zcrx_slot slot, unsigned int refs)
 {
-	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
-
-	return &area->user_refs[net_iov_idx(niov)];
-}
-
-static bool io_zcrx_put_niov_uref(struct net_iov *niov, unsigned refs)
-{
-	atomic_t *uref = io_get_user_counter(niov);
+	atomic_t *uref = io_zcrx_slot_uref(slot);
 	int old;
 
 	old = atomic_read(uref);
@@ -400,9 +411,14 @@ static bool io_zcrx_put_niov_uref(struct net_iov *niov, unsigned refs)
 	return true;
 }
 
+static void io_zcrx_get_uref(struct io_zcrx_slot slot)
+{
+	atomic_inc(io_zcrx_slot_uref(slot));
+}
+
 static void io_zcrx_get_niov_uref(struct net_iov *niov)
 {
-	atomic_inc(io_get_user_counter(niov));
+	io_zcrx_get_uref(io_zcrx_niov_slot(niov));
 }
 
 static void io_fill_zcrx_offsets(struct io_uring_zcrx_offsets *offsets)
@@ -684,15 +700,15 @@ static void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq)
 		io_zcrx_ifq_free(ifq);
 }
 
-static void io_zcrx_return_niov_freelist(struct net_iov *niov)
+static void io_zcrx_return_slot_freelist(struct io_zcrx_slot slot)
 {
-	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
+	struct io_zcrx_area *area = slot.area;
 	struct io_zcrx_ifq *ifq = area->ifq;
 
 	guard(spinlock_bh)(&ifq->alloc_lock);
 	if (WARN_ON_ONCE(area->free_count >= area->nia.num_niovs))
 		return;
-	area->freelist[area->free_count++] = net_iov_idx(niov);
+	area->freelist[area->free_count++] = slot.idx;
 }
 
 static struct net_iov *zcrx_get_free_niov(struct io_zcrx_area *area)
@@ -708,16 +724,22 @@ static struct net_iov *zcrx_get_free_niov(struct io_zcrx_area *area)
 	return &area->nia.niovs[niov_idx];
 }
 
-static void io_zcrx_return_niov(struct net_iov *niov)
+static void io_zcrx_return_slot(struct io_zcrx_slot slot)
 {
-	netmem_ref netmem = net_iov_to_netmem(niov);
+	netmem_ref netmem = io_zcrx_slot_netmem(slot);
+	struct page_pool *pp = netmem_get_pp(netmem);
 
-	if (!niov->desc.pp) {
-		/* copy fallback allocated niovs */
-		io_zcrx_return_niov_freelist(niov);
+	if (!pp) {
+		/* copy fallback allocated slots */
+		io_zcrx_return_slot_freelist(slot);
 		return;
 	}
-	page_pool_put_unrefed_netmem(niov->desc.pp, netmem, -1, false);
+	page_pool_put_unrefed_netmem(pp, netmem, -1, false);
+}
+
+static void io_zcrx_return_niov(struct net_iov *niov)
+{
+	io_zcrx_return_slot(io_zcrx_niov_slot(niov));
 }
 
 static void io_zcrx_scrub_area(struct io_zcrx_ifq *ifq, struct io_zcrx_area *area)
@@ -726,14 +748,14 @@ static void io_zcrx_scrub_area(struct io_zcrx_ifq *ifq, struct io_zcrx_area *are
 
 	/* Reclaim back all buffers given to the user space. */
 	for (i = 0; i < area->nia.num_niovs; i++) {
-		struct net_iov *niov = &area->nia.niovs[i];
+		struct io_zcrx_slot slot = { .area = area, .idx = i };
 		int nr;
 
-		if (!atomic_read(io_get_user_counter(niov)))
+		if (!atomic_read(io_zcrx_slot_uref(slot)))
 			continue;
-		nr = atomic_xchg(io_get_user_counter(niov), 0);
-		if (nr && !page_pool_unref_netmem(net_iov_to_netmem(niov), nr))
-			io_zcrx_return_niov(niov);
+		nr = atomic_xchg(io_zcrx_slot_uref(slot), 0);
+		if (nr && !page_pool_unref_netmem(io_zcrx_slot_netmem(slot), nr))
+			io_zcrx_return_slot(slot);
 	}
 }
 
@@ -1217,7 +1239,7 @@ static inline bool zcrx_rq_iter_next(struct zcrx_rq_iter *it,
 
 static inline bool io_parse_rqe(struct io_uring_zcrx_rqe *rqe,
 				struct io_zcrx_ifq *ifq,
-				struct net_iov **ret_niov)
+				struct io_zcrx_slot *ret_slot)
 {
 	__u64 off = READ_ONCE(rqe->off);
 	unsigned niov_idx, area_idx;
@@ -1237,21 +1259,22 @@ static inline bool io_parse_rqe(struct io_uring_zcrx_rqe *rqe,
 		return false;
 	niov_idx = array_index_nospec(niov_idx, area->nia.num_niovs);
 
-	*ret_niov = &area->nia.niovs[niov_idx];
+	ret_slot->area = area;
+	ret_slot->idx = niov_idx;
 	return true;
 }
 
-static bool zcrx_put_refill_niov(struct net_iov *niov, struct page_pool *pp,
+static bool zcrx_put_refill_slot(struct io_zcrx_slot slot, struct page_pool *pp,
 				 unsigned refs)
 {
-	netmem_ref netmem = net_iov_to_netmem(niov);
+	netmem_ref netmem = io_zcrx_slot_netmem(slot);
 
-	if (!io_zcrx_put_niov_uref(niov, refs))
+	if (!io_zcrx_put_uref(slot, refs))
 		return false;
 	if (page_pool_unref_netmem(netmem, refs) != 0)
 		return false;
-	if (unlikely(niov->desc.pp != pp)) {
-		io_zcrx_return_niov(niov);
+	if (unlikely(netmem_get_pp(netmem) != pp)) {
+		io_zcrx_return_slot(slot);
 		return false;
 	}
 	return true;
@@ -1264,8 +1287,8 @@ static unsigned io_zcrx_ring_refill(struct page_pool *pp,
 	struct zcrx_rq *rq = &ifq->rq;
 	struct io_uring_zcrx_rqe *rqe;
 	struct zcrx_rq_iter it;
-	struct net_iov *niov = NULL;
-	unsigned niov_refs = 0;
+	struct io_zcrx_slot slot = {};
+	unsigned int slot_refs = 0;
 	unsigned allocated = 0;
 
 	guard(spinlock_bh)(&rq->lock);
@@ -1273,24 +1296,24 @@ static unsigned io_zcrx_ring_refill(struct page_pool *pp,
 	zcrx_rq_iter_init(&it, rq);
 
 	while (allocated < to_alloc - 1 && zcrx_rq_iter_next(&it, rq, &rqe)) {
-		struct net_iov *next_niov;
+		struct io_zcrx_slot next_slot;
 
-		if (!io_parse_rqe(rqe, ifq, &next_niov))
+		if (!io_parse_rqe(rqe, ifq, &next_slot))
 			continue;
-		if (niov == next_niov) {
-			niov_refs++;
+		if (slot.area == next_slot.area && slot.idx == next_slot.idx) {
+			slot_refs++;
 			continue;
 		}
-		if (niov && zcrx_put_refill_niov(niov, pp, niov_refs)) {
-			netmems[allocated] = net_iov_to_netmem(niov);
+		if (slot.area && zcrx_put_refill_slot(slot, pp, slot_refs)) {
+			netmems[allocated] = io_zcrx_slot_netmem(slot);
 			allocated++;
 		}
-		niov = next_niov;
-		niov_refs = 1;
+		slot = next_slot;
+		slot_refs = 1;
 	}
 
-	if (niov && zcrx_put_refill_niov(niov, pp, niov_refs)) {
-		netmems[allocated] = net_iov_to_netmem(niov);
+	if (slot.area && zcrx_put_refill_slot(slot, pp, slot_refs)) {
+		netmems[allocated] = io_zcrx_slot_netmem(slot);
 		allocated++;
 	}
 
@@ -1406,7 +1429,7 @@ static bool io_pp_zc_release_netmem(struct page_pool *pp, netmem_ref netmem)
 
 	niov = netmem_to_net_iov(netmem);
 	net_mp_niov_clear_page_pool(niov);
-	io_zcrx_return_niov_freelist(niov);
+	io_zcrx_return_slot_freelist(io_zcrx_niov_slot(niov));
 	return false;
 }
 
@@ -1479,8 +1502,8 @@ static const struct memory_provider_ops io_uring_pp_zc_ops = {
 	.uninstall		= io_pp_uninstall,
 };
 
-static unsigned zcrx_parse_rq(netmem_ref *netmem_array, unsigned nr,
-			      struct io_zcrx_ifq *zcrx, struct zcrx_rq *rq)
+static unsigned int zcrx_parse_rq(struct io_zcrx_slot *slots, unsigned int nr,
+				  struct io_zcrx_ifq *zcrx, struct zcrx_rq *rq)
 {
 	unsigned int mask = rq->nr_entries - 1;
 	unsigned int i;
@@ -1488,11 +1511,9 @@ static unsigned zcrx_parse_rq(netmem_ref *netmem_array, unsigned nr,
 	nr = min(nr, zcrx_rq_entries(rq));
 	for (i = 0; i < nr; i++) {
 		struct io_uring_zcrx_rqe *rqe = zcrx_next_rqe(rq, mask);
-		struct net_iov *niov;
 
-		if (!io_parse_rqe(rqe, zcrx, &niov))
+		if (!io_parse_rqe(rqe, zcrx, &slots[i]))
 			break;
-		netmem_array[i] = net_iov_to_netmem(niov);
 	}
 
 	smp_store_release(&rq->ring->head, rq->cached_head);
@@ -1501,19 +1522,19 @@ static unsigned zcrx_parse_rq(netmem_ref *netmem_array, unsigned nr,
 
 #define ZCRX_FLUSH_BATCH 32
 
-static void zcrx_return_buffers(netmem_ref *netmems, unsigned nr)
+static void zcrx_return_buffers(struct io_zcrx_slot *slots, unsigned int nr)
 {
 	unsigned i;
 
 	for (i = 0; i < nr; i++) {
-		netmem_ref netmem = netmems[i];
-		struct net_iov *niov = netmem_to_net_iov(netmem);
+		struct io_zcrx_slot slot = slots[i];
+		netmem_ref netmem = io_zcrx_slot_netmem(slot);
 
-		if (!io_zcrx_put_niov_uref(niov, 1))
+		if (!io_zcrx_put_uref(slot, 1))
 			continue;
 		if (!page_pool_unref_and_test(netmem))
 			continue;
-		io_zcrx_return_niov(niov);
+		io_zcrx_return_slot(slot);
 	}
 }
 
@@ -1521,7 +1542,7 @@ static int zcrx_flush_rq(struct io_ring_ctx *ctx, struct io_zcrx_ifq *zcrx,
 			 struct zcrx_ctrl *ctrl)
 {
 	struct zcrx_ctrl_flush_rq *frq = &ctrl->zc_flush;
-	netmem_ref netmems[ZCRX_FLUSH_BATCH];
+	struct io_zcrx_slot slots[ZCRX_FLUSH_BATCH];
 	unsigned total = 0;
 	unsigned nr;
 
@@ -1532,8 +1553,8 @@ static int zcrx_flush_rq(struct io_ring_ctx *ctx, struct io_zcrx_ifq *zcrx,
 		struct zcrx_rq *rq = &zcrx->rq;
 
 		scoped_guard(spinlock_bh, &rq->lock) {
-			nr = zcrx_parse_rq(netmems, ZCRX_FLUSH_BATCH, zcrx, rq);
-			zcrx_return_buffers(netmems, nr);
+			nr = zcrx_parse_rq(slots, ZCRX_FLUSH_BATCH, zcrx, rq);
+			zcrx_return_buffers(slots, nr);
 		}
 
 		total += nr;

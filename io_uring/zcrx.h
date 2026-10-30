@@ -43,6 +43,15 @@ struct io_zcrx_area {
 	struct io_zcrx_mem	mem;
 };
 
+/*
+ * A slot is the unit that the refill ring and the CQE offsets address. It is
+ * the idx-th net_iov of the area.
+ */
+struct io_zcrx_slot {
+	struct io_zcrx_area	*area;
+	u32			idx;
+};
+
 struct zcrx_rq_hdr {
 	u32		head ____cacheline_aligned_in_smp;
 	u32		tail ____cacheline_aligned_in_smp;
