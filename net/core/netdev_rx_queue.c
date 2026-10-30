@@ -82,8 +82,12 @@ __netif_get_rx_queue_lease(struct net_device **dev, unsigned int *rxq_idx,
 /* See also page_pool_is_unreadable() */
 bool netif_rxq_has_unreadable_mp(struct net_device *dev, unsigned int rxq_idx)
 {
-	if (rxq_idx < dev->real_num_rx_queues)
-		return __netif_get_rx_queue(dev, rxq_idx)->mp_params.mp_ops;
+	if (rxq_idx < dev->real_num_rx_queues) {
+		const struct pp_memory_provider_params *p;
+
+		p = &__netif_get_rx_queue(dev, rxq_idx)->mp_params;
+		return p->mp_ops && !(p->flags & PP_MP_F_READABLE);
+	}
 	return false;
 }
 EXPORT_SYMBOL(netif_rxq_has_unreadable_mp);
@@ -196,13 +200,23 @@ static int __netif_mp_open_rxq(struct net_device *dev, unsigned int rxq_idx,
 	if (!qops)
 		return -EOPNOTSUPP;
 
-	if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED) {
-		NL_SET_ERR_MSG(extack, "tcp-data-split is disabled");
+	if (p->flags & ~PP_MP_F_ALL) {
+		NL_SET_ERR_MSG(extack, "unknown memory provider flags");
 		return -EINVAL;
 	}
-	if (dev->cfg->hds_thresh) {
-		NL_SET_ERR_MSG(extack, "hds-thresh is not zero");
-		return -EINVAL;
+
+	/* A provider of readable pages needs no header split. The driver
+	 * keeps every header out of the pool pages.
+	 */
+	if (!(p->flags & PP_MP_F_READABLE)) {
+		if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED) {
+			NL_SET_ERR_MSG(extack, "tcp-data-split is disabled");
+			return -EINVAL;
+		}
+		if (dev->cfg->hds_thresh) {
+			NL_SET_ERR_MSG(extack, "hds-thresh is not zero");
+			return -EINVAL;
+		}
 	}
 	if (dev_xdp_prog_count(dev)) {
 		NL_SET_ERR_MSG(extack, "unable to custom memory provider to device with XDP program attached");
