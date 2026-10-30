@@ -63,6 +63,12 @@ struct io_opaque_data {
 	u32 nr;
 	bool dense;
 	bool forward_only;
+	/*
+	 * Every extent is in the area of the MAIO instance of the store. Set
+	 * when the vector is built. A dense copy would move the bytes out of
+	 * the area, so compaction skips these objects.
+	 */
+	bool mapped;
 };
 
 struct io_opaque_slot {

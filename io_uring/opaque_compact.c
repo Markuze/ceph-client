@@ -220,6 +220,9 @@ int io_opaque_compact_start(struct io_opaque_req *op)
 	slot = io_opaque_lookup(store, op->handle);
 	if (!slot || !slot->data)
 		return -ESTALE;
+	/* A dense copy would move the bytes out of the area. */
+	if (slot->data->mapped)
+		return -EOPNOTSUPP;
 	if (slot->compacting)
 		return -EBUSY;
 	if (slot->data->dense)
@@ -270,7 +273,7 @@ int io_opaque_set_policy(struct io_opaque_req *op)
 
 		if ((policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) &&
 		    slot->data && !slot->data->dense && !slot->data->forward_only &&
-		    list_empty(&slot->candidate)) {
+		    !slot->data->mapped && list_empty(&slot->candidate)) {
 			list_add_tail(&slot->candidate, &store->candidates);
 			slot->retry = jiffies;
 		} else if (!(policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {

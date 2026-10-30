@@ -358,6 +358,7 @@ int io_opaque_vector(struct io_opaque_data *data)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
+	bool mapped = true;
 	u32 nr = 0;
 
 	data->charge = 0;
@@ -366,11 +367,13 @@ int io_opaque_vector(struct io_opaque_data *data)
 		if (extent->backing != previous)
 			data->charge += extent->backing->charge;
 		previous = extent->backing;
+		mapped &= extent->backing->area;
 	}
 	data->bvec = kvmalloc_objs(*data->bvec, nr, GFP_KERNEL_ACCOUNT);
 	if (!data->bvec)
 		return -ENOMEM;
 	data->nr = nr;
+	data->mapped = nr && mapped;
 	nr = 0;
 	list_for_each_entry(extent, &data->extents, list)
 		bvec_set_page(&data->bvec[nr++], extent->backing->page,
@@ -1660,7 +1663,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 				op->slot_reserved = false;
 				slot->born = jiffies;
 				slot->retry = jiffies;
-				if (!slot->data->forward_only &&
+				if (!slot->data->forward_only && !slot->data->mapped &&
 				    (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
 					list_add_tail(&slot->candidate, &store->candidates);
 					queue_delayed_work(system_dfl_wq, &store->compact_work,
