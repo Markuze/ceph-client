@@ -1755,7 +1755,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -ENXIO;
 	if (READ_ONCE(sqe->fd) != -1 || READ_ONCE(sqe->rw_flags) ||
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
-	    cmd > IORING_OPAQUE_SET_POLICY ||
+	    cmd > IORING_OPAQUE_OBJECT_EXTENTS ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
 	control = cmd == IORING_OPAQUE_FREE || cmd == IORING_OPAQUE_STAT ||
@@ -1798,6 +1798,13 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		if (op->handle || !op->addr)
 			return -EINVAL;
 	}
+	if (cmd == IORING_OPAQUE_OBJECT_EXTENTS) {
+		/* A buffer of size 0 asks for the size that the vector needs. */
+		if (op->length && !op->addr)
+			return -EINVAL;
+		if (!store->maio)
+			return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -1824,7 +1831,8 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 			refcount_inc(&op->stream->refs);
 			op->req->file = get_file(op->stream->file);
 		}
-	} else if (cmd == IORING_OPAQUE_READ_OBJECT || cmd == IORING_OPAQUE_OBJECT_STAT) {
+	} else if (cmd == IORING_OPAQUE_READ_OBJECT || cmd == IORING_OPAQUE_OBJECT_STAT ||
+		   cmd == IORING_OPAQUE_OBJECT_EXTENTS) {
 		slot = io_opaque_lookup(store, op->handle);
 		if (!slot || !slot->data) {
 			ret = -ESTALE;
@@ -1893,6 +1901,55 @@ static int io_opaque_stat_copy(struct io_opaque_req *op, const void *stat, u32 s
 	return copy_struct_to_user(op->addr, op->length, stat, size, NULL);
 }
 
+/*
+ * The pair that names the bytes of an extent in the area of the instance of
+ * the store: the area offset of the page, plus the offset of the extent in the
+ * page. An extent outside the area gets IORING_OPAQUE_EXTENT_UNMAPPED. A
+ * bound store has none, because capture copies every byte outside the area
+ * into it. The mark and the lookup together keep the answer true if a later
+ * change adds such an extent.
+ */
+VISIBLE_IF_KUNIT struct io_uring_opaque_extent
+io_opaque_extent_pair(struct io_opaque_store *store, const struct io_opaque_extent *extent)
+{
+	struct io_uring_opaque_extent pair = {
+		.area_off = IORING_OPAQUE_EXTENT_UNMAPPED,
+		.len = extent->length,
+	};
+	u64 page_off;
+
+	if (extent->backing->area &&
+	    io_zcrx_maio_page_off(store->maio, extent->backing->page, &page_off))
+		pair.area_off = page_off + extent->offset;
+	return pair;
+}
+
+/*
+ * Write the extents of the object of @op to the user buffer, and return the
+ * number of bytes. *@needed is the size of the whole vector. The list of
+ * extents does not change after the object is published, and nr counts it.
+ */
+static int io_opaque_extents(struct io_opaque_req *op, u64 *needed)
+{
+	struct io_opaque_extent *extent;
+	u64 done = 0;
+
+	*needed = (u64)op->data->nr * sizeof(struct io_uring_opaque_extent);
+	if (op->length < *needed)
+		return -EOVERFLOW;
+	list_for_each_entry(extent, &op->data->extents, list) {
+		struct io_uring_opaque_extent pair = io_opaque_extent_pair(op->store, extent);
+
+		/* Never write past the vector that the buffer was checked for. */
+		if (WARN_ON_ONCE(done == *needed))
+			break;
+		if (copy_to_user(op->addr + done, &pair, sizeof(pair)))
+			return -EFAULT;
+		done += sizeof(pair);
+	}
+	return done;
+}
+
 static int io_opaque_stat(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
@@ -1923,6 +1980,7 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
 	struct io_opaque_store *store = op->store;
+	u64 needed = 0;
 	int ret;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
@@ -1979,6 +2037,9 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 			ret = io_opaque_stat_copy(op, &stat, sizeof(stat));
 		}
 		break;
+	case IORING_OPAQUE_OBJECT_EXTENTS:
+		ret = io_opaque_extents(op, &needed);
+		break;
 	case IORING_OPAQUE_STREAM_STAT:
 		{
 			struct io_uring_opaque_stream_stat stat = { .size = sizeof(stat) };
@@ -2021,7 +2082,11 @@ out:
 	if (ret != IOU_ISSUE_SKIP_COMPLETE) {
 		if (ret < 0)
 			req_set_fail(req);
-		io_req_set_res(req, ret, 0);
+		/* An EXTENTS buffer that is too small learns the size it needs. */
+		if (ret == -EOVERFLOW && op->op == IORING_OPAQUE_OBJECT_EXTENTS)
+			io_req_set_res32(req, ret, 0, needed, 0);
+		else
+			io_req_set_res(req, ret, 0);
 		ret = IOU_COMPLETE;
 	}
 	io_ring_submit_unlock(req->ctx, issue_flags);

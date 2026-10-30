@@ -239,5 +239,7 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 		    unsigned int offset, size_t length);
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 int io_opaque_send_acquire(struct io_opaque_req *op);
+struct io_uring_opaque_extent
+io_opaque_extent_pair(struct io_opaque_store *store, const struct io_opaque_extent *extent);
 #endif
 #endif

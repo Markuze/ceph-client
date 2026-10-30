@@ -77,7 +77,38 @@ enum io_uring_opaque_op {
 	IORING_OPAQUE_STREAM_CLOSE,
 	IORING_OPAQUE_COMPACT,
 	IORING_OPAQUE_SET_POLICY,
+	/*
+	 * List where the bytes of an object are in the area of the MAIO
+	 * instance that the store binds. addr is the handle and off is 0. The
+	 * buffer at addr3 has len bytes. The kernel writes one
+	 * struct io_uring_opaque_extent for each extent of the object, in object
+	 * order, and the result is the number of bytes written. If the buffer is
+	 * too small, the result is -EOVERFLOW, nothing is written, and the first
+	 * extra word of the completion holds the size that is needed. A buffer
+	 * with len 0 and addr3 0 asks for that size. A store that binds no
+	 * instance returns -EOPNOTSUPP.
+	 */
+	IORING_OPAQUE_OBJECT_EXTENTS,
 };
+
+/*
+ * One extent of an object in the area of a MAIO instance. The sum of the @len
+ * of all extents is the length of the object.
+ */
+struct io_uring_opaque_extent {
+	/*
+	 * The zcrx offset of the first byte of the extent: the area id in the
+	 * bits from IORING_ZCRX_AREA_SHIFT up, and the byte offset in the area
+	 * below. It is the format of the offset in the completion of RECV_ZC.
+	 * IORING_OPAQUE_EXTENT_UNMAPPED if the extent is not in the area.
+	 */
+	__u64 area_off;
+	/* The number of bytes of the extent. They do not cross a page. */
+	__u64 len;
+};
+
+/* @area_off of an extent that is not in the area. A bound store has none. */
+#define IORING_OPAQUE_EXTENT_UNMAPPED	(~0ULL)
 
 /* IORING_OP_OPAQUE_OBJ_SEND: sqe->ioprio contains these flags. */
 #define IORING_OPAQUE_SEND_LAST	(1U << 0)
