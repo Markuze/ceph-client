@@ -1544,3 +1544,57 @@ static struct kunit_suite zcrx_maio_suite = {
 };
 
 kunit_test_suite(zcrx_maio_suite);
+
+/*
+ * Aids for the KUnit tests of other io_uring code. Those tests cannot reach
+ * the static functions of zcrx.c, which includes this file. An aid creates a
+ * resource and registers a deferred action that frees it when the test ends.
+ * KUnit runs the actions in the reverse order of their registration, so a test
+ * must create a pool after the instance that it uses.
+ */
+static void zt_aid_put_ifq(void *ifq)
+{
+	io_put_zcrx_ifq(ifq);
+}
+
+static void zt_aid_free_netdev(void *dev)
+{
+	free_netdev(dev);
+}
+
+static void zt_aid_destroy_pool(void *pp)
+{
+	page_pool_destroy(pp);
+}
+
+/*
+ * Create an instance without a device. Its area has @pages pages. The test owns
+ * one reference. The deferred action drops it, and the other holders of the
+ * instance must be gone by then.
+ */
+struct io_zcrx_ifq *io_zcrx_maio_test_ifq(struct kunit *test, unsigned int pages)
+{
+	struct io_zcrx_ifq *ifq = zt_ifq(test, pages);
+
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, zt_aid_put_ifq, ifq), 0);
+	return ifq;
+}
+
+/*
+ * Create a page pool that binds the provider of @ifq, through the same gate as
+ * the pool of a driver. The pool belongs to queue 0 of a net_device that is not
+ * registered. The test must return every page of the pool before it ends,
+ * because the pool finishes only when all its pages are back.
+ */
+struct page_pool *io_zcrx_maio_test_pool(struct kunit *test,
+					 struct io_zcrx_ifq *ifq)
+{
+	struct net_device *dev = zt_netdev(test, 1);
+	struct page_pool *pp;
+
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, zt_aid_free_netdev, dev), 0);
+	zt_bind(dev, 0, ifq);
+	pp = zt_pool(test, dev, 0, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, zt_aid_destroy_pool, pp), 0);
+	return pp;
+}
