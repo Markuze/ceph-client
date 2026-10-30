@@ -438,6 +438,12 @@ struct virtnet_info {
 	/* Work struct for config space updates */
 	struct work_struct config_work;
 
+	/* The device is ready and accepts control commands. virtnet_probe()
+	 * sets it with dev->lock held. virtnet_ethtool_begin() and
+	 * virtnet_get_hw_stats() read it with dev->lock held.
+	 */
+	bool setup_done;
+
 	/* Does the affinity hint is set for virtqueues? */
 	bool affinity_hint_set;
 
@@ -2780,10 +2786,16 @@ static void skb_recv_done(struct virtqueue *rvq)
 	virtqueue_napi_schedule(&rq->napi, rvq);
 }
 
+/* The NAPI helpers below run under the netdev instance lock (dev->lock).
+ * ndo_open, ndo_stop, ndo_bpf and the ethtool operations get it from the
+ * core. virtnet_freeze_down() and virtnet_restore_up() take it. The
+ * unlocked napi_enable() and napi_disable() take the lock again, so the
+ * helpers use the _locked forms.
+ */
 static void virtnet_napi_do_enable(struct virtqueue *vq,
 				   struct napi_struct *napi)
 {
-	napi_enable(napi);
+	napi_enable_locked(napi);
 
 	/* If all buffers were filled by other side before we napi_enabled, we
 	 * won't get another interrupt, so process any outstanding packets now.
@@ -2832,7 +2844,7 @@ static void virtnet_napi_tx_disable(struct send_queue *sq)
 
 	if (napi->weight) {
 		netif_queue_set_napi(vi->dev, qidx, NETDEV_QUEUE_TYPE_TX, NULL);
-		napi_disable(napi);
+		napi_disable_locked(napi);
 	}
 }
 
@@ -2843,7 +2855,7 @@ static void virtnet_napi_disable(struct receive_queue *rq)
 	int qidx = vq2rxq(rq->vq);
 
 	netif_queue_set_napi(vi->dev, qidx, NETDEV_QUEUE_TYPE_RX, NULL);
-	napi_disable(napi);
+	napi_disable_locked(napi);
 }
 
 static int virtnet_receive_xsk_bufs(struct virtnet_info *vi,
@@ -4977,6 +4989,13 @@ static int virtnet_get_hw_stats(struct virtnet_info *vi,
 	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_DEVICE_STATS))
 		return 0;
 
+	/* The netlink queue statistics reach this function in the gap that
+	 * the comment of virtnet_ethtool_begin() describes. The device does
+	 * not answer a control command yet.
+	 */
+	if (!vi->setup_done)
+		return 0;
+
 	if (qid == -1) {
 		last_vq = vi->curr_queue_pairs * 2 - 1;
 		first_vq = 0;
@@ -5576,9 +5595,41 @@ static u32 virtnet_get_rx_ring_count(struct net_device *dev)
 	return vi->curr_queue_pairs;
 }
 
+/* virtnet_probe() registers the device before it calls
+ * virtio_device_ready(). Until then the device does not answer a control
+ * command, and virtnet_send_command() waits for the answer in a loop.
+ *
+ * The core calls an ethtool operation with dev->lock held. It holds
+ * rtnl_lock as well only if op_needs_rtnl asks for it. probe holds
+ * rtnl_lock until the setup is done, so an operation without the bit can
+ * run between the registration and the point where probe takes dev->lock.
+ * Refuse the operation in that gap. Later it waits for dev->lock.
+ */
+static int virtnet_ethtool_begin(struct net_device *dev)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+
+	return vi->setup_done ? 0 : -EBUSY;
+}
+
 static const struct ethtool_ops virtnet_ethtool_ops = {
 	.supported_coalesce_params = ETHTOOL_COALESCE_MAX_FRAMES |
 		ETHTOOL_COALESCE_USECS | ETHTOOL_COALESCE_USE_ADAPTIVE_RX,
+	/* The core takes dev->lock for every operation. It takes rtnl_lock
+	 * as well for the operations below:
+	 * - set_channels calls netif_set_real_num_*_queues(), which reads
+	 *   the qdisc under rtnl.
+	 * - get_link is ethtool_op_get_link(). It runs the link watch, which
+	 *   changes the qdisc state under rtnl.
+	 * - The others send control commands. probe holds rtnl_lock until
+	 *   the setup is done, and the commands must not run before that.
+	 */
+	.op_needs_rtnl = ETHTOOL_OP_NEEDS_RTNL_SRINGPARAM |
+			 ETHTOOL_OP_NEEDS_RTNL_SCHANNELS |
+			 ETHTOOL_OP_NEEDS_RTNL_SCOALESCE |
+			 ETHTOOL_OP_NEEDS_RTNL_RSS |
+			 ETHTOOL_OP_NEEDS_RTNL_GLINK,
+	.begin = virtnet_ethtool_begin,
 	.get_drvinfo = virtnet_get_drvinfo,
 	.get_link = ethtool_op_get_link,
 	.get_ringparam = virtnet_get_ringparam,
@@ -5706,18 +5757,21 @@ static void virtnet_freeze_down(struct virtio_device *vdev)
 	/* Make sure no work handler is accessing the device */
 	flush_work(&vi->config_work);
 
-	/* The core runs the receive mode update under rtnl_lock. It skips a
-	 * device that is not present. Close and detach under one hold of the
-	 * lock, so that the update never sees a device that this function
-	 * has closed but not yet detached.
+	/* Close and detach under one hold of rtnl_lock and dev->lock. The
+	 * core runs the receive mode update and the other operations of the
+	 * device under these locks. An operation then sees the state before
+	 * the freeze, or a detached device. It never sees a device that this
+	 * function has closed but not yet detached.
 	 */
 	rtnl_lock();
+	netdev_lock(vi->dev);
 	if (netif_running(vi->dev))
 		virtnet_close(vi->dev);
 
 	netif_tx_lock_bh(vi->dev);
 	netif_device_detach(vi->dev);
 	netif_tx_unlock_bh(vi->dev);
+	netdev_unlock(vi->dev);
 	rtnl_unlock();
 }
 
@@ -5732,6 +5786,15 @@ static int virtnet_restore_up(struct virtio_device *vdev)
 	if (err)
 		return err;
 
+	/* Create the pools, open the device and attach it in one hold of
+	 * rtnl_lock and dev->lock. The core runs its operations under these
+	 * locks, so an operation sees a device that is not present, or a
+	 * present device that has its new queues. It never sees the state
+	 * between the two.
+	 */
+	rtnl_lock();
+	netdev_lock(vi->dev);
+
 	err = virtnet_create_page_pools(vi);
 	if (err)
 		goto err_del_vqs;
@@ -5739,9 +5802,7 @@ static int virtnet_restore_up(struct virtio_device *vdev)
 	virtio_device_ready(vdev);
 
 	if (netif_running(vi->dev)) {
-		rtnl_lock();
 		err = virtnet_open(vi->dev);
-		rtnl_unlock();
 		if (err)
 			goto err_destroy_pools;
 	}
@@ -5749,9 +5810,17 @@ static int virtnet_restore_up(struct virtio_device *vdev)
 	netif_tx_lock_bh(vi->dev);
 	netif_device_attach(vi->dev);
 	netif_tx_unlock_bh(vi->dev);
+	netdev_unlock(vi->dev);
+	rtnl_unlock();
 	return 0;
 
 err_destroy_pools:
+	/* virtnet_del_vqs() takes dev->lock in __netif_napi_del(). Drop the
+	 * locks first. The device is still detached, so no operation can
+	 * reach it.
+	 */
+	netdev_unlock(vi->dev);
+	rtnl_unlock();
 	virtio_reset_device(vdev);
 	free_unused_bufs(vi);
 	virtnet_destroy_page_pools(vi);
@@ -5759,6 +5828,8 @@ err_destroy_pools:
 	return err;
 
 err_del_vqs:
+	netdev_unlock(vi->dev);
+	rtnl_unlock();
 	virtio_reset_device(vdev);
 	virtnet_del_vqs(vi);
 	return err;
@@ -6075,9 +6146,9 @@ static int virtnet_xdp_set(struct net_device *dev, struct bpf_prog *prog,
 				virtnet_clear_guest_offloads(vi);
 		}
 		if (!old_prog)
-			xdp_features_set_redirect_target(dev, true);
+			xdp_features_set_redirect_target_locked(dev, true);
 	} else {
-		xdp_features_clear_redirect_target(dev);
+		xdp_features_clear_redirect_target_locked(dev);
 		vi->xdp_enabled = false;
 	}
 
@@ -6758,6 +6829,7 @@ static int virtnet_probe(struct virtio_device *vdev)
 			   IFF_TX_SKB_NO_LINEAR;
 	dev->netdev_ops = &virtnet_netdev;
 	dev->stat_ops = &virtnet_stat_ops;
+	dev->request_ops_lock = true;
 	dev->features = NETIF_F_HIGHDMA;
 
 	dev->ethtool_ops = &virtnet_ethtool_ops;
@@ -7024,6 +7096,14 @@ static int virtnet_probe(struct virtio_device *vdev)
 		goto free_failover;
 	}
 
+	/* The core runs some ethtool operations under dev->lock without
+	 * rtnl_lock, and some of them send control commands. Hold dev->lock
+	 * until the device is ready, so that they wait. The registration has
+	 * made the device visible before this point. In that gap
+	 * virtnet_ethtool_begin() refuses the operations.
+	 */
+	netdev_lock(dev);
+
 	/* Disable config change notification until ndo_open. */
 	virtio_config_driver_disable(vi->vdev);
 
@@ -7052,6 +7132,7 @@ static int virtnet_probe(struct virtio_device *vdev)
 		if (!virtnet_send_command(vi, VIRTIO_NET_CTRL_MAC,
 					  VIRTIO_NET_CTRL_MAC_ADDR_SET, &sg)) {
 			pr_debug("virtio_net: setting MAC address failed\n");
+			netdev_unlock(dev);
 			rtnl_unlock();
 			err = -EINVAL;
 			goto free_unregister_netdev;
@@ -7065,6 +7146,7 @@ static int virtnet_probe(struct virtio_device *vdev)
 
 		stats_cap = kzalloc_obj(*stats_cap);
 		if (!stats_cap) {
+			netdev_unlock(dev);
 			rtnl_unlock();
 			err = -ENOMEM;
 			goto free_unregister_netdev;
@@ -7076,6 +7158,7 @@ static int virtnet_probe(struct virtio_device *vdev)
 						VIRTIO_NET_CTRL_STATS_QUERY,
 						NULL, &sg)) {
 			pr_debug("virtio_net: fail to get stats capability\n");
+			netdev_unlock(dev);
 			rtnl_unlock();
 			err = -EINVAL;
 			goto free_unregister_netdev;
@@ -7096,6 +7179,9 @@ static int virtnet_probe(struct virtio_device *vdev)
 		netif_carrier_on(dev);
 	}
 
+	vi->setup_done = true;
+
+	netdev_unlock(dev);
 	rtnl_unlock();
 
 	err = virtnet_cpu_notif_add(vi);
