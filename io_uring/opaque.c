@@ -485,11 +485,13 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 					const struct io_uring_opaque_config *config)
 {
 	struct io_uring_opaque_config cfg = *config;
+	struct io_zcrx_ifq *maio = NULL;
 	struct io_opaque_store *store;
 	int ret;
 	u32 i;
 
-	if (cfg.flags || cfg.__resv1 || cfg.__resv2 ||
+	if ((cfg.flags & ~IORING_OPAQUE_CFG_MAIO) || cfg.__resv1 ||
+	    (cfg.zcrx_id && !(cfg.flags & IORING_OPAQUE_CFG_MAIO)) ||
 	    !mem_is_zero(cfg.__resv, sizeof(cfg.__resv)))
 		return ERR_PTR(-EINVAL);
 	if (!cfg.hard_limit || cfg.hard_limit > SZ_1T ||
@@ -512,12 +514,27 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	      cfg.low_watermark >= cfg.high_watermark ||
 	      cfg.high_watermark > cfg.hard_limit - cfg.compact_headroom - cfg.reply_reserve)))
 		return ERR_PTR(-EINVAL);
+	/*
+	 * The caller holds the lock of the ring, which io_zcrx_maio_get()
+	 * needs. The store keeps the reference to the instance until
+	 * io_opaque_free(), and so it outlives every page of the store.
+	 */
+	if (cfg.flags & IORING_OPAQUE_CFG_MAIO) {
+		if (!IS_ENABLED(CONFIG_IO_URING_ZCRX))
+			return ERR_PTR(-EOPNOTSUPP);
+		maio = io_zcrx_maio_get(ctx, cfg.zcrx_id);
+		if (!maio)
+			return ERR_PTR(-ENXIO);
+	}
 	store = kzalloc_obj(*store, GFP_KERNEL_ACCOUNT);
-	if (!store)
-		return ERR_PTR(-ENOMEM);
+	if (!store) {
+		ret = -ENOMEM;
+		goto put_maio;
+	}
 	refcount_set(&store->refs, 1);
 	refcount_set(&store->users, 1);
 	store->config = cfg;
+	store->maio = maio;
 	store->objects = kvcalloc(cfg.max_objects, sizeof(*store->objects),
 				  GFP_KERNEL_ACCOUNT);
 	store->streams = kvcalloc(cfg.max_streams, sizeof(*store->streams),
@@ -563,6 +580,9 @@ free_store:
 	kvfree(store->streams);
 	kvfree(store->objects);
 	kfree(store);
+put_maio:
+	if (maio)
+		io_zcrx_maio_put(maio);
 	return ERR_PTR(ret);
 }
 
@@ -617,6 +637,12 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
 	WARN_ON_ONCE(atomic_read(&store->extents));
 	WARN_ON_ONCE(atomic_read(&store->requests));
+	/*
+	 * Every backing is gone. The last ones released their pages into the
+	 * instance, so the reference ends after them.
+	 */
+	if (store->maio)
+		io_zcrx_maio_put(store->maio);
 	io_unaccount_mem(store->user, store->mm,
 			 store->config.hard_limit >> PAGE_SHIFT);
 	obj_cgroup_put(store->objcg);

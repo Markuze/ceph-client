@@ -28,14 +28,38 @@ struct io_uring_opaque_config {
 	__u32 max_streams;
 	__u32 max_extents;
 	__u32 max_requests;
-	__u32 flags;
+	__u32 flags;			/* IORING_OPAQUE_CFG_* */
 	__u64 __resv[2];
 	__u64 high_watermark;
 	__u64 low_watermark;
 	__u64 reply_reserve;
-	__u32 __resv2;
+	/*
+	 * The zcrx id of the MAIO instance to bind, in the registering ring.
+	 * Valid only with IORING_OPAQUE_CFG_MAIO. Must be 0 without it.
+	 */
+	__u32 zcrx_id;
 	__u32 __resv1;
 };
+
+/*
+ * Bind the store to a MAIO zcrx instance (ZCRX_REG_MAIO) of the registering
+ * ring. @zcrx_id names the instance. The store keeps every byte that it holds
+ * in the area of the instance. The process that maps the area can read and
+ * write the bytes of an object in place. A send transmits the bytes that are
+ * present when TCP builds the segment. A byte that is not in the area is
+ * copied into it. When the area has no free page, the copy waits and retries,
+ * as it does when a page allocation fails.
+ *
+ * The store holds a reference to the instance until the store is gone. The
+ * instance can go first, for example when its ring exits. The objects keep
+ * their pages, and the store keeps taking free pages of the area. Another ring
+ * can import the store. The store stays bound to the instance of the ring that
+ * created it.
+ *
+ * Registration fails with -ENXIO if the ring has no MAIO instance with this
+ * id, and with -EOPNOTSUPP if the kernel has no zero-copy receive.
+ */
+#define IORING_OPAQUE_CFG_MAIO		(1U << 0)
 
 /* IORING_OP_OPAQUE_OBJ: sqe->ioprio selects the operation. */
 enum io_uring_opaque_op {

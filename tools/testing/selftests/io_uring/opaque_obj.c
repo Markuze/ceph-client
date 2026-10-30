@@ -2727,7 +2727,7 @@ static void test_registration_abi(struct io_uring_opaque_config cfg)
 	reg.__resv0 = 1;
 	require(register_request(&r, &reg) == -EINVAL, "registration reserved field");
 	reg = create;
-	cfg.flags = 1;
+	cfg.flags = 1U << 31;
 	require(register_request(&r, &reg) == -EINVAL, "configuration flags");
 	cfg.flags = 0;
 	cfg.__resv[0] = 1;
@@ -4121,7 +4121,7 @@ static void test_watermark_config(struct io_uring_opaque_config cfg)
 			bad.reply_reserve = 0;
 			break;
 		case 5:
-			bad.__resv2 = 1;
+			bad.zcrx_id = 1;
 			break;
 		case 6:
 			bad.__resv1 = 1;
