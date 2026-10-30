@@ -37,7 +37,7 @@
 
 #include "../kselftest.h"
 
-#define PLAN			13
+#define PLAN			14
 #define AREA_PAGES		64
 #define RQ_ENTRIES		64
 #define RQ_REGION_SIZE		8192
@@ -716,11 +716,14 @@ struct rx {
 	int final_res;
 };
 
+/* Start a request. The event counts of @rx survive, the rest starts again. */
 static void rx_start(struct ring *r, struct rx *rx, struct zcrx *z, int fd)
 {
 	struct io_uring_sqe sqe = {};
 
-	memset(rx, 0, sizeof(*rx));
+	rx->nr_data = 0;
+	rx->bytes = 0;
+	rx->done = false;
 	sqe.opcode = IORING_OP_RECV_ZC;
 	sqe.fd = fd;
 	sqe.ioprio = IORING_RECV_MULTISHOT;
@@ -844,7 +847,7 @@ static void test_recv_copy(struct ring *r)
 	uint64_t slots1, slots2, copies1, pos = 0;
 	struct zcrx_stats *st;
 	unsigned int n1;
-	struct rx rx;
+	struct rx rx = {};
 	struct zcrx z;
 	int tcp[2];
 
@@ -893,6 +896,86 @@ static void test_recv_copy(struct ring *r)
 	close(tcp[1]);
 	zcrx_close(&z);
 	ksft_test_result_pass("RECV_ZC on MAIO|NODEV copies into the area and reuses slots\n");
+}
+
+static void arm_event(struct ring *r, struct zcrx *z, unsigned int type, int want)
+{
+	struct zcrx_ctrl ctrl = { .zcrx_id = z->id, .op = ZCRX_CTRL_ARM_EVENT };
+
+	ctrl.zc_arm_event.event_type = type;
+	require(zcrx_ctrl(r, &ctrl) == want, "arm an event");
+}
+
+/*
+ * 8. The area runs out during a copy. The request gets the bytes that fit and
+ * then -ENOMEM. The first copy that finds the area empty starts an episode.
+ * It counts once, also if the request tries again, and it sends
+ * ZCRX_EVENT_ALLOC_FAIL once until the process arms the event. A slot that
+ * the process returns ends the episode, and the next receive works.
+ */
+static void test_recv_exhaust(struct ring *r)
+{
+	const unsigned int pages = 8;
+	/* One page more than the area holds. */
+	const size_t send_len = (pages + 1) * page_size;
+	uint64_t sent = 0, recvd = 0;
+	struct zcrx_stats *st;
+	struct rx rx = {};
+	struct zcrx z;
+	int tcp[2], round;
+
+	zcrx_prepare(&z, r, ZCRX_REG_MAIO | ZCRX_REG_NODEV, 0, pages);
+	zcrx_want_events(&z, (1U << ZCRX_EVENT_ALLOC_FAIL) | (1U << ZCRX_EVENT_COPY));
+	require(!zcrx_do_register(&z), "register a small area");
+	z.map = map_area(r, z.area.mmap_offset, z.area.len, PROT_READ | PROT_WRITE, MAP_SHARED);
+	require(z.map != MAP_FAILED, "map the small area");
+	st = zcrx_stats(&z);
+	tcp_pair(tcp);
+
+	/* The event has not fired, so there is nothing to arm. */
+	arm_event(r, &z, ZCRX_EVENT_ALLOC_FAIL, -EINVAL);
+
+	for (round = 1; round <= 3; round++) {
+		rx_start(r, &rx, &z, tcp[1]);
+		send_stream(tcp[0], sent, send_len, 4);
+		sent += send_len;
+		rx_wait(r, &rx, UINT64_MAX);
+		require(rx.done && rx.final_res == -ENOMEM,
+			"the request ends with -ENOMEM when the area is empty");
+		require(rx.nr_data >= 1 && rx.nr_data <= pages, "one completion per slot at most");
+		require(rx.bytes < sent - recvd, "the socket keeps bytes that did not fit");
+		rx_check_copies(&z, &rx, 0, recvd, 4);
+		ksft_print_msg("round %d: %u completions, %lu bytes, then -ENOMEM\n",
+			       round, rx.nr_data, (unsigned long)rx.bytes);
+		recvd += rx.bytes;
+
+		/* The request tried again with an empty area: still one episode. */
+		require(stat_read(&st->exhaust_count) == (unsigned int)round,
+			"each exhaustion counts once");
+		/* The event fires once. It fires again after the process armed it. */
+		require(rx.nr_event[ZCRX_EVENT_ALLOC_FAIL] == (round < 3 ? 1U : 2U),
+			"the allocation failure event follows the latch");
+		if (round == 2)
+			arm_event(r, &z, ZCRX_EVENT_ALLOC_FAIL, 0);
+
+		/* Return the slots. The next round starts with free slots. */
+		rq_return(&z, &rx, 0);
+		rq_flush(r, &z);
+	}
+
+	/* The bytes that did not fit arrive when the slots are back. */
+	rx_start(r, &rx, &z, tcp[1]);
+	rx_wait(r, &rx, sent - recvd);
+	require(rx.bytes == sent - recvd, "the next receive gets the bytes that were left");
+	rx_check_copies(&z, &rx, 0, recvd, 4);
+	require(stat_read(&st->exhaust_count) == 3, "no new episode");
+	require(!st->limbo_enter && !st->fallback_pages, "no limbo and no fallback pages");
+
+	rx_finish(r, &rx, tcp[0]);
+	require(rx.final_res == 0, "the request ends at the end of the stream");
+	close(tcp[1]);
+	zcrx_close(&z);
+	ksft_test_result_pass("empty area: bytes that fit, -ENOMEM, one episode, one event\n");
 }
 
 /* The netdevsim fixture. */
@@ -1211,6 +1294,7 @@ int main(void)
 	test_add_area(&r);
 	test_capability();
 	test_recv_copy(&r);
+	test_recv_exhaust(&r);
 	test_loopback(&r);
 	test_large_area(&r);
 	test_memlock();

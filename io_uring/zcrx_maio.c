@@ -514,6 +514,28 @@ static void io_zcrx_kmem_sync_for_device(struct page_pool *pp,
 }
 
 /*
+ * Record the result of an allocation from the area, by a pool or by a copy.
+ * The first allocation that finds the area empty starts an exhaustion
+ * episode. It counts the episode and sets *exhausted, so that the caller
+ * can tell the application when it has dropped the lock. Any allocation that
+ * gets a page ends the episode.
+ */
+static void io_zcrx_kmem_episode(struct io_zcrx_ifq *ifq, bool got_page,
+				 bool *exhausted)
+{
+	lockdep_assert_held(&ifq->alloc_lock);
+
+	if (got_page) {
+		ifq->maio_exhausted = false;
+	} else if (!ifq->maio_exhausted) {
+		ifq->maio_exhausted = true;
+		*exhausted = true;
+		io_zcrx_maio_stat_add(ifq,
+				      offsetof(struct zcrx_stats, exhaust_count), 1);
+	}
+}
+
+/*
  * Take pages from the freelist, after it took back the pages in limbo that
  * are ready. Give each page to the pool. Return the number of pages.
  * Set *exhausted if this call found the area empty and the previous call
@@ -542,14 +564,7 @@ static unsigned int io_zcrx_kmem_refill(struct page_pool *pp,
 		netmems[allocated++] = page_to_netmem(page);
 	}
 
-	if (allocated) {
-		ifq->maio_exhausted = false;
-	} else if (!ifq->maio_exhausted) {
-		ifq->maio_exhausted = true;
-		*exhausted = true;
-		io_zcrx_maio_stat_add(ifq,
-				      offsetof(struct zcrx_stats, exhaust_count), 1);
-	}
+	io_zcrx_kmem_episode(ifq, allocated, exhausted);
 	return allocated;
 }
 
@@ -771,7 +786,15 @@ void io_zcrx_maio_page_put(struct io_zcrx_ifq *ifq, struct page *page)
  *
  * The page has no pool, and it holds one pool reference. The caller fills it.
  * The caller gives the page back with io_zcrx_maio_page_put(). The content of
- * the page is not defined. The function runs in process and softirq context.
+ * the page is not defined.
+ *
+ * A call that finds the area empty, when the last allocation from the area
+ * got a page, starts an exhaustion episode as a pool does: it counts the
+ * episode in exhaust_count and sends ZCRX_EVENT_ALLOC_FAIL. Any allocation
+ * that gets a page, also this one, ends the episode.
+ *
+ * The function runs in process and softirq context. The caller must not hold
+ * ->alloc_lock.
  *
  * Return: the page, or NULL if the area has no free page.
  */
@@ -779,17 +802,27 @@ struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq, u64 *area_off)
 {
 	struct io_zcrx_area *area = io_zcrx_maio_area(ifq);
 	struct io_zcrx_kmem *kmem = area->kmem;
+	bool exhausted = false;
 	struct page *page;
-	u32 idx;
+	bool got_page;
+	u32 idx = 0;
 
 	scoped_guard(spinlock_bh, &ifq->alloc_lock) {
 		if (!area->free_count)
 			io_zcrx_kmem_reclaim(area, 1);
-		if (!area->free_count)
-			return NULL;
-		idx = area->freelist[--area->free_count];
-		kmem->state[idx] = IO_ZCRX_KSLOT_OWNED;
+		got_page = !!area->free_count;
+		if (got_page) {
+			idx = area->freelist[--area->free_count];
+			kmem->state[idx] = IO_ZCRX_KSLOT_OWNED;
+		}
+		io_zcrx_kmem_episode(ifq, got_page, &exhausted);
 	}
+
+	/* The application hears of the episode once the lock is gone. */
+	if (exhausted)
+		zcrx_send_notif(ifq, ZCRX_EVENT_ALLOC_FAIL);
+	if (!got_page)
+		return NULL;
 
 	page = area->mem.pages[idx];
 	/* With one reference, the last put returns the slot. */
