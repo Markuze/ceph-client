@@ -68,23 +68,24 @@ static bool zcrx_set_ring_ctx(struct io_zcrx_ifq *zcrx,
 	return true;
 }
 
-static inline struct page *io_zcrx_iov_page(const struct net_iov *niov)
-{
-	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
-	unsigned niov_pages_shift;
-
-	lockdep_assert(!area->mem.is_dmabuf);
-
-	niov_pages_shift = area->ifq->niov_shift - PAGE_SHIFT;
-	return area->mem.pages[net_iov_idx(niov) << niov_pages_shift];
-}
-
 static inline struct io_zcrx_slot io_zcrx_niov_slot(const struct net_iov *niov)
 {
 	return (struct io_zcrx_slot){
 		.area	= io_zcrx_iov_to_area(niov),
 		.idx	= net_iov_idx(niov),
 	};
+}
+
+/* The first page of a slot. A slot of a kernel area is one page. */
+static inline struct page *io_zcrx_slot_page(struct io_zcrx_slot slot)
+{
+	struct io_zcrx_area *area = slot.area;
+	unsigned int slot_pages_shift;
+
+	lockdep_assert(!area->mem.is_dmabuf);
+
+	slot_pages_shift = area->ifq->niov_shift - PAGE_SHIFT;
+	return area->mem.pages[slot.idx << slot_pages_shift];
 }
 
 static inline netmem_ref io_zcrx_slot_netmem(struct io_zcrx_slot slot)
@@ -810,11 +811,6 @@ static void io_zcrx_return_slot(struct io_zcrx_slot slot)
 		return;
 	}
 	page_pool_put_unrefed_netmem(pp, netmem, -1, false);
-}
-
-static void io_zcrx_return_niov(struct net_iov *niov)
-{
-	io_zcrx_return_slot(io_zcrx_niov_slot(niov));
 }
 
 static void io_zcrx_scrub_area(struct io_zcrx_ifq *ifq, struct io_zcrx_area *area)
@@ -1938,6 +1934,36 @@ static ssize_t io_copy_page(struct io_copy_cache *cc, struct page *src_page,
 	return copied;
 }
 
+/*
+ * Take a free slot of the area for a copy. The slot belongs to no page pool,
+ * and it holds one pool reference. The caller fills the page of the slot,
+ * posts the CQE and takes the user reference. If the caller cannot post the
+ * CQE, it gives the slot back with io_zcrx_return_slot().
+ */
+static bool io_zcrx_alloc_copy_slot(struct io_zcrx_ifq *ifq,
+				    struct io_zcrx_slot *slot)
+{
+	struct net_iov *niov;
+	struct page *page;
+	u64 area_off;
+
+	if (!ifq->maio) {
+		niov = io_alloc_fallback_niov(ifq);
+		if (!niov)
+			return false;
+		*slot = io_zcrx_niov_slot(niov);
+		return true;
+	}
+
+	page = io_zcrx_maio_copy_page(ifq, &area_off);
+	if (!page)
+		return false;
+	/* A MAIO instance has one area, and a slot of it is one page. */
+	slot->area = ifq->areas[0];
+	slot->idx = (area_off & ~IORING_ZCRX_AREA_MASK) >> PAGE_SHIFT;
+	return true;
+}
+
 static ssize_t io_zcrx_copy_chunk(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 				  struct page *src_page, unsigned int src_offset,
 				  size_t len)
@@ -1947,28 +1973,27 @@ static ssize_t io_zcrx_copy_chunk(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 
 	while (len) {
 		struct io_copy_cache cc;
-		struct net_iov *niov;
+		struct io_zcrx_slot slot;
 		size_t n;
 
-		niov = io_alloc_fallback_niov(ifq);
-		if (!niov) {
+		if (!io_zcrx_alloc_copy_slot(ifq, &slot)) {
 			ret = -ENOMEM;
 			break;
 		}
 
-		cc.page = io_zcrx_iov_page(niov);
+		cc.page = io_zcrx_slot_page(slot);
 		cc.offset = 0;
 		cc.size = PAGE_SIZE;
 
 		n = io_copy_page(&cc, src_page, src_offset, len);
 
-		if (!io_zcrx_queue_cqe(req, io_zcrx_niov_slot(niov), ifq, 0, n)) {
-			io_zcrx_return_niov(niov);
+		if (!io_zcrx_queue_cqe(req, slot, ifq, 0, n)) {
+			io_zcrx_return_slot(slot);
 			ret = -ENOSPC;
 			break;
 		}
 
-		io_zcrx_get_niov_uref(niov);
+		io_zcrx_get_uref(slot);
 		src_offset += n;
 		len -= n;
 		copied += n;
@@ -2182,9 +2207,6 @@ int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	struct sock *sk = sock->sk;
 	const struct proto *prot = READ_ONCE(sk->sk_prot);
 
-	/* The receive path does not handle the page slots of a MAIO area yet. */
-	if (ifq->maio)
-		return -EOPNOTSUPP;
 	if (prot->recvmsg != tcp_recvmsg)
 		return -EPROTONOSUPPORT;
 

@@ -41,6 +41,10 @@
 #define AREA_PAGES		64
 #define RQ_ENTRIES		64
 #define RQ_REGION_SIZE		8192
+/* The stats of an instance are in the refill ring region, behind the entries. */
+#define STATS_OFFSET		2048
+#define NOTIF_TAG		0xe0e0e0e0ULL
+#define MAX_DATA		512
 /* The kernel keeps these two values private. The mmap offsets are documented
  * in the commit that adds them. The tests check them against the offset that
  * the kernel returns.
@@ -75,6 +79,7 @@ struct zcrx {
 	struct io_uring_region_desc rd;
 	struct io_uring_zcrx_area_reg area;
 	struct io_uring_zcrx_ifq_reg reg;
+	struct zcrx_event_desc ev;
 	void *rq;			/* the mapped refill ring region */
 	unsigned char *map;		/* the mapped area, if any */
 };
@@ -162,18 +167,6 @@ static bool peek(struct ring *r, struct event *event)
 	return true;
 }
 
-static struct event wait_tag(struct ring *r, uint64_t tag)
-{
-	struct event event;
-
-	for (;;) {
-		enter(r, 1);
-		while (peek(r, &event))
-			if (event.tag == tag)
-				return event;
-	}
-}
-
 static int zcrx_register_raw(struct ring *r, struct io_uring_zcrx_ifq_reg *reg)
 {
 	int ret = syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_ZCRX_IFQ, reg, 1);
@@ -205,6 +198,26 @@ static void zcrx_prepare(struct zcrx *z, struct ring *r, unsigned int flags,
 	z->reg.flags = flags;
 	z->reg.area_ptr = (uintptr_t)&z->area;
 	z->reg.region_ptr = (uintptr_t)&z->rd;
+}
+
+/* Ask for the events in @mask and for the stats area, before the registration. */
+static void zcrx_want_events(struct zcrx *z, uint32_t mask)
+{
+	z->ev.user_data = NOTIF_TAG;
+	z->ev.type_mask = mask;
+	z->ev.flags = ZCRX_EVENT_DESC_FLAG_STATS;
+	z->ev.stats_offset = STATS_OFFSET;
+	z->reg.event_desc = (uintptr_t)&z->ev;
+}
+
+static struct zcrx_stats *zcrx_stats(struct zcrx *z)
+{
+	return z->rq + STATS_OFFSET;
+}
+
+static uint64_t stat_read(const __u64 *counter)
+{
+	return __atomic_load_n(counter, __ATOMIC_RELAXED);
 }
 
 static int zcrx_do_register(struct zcrx *z)
@@ -652,30 +665,234 @@ static void tcp_pair(int pair[2])
 	close(listener);
 }
 
-/* 7. Until the receive path handles page slots, RECV_ZC fails. */
-static void test_recv_unsupported(struct ring *r)
+/* The byte of a stream at position @pos. */
+static unsigned char stream_byte(uint64_t pos, unsigned int seed)
+{
+	return (unsigned char)((pos * 131 + seed) ^ (pos >> 8));
+}
+
+static void fill_stream(unsigned char *p, uint64_t pos, size_t len, unsigned int seed)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		p[i] = stream_byte(pos + i, seed);
+}
+
+static bool check_stream(const unsigned char *p, uint64_t pos, size_t len, unsigned int seed)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		if (p[i] != stream_byte(pos + i, seed))
+			return false;
+	return true;
+}
+
+static void send_stream(int fd, uint64_t pos, size_t len, unsigned int seed)
+{
+	unsigned char *buf = malloc(len);
+	size_t done = 0;
+
+	require(buf, "buffer for the stream");
+	fill_stream(buf, pos, len, seed);
+	while (done < len) {
+		ssize_t n = send(fd, buf + done, len - done, MSG_NOSIGNAL);
+
+		require(n > 0, "send the stream");
+		done += n;
+	}
+	free(buf);
+}
+
+/* The completions of one RECV_ZC request and of the events of its instance. */
+struct rx {
+	uint64_t recv_tag;
+	struct event data[MAX_DATA];
+	unsigned int nr_data;
+	unsigned int nr_event[2];	/* by ZCRX_EVENT_* */
+	uint64_t bytes;			/* the sum of the data CQEs */
+	bool done;			/* the CQE that ends the request came */
+	int final_res;
+};
+
+static void rx_start(struct ring *r, struct rx *rx, struct zcrx *z, int fd)
 {
 	struct io_uring_sqe sqe = {};
-	struct event event;
+
+	memset(rx, 0, sizeof(*rx));
+	sqe.opcode = IORING_OP_RECV_ZC;
+	sqe.fd = fd;
+	sqe.ioprio = IORING_RECV_MULTISHOT;
+	sqe.zcrx_ifq_idx = z->id;
+	sqe.user_data = next_tag++;
+	rx->recv_tag = sqe.user_data;
+	stage(r, sqe);
+}
+
+static void rx_drain(struct ring *r, struct rx *rx)
+{
+	struct event e;
+
+	while (peek(r, &e)) {
+		if (e.tag == rx->recv_tag && (e.flags & IORING_CQE_F_MORE)) {
+			require(rx->nr_data < MAX_DATA, "room for the data CQEs");
+			require(e.res > 0, "a data CQE carries bytes");
+			rx->data[rx->nr_data++] = e;
+			rx->bytes += e.res;
+		} else if (e.tag == rx->recv_tag) {
+			rx->done = true;
+			rx->final_res = e.res;
+		} else if (e.tag == NOTIF_TAG) {
+			require(e.res >= 0 && e.res < 2, "a known event type");
+			rx->nr_event[e.res]++;
+		}
+	}
+}
+
+/* Run the ring until @bytes bytes arrived or the request ended. */
+static void rx_wait(struct ring *r, struct rx *rx, uint64_t bytes)
+{
+	alarm(120);
+	for (;;) {
+		rx_drain(r, rx);
+		if (rx->bytes >= bytes || rx->done)
+			break;
+		enter(r, 1);
+	}
+	/* Run the deferred work that is left, so that the event CQEs are in. */
+	enter(r, 0);
+	rx_drain(r, rx);
+	alarm(0);
+}
+
+/* Close the sending side and wait for the CQE that ends the request. */
+static void rx_finish(struct ring *r, struct rx *rx, int sender)
+{
+	close(sender);
+	rx_wait(r, rx, UINT64_MAX);
+	require(rx->done, "the request ends");
+}
+
+/*
+ * Check the data CQEs from @first on. Each names a copy in the area. The area
+ * holds the bytes of the stream that the peer sent. Return the bit mask of the
+ * slots that the completions name.
+ */
+static uint64_t rx_check_copies(struct zcrx *z, struct rx *rx, unsigned int first,
+				uint64_t pos, unsigned int seed)
+{
+	uint64_t slots = 0;
+	unsigned int i;
+
+	for (i = first; i < rx->nr_data; i++) {
+		uint64_t off = rx->data[i].extra[0];
+		uint32_t len = rx->data[i].res;
+
+		require(!(off >> IORING_ZCRX_AREA_SHIFT), "the completion names area 0");
+		require(!(off & (page_size - 1)), "a copy starts at the start of a page");
+		require(len <= page_size, "a copy fits in a page");
+		require(off + len <= z->area.len, "the completion is inside the area");
+		require(check_stream(z->map + off, pos, len, seed),
+			"the area holds the bytes that the peer sent");
+		slots |= 1ULL << (off / page_size);
+		pos += len;
+	}
+	return slots;
+}
+
+static void rq_push(struct zcrx *z, uint64_t off)
+{
+	unsigned int tail = *rq_tail(z);
+	struct io_uring_zcrx_rqe *rqe = &rq_rqes(z)[tail & (RQ_ENTRIES - 1)];
+
+	require(tail - __atomic_load_n(rq_head(z), __ATOMIC_ACQUIRE) < RQ_ENTRIES,
+		"room in the refill ring");
+	rqe->off = off;
+	rqe->len = page_size;
+	rqe->__pad = 0;
+	__atomic_store_n(rq_tail(z), tail + 1, __ATOMIC_RELEASE);
+}
+
+/* Give the slots of the data CQEs from @first on back to the kernel. */
+static void rq_return(struct zcrx *z, struct rx *rx, unsigned int first)
+{
+	unsigned int i;
+
+	for (i = first; i < rx->nr_data; i++)
+		rq_push(z, rx->data[i].extra[0]);
+}
+
+/* An instance without a device does not consume the refill ring by itself. */
+static void rq_flush(struct ring *r, struct zcrx *z)
+{
+	struct zcrx_ctrl ctrl = { .zcrx_id = z->id, .op = ZCRX_CTRL_FLUSH_RQ };
+
+	require(!zcrx_ctrl(r, &ctrl), "flush the refill ring");
+	require(__atomic_load_n(rq_head(z), __ATOMIC_ACQUIRE) == *rq_tail(z),
+		"the flush consumes the entries");
+}
+
+/*
+ * 7. RECV_ZC on an instance without a device copies every byte into a page of
+ * the area. The completions name the pages, the stats and the event count the
+ * copies, and a slot that the process returns serves the next copy.
+ */
+static void test_recv_copy(struct ring *r)
+{
+	const size_t len1 = 5 * page_size + 100, len2 = 3 * page_size;
+	uint64_t slots1, slots2, copies1, pos = 0;
+	struct zcrx_stats *st;
+	unsigned int n1;
+	struct rx rx;
 	struct zcrx z;
 	int tcp[2];
 
 	zcrx_prepare(&z, r, ZCRX_REG_MAIO | ZCRX_REG_NODEV, 0, AREA_PAGES);
+	zcrx_want_events(&z, (1U << ZCRX_EVENT_COPY) | (1U << ZCRX_EVENT_ALLOC_FAIL));
 	require(!zcrx_do_register(&z), "register for the receive test");
+	z.map = map_area(r, z.area.mmap_offset, z.area.len, PROT_READ | PROT_WRITE, MAP_SHARED);
+	require(z.map != MAP_FAILED, "map the area for the receive test");
+	st = zcrx_stats(&z);
 	tcp_pair(tcp);
+	rx_start(r, &rx, &z, tcp[1]);
 
-	sqe.opcode = IORING_OP_RECV_ZC;
-	sqe.fd = tcp[1];
-	sqe.ioprio = IORING_RECV_MULTISHOT;
-	sqe.zcrx_ifq_idx = z.id;
-	sqe.user_data = next_tag++;
-	stage(r, sqe);
-	event = wait_tag(r, sqe.user_data);
-	require(event.res == -EOPNOTSUPP, "RECV_ZC on a MAIO instance is not supported");
-	close(tcp[0]);
+	/* Round one: the completions name copies that hold the stream. */
+	send_stream(tcp[0], pos, len1, 1);
+	rx_wait(r, &rx, len1);
+	require(rx.bytes == len1, "all the bytes arrive");
+	slots1 = rx_check_copies(&z, &rx, 0, pos, 1);
+	n1 = rx.nr_data;
+	ksft_print_msg("round one: %u completions for %zu bytes, copy_count %lu\n",
+		       n1, len1, (unsigned long)stat_read(&st->copy_count));
+	/* A copy of a fragment can need several pages, so copy_count <= n1. */
+	copies1 = stat_read(&st->copy_count);
+	require(copies1 >= 1 && copies1 <= n1, "copy_count counts the copied fragments");
+	require(stat_read(&st->copy_bytes) == len1, "copy_bytes counts the bytes");
+	require(rx.nr_event[ZCRX_EVENT_COPY] == 1, "the copy event fires");
+	require(!rx.nr_event[ZCRX_EVENT_ALLOC_FAIL], "no allocation failure");
+	require(!stat_read(&st->exhaust_count), "the area did not run out");
+
+	/* Return the slots. The next copies use them again. */
+	rq_return(&z, &rx, 0);
+	rq_flush(r, &z);
+	pos += len1;
+	send_stream(tcp[0], pos, len2, 2);
+	rx_wait(r, &rx, len1 + len2);
+	require(rx.bytes == len1 + len2, "all the bytes of round two arrive");
+	slots2 = rx_check_copies(&z, &rx, n1, pos, 2);
+	require(slots2 && !(slots2 & ~slots1), "the copies reuse the returned slots");
+	require(stat_read(&st->copy_count) > copies1 &&
+		stat_read(&st->copy_count) <= rx.nr_data, "copy_count grows");
+	require(stat_read(&st->copy_bytes) == rx.bytes, "copy_bytes counts all bytes");
+	/* An event fires once until the process arms it again. */
+	require(rx.nr_event[ZCRX_EVENT_COPY] == 1, "the copy event fires once");
+
+	rx_finish(r, &rx, tcp[0]);
+	require(rx.final_res == 0, "the request ends at the end of the stream");
 	close(tcp[1]);
 	zcrx_close(&z);
-	ksft_test_result_pass("RECV_ZC on a MAIO instance fails until the receive path lands\n");
+	ksft_test_result_pass("RECV_ZC on MAIO|NODEV copies into the area and reuses slots\n");
 }
 
 /* The netdevsim fixture. */
@@ -993,7 +1210,7 @@ int main(void)
 	test_refill_ring(&r);
 	test_add_area(&r);
 	test_capability();
-	test_recv_unsupported(&r);
+	test_recv_copy(&r);
 	test_loopback(&r);
 	test_large_area(&r);
 	test_memlock();
