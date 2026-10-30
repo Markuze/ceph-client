@@ -5,7 +5,8 @@
  * receive queue of a device.
  *
  * The tests use raw SQEs and the 32-byte CQE ABI, no liburing. The device
- * tests use netdevsim and need a kernel that has it. Without it, they skip.
+ * tests use netdevsim. The tests of a port with a peer need network namespaces
+ * too. Without these, the tests skip.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -19,6 +20,9 @@
 #include <linux/sockios.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -37,12 +41,12 @@
 
 #include "../kselftest.h"
 
-#define PLAN			14
+#define PLAN			15
 #define AREA_PAGES		64
 #define RQ_ENTRIES		64
 #define RQ_REGION_SIZE		8192
 /* The stats of an instance are in the refill ring region, behind the entries. */
-#define STATS_OFFSET		2048
+#define STATS_OFFSET		6144
 #define NOTIF_TAG		0xe0e0e0e0ULL
 #define MAX_DATA		512
 /* The kernel keeps these two values private. The mmap offsets are documented
@@ -80,6 +84,7 @@ struct zcrx {
 	struct io_uring_zcrx_area_reg area;
 	struct io_uring_zcrx_ifq_reg reg;
 	struct zcrx_event_desc ev;
+	unsigned int nr_rqes;		/* entries of the refill ring */
 	void *rq;			/* the mapped refill ring region */
 	unsigned char *map;		/* the mapped area, if any */
 };
@@ -194,6 +199,7 @@ static void zcrx_prepare(struct zcrx *z, struct ring *r, unsigned int flags,
 	z->area.len = (uint64_t)pages * page_size;
 	z->area.flags = IORING_ZCRX_AREA_KERNEL;
 	z->reg.if_idx = if_idx;
+	z->nr_rqes = RQ_ENTRIES;
 	z->reg.rq_entries = RQ_ENTRIES;
 	z->reg.flags = flags;
 	z->reg.area_ptr = (uintptr_t)&z->area;
@@ -778,9 +784,30 @@ static void rx_finish(struct ring *r, struct rx *rx, int sender)
 }
 
 /*
+ * Check one data CQE: it names bytes of the area, and the area holds the bytes
+ * of the stream at @pos. A copy starts at the start of a page. A reference may
+ * start inside a page. Return the slot.
+ */
+static unsigned int rx_check_one(struct zcrx *z, const struct event *e, uint64_t pos,
+				 unsigned int seed, bool byref)
+{
+	uint64_t off = e->extra[0];
+	uint32_t len = e->res;
+
+	require(!(off >> IORING_ZCRX_AREA_SHIFT), "the completion names area 0");
+	if (!byref)
+		require(!(off & (page_size - 1)), "a copy starts at the start of a page");
+	require((off & (page_size - 1)) + len <= page_size, "the bytes are in one page");
+	require(off + len <= z->area.len, "the completion is inside the area");
+	require(check_stream(z->map + off, pos, len, seed),
+		"the area holds the bytes that the peer sent");
+	return off / page_size;
+}
+
+/*
  * Check the data CQEs from @first on. Each names a copy in the area. The area
  * holds the bytes of the stream that the peer sent. Return the bit mask of the
- * slots that the completions name.
+ * slots that the completions name. The area has at most 64 slots.
  */
 static uint64_t rx_check_copies(struct zcrx *z, struct rx *rx, unsigned int first,
 				uint64_t pos, unsigned int seed)
@@ -789,17 +816,8 @@ static uint64_t rx_check_copies(struct zcrx *z, struct rx *rx, unsigned int firs
 	unsigned int i;
 
 	for (i = first; i < rx->nr_data; i++) {
-		uint64_t off = rx->data[i].extra[0];
-		uint32_t len = rx->data[i].res;
-
-		require(!(off >> IORING_ZCRX_AREA_SHIFT), "the completion names area 0");
-		require(!(off & (page_size - 1)), "a copy starts at the start of a page");
-		require(len <= page_size, "a copy fits in a page");
-		require(off + len <= z->area.len, "the completion is inside the area");
-		require(check_stream(z->map + off, pos, len, seed),
-			"the area holds the bytes that the peer sent");
-		slots |= 1ULL << (off / page_size);
-		pos += len;
+		slots |= 1ULL << rx_check_one(z, &rx->data[i], pos, seed, false);
+		pos += rx->data[i].res;
 	}
 	return slots;
 }
@@ -807,9 +825,9 @@ static uint64_t rx_check_copies(struct zcrx *z, struct rx *rx, unsigned int firs
 static void rq_push(struct zcrx *z, uint64_t off)
 {
 	unsigned int tail = *rq_tail(z);
-	struct io_uring_zcrx_rqe *rqe = &rq_rqes(z)[tail & (RQ_ENTRIES - 1)];
+	struct io_uring_zcrx_rqe *rqe = &rq_rqes(z)[tail & (z->nr_rqes - 1)];
 
-	require(tail - __atomic_load_n(rq_head(z), __ATOMIC_ACQUIRE) < RQ_ENTRIES,
+	require(tail - __atomic_load_n(rq_head(z), __ATOMIC_ACQUIRE) < z->nr_rqes,
 		"room in the refill ring");
 	rqe->off = off;
 	rqe->len = page_size;
@@ -1175,6 +1193,363 @@ static void test_device_removal(void)
 	ksft_test_result_pass("netdevsim: the instance outlives the removal of the device\n");
 }
 
+/*
+ * Two netdevsim ports as peers. Port A is in this namespace. Its peer B, and
+ * the TCP sockets that send through B, are in a namespace of their own.
+ * Traffic between two addresses of one namespace takes the loopback path, so
+ * the second namespace makes the frames cross the devices.
+ */
+#define LOCAL_ADDR		"10.77.0.1"
+#define PEER_ADDR		"10.77.0.2"
+#define PEER_SOCKETS		2
+
+struct peer {
+	unsigned int id;		/* netdevsim device id of the peer */
+	unsigned int ifindex;		/* in the namespace of the peer */
+	int netns;			/* a file descriptor of that namespace */
+	int socks[PEER_SOCKETS];	/* TCP sockets in that namespace */
+	int err;
+};
+
+struct pair {
+	unsigned int id;		/* netdevsim device id of port A */
+	char name[IFNAMSIZ];
+	unsigned int ifindex;
+	struct peer peer;
+};
+
+static int set_addr(const char *name, const char *addr)
+{
+	struct sockaddr_in *sin;
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	sin->sin_family = AF_INET;
+	inet_pton(AF_INET, addr, &sin->sin_addr);
+	ret = ioctl(s, SIOCSIFADDR, &ifr);
+	if (!ret) {
+		inet_pton(AF_INET, "255.255.255.0", &sin->sin_addr);
+		ret = ioctl(s, SIOCSIFNETMASK, &ifr);
+	}
+	close(s);
+	return ret ? -errno : 0;
+}
+
+/* Without TSO the stack sends one frame per segment. */
+static int tso_set(const char *name, bool on)
+{
+	struct ethtool_value eval = { .cmd = ETHTOOL_STSO, .data = on };
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	ifr.ifr_data = (void *)&eval;
+	ret = ioctl(s, SIOCETHTOOL, &ifr);
+	close(s);
+	return ret ? -errno : 0;
+}
+
+/* The name of the last device in this namespace that is not the loopback device. */
+static bool first_nonlo(char name[IFNAMSIZ])
+{
+	struct if_nameindex *list, *e;
+
+	name[0] = 0;
+	list = if_nameindex();
+	for (e = list; e && e->if_index; e++)
+		if (strcmp(e->if_name, "lo"))
+			snprintf(name, IFNAMSIZ, "%s", e->if_name);
+	if_freenameindex(list);
+	return name[0];
+}
+
+/*
+ * The network namespace belongs to a thread. unshare() gives this thread a
+ * namespace of its own, and netdevsim creates a device in the namespace of the
+ * task that asks for it. The sockets keep the namespace after the thread ends.
+ */
+static void *peer_thread(void *arg)
+{
+	struct peer *p = arg;
+	char name[IFNAMSIZ], text[32];
+	int i;
+
+	p->err = -1;
+	if (unshare(CLONE_NEWNET))
+		return NULL;
+	snprintf(text, sizeof(text), "%u 1 1", p->id);
+	if (sysfs_write("/sys/bus/netdevsim/new_device", text))
+		return NULL;
+	if (!first_nonlo(name) || set_addr(name, PEER_ADDR) || tso_set(name, false) ||
+	    link_up(name))
+		return NULL;
+	p->ifindex = if_nametoindex(name);
+	p->netns = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+	for (i = 0; i < PEER_SOCKETS; i++)
+		p->socks[i] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (!p->ifindex || p->netns < 0)
+		return NULL;
+	p->err = 0;
+	return NULL;
+}
+
+/* Return false if the fixture is not available. */
+static bool pair_create(struct pair *pr, unsigned int id_a, unsigned int id_b)
+{
+	char text[64];
+	pthread_t th;
+	int ns_a, ret;
+
+	memset(pr, 0, sizeof(*pr));
+	pr->id = id_a;
+	pr->peer.id = id_b;
+	pr->peer.netns = -1;
+	if (!nsim_create(id_a, 1, pr->name))
+		return false;
+	pr->ifindex = if_nametoindex(pr->name);
+	if (!pr->ifindex || set_addr(pr->name, LOCAL_ADDR) || link_up(pr->name))
+		goto err_a;
+	if (pthread_create(&th, NULL, peer_thread, &pr->peer))
+		goto err_a;
+	pthread_join(th, NULL);
+	if (pr->peer.err)
+		goto err_b;
+
+	ns_a = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+	snprintf(text, sizeof(text), "%d:%u %d:%u", ns_a, pr->ifindex,
+		 pr->peer.netns, pr->peer.ifindex);
+	ret = sysfs_write("/sys/bus/netdevsim/link_device", text);
+	close(ns_a);
+	if (!ret)
+		return true;
+err_b:
+	nsim_destroy(id_b);
+err_a:
+	nsim_destroy(id_a);
+	return false;
+}
+
+struct tso_arg {
+	int netns;
+	bool on;
+	int err;
+};
+
+static void *tso_thread(void *arg)
+{
+	struct tso_arg *a = arg;
+	char name[IFNAMSIZ];
+
+	a->err = -1;
+	if (!setns(a->netns, CLONE_NEWNET) && first_nonlo(name))
+		a->err = tso_set(name, a->on);
+	return NULL;
+}
+
+/* Change TSO of the peer device. The thread enters the namespace of the peer. */
+static void pair_set_tso(struct pair *pr, bool on)
+{
+	struct tso_arg arg = { .netns = pr->peer.netns, .on = on };
+	pthread_t th;
+
+	require(!pthread_create(&th, NULL, tso_thread, &arg), "thread for the peer");
+	pthread_join(th, NULL);
+	require(!arg.err, "change TSO of the peer device");
+}
+
+static void pair_destroy(struct pair *pr)
+{
+	int i;
+
+	for (i = 0; i < PEER_SOCKETS; i++)
+		close(pr->peer.socks[i]);
+	close(pr->peer.netns);
+	nsim_destroy(pr->id);
+	nsim_destroy(pr->peer.id);
+}
+
+static int listen_local(uint16_t *port)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET };
+	socklen_t len = sizeof(addr);
+	int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+	require(s >= 0, "listen socket");
+	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
+	require(!bind(s, (void *)&addr, len), "bind the listen socket to port A");
+	require(!getsockname(s, (void *)&addr, &len), "getsockname");
+	require(!listen(s, 4), "listen");
+	*port = ntohs(addr.sin_port);
+	return s;
+}
+
+/* Connect a socket of the peer to port A and return the accepted socket. */
+static int connect_peer(struct pair *pr, int idx, int listener, uint16_t port)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+	int fd;
+
+	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
+	alarm(120);
+	require(!connect(pr->peer.socks[idx], (void *)&addr, sizeof(addr)),
+		"connect the peer to port A");
+	fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+	require(fd >= 0, "accept the connection of the peer");
+	alarm(0);
+	return fd;
+}
+
+/*
+ * Receive frames that arrive on a port with an instance. The pool of the port
+ * puts the payload of each frame into a page, as a driver with private
+ * headers does. How the instance hands the page to the process is up to the
+ * receive path, so this function takes @byref.
+ */
+#define DEV_AREA_PAGES		256
+#define DEV_RQ_ENTRIES		256
+#define DEV_FRAMES		24
+#define DEV_ROUNDS		5
+
+/* Check the CQEs from @first on. Count the CQEs that name a slot seen before. */
+static unsigned int rx_check_dev(struct zcrx *z, struct rx *rx, unsigned int first,
+				 uint64_t pos, unsigned int seed, bool byref,
+				 unsigned char *seen)
+{
+	unsigned int i, reused = 0;
+
+	for (i = first; i < rx->nr_data; i++) {
+		unsigned int slot = rx_check_one(z, &rx->data[i], pos, seed, byref);
+
+		require(slot < DEV_AREA_PAGES, "the slot is in the area");
+		reused += seen[slot];
+		seen[slot] = 1;
+		pos += rx->data[i].res;
+	}
+	return reused;
+}
+
+/* 10. Receive from a netdevsim port that has an instance. */
+static void test_netdevsim_rx(void)
+{
+	const bool byref = false;
+	unsigned char seen[DEV_AREA_PAGES] = {};
+	struct zcrx_ctrl ctrl = { .op = ZCRX_CTRL_EXPORT };
+	struct io_uring_zcrx_ifq_reg reg = {};
+	unsigned int round, reused = 0, n1;
+	uint64_t pos = 0, pos2 = 0;
+	struct rx rx = {}, rx2 = {};
+	struct zcrx z, z2;
+	struct zcrx_stats *st;
+	struct ring r1, r2;
+	struct pair pr;
+	size_t round_len;
+	int sock1, sock2, listener, export_fd, mss, ret;
+	socklen_t optlen = sizeof(mss);
+	uint16_t port;
+
+	if (!pair_create(&pr, 200, 201)) {
+		ksft_test_result_skip("netdevsim ports or network namespaces are not available\n");
+		return;
+	}
+	require(!ring_init(&r1, IORING_SETUP_CQE32), "ring for the port test");
+	zcrx_prepare(&z, &r1, ZCRX_REG_MAIO, pr.ifindex, DEV_AREA_PAGES);
+	z.nr_rqes = DEV_RQ_ENTRIES;
+	z.reg.rq_entries = DEV_RQ_ENTRIES;
+	zcrx_want_events(&z, (1U << ZCRX_EVENT_COPY) | (1U << ZCRX_EVENT_ALLOC_FAIL));
+	ret = zcrx_do_register(&z);
+	if (ret == -EOPNOTSUPP || ret == -ENODEV) {
+		ksft_test_result_skip("the port has no queue API: %d\n", ret);
+		ring_exit(&r1);
+		pair_destroy(&pr);
+		return;
+	}
+	require(!ret, "install the provider on port A");
+	z.map = map_area(&r1, z.area.mmap_offset, z.area.len, PROT_READ | PROT_WRITE, MAP_SHARED);
+	require(z.map != MAP_FAILED, "map the area of port A");
+	st = zcrx_stats(&z);
+
+	listener = listen_local(&port);
+	sock1 = connect_peer(&pr, 0, listener, port);
+	require(!getsockopt(sock1, IPPROTO_TCP, TCP_MAXSEG, &mss, &optlen), "read the MSS");
+	round_len = (size_t)DEV_FRAMES * mss;
+	rx_start(&r1, &rx, &z, sock1);
+
+	for (round = 0; round < DEV_ROUNDS; round++) {
+		unsigned int first = rx.nr_data;
+
+		send_stream(pr.peer.socks[0], pos, round_len, 5);
+		rx_wait(&r1, &rx, pos + round_len);
+		require(rx.bytes == pos + round_len, "all the bytes of the round arrive");
+		reused += rx_check_dev(&z, &rx, first, pos, 5, byref, seen);
+		/* The process returns the slots. The pool or a flush takes them. */
+		rq_return(&z, &rx, first);
+		pos += round_len;
+	}
+	ksft_print_msg("port A: %u completions for %lu bytes, %u names a slot seen before\n",
+		       rx.nr_data, (unsigned long)rx.bytes, reused);
+	require(!stat_read(&st->exhaust_count) && !stat_read(&st->fallback_pages),
+		"the area did not run out");
+	require(!rx.nr_event[ZCRX_EVENT_ALLOC_FAIL], "no allocation failure event");
+	require(stat_read(&st->copy_bytes) == (byref ? 0 : rx.bytes),
+		"copy_bytes matches the way the instance receives");
+	n1 = rx.nr_data;
+
+	/* A second ring imports the instance and receives on another socket. */
+	ctrl.zcrx_id = z.id;
+	require(!zcrx_ctrl(&r1, &ctrl), "export the instance");
+	export_fd = ctrl.zc_export.zcrx_fd;
+	require(!ring_init(&r2, IORING_SETUP_CQE32), "second ring for the port test");
+	reg.if_idx = export_fd;
+	reg.flags = ZCRX_REG_IMPORT;
+	require(!zcrx_register_raw(&r2, &reg), "import the instance");
+	z2 = z;
+	z2.ring = &r2;
+	z2.id = reg.zcrx_id;
+
+	sock2 = connect_peer(&pr, 1, listener, port);
+	rx_start(&r2, &rx2, &z2, sock2);
+	send_stream(pr.peer.socks[1], pos2, round_len, 6);
+	rx_wait(&r2, &rx2, round_len);
+	require(rx2.bytes == round_len, "the second ring gets the bytes of its socket");
+	rx_check_dev(&z, &rx2, 0, pos2, 6, byref, seen);
+	rq_return(&z, &rx2, 0);
+	require(rx.nr_data == n1, "the first ring got nothing of the second socket");
+	ksft_print_msg("second ring: %u completions for %lu bytes\n", rx2.nr_data,
+		       (unsigned long)rx2.bytes);
+
+	/*
+	 * With TSO a frame carries many segments. Its payload fills several
+	 * pages, and the bytes must still arrive in order and unchanged.
+	 */
+	pair_set_tso(&pr, true);
+	for (round = 0; round < 2; round++) {
+		unsigned int first = rx.nr_data;
+
+		send_stream(pr.peer.socks[0], pos, round_len, 5);
+		rx_wait(&r1, &rx, pos + round_len);
+		require(rx.bytes == pos + round_len, "all the bytes of the TSO round arrive");
+		rx_check_dev(&z, &rx, first, pos, 5, byref, seen);
+		rq_return(&z, &rx, first);
+		pos += round_len;
+	}
+	ksft_print_msg("TSO: %u completions in all\n", rx.nr_data);
+	require(!stat_read(&st->exhaust_count), "the area did not run out with TSO");
+
+	close(sock1);
+	close(sock2);
+	close(listener);
+	zcrx_close(&z);
+	ring_exit(&r2);
+	close(export_fd);
+	ring_exit(&r1);
+	pair_destroy(&pr);
+	ksft_test_result_pass("netdevsim: a MAIO instance receives frames, two rings share it\n");
+}
+
 /* 9. A device without the queue API cannot take the provider. */
 static void test_loopback(struct ring *r)
 {
@@ -1300,6 +1675,7 @@ int main(void)
 	test_memlock();
 	test_device();
 	test_device_removal();
+	test_netdevsim_rx();
 	/* The last test closes the first ring. */
 	test_export_import(&r);
 
