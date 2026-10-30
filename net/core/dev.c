@@ -10892,6 +10892,20 @@ u32 dev_get_min_mp_channel_count(const struct net_device *dev)
 	return 0;
 }
 
+/* Return true if a receive queue of the device has a provider of readable pages. */
+bool dev_has_readable_mp(const struct net_device *dev)
+{
+	int i;
+
+	netdev_assert_locked_ops_compat(dev);
+
+	for (i = 0; i < dev->real_num_rx_queues; i++)
+		if (dev->_rx[i].mp_params.flags & PP_MP_F_READABLE)
+			return true;
+
+	return false;
+}
+
 /**
  * dev_index_reserve() - allocate an ifindex in a namespace
  * @net: the applicable net namespace
