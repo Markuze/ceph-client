@@ -438,12 +438,6 @@ struct virtnet_info {
 	/* Work struct for config space updates */
 	struct work_struct config_work;
 
-	/* Work struct for setting rx mode */
-	struct work_struct rx_mode_work;
-
-	/* OK to queue work setting RX mode? */
-	bool rx_mode_work_enabled;
-
 	/* Does the affinity hint is set for virtqueues? */
 	bool affinity_hint_set;
 
@@ -706,20 +700,6 @@ static void virtnet_rq_free_buf(struct virtnet_info *vi,
 		give_pages(rq, buf);
 	else
 		page_pool_put_page(rq->page_pool, virt_to_head_page(buf), -1, false);
-}
-
-static void enable_rx_mode_work(struct virtnet_info *vi)
-{
-	rtnl_lock();
-	vi->rx_mode_work_enabled = true;
-	rtnl_unlock();
-}
-
-static void disable_rx_mode_work(struct virtnet_info *vi)
-{
-	rtnl_lock();
-	vi->rx_mode_work_enabled = false;
-	rtnl_unlock();
 }
 
 static void virtqueue_napi_schedule(struct napi_struct *napi,
@@ -3835,31 +3815,29 @@ static int virtnet_close(struct net_device *dev)
 	return 0;
 }
 
-static void virtnet_rx_mode_work(struct work_struct *work)
+static int virtnet_set_rx_mode(struct net_device *dev,
+			       struct netdev_hw_addr_list *uc,
+			       struct netdev_hw_addr_list *mc)
 {
-	struct virtnet_info *vi =
-		container_of(work, struct virtnet_info, rx_mode_work);
+	struct virtnet_info *vi = netdev_priv(dev);
 	u8 *promisc_allmulti  __free(kfree) = NULL;
-	struct net_device *dev = vi->dev;
 	struct scatterlist sg[2];
 	struct virtio_net_ctrl_mac *mac_data;
 	struct netdev_hw_addr *ha;
-	int uc_count;
-	int mc_count;
+	int uc_count = netdev_hw_addr_list_count(uc);
+	int mc_count = netdev_hw_addr_list_count(mc);
 	void *buf;
 	int i;
 
-	/* We can't dynamically set ndo_set_rx_mode, so return gracefully */
+	/* We can't dynamically set ndo_set_rx_mode_async, so return gracefully */
 	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_CTRL_RX))
-		return;
+		return 0;
 
 	promisc_allmulti = kzalloc_obj(*promisc_allmulti);
 	if (!promisc_allmulti) {
 		dev_warn(&dev->dev, "Failed to set RX mode, no memory.\n");
-		return;
+		return -ENOMEM;
 	}
-
-	rtnl_lock();
 
 	*promisc_allmulti = !!(dev->flags & IFF_PROMISC);
 	sg_init_one(sg, promisc_allmulti, sizeof(*promisc_allmulti));
@@ -3877,26 +3855,19 @@ static void virtnet_rx_mode_work(struct work_struct *work)
 		dev_warn(&dev->dev, "Failed to %sable allmulti mode.\n",
 			 *promisc_allmulti ? "en" : "dis");
 
-	netif_addr_lock_bh(dev);
-
-	uc_count = netdev_uc_count(dev);
-	mc_count = netdev_mc_count(dev);
 	/* MAC filter - use one buffer for both lists */
 	buf = kzalloc(((uc_count + mc_count) * ETH_ALEN) +
-		      (2 * sizeof(mac_data->entries)), GFP_ATOMIC);
+		      (2 * sizeof(mac_data->entries)), GFP_KERNEL);
 	mac_data = buf;
-	if (!buf) {
-		netif_addr_unlock_bh(dev);
-		rtnl_unlock();
-		return;
-	}
+	if (!buf)
+		return -ENOMEM;
 
 	sg_init_table(sg, 2);
 
 	/* Store the unicast list and count in the front of the buffer */
 	mac_data->entries = cpu_to_virtio32(vi->vdev, uc_count);
 	i = 0;
-	netdev_for_each_uc_addr(ha, dev)
+	netdev_hw_addr_list_for_each(ha, uc)
 		memcpy(&mac_data->macs[i++][0], ha->addr, ETH_ALEN);
 
 	sg_set_buf(&sg[0], mac_data,
@@ -3907,10 +3878,8 @@ static void virtnet_rx_mode_work(struct work_struct *work)
 
 	mac_data->entries = cpu_to_virtio32(vi->vdev, mc_count);
 	i = 0;
-	netdev_for_each_mc_addr(ha, dev)
+	netdev_hw_addr_list_for_each(ha, mc)
 		memcpy(&mac_data->macs[i++][0], ha->addr, ETH_ALEN);
-
-	netif_addr_unlock_bh(dev);
 
 	sg_set_buf(&sg[1], mac_data,
 		   sizeof(mac_data->entries) + (mc_count * ETH_ALEN));
@@ -3919,17 +3888,9 @@ static void virtnet_rx_mode_work(struct work_struct *work)
 				  VIRTIO_NET_CTRL_MAC_TABLE_SET, sg))
 		dev_warn(&dev->dev, "Failed to set MAC filter table.\n");
 
-	rtnl_unlock();
-
 	kfree(buf);
-}
 
-static void virtnet_set_rx_mode(struct net_device *dev)
-{
-	struct virtnet_info *vi = netdev_priv(dev);
-
-	if (vi->rx_mode_work_enabled)
-		schedule_work(&vi->rx_mode_work);
+	return 0;
 }
 
 static int virtnet_vlan_rx_add_vid(struct net_device *dev,
@@ -5744,18 +5705,20 @@ static void virtnet_freeze_down(struct virtio_device *vdev)
 
 	/* Make sure no work handler is accessing the device */
 	flush_work(&vi->config_work);
-	disable_rx_mode_work(vi);
-	flush_work(&vi->rx_mode_work);
 
-	if (netif_running(vi->dev)) {
-		rtnl_lock();
+	/* The core runs the receive mode update under rtnl_lock. It skips a
+	 * device that is not present. Close and detach under one hold of the
+	 * lock, so that the update never sees a device that this function
+	 * has closed but not yet detached.
+	 */
+	rtnl_lock();
+	if (netif_running(vi->dev))
 		virtnet_close(vi->dev);
-		rtnl_unlock();
-	}
 
 	netif_tx_lock_bh(vi->dev);
 	netif_device_detach(vi->dev);
 	netif_tx_unlock_bh(vi->dev);
+	rtnl_unlock();
 }
 
 static int init_vqs(struct virtnet_info *vi);
@@ -5774,8 +5737,6 @@ static int virtnet_restore_up(struct virtio_device *vdev)
 		goto err_del_vqs;
 
 	virtio_device_ready(vdev);
-
-	enable_rx_mode_work(vi);
 
 	if (netif_running(vi->dev)) {
 		rtnl_lock();
@@ -6275,7 +6236,7 @@ static const struct net_device_ops virtnet_netdev = {
 	.ndo_start_xmit      = start_xmit,
 	.ndo_validate_addr   = eth_validate_addr,
 	.ndo_set_mac_address = virtnet_set_mac_address,
-	.ndo_set_rx_mode     = virtnet_set_rx_mode,
+	.ndo_set_rx_mode_async = virtnet_set_rx_mode,
 	.ndo_get_stats64     = virtnet_stats,
 	.ndo_vlan_rx_add_vid = virtnet_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid = virtnet_vlan_rx_kill_vid,
@@ -6882,7 +6843,6 @@ static int virtnet_probe(struct virtio_device *vdev)
 	vdev->priv = vi;
 
 	INIT_WORK(&vi->config_work, virtnet_config_changed_work);
-	INIT_WORK(&vi->rx_mode_work, virtnet_rx_mode_work);
 
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_MRG_RXBUF)) {
 		vi->mergeable_rx_bufs = true;
@@ -7041,8 +7001,6 @@ static int virtnet_probe(struct virtio_device *vdev)
 	if (vi->has_rss || vi->has_rss_hash_report)
 		virtnet_init_default_rss(vi);
 
-	enable_rx_mode_work(vi);
-
 	for (i = 0; i < ARRAY_SIZE(guest_offloads); i++) {
 		unsigned int fbit;
 
@@ -7197,8 +7155,6 @@ static void virtnet_remove(struct virtio_device *vdev)
 
 	/* Make sure no work handler is accessing the device. */
 	flush_work(&vi->config_work);
-	disable_rx_mode_work(vi);
-	flush_work(&vi->rx_mode_work);
 
 	virtnet_free_irq_moder(vi);
 
