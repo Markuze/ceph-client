@@ -20,6 +20,7 @@
 #include <linux/filter.h>
 #include <linux/kernel.h>
 #include <linux/dim.h>
+#include <linux/nospec.h>
 #include <net/route.h>
 #include <net/xdp.h>
 #include <net/net_failover.h>
@@ -2787,10 +2788,10 @@ static void skb_recv_done(struct virtqueue *rvq)
 }
 
 /* The NAPI helpers below run under the netdev instance lock (dev->lock).
- * ndo_open, ndo_stop, ndo_bpf and the ethtool operations get it from the
- * core. virtnet_freeze_down() and virtnet_restore_up() take it. The
- * unlocked napi_enable() and napi_disable() take the lock again, so the
- * helpers use the _locked forms.
+ * ndo_open, ndo_stop, ndo_bpf, the ethtool operations and the queue
+ * management operations get it from the core. virtnet_freeze_down() and
+ * virtnet_restore_up() take it. The unlocked napi_enable() and
+ * napi_disable() take the lock again, so the helpers use the _locked forms.
  */
 static void virtnet_napi_do_enable(struct virtqueue *vq,
 				   struct napi_struct *napi)
@@ -3102,7 +3103,8 @@ static void virtnet_update_settings(struct virtnet_info *vi)
 }
 
 static struct page_pool *virtnet_create_page_pool(struct virtnet_info *vi,
-						  struct receive_queue *rq)
+						  struct receive_queue *rq,
+						  struct napi_struct *napi)
 {
 	struct page_pool_params pp_params = { 0 };
 	struct device *dma_dev;
@@ -3111,7 +3113,7 @@ static struct page_pool *virtnet_create_page_pool(struct virtnet_info *vi,
 	pp_params.pool_size = virtqueue_get_vring_size(rq->vq);
 	pp_params.nid = dev_to_node(vi->vdev->dev.parent);
 	pp_params.netdev = vi->dev;
-	pp_params.napi = &rq->napi;
+	pp_params.napi = napi;
 
 	/* Use page_pool DMA mapping if backend supports DMA API.
 	 * DMA_SYNC_DEV is needed for non-coherent archs on recycle.
@@ -3155,7 +3157,7 @@ static int virtnet_create_page_pools(struct virtnet_info *vi)
 		if (rq->xsk_pool)
 			continue;
 
-		rq->page_pool = virtnet_create_page_pool(vi, rq);
+		rq->page_pool = virtnet_create_page_pool(vi, rq, &rq->napi);
 		if (IS_ERR(rq->page_pool)) {
 			err = PTR_ERR(rq->page_pool);
 			rq->page_pool = NULL;
@@ -5750,6 +5752,176 @@ static const struct netdev_stat_ops virtnet_stat_ops = {
 	.get_base_stats		= virtnet_get_base_stats,
 };
 
+/* Receive queue management API.
+ *
+ * The core replaces the memory of one receive queue in four steps:
+ * ndo_queue_mem_alloc() builds the new memory, ndo_queue_stop() takes the
+ * current memory out of the queue, ndo_queue_start() puts the new memory
+ * in, and ndo_queue_mem_free() releases what is left. If the start fails,
+ * the core starts the old memory again and frees the new memory.
+ *
+ * The memory of a virtio-net receive queue is its page pool. The core
+ * holds dev->lock from the first call to the last. NAPI of the queue is
+ * off from the stop to the start.
+ *
+ * ndo_queue_mem_alloc() creates the pool, because the core looks for the
+ * new pool of a queue with a memory provider before it stops the queue.
+ * It also registers the pool with XDP, because that step can fail.
+ * ndo_queue_start() only attaches the registered pool and cannot fail. The
+ * core restores the old memory with a second call to ndo_queue_start() and
+ * cannot recover if that call fails.
+ */
+struct virtnet_rq_mem {
+	struct page_pool *page_pool;
+};
+
+static int virtnet_queue_mem_alloc(struct net_device *dev,
+				   struct netdev_queue_config *qcfg,
+				   void *per_queue_mem, int idx)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+	struct virtnet_rq_mem *mem = per_queue_mem;
+	struct receive_queue *rq = &vi->rq[idx];
+	struct page_pool *pool;
+	int err;
+
+	/* While the interface is down, the core calls this only to check the
+	 * memory, and it frees the memory at once. The driver keeps its pools
+	 * while the interface is down, so a new pool would never replace the
+	 * old pool. Refuse, so that a caller that binds a provider sees the
+	 * error. __netif_mp_close_rxq() accepts -ENETDOWN. A detached device
+	 * has no queues: the freeze path frees them.
+	 */
+	if (!netif_running(dev) || !netif_device_present(dev))
+		return -ENETDOWN;
+
+	/* An AF_XDP queue fills its ring from the XSK pool, not from the
+	 * page pool.
+	 */
+	if (rq->xsk_pool)
+		return -EBUSY;
+
+	/* Create the pool without a NAPI instance. The queue still runs on
+	 * its old pool, and its NAPI is on. page_pool_destroy() warns if the
+	 * pool names a NAPI instance that is on, and the core can free this
+	 * pool before it starts it. ndo_queue_start() gives the pool to the
+	 * NAPI instance.
+	 */
+	pool = virtnet_create_page_pool(vi, rq, NULL);
+	if (IS_ERR(pool))
+		return PTR_ERR(pool);
+
+	err = xdp_reg_page_pool(pool);
+	if (err) {
+		page_pool_destroy(pool);
+		return err;
+	}
+
+	mem->page_pool = pool;
+	return 0;
+}
+
+static void virtnet_queue_mem_free(struct net_device *dev, void *per_queue_mem)
+{
+	struct virtnet_rq_mem *mem = per_queue_mem;
+
+	if (!mem->page_pool)
+		return;
+
+	xdp_unreg_page_pool(mem->page_pool);
+	page_pool_destroy(mem->page_pool);
+	mem->page_pool = NULL;
+}
+
+static int virtnet_queue_stop(struct net_device *dev, void *per_queue_mem,
+			      int idx)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+	struct virtnet_rq_mem *mem = per_queue_mem;
+	struct receive_queue *rq = &vi->rq[idx];
+	int err;
+
+	virtnet_rx_pause(vi, rq);
+
+	/* Return every posted buffer to the old pool. Skbs in flight hold
+	 * their own pool references and return their pages later. The core
+	 * destroys the old pool after the start, and the destroy does not
+	 * wait for them.
+	 */
+	err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
+	if (err) {
+		netdev_err(dev, "reset rx fail: rx queue index: %d err: %d\n",
+			   idx, err);
+		virtnet_rx_resume(vi, rq, true);
+		return err;
+	}
+
+	/* NAPI is off and the ring is empty, so the old pool has no direct
+	 * recycling user left. Keep the pool registered with XDP, because
+	 * the core may start it again.
+	 */
+	page_pool_disable_direct_recycling(rq->page_pool);
+	xdp_rxq_info_detach_mem_model(&rq->xdp_rxq);
+	mem->page_pool = rq->page_pool;
+	rq->page_pool = NULL;
+
+	return 0;
+}
+
+static int virtnet_queue_start(struct net_device *dev,
+			       struct netdev_queue_config *qcfg,
+			       void *per_queue_mem, int idx)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+	struct virtnet_rq_mem *mem = per_queue_mem;
+	struct receive_queue *rq = &vi->rq[idx];
+
+	/* NAPI is off, so no poll sees the queue half installed. */
+	rq->page_pool = mem->page_pool;
+	mem->page_pool = NULL;
+	page_pool_enable_direct_recycling(rq->page_pool, &rq->napi);
+	xdp_rxq_info_attach_page_pool(&rq->xdp_rxq, rq->page_pool);
+
+	/* Fill the ring from the new pool, then enable NAPI. A failed fill
+	 * is not an error: the next poll fills the ring.
+	 */
+	virtnet_rx_resume(vi, rq, true);
+
+	return 0;
+}
+
+static struct device *virtnet_queue_get_dma_dev(struct net_device *dev,
+						int idx)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+
+	/* The caller holds dev->lock. A detached device has no queues,
+	 * because the freeze path frees them. It detaches the device under
+	 * dev->lock, and the restore path attaches it under dev->lock.
+	 */
+	if (!netif_device_present(dev))
+		return NULL;
+
+	/* The caller has not checked idx yet. io_uring takes it from user
+	 * space.
+	 */
+	if ((unsigned int)idx >= dev->real_num_rx_queues)
+		return NULL;
+	idx = array_index_nospec(idx, dev->real_num_rx_queues);
+
+	/* NULL when the device does not use the DMA API. */
+	return virtqueue_dma_dev(vi->rq[idx].vq);
+}
+
+static const struct netdev_queue_mgmt_ops virtnet_queue_mgmt_ops = {
+	.ndo_queue_mem_size	= sizeof(struct virtnet_rq_mem),
+	.ndo_queue_mem_alloc	= virtnet_queue_mem_alloc,
+	.ndo_queue_mem_free	= virtnet_queue_mem_free,
+	.ndo_queue_start	= virtnet_queue_start,
+	.ndo_queue_stop		= virtnet_queue_stop,
+	.ndo_queue_get_dma_dev	= virtnet_queue_get_dma_dev,
+};
+
 static void virtnet_freeze_down(struct virtio_device *vdev)
 {
 	struct virtnet_info *vi = vdev->priv;
@@ -6920,6 +7092,17 @@ static int virtnet_probe(struct virtio_device *vdev)
 		vi->mergeable_rx_bufs = true;
 		dev->xdp_features |= NETDEV_XDP_ACT_RX_SG;
 	}
+
+	/* The queue management API replaces the page pool of a receive queue.
+	 * Offer it only for the mergeable buffer mode. The big packets mode
+	 * has no page pool. The small buffer mode builds every skb over the
+	 * page, so it cannot keep a header out of a page that another party
+	 * writes. The restart resets the virtqueue, which needs
+	 * VIRTIO_F_RING_RESET.
+	 */
+	if (vi->mergeable_rx_bufs &&
+	    virtio_has_feature(vdev, VIRTIO_F_RING_RESET))
+		dev->queue_mgmt_ops = &virtnet_queue_mgmt_ops;
 
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_HASH_REPORT))
 		vi->has_rss_hash_report = true;
