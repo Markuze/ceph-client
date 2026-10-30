@@ -622,3 +622,141 @@ int io_pp_maio_init(struct page_pool *pp)
 	refcount_inc(&ifq->refs);
 	return 0;
 }
+
+/**
+ * io_zcrx_maio_get() - find a MAIO instance of a ring
+ * @ctx:	the ring, locked by the caller with ->uring_lock
+ * @zcrx_id:	the zcrx id that registration or import returned for the ring
+ *
+ * The reference keeps the area and its pages alive. It does not keep the
+ * provider installed: the application can unregister the instance. Drop the
+ * reference with io_zcrx_maio_put().
+ *
+ * Return: the instance with a reference, or NULL if the ring has no MAIO
+ * instance with this id.
+ */
+struct io_zcrx_ifq *io_zcrx_maio_get(struct io_ring_ctx *ctx, u32 zcrx_id)
+{
+	struct io_zcrx_ifq *ifq;
+
+	lockdep_assert_held(&ctx->uring_lock);
+
+	/* The entry holds a reference of the ring while it exists. */
+	ifq = xa_load(&ctx->zcrx_ctxs, zcrx_id);
+	if (!ifq || !ifq->maio || !refcount_inc_not_zero(&ifq->refs))
+		return NULL;
+	return ifq;
+}
+
+/** io_zcrx_maio_put() - drop the reference of io_zcrx_maio_get() */
+void io_zcrx_maio_put(struct io_zcrx_ifq *ifq)
+{
+	io_put_zcrx_ifq(ifq);
+}
+
+/**
+ * io_zcrx_maio_page_off() - tell if a page is in the area
+ * @ifq:	a MAIO instance
+ * @page:	any page
+ * @area_off:	output: the offset of the page in the zcrx offset format, that is
+ *		the area id in the top bits and the byte offset in the area below.
+ *		The offset names the first byte of the page.
+ *
+ * A page that a page pool got as a fallback is outside the area. The function
+ * takes no lock and runs in any context.
+ *
+ * Return: true if @page is in the area, and then @area_off holds its offset.
+ * False for a page outside the area.
+ */
+bool io_zcrx_maio_page_off(struct io_zcrx_ifq *ifq, struct page *page,
+			   u64 *area_off)
+{
+	struct io_zcrx_area *area = io_zcrx_maio_area(ifq);
+	u32 idx;
+
+	if (!io_zcrx_kmem_lookup(area, page, &idx))
+		return false;
+	*area_off = zcrx_area_id_to_token(area->area_id) + ((u64)idx << PAGE_SHIFT);
+	return true;
+}
+
+/**
+ * io_zcrx_maio_page_get() - take a pool reference to an area page
+ * @ifq:	a MAIO instance
+ * @page:	a page of the area that a page pool owns, or a copy page
+ *
+ * A pool reference keeps the page out of the pool until the holder drops it.
+ * Other holders of a pool reference are socket buffers of the receive path.
+ * The caller must already hold a pool reference or know that the page is
+ * owned. The function runs in any context.
+ */
+void io_zcrx_maio_page_get(struct io_zcrx_ifq *ifq, struct page *page)
+{
+	page_pool_ref_netmem(page_to_netmem(page));
+}
+
+/**
+ * io_zcrx_maio_page_put() - drop a pool reference to an area page
+ * @ifq:	a MAIO instance
+ * @page:	a page of the area
+ *
+ * The last reference returns the page to its pool. A copy page has no pool,
+ * and it returns to the freelist of the area. A page that an outsider still
+ * references waits in limbo until the outsider is gone. The function runs in
+ * any context in which the caller holds neither ->alloc_lock nor the lock of
+ * the refill ring.
+ */
+void io_zcrx_maio_page_put(struct io_zcrx_ifq *ifq, struct page *page)
+{
+	netmem_ref netmem = page_to_netmem(page);
+	struct io_zcrx_area *area = io_zcrx_maio_area(ifq);
+	struct page_pool *pp;
+	u32 idx;
+
+	if (page_pool_unref_netmem(netmem, 1))
+		return;
+
+	pp = netmem_get_pp(netmem);
+	if (pp) {
+		page_pool_put_unrefed_netmem(pp, netmem, -1, false);
+		return;
+	}
+
+	/* A copy page: no pool owns it. */
+	if (!WARN_ON_ONCE(!io_zcrx_kmem_lookup(area, page, &idx)))
+		io_zcrx_kmem_return_slot(area, idx);
+}
+
+/**
+ * io_zcrx_maio_copy_page() - take a free page of the area
+ * @ifq:	a MAIO instance
+ * @area_off:	output: the offset of the page, see io_zcrx_maio_page_off()
+ *
+ * The page has no pool, and it holds one pool reference. The caller fills it.
+ * The caller gives the page back with io_zcrx_maio_page_put(). The content of
+ * the page is not defined. The function runs in process and softirq context.
+ *
+ * Return: the page, or NULL if the area has no free page.
+ */
+struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq, u64 *area_off)
+{
+	struct io_zcrx_area *area = io_zcrx_maio_area(ifq);
+	struct io_zcrx_kmem *kmem = area->kmem;
+	struct page *page;
+	u32 idx;
+
+	scoped_guard(spinlock_bh, &ifq->alloc_lock) {
+		if (!area->free_count)
+			io_zcrx_kmem_reclaim(area, 1);
+		if (!area->free_count)
+			return NULL;
+		idx = area->freelist[--area->free_count];
+		kmem->state[idx] = IO_ZCRX_KSLOT_OWNED;
+	}
+
+	page = area->mem.pages[idx];
+	/* With one reference, the last put returns the slot. */
+	page_pool_fragment_netmem(page_to_netmem(page), 1);
+	*area_off = zcrx_area_id_to_token(area->area_id) + ((u64)idx << PAGE_SHIFT);
+	return page;
+}

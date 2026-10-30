@@ -194,24 +194,72 @@ bool io_zcrx_kmem_lookup(const struct io_zcrx_area *area,
 netmem_ref io_pp_maio_alloc_netmems(struct page_pool *pp, gfp_t gfp);
 bool io_pp_maio_release_netmem(struct page_pool *pp, netmem_ref netmem);
 int io_pp_maio_init(struct page_pool *pp);
+
+/*
+ * The interface of a MAIO instance for in-kernel users, for example the
+ * opaque stores. The contracts are in zcrx_maio.c.
+ */
+struct io_zcrx_ifq *io_zcrx_maio_get(struct io_ring_ctx *ctx, u32 zcrx_id);
+void io_zcrx_maio_put(struct io_zcrx_ifq *ifq);
+bool io_zcrx_maio_page_off(struct io_zcrx_ifq *ifq, struct page *page,
+			   u64 *area_off);
+void io_zcrx_maio_page_get(struct io_zcrx_ifq *ifq, struct page *page);
+void io_zcrx_maio_page_put(struct io_zcrx_ifq *ifq, struct page *page);
+struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq, u64 *area_off);
 #else
+static inline struct io_zcrx_ifq *io_zcrx_maio_get(struct io_ring_ctx *ctx,
+						   u32 zcrx_id)
+{
+	return NULL;
+}
+
+static inline void io_zcrx_maio_put(struct io_zcrx_ifq *ifq)
+{
+}
+
+static inline bool io_zcrx_maio_page_off(struct io_zcrx_ifq *ifq,
+					 struct page *page, u64 *area_off)
+{
+	return false;
+}
+
+static inline void io_zcrx_maio_page_get(struct io_zcrx_ifq *ifq,
+					 struct page *page)
+{
+}
+
+static inline void io_zcrx_maio_page_put(struct io_zcrx_ifq *ifq,
+					 struct page *page)
+{
+}
+
+static inline struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq,
+						  u64 *area_off)
+{
+	return NULL;
+}
+
 static inline int io_register_zcrx(struct io_ring_ctx *ctx,
 				   struct io_uring_zcrx_ifq_reg __user *arg)
 {
 	return -EOPNOTSUPP;
 }
+
 static inline void io_unregister_zcrx(struct io_ring_ctx *ctx)
 {
 }
+
 static inline void io_terminate_zcrx(struct io_ring_ctx *ctx)
 {
 }
+
 static inline int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 			       struct socket *sock, unsigned int flags,
 			       unsigned issue_flags, unsigned int *len)
 {
 	return -EOPNOTSUPP;
 }
+
 static inline struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 							  unsigned int id)
 {
@@ -223,6 +271,7 @@ static inline struct io_mapped_region *io_zcrx_get_area_region(struct io_ring_ct
 {
 	return NULL;
 }
+
 static inline int io_zcrx_ctrl(struct io_ring_ctx *ctx,
 				void __user *arg, unsigned nr_arg)
 {
