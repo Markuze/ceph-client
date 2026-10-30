@@ -1156,10 +1156,8 @@ void tick_nohz_idle_stop_tick(void)
 		ts->idle_sleeps++;
 		ts->idle_expires = expires;
 
-		if (!was_stopped && tick_sched_flag_test(ts, TS_FLAG_STOPPED)) {
-			kcpustat_dyntick_start(ts->idle_entrytime);
+		if (!was_stopped && tick_sched_flag_test(ts, TS_FLAG_STOPPED))
 			nohz_balance_enter_idle(cpu);
-		}
 	} else {
 		tick_nohz_retain_tick(ts);
 	}
@@ -1201,6 +1199,15 @@ void tick_nohz_idle_enter(void)
 	WARN_ON_ONCE(ts->timer_expires_base);
 	tick_sched_flag_set(ts, TS_FLAG_INIDLE);
 	ts->idle_entrytime = ktime_get();
+	/*
+	 * Account idle time precisely from here on, whether or not the tick
+	 * gets stopped during this idle trip. Ticks landing in idle then
+	 * charge nothing (account_process_tick() bails out while
+	 * kcpustat_idle_dyntick()), so the busy tail of the tick period
+	 * preceding idle entry is no longer booked as idle, and an idle trip
+	 * that keeps its tick is no longer sampled.
+	 */
+	kcpustat_dyntick_start(ts->idle_entrytime);
 	tick_nohz_clock_sleep(ts);
 
 	local_irq_enable();
@@ -1232,8 +1239,7 @@ void tick_nohz_irq_exit(void)
 	if (tick_sched_flag_test(ts, TS_FLAG_INIDLE)) {
 		tick_nohz_clock_sleep(ts);
 		ts->idle_entrytime = ktime_get();
-		if (tick_sched_flag_test(ts, TS_FLAG_STOPPED))
-			kcpustat_irq_exit(ts->idle_entrytime);
+		kcpustat_irq_exit(ts->idle_entrytime);
 	} else {
 		tick_nohz_full_update_tick(ts);
 	}
@@ -1335,13 +1341,11 @@ void tick_nohz_idle_restart_tick(void)
 
 	if (tick_sched_flag_test(ts, TS_FLAG_STOPPED)) {
 		/*
-		 * Update entrytime here in case the tick restart is due to temporary
-		 * polling on forced broadcast. The tick may be stopped again later within
-		 * the same idle trip. The idle_entrytime was updated recently but make sure
-		 * no tiny amount of idle time is accounted twice.
+		 * The CPU stays in its idle trip (temporary polling on forced
+		 * broadcast); idle accounting keeps running until
+		 * tick_nohz_idle_exit().
 		 */
 		ts->idle_entrytime = ktime_get();
-		kcpustat_dyntick_stop(ts->idle_entrytime);
 		tick_nohz_restart_sched_tick(ts, ts->idle_entrytime);
 	}
 }
@@ -1383,11 +1387,10 @@ void tick_nohz_idle_exit(void)
 	tick_sched_flag_clear(ts, TS_FLAG_INIDLE);
 	tick_nohz_clock_wakeup(ts);
 
-	if (tick_sched_flag_test(ts, TS_FLAG_STOPPED)) {
-		now = ktime_get();
-		kcpustat_dyntick_stop(now);
+	now = ktime_get();
+	kcpustat_dyntick_stop(now);
+	if (tick_sched_flag_test(ts, TS_FLAG_STOPPED))
 		tick_nohz_idle_update_tick(ts, now);
-	}
 
 	local_irq_enable();
 }
@@ -1444,11 +1447,15 @@ static inline void tick_nohz_irq_enter(void)
 
 	tick_nohz_clock_wakeup(ts);
 
-	if (!tick_sched_flag_test(ts, TS_FLAG_STOPPED))
+	if (!tick_sched_flag_test(ts, TS_FLAG_INIDLE) &&
+	    !tick_sched_flag_test(ts, TS_FLAG_STOPPED))
 		return;
 
 	now = ktime_get();
 	kcpustat_irq_enter(now);
+
+	if (!tick_sched_flag_test(ts, TS_FLAG_STOPPED))
+		return;
 
 	/*
 	 * If all CPUs are idle we may need to update a stale jiffies value.

@@ -358,6 +358,16 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
 	}
 }
 
+/*
+ * True when idle time is measured precisely by kcpustat_dyntick_start/stop()
+ * over the whole idle trip, so the tick must never charge idle time itself.
+ */
+static inline bool kcpustat_idle_precise(void)
+{
+	return IS_ENABLED(CONFIG_NO_HZ_COMMON) &&
+	       !IS_ENABLED(CONFIG_HAVE_VIRT_CPU_ACCOUNTING_IDLE);
+}
+
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 /*
  * Account a tick to a process and cpustat
@@ -407,7 +417,7 @@ static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 		account_system_index_time(p, cputime, CPUTIME_SOFTIRQ);
 	} else if (user_tick) {
 		account_user_time(p, cputime);
-	} else if (p == this_rq()->idle) {
+	} else if (p == this_rq()->idle && !kcpustat_idle_precise()) {
 		account_idle_time(cputime);
 	} else if (p->flags & PF_VCPU) { /* System time or guest time */
 		account_guest_time(p, cputime);
@@ -684,6 +694,14 @@ void thread_group_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
  * Account a single tick of CPU time.
  * @p: the process that the CPU time gets accounted to
  * @user_tick: indicates if the tick is a user or a system tick
+ *
+ * With dyntick idle accounting, the idle task's sleep time is measured
+ * precisely from tick_nohz_idle_enter() to tick_nohz_idle_exit() and ticks
+ * landing in that window charge nothing (kcpustat_idle_dyntick()). A tick
+ * that finds the idle task outside that window (idle loop entry and exit,
+ * the scheduler switching to and from the idle task) finds a CPU that is
+ * not sleeping: charge it as system time rather than idle, so that the
+ * fields keep summing up to wall time and idle stays the precise value.
  */
 void account_process_tick(struct task_struct *p, int user_tick)
 {
@@ -710,7 +728,8 @@ void account_process_tick(struct task_struct *p, int user_tick)
 
 	if (user_tick)
 		account_user_time(p, cputime);
-	else if ((p != this_rq()->idle) || (irq_count() != HARDIRQ_OFFSET))
+	else if ((p != this_rq()->idle) || (irq_count() != HARDIRQ_OFFSET) ||
+		 kcpustat_idle_precise())
 		account_system_time(p, HARDIRQ_OFFSET, cputime);
 	else
 		account_idle_time(cputime);
