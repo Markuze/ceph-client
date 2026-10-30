@@ -99,6 +99,14 @@ struct io_uring_opaque_frame {
 #define IORING_OPAQUE_OBJECT_F_COMPACTED	(1U << 0)
 #define IORING_OPAQUE_OBJECT_F_COMPACTING	(1U << 1)
 #define IORING_OPAQUE_OBJECT_F_FORWARD_ONLY (1U << 2)
+/*
+ * Every extent of the object is in the area of the MAIO instance that the
+ * store binds, so the process can see all its bytes through the mapping of the
+ * area. Always set for an object of a bound store. The flag is in the flags of
+ * IORING_OPAQUE_OBJECT_STAT and in the second extra word of the completion of
+ * IORING_OPAQUE_RECV_OBJECT, next to IORING_OPAQUE_OBJECT_F_FORWARD_ONLY.
+ */
+#define IORING_OPAQUE_OBJECT_F_MAPPED		(1U << 3)
 #define IORING_OPAQUE_STREAM_F_EOF		(1U << 0)
 #define IORING_OPAQUE_POLICY_F_AUTO_COMPACT	(1U << 0)
 

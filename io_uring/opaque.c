@@ -1683,6 +1683,8 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 				slot->data = op->data;
 				if (op->data->forward_only)
 					object_flags = IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
+				if (op->data->mapped)
+					object_flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
 				store->nr_objects++;
 				op->data = NULL;
 				slot->reserved = false;
@@ -1967,6 +1969,8 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 
 			if (op->data->forward_only)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
+			if (op->data->mapped)
+				stat.flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
 			mutex_lock(&store->tables);
 			slot = io_opaque_lookup(store, op->handle);
 			if (slot && slot->compacting)
