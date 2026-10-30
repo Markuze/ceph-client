@@ -24,6 +24,7 @@
 #include <net/route.h>
 #include <net/xdp.h>
 #include <net/net_failover.h>
+#include <net/netdev_lock.h>
 #include <net/netdev_rx_queue.h>
 #include <net/netdev_queues.h>
 #include <net/xdp_sock_drv.h>
@@ -354,6 +355,14 @@ struct receive_queue {
 
 	/* True if page_pool handles DMA mapping via PP_FLAG_DMA_MAP */
 	bool use_page_pool_dma;
+
+	/* True if the pool was created with PP_FLAG_PRIVATE_HEADERS, for a
+	 * queue that has a provider of readable pages. Another party can then
+	 * read and write the pool pages, so page_to_skb() copies the headers
+	 * into a private head. Changes only while NAPI is off. XDP and AF_XDP
+	 * cannot attach to a device with a provider: the core refuses it.
+	 */
+	bool private_headers;
 
 	/* RX: fragments + linear part + virtio header */
 	struct scatterlist sg[MAX_SKB_FRAGS + 2];
@@ -819,6 +828,45 @@ static struct sk_buff *virtnet_build_skb(void *buf, unsigned int buflen,
 	return skb;
 }
 
+/* Return how many frame bytes to copy into the private head of a queue that
+ * binds a memory provider. @data points at the Ethernet header. @len is the
+ * number of frame bytes in the first receive buffer. It is at least
+ * ETH_HLEN.
+ *
+ * Copy the headers up to the end of the transport header, as
+ * eth_get_headlen() finds them. Then no payload byte lands in the head.
+ * Never copy more than GOOD_COPY_LEN bytes. If the headers are longer, the
+ * head ends inside them, and the stack pulls the rest from the fragment
+ * when it needs it.
+ *
+ * If the dissector finds nothing beyond the Ethernet header, copy the frame
+ * up to the same limit. eth_type_trans() pulls the Ethernet header. A head
+ * that is empty after that makes GRO read the first fragment, which is the
+ * page, in place of the head.
+ *
+ * Another party can write the page while this code runs. The dissector
+ * checks every read against the limit, and the result stays inside the
+ * bounds above. A concurrent write can only move the border between head
+ * and fragment. The stack parses the copy in the head, or a copy that
+ * pskb_may_pull() makes, never the page.
+ */
+static unsigned int virtnet_priv_head_len(const struct virtnet_info *vi,
+					  const void *data, unsigned int len)
+{
+	unsigned int max = min_t(unsigned int, len, GOOD_COPY_LEN);
+	unsigned int hlen;
+
+	/* The dissector never returns more than it gets. Another party wrote
+	 * the bytes, so the test makes sure that a fault in the dissector
+	 * cannot move the copy outside the buffer.
+	 */
+	hlen = eth_get_headlen(vi->dev, data, max);
+	if (hlen <= ETH_HLEN || hlen > max)
+		hlen = max;
+
+	return hlen;
+}
+
 /* Called from bottom half context */
 static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 				   struct receive_queue *rq,
@@ -849,6 +897,30 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 	tailroom = truesize - headroom  - hdr_padded_len - len;
 
 	shinfo_size = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+	/* The pool binds a memory provider, so another party can write the
+	 * page. Do not build the skb over the page: the stack would parse
+	 * headers in it. Copy the headers into a private head and attach the
+	 * rest of the buffer as a fragment of the page. Allocate the same
+	 * head as for the other queues, so that a later pull from the
+	 * fragment finds room. Only mergeable buffers get here: no other mode
+	 * has such a queue.
+	 */
+	if (unlikely(rq->private_headers)) {
+		skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
+		if (unlikely(!skb))
+			return NULL;
+
+		copy = virtnet_priv_head_len(vi, p, len);
+		skb_put_data(skb, p, copy);
+		len -= copy;
+		offset += copy;
+		if (len)
+			skb_add_rx_frag(skb, 0, page, offset, len, truesize);
+		else
+			page_to_free = page;
+		goto ok;
+	}
 
 	if (!NET_IP_ALIGN && len > GOOD_COPY_LEN && tailroom >= shinfo_size) {
 		skb = virtnet_build_skb(buf, truesize, p - buf, len);
@@ -3102,9 +3174,36 @@ static void virtnet_update_settings(struct virtnet_info *vi)
 		vi->duplex = duplex;
 }
 
+/* True if the pool of @rq must bind the memory provider of the queue. Only a
+ * provider of readable pages counts. A provider of unreadable memory needs
+ * header split, which this driver cannot enable, so the core never binds one
+ * to a queue of this device. The provider of a queue changes only under
+ * dev->lock. The caller holds it, except before the device registers, when no
+ * provider exists. A queue of a closed interface gets no such pool. The
+ * provider can go away while the interface is closed, and the driver gets no
+ * call then. virtnet_open() creates the pool.
+ */
+static bool virtnet_rq_has_readable_provider(struct virtnet_info *vi,
+					     struct receive_queue *rq)
+{
+	const struct pp_memory_provider_params *mpp;
+
+	netdev_assert_locked_or_invisible(vi->dev);
+
+	if (!netif_running(vi->dev))
+		return false;
+	mpp = &__netif_get_rx_queue(vi->dev, rq - vi->rq)->mp_params;
+	return mpp->mp_ops && (mpp->flags & PP_MP_F_READABLE);
+}
+
+/* With @private_headers set, the pool binds the memory provider of the queue.
+ * The driver then promises that no header the stack parses stays in a pool
+ * page: page_to_skb() copies it.
+ */
 static struct page_pool *virtnet_create_page_pool(struct virtnet_info *vi,
 						  struct receive_queue *rq,
-						  struct napi_struct *napi)
+						  struct napi_struct *napi,
+						  bool private_headers)
 {
 	struct page_pool_params pp_params = { 0 };
 	struct device *dma_dev;
@@ -3113,6 +3212,7 @@ static struct page_pool *virtnet_create_page_pool(struct virtnet_info *vi,
 	pp_params.pool_size = virtqueue_get_vring_size(rq->vq);
 	pp_params.nid = dev_to_node(vi->vdev->dev.parent);
 	pp_params.netdev = vi->dev;
+	pp_params.queue_idx = rq - vi->rq;
 	pp_params.napi = napi;
 
 	/* Use page_pool DMA mapping if backend supports DMA API.
@@ -3130,6 +3230,9 @@ static struct page_pool *virtnet_create_page_pool(struct virtnet_info *vi,
 		pp_params.flags = 0;
 	}
 
+	if (private_headers)
+		pp_params.flags |= PP_FLAG_PRIVATE_HEADERS;
+
 	return page_pool_create(&pp_params);
 }
 
@@ -3138,33 +3241,43 @@ static void virtnet_destroy_page_pool(struct receive_queue *rq)
 	if (rq->page_pool) {
 		page_pool_destroy(rq->page_pool);
 		rq->page_pool = NULL;
+		rq->private_headers = false;
 	}
+}
+
+/* Create the page pool of @rq, unless the queue has one or uses none. */
+static int virtnet_setup_page_pool(struct virtnet_info *vi,
+				   struct receive_queue *rq)
+{
+	struct page_pool *pool;
+	bool private_headers;
+
+	if (vi->big_packets && !vi->mergeable_rx_bufs)
+		return 0;
+
+	if (rq->page_pool || rq->xsk_pool)
+		return 0;
+
+	private_headers = virtnet_rq_has_readable_provider(vi, rq);
+	pool = virtnet_create_page_pool(vi, rq, &rq->napi, private_headers);
+	if (IS_ERR(pool))
+		return PTR_ERR(pool);
+
+	rq->page_pool = pool;
+	rq->private_headers = private_headers;
+	rq->use_page_pool_dma = !!virtqueue_dma_dev(rq->vq);
+
+	return 0;
 }
 
 static int virtnet_create_page_pools(struct virtnet_info *vi)
 {
 	int i, err;
 
-	if (vi->big_packets && !vi->mergeable_rx_bufs)
-		return 0;
-
 	for (i = 0; i < vi->max_queue_pairs; i++) {
-		struct receive_queue *rq = &vi->rq[i];
-
-		if (rq->page_pool)
-			continue;
-
-		if (rq->xsk_pool)
-			continue;
-
-		rq->page_pool = virtnet_create_page_pool(vi, rq, &rq->napi);
-		if (IS_ERR(rq->page_pool)) {
-			err = PTR_ERR(rq->page_pool);
-			rq->page_pool = NULL;
+		err = virtnet_setup_page_pool(vi, &vi->rq[i]);
+		if (err)
 			goto err_cleanup;
-		}
-
-		rq->use_page_pool_dma = !!virtqueue_dma_dev(rq->vq);
 	}
 	return 0;
 
@@ -3182,10 +3295,80 @@ static void virtnet_destroy_page_pools(struct virtnet_info *vi)
 		virtnet_destroy_page_pool(&vi->rq[i]);
 }
 
+/* Return every posted buffer of @rq to its pool and destroy the pool.
+ *
+ * The caller holds dev->lock, and NAPI of the queue is off. On an error the
+ * queue keeps its pool. The ring is already empty if only the last step of
+ * the reset failed.
+ */
+static int virtnet_release_page_pool(struct virtnet_info *vi,
+				     struct receive_queue *rq)
+{
+	int err;
+
+	err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
+	if (err) {
+		netdev_err(vi->dev, "reset rx fail: rx queue index: %d err: %d\n",
+			   (int)(rq - vi->rq), err);
+		return err;
+	}
+
+	page_pool_disable_direct_recycling(rq->page_pool);
+	virtnet_destroy_page_pool(rq);
+
+	return 0;
+}
+
+/* A pool that binds a memory provider lives only while the interface is up.
+ * The core expects such a pool to die in ndo_stop, and the provider can go
+ * away while the interface is down. The other pools live as long as the
+ * device. virtnet_open() creates the pool again.
+ */
+static void virtnet_release_provider_pools(struct virtnet_info *vi)
+{
+	int i;
+
+	for (i = 0; i < vi->max_queue_pairs; i++)
+		if (vi->rq[i].private_headers)
+			virtnet_release_page_pool(vi, &vi->rq[i]);
+}
+
+/* Give @rq the pool that fits the provider of the queue now. A pool stays
+ * as it is when it fits. Otherwise the pool is a leftover: virtnet_close()
+ * could not release it, or the device came back from a suspend while the
+ * interface was closed.
+ */
+static int virtnet_sync_page_pool(struct virtnet_info *vi,
+				  struct receive_queue *rq)
+{
+	int err;
+
+	if (rq->page_pool &&
+	    rq->private_headers != virtnet_rq_has_readable_provider(vi, rq)) {
+		err = virtnet_release_page_pool(vi, rq);
+		if (err)
+			return err;
+	}
+
+	return virtnet_setup_page_pool(vi, rq);
+}
+
 static int virtnet_open(struct net_device *dev)
 {
 	struct virtnet_info *vi = netdev_priv(dev);
 	int i, err;
+
+	/* virtnet_close() released the pool of each queue that binds a memory
+	 * provider. Create it again before the first fill, so that it binds
+	 * the provider that the queue has now. Replace a pool that does not
+	 * fit the provider. All other queues keep their pool, and this loop
+	 * does nothing for them.
+	 */
+	for (i = 0; i < vi->max_queue_pairs; i++) {
+		err = virtnet_sync_page_pool(vi, &vi->rq[i]);
+		if (err)
+			goto err_pools;
+	}
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		if (i < vi->curr_queue_pairs)
@@ -3215,6 +3398,8 @@ err_enable_qp:
 		virtnet_disable_queue_pair(vi, i);
 		virtnet_cancel_dim(vi, &vi->rq[i].dim);
 	}
+err_pools:
+	virtnet_release_provider_pools(vi);
 
 	return err;
 }
@@ -3825,6 +4010,9 @@ static int virtnet_close(struct net_device *dev)
 	}
 
 	netif_carrier_off(dev);
+
+	/* NAPI is off and XDP no longer uses the pools. */
+	virtnet_release_provider_pools(vi);
 
 	return 0;
 }
@@ -5773,6 +5961,7 @@ static const struct netdev_stat_ops virtnet_stat_ops = {
  */
 struct virtnet_rq_mem {
 	struct page_pool *page_pool;
+	bool private_headers;
 };
 
 static int virtnet_queue_mem_alloc(struct net_device *dev,
@@ -5783,14 +5972,16 @@ static int virtnet_queue_mem_alloc(struct net_device *dev,
 	struct virtnet_rq_mem *mem = per_queue_mem;
 	struct receive_queue *rq = &vi->rq[idx];
 	struct page_pool *pool;
+	bool private_headers;
 	int err;
 
 	/* While the interface is down, the core calls this only to check the
-	 * memory, and it frees the memory at once. The driver keeps its pools
-	 * while the interface is down, so a new pool would never replace the
-	 * old pool. Refuse, so that a caller that binds a provider sees the
-	 * error. __netif_mp_close_rxq() accepts -ENETDOWN. A detached device
-	 * has no queues: the freeze path frees them.
+	 * memory, and it frees the new memory at once. A new pool would never
+	 * replace the pool of the queue. Refuse, so that a caller that binds
+	 * a provider sees the error. __netif_mp_close_rxq() accepts -ENETDOWN.
+	 * A provider that stays bound while the interface goes down gets its
+	 * pool in virtnet_open(). A detached device has no queues: the freeze
+	 * path frees them.
 	 */
 	if (!netif_running(dev) || !netif_device_present(dev))
 		return -ENETDOWN;
@@ -5807,7 +5998,8 @@ static int virtnet_queue_mem_alloc(struct net_device *dev,
 	 * pool before it starts it. ndo_queue_start() gives the pool to the
 	 * NAPI instance.
 	 */
-	pool = virtnet_create_page_pool(vi, rq, NULL);
+	private_headers = virtnet_rq_has_readable_provider(vi, rq);
+	pool = virtnet_create_page_pool(vi, rq, NULL, private_headers);
 	if (IS_ERR(pool))
 		return PTR_ERR(pool);
 
@@ -5818,6 +6010,7 @@ static int virtnet_queue_mem_alloc(struct net_device *dev,
 	}
 
 	mem->page_pool = pool;
+	mem->private_headers = private_headers;
 	return 0;
 }
 
@@ -5863,7 +6056,9 @@ static int virtnet_queue_stop(struct net_device *dev, void *per_queue_mem,
 	page_pool_disable_direct_recycling(rq->page_pool);
 	xdp_rxq_info_detach_mem_model(&rq->xdp_rxq);
 	mem->page_pool = rq->page_pool;
+	mem->private_headers = rq->private_headers;
 	rq->page_pool = NULL;
+	rq->private_headers = false;
 
 	return 0;
 }
@@ -5878,7 +6073,9 @@ static int virtnet_queue_start(struct net_device *dev,
 
 	/* NAPI is off, so no poll sees the queue half installed. */
 	rq->page_pool = mem->page_pool;
+	rq->private_headers = mem->private_headers;
 	mem->page_pool = NULL;
+	mem->private_headers = false;
 	page_pool_enable_direct_recycling(rq->page_pool, &rq->napi);
 	xdp_rxq_info_attach_page_pool(&rq->xdp_rxq, rq->page_pool);
 
