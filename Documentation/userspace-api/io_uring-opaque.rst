@@ -48,8 +48,9 @@ All configuration limits are explicit. ``hard_limit`` and
 ``compact_headroom`` are page aligned; ordinary capture cannot use headroom.
 The hard limit includes headroom. Object size, object slots, stream slots,
 extents and pending requests have separate bounds. Registering reserves the
-hard-limit capacity against the registration owner's locked-memory accounting.
-The payload is allocated or retained on demand.
+hard-limit capacity against the registration owner's locked-memory accounting,
+plus the destination unit cache when one is enabled (see `Destination unit
+cache`_). The payload is allocated or retained on demand.
 
 The optional ``high_watermark``, ``low_watermark`` and ``reply_reserve``
 fields define a memory-pressure policy at store creation. Omitted fields are
@@ -158,6 +159,13 @@ linking/cancellation retain their usual meaning. CQE suppression is rejected.
        consuming them. Length is capacity. If no bytes are available at the
        requested offset, arm asynchronously for the first bytes. Result is
        the actual copied count, or zero at EOF. There is no WAITALL option.
+   * - AVAILABLE
+     - Query the contiguous unclassified byte count without consuming or
+       copying payload. ``addr`` is the stream token, ``off`` the stream
+       offset, ``len`` a capacity from 1 through INT_MAX, and ``addr3`` zero.
+       Like INSPECT, it waits for the first byte, stops at a consumed gap,
+       returns zero only at EOF, and shares its cancellation, error, demand
+       and first-byte conflict rules. The returned count is limited by ``len``.
    * - RECV_OBJECT
      - Consume a selected range into private assembly. Publish an object only
        when the entire range and its vector are complete. Result is length;
@@ -468,6 +476,39 @@ cannot consume compaction headroom. With a zero reply reserve, snapshots share
 ordinary capture capacity, so an eviction guarantees reply admission only
 while no permitted collection pass takes the freed capacity first.
 
+Destination unit cache
+----------------------
+
+Compaction and CREATE destinations can be recycled through a per-store cache
+of whole destination units, compound pages of 32 KiB by default. The cache is
+disabled unless the ``cache_bytes`` parameter (see `Evaluation parameters`_)
+was nonzero when the store was registered. Only pages the store allocated for
+compaction or CREATE enter it; retained RX pages, capture copy pages and
+smaller tail chunks are freed as before.
+
+When the last extent reference to a unit drops, the store keeps its own page
+reference instead of freeing the page. If nothing else references the page,
+the unit becomes idle and the next compaction or CREATE writes it, most
+recently released first. If TCP still references it through queued or
+unacknowledged data, transmit clones or retransmission copies, the unit cools:
+it is reused only once its page reference count shows the cache as the last
+holder. A cooling unit still referenced after one second is released to the
+allocator; the outside holder keeps that memory valid. Reuse never depends on
+the send CQE or SEND_LAST cleanup, which both happen while TCP may still hold
+the data.
+
+Cached units are store overhead, not payload. They are outside the hard limit,
+``backing_bytes`` and the watermarks, so they never reduce capture or
+compaction capacity; a unit taken from the cache consumes the compaction or
+CREATE reservation exactly like a fresh allocation. Cached units stay charged
+to the registration owner's memory cgroup, and registration reserves the cache
+size against locked-memory accounting in addition to the hard limit. The size
+is bounded by ``compact_headroom`` and rounded down to whole units; a full
+cache frees further units. A failed or canceled compaction returns its partial
+destination units to the cache. Store teardown releases every cached unit, and
+units released after teardown, for example by a send that outlives the store,
+are freed rather than cached.
+
 Watermarks and forwarding-only objects
 --------------------------------------
 
@@ -507,7 +548,8 @@ cacheable bytes or a guarantee of unlimited forwarding progress.
 The hard limit bounds store-owned backing, framing and reserved replacement capacity.
 It is not a census or bound of all physical memory retained by networking.
 TCP can retain pages after the store drops its last reference and accounting
-charge. Socket accounting and shared page-pool/compound-page slack must be
+charge. Cached destination units are bounded separately by the cache size.
+Socket accounting and shared page-pool/compound-page slack must be
 considered separately in physical-memory evaluation. OBJECT_STAT's summed
 extent charges can overestimate exclusive reclaimable backing when it is shared.
 
@@ -519,12 +561,17 @@ Manual and automatic compaction use the same copy and publication algorithm:
 1. Pin the source version and claim the slot for compaction.
 2. Reserve ``round_up(length, PAGE_SIZE)`` destination bytes under the hard
    limit while source backing remains charged.
-3. Allocate chunks of at most 64 KiB. Choose the largest power of two within
-   the remaining rounded size and fall back through smaller orders to base
-   pages. Only the final page has byte slack; the tail is not oversized.
-4. Copy with a persistent source cursor outside stream/table locks. Check
-   cancellation and store shutdown between page-sized copies and yield
-   between chunks. Replacement allocations use the registration owner's memcg.
+3. Without a unit cache, allocate chunks of at most 64 KiB: choose the
+   largest power of two within the remaining rounded size and fall back
+   through smaller orders to base pages. With a unit cache, take every whole
+   unit (32 KiB by default) from the cache or allocate it at the unit order,
+   and allocate the remainder as above. Only the final page has byte slack;
+   the tail is not oversized.
+4. Copy with a persistent source cursor outside stream/table locks, one copy
+   per contiguous source run within a destination chunk (page-sized pieces
+   with HIGHMEM or the ``compact_copy_per_page`` parameter). Check
+   cancellation and store shutdown between copies and yield between chunks.
+   Replacement allocations use the registration owner's memcg.
 5. Build the replacement vector, revalidate generation and source identity,
    and atomically replace the table's backing reference without changing the
    handle. Existing operations continue with their old version.
@@ -535,8 +582,10 @@ Allocated destination bytes consume the reservation rather than adding a
 second charge. Thus total accounting is source/other backing plus allocated
 destination plus unallocated destination reservation. For a fixture holding
 80,000 bytes in 40 independently charged 4 KiB pages, dense backing charges
-81,920 bytes and peak source-plus-destination charge is 245,760 bytes. The
-preferred allocations produce two extents; fallback may produce more.
+81,920 bytes and peak source-plus-destination charge is 245,760 bytes.
+Without a unit cache the preferred allocations produce two extents (64 and
+16 KiB); with 32 KiB units they produce three (32, 32 and 16 KiB). Fallback
+may produce more. The charges are the same in both cases.
 
 Automatic compaction is opt-in through ``IORING_OPAQUE_POLICY_F_AUTO_COMPACT``.
 Policy exposes only copy bytes per second, burst allowance and maximum
@@ -547,7 +596,9 @@ multiple extents; these thresholds can change without changing the ABI. One
 delayed compaction dispatcher per store handles manual requests and automatic
 selection. An automatic scan examines at most 32 candidates and copies at
 most one object, with the next scan paced independently of manual wakeups.
-The single work item serializes copying without a second worker or copy mutex.
+The single work item serializes its copies without a second worker or copy
+mutex; inline manual copies (below) run in their issuing tasks and can overlap
+a dispatcher copy of another object.
 FREE and SEND_LAST remove
 candidates; forwarding-only objects are excluded, dense versions are removed
 after success, and failures back off. Publication queues the next paced scan
@@ -560,6 +611,16 @@ policy changes. Permanently ineligible candidates are removed from the scan
 list so they do not keep an idle timer running; a policy update reconsiders
 all non-dense objects. A transient token shortage or failed allocation keeps
 its candidate for a later retry.
+
+A manual COMPACT of an object no larger than the ``inline_compact_max``
+parameter instead runs in the issuing task under the ring submission lock,
+like CREATE: it claims the slot, copies, publishes and completes without the
+dispatcher or a task-work round trip, and blocks other submissions on that
+ring for the duration of the copy. Publication, revalidation and the failure
+rules are unchanged. The request is never queued, so there is nothing for
+cancellation to claim; store shutdown still stops the copy and rejects
+publication. The default of zero sends every manual request to the
+dispatcher. Automatic compaction and larger objects always use it.
 
 The dispatcher uses the shared unbound worker pool and processes at most
 eight manual requests per invocation before checking automatic policy. Stores
@@ -578,6 +639,59 @@ rejects publication and replacement backing is released. A manual COMPACT
 returns ESTALE; neither compaction path can restore the handle or overwrite
 a reused slot. If compaction publishes first, SEND_LAST claims the replacement
 under the same handle. Both send modes use the same compaction machinery.
+
+Evaluation parameters
+=====================
+
+The destination unit cache, the unit size, inline manual compaction and the
+compaction copy loop are selected by parameters under
+``/sys/module/io_uring_opaque/parameters/``, writable by root at run time or
+set on the kernel command line as ``io_uring_opaque.<name>=<value>``. They
+exist for measurement, are not ABI and may change or disappear. The defaults
+keep the behaviour without the cache and without inline compaction; the
+per-run copy is byte-identical to the page-split copy it replaces.
+
+``cache_bytes`` (default 0)
+    Per-store unit cache size in bytes, sampled when a store is registered;
+    0 disables the cache. Bounded by ``compact_headroom`` and rounded down to
+    whole units. Existing stores keep their size.
+``unit_order`` (default 3, 32 KiB with 4 KiB pages)
+    Page order of a unit, 0 to 4, sampled at registration. Used only by stores
+    with a cache; without one, chunk selection is unchanged.
+``inline_compact_max`` (default 0)
+    Largest object in bytes that a manual COMPACT copies in the issuing task;
+    0 sends every manual request to the dispatcher. Read at each request.
+``compact_copy_per_page`` (default N)
+    Y selects the original compaction copy loop, which also cuts at every
+    source and destination page. Read at each compaction.
+
+The same directory holds read-only counters summed over all stores. They are
+cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
+
+``stat_cache_hits``, ``stat_cache_misses``
+    Whole-unit destinations taken from the cache, or allocated because no
+    cached unit was reusable.
+``stat_cache_fallbacks``
+    Misses whose unit-order allocation failed and fell back to a smaller order;
+    such chunks are not cached later.
+``stat_cache_remote``
+    Hits on a unit from a different NUMA node than the copying CPU.
+``stat_cache_retired``, ``stat_cache_cooled``
+    Units accepted by a cache, and those of them still referenced elsewhere
+    when accepted.
+``stat_cache_cooling_hits``, ``stat_cache_probes_failed``, ``stat_cache_expired``
+    Cooling units found unreferenced and made idle, probes of cooling units
+    still referenced, and cooling units released after one second.
+``stat_cache_trimmed``, ``stat_cache_drained``
+    Units freed because a cache was full, and units released at store
+    teardown.
+``stat_cached_bytes``
+    Bytes currently held by all caches, idle and cooling.
+``stat_compact_inline``, ``stat_compact_worker``, ``stat_compact_auto``
+    Manual compactions run in the issuing task, manual compactions queued to
+    the dispatcher, and automatic compactions started.
+``stat_compact_bytes``
+    Bytes copied into compaction destinations.
 
 Validation and reproduction
 ===========================
@@ -663,6 +777,15 @@ decided bytes through a held gate), and forwarding-only version replacement
 with advisory send admission.
 CREATE cases cover private reservation and extent-failure unwind, publication
 generation/shutdown checks, and dense admission with generation retirement.
+Destination unit cache cases cover reuse of released units, cooling while an
+skb fragment, transmit clone or retransmission copy still references a unit,
+the size limit, ageing, accounting outside the hard limit, locked-memory
+reservation and parameter sampling at registration, teardown with a version
+that outlives it, unit return after a mid-copy cancellation, and CREATE reuse.
+Copy cases compare the per-run and page-split loops byte for byte with and
+without units; inline cases cover synchronous publication, the dispatcher
+threshold and an inline reservation failure. A pressure case shows that a full
+cache leaves capture admission and watermarks unchanged.
 ``CONFIG_KUNIT`` is required. Compaction and tests compile as separate source
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.

@@ -46,7 +46,7 @@ static int pressure_wake(wait_queue_entry_t *entry, unsigned int mode,
 static void pressure_cleanup(void *arg)
 {
 	struct pressure_fixture *f = arg;
-	struct pressure_range *range;
+	struct pressure_range *range, *next;
 
 	list_del_init(&f->collector.wait);
 	cancel_delayed_work_sync(&f->store.retry_work);
@@ -66,6 +66,9 @@ static void pressure_cleanup(void *arg)
 		sock_release(f->tx);
 	if (f->listener)
 		sock_release(f->listener);
+	/* Not test-managed: KUnit frees managed allocations before this action. */
+	list_for_each_entry_safe(range, next, &f->ranges, list)
+		kfree(range);
 }
 
 static int pressure_init(struct kunit *test)
@@ -144,7 +147,7 @@ static struct io_opaque_req *pressure_range(struct kunit *test, u16 cmd,
 					  u64 offset, u32 length)
 {
 	struct pressure_fixture *f = test->priv;
-	struct pressure_range *range = kunit_kzalloc(test, sizeof(*range), GFP_KERNEL);
+	struct pressure_range *range = kzalloc(sizeof(*range), GFP_KERNEL);
 	struct io_opaque_req *op;
 
 	KUNIT_ASSERT_NOT_NULL(test, range);
@@ -163,7 +166,7 @@ static struct io_opaque_req *pressure_range(struct kunit *test, u16 cmd,
 	range->req.async_data = op;
 	range->req.cqe.user_data = (unsigned long)op;
 	list_add_tail(&range->list, &f->ranges);
-	if (cmd != IORING_OPAQUE_DISCARD) {
+	if (cmd != IORING_OPAQUE_DISCARD && cmd != IORING_OPAQUE_AVAILABLE) {
 		op->data = io_opaque_data_alloc();
 		KUNIT_ASSERT_NOT_NULL(test, op->data);
 	}
@@ -371,6 +374,166 @@ static void pressure_buffered_inspect(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->stream.undecided, 96ULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), (s64)4 * PAGE_SIZE);
 	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+}
+
+static void pressure_available(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op, *discard;
+	struct io_opaque_extent *extent;
+	int refs, extents;
+
+	pressure_seed(test, false);
+	extent = list_first_entry(&f->stream.extents, struct io_opaque_extent, list);
+	refs = refcount_read(&extent->backing->refs);
+	extents = atomic_read(&f->store.extents);
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 16, 40);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->result, 40);
+	KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&extent->backing->refs), refs);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.copied), 0LL);
+	discard = pressure_range(test, IORING_OPAQUE_DISCARD, 32, 32);
+	pressure_start(test, discard);
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 16, 80);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->result, 16);
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 32, 1);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->result, -ENODATA);
+	f->stream.eof = true;
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 96, 1);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->result, 0);
+	f->stream.eof = false;
+	f->stream.error = -ECONNRESET;
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 96, 1);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->result, -ECONNRESET);
+}
+
+static void pressure_available_wait(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op, *take, *conflict;
+	struct io_cancel_data cd = { .ctx = f->ctx };
+
+	pressure_seed(test, false);
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 96, 32);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_RANGE_WAIT);
+	mutex_lock(&f->stream.lock);
+	KUNIT_EXPECT_TRUE(test, io_opaque_collect_demand(&f->stream));
+	mutex_unlock(&f->stream.lock);
+	KUNIT_EXPECT_GT(test, f->wakes, 0U);
+	conflict = pressure_range(test, IORING_OPAQUE_DISCARD, 96, 1);
+	mutex_lock(&f->ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, io_opaque_range_start(conflict), -EBUSY);
+	mutex_unlock(&f->ctx->uring_lock);
+	take = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 32);
+	pressure_start(test, take);
+	KUNIT_EXPECT_EQ(test, take->result, 32);
+	cd.data = op->req->cqe.user_data;
+	KUNIT_EXPECT_EQ(test, io_opaque_cancel(f->ctx, &cd, IO_URING_F_UNLOCKED), 0);
+	KUNIT_EXPECT_EQ(test, op->result, -ECANCELED);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->stream.reads));
+}
+
+static void pressure_available_capture(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+
+	pressure_seed(test, false);
+	io_opaque_extents_free(&f->store, &f->held);
+	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 96, 8);
+	pressure_start(test, op);
+	pressure_send(test, 0x42, 32);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, 8);
+	KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
+	KUNIT_EXPECT_EQ(test, f->stream.undecided, 128ULL);
+}
+
+static void pressure_available_deferred_take(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *take, *query, *conflict;
+
+	pressure_fill(test, false);
+	take = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 32, 96);
+	pressure_start(test, take);
+	KUNIT_ASSERT_EQ(test, take->phase, IO_OPAQUE_RANGE_WAIT);
+	KUNIT_ASSERT_EQ(test, take->progress, 0ULL);
+	KUNIT_ASSERT_EQ(test, f->stream.undecided, 96ULL);
+	query = pressure_range(test, IORING_OPAQUE_AVAILABLE, 16, 80);
+	pressure_start(test, query);
+	KUNIT_EXPECT_EQ(test, query->result, 16);
+	KUNIT_EXPECT_PTR_EQ(test, query->data, NULL);
+	query = pressure_range(test, IORING_OPAQUE_AVAILABLE, 16, 8);
+	pressure_start(test, query);
+	KUNIT_EXPECT_EQ(test, query->result, 8);
+	conflict = pressure_range(test, IORING_OPAQUE_AVAILABLE, 32, 1);
+	mutex_lock(&f->ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, io_opaque_range_start(conflict), -EBUSY);
+	mutex_unlock(&f->ctx->uring_lock);
+}
+
+static void pressure_available_prep(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_uring_sqe sqe = {
+		.fd = -1, .ioprio = IORING_OPAQUE_AVAILABLE,
+		.opaque_store_id = 1, .addr = 0x123456, .len = 1,
+	};
+	struct io_kiocb req = { .ctx = f->ctx, .opcode = IORING_OP_OPAQUE_OBJ };
+	struct io_opaque_req *op;
+	int i, ret;
+	static const struct {
+		u64 off, addr3;
+		u32 len;
+		int result;
+	} cases[] = {
+		{ 0, 0, 0, -EINVAL },
+		{ 0, 0, INT_MAX, 0 },
+		{ 0, 0, (u32)INT_MAX + 1, -EINVAL },
+		{ U64_MAX, 0, 1, -EOVERFLOW },
+		{ 0, 1, 1, -EINVAL },
+		{ 7, 0, 1, 0 },
+	};
+
+	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(f->ctx));
+	xa_init(&f->ctx->opaque_stores);
+	mutex_init(&f->store.tables);
+	f->store.config.max_requests = 8;
+	ret = xa_err(xa_store(&f->ctx->opaque_stores, 1, &f->store, GFP_KERNEL));
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		sqe.off = cases[i].off;
+		sqe.addr3 = cases[i].addr3;
+		sqe.len = cases[i].len;
+		ret = io_opaque_prep(&req, &sqe);
+		KUNIT_EXPECT_EQ(test, ret, cases[i].result);
+		op = req.async_data;
+		if (!ret && op) {
+			KUNIT_EXPECT_EQ(test, op->handle, sqe.addr);
+			KUNIT_EXPECT_PTR_EQ(test, op->addr, NULL);
+			/* No stream slot exists: token resolution must reject it. */
+			KUNIT_EXPECT_EQ(test, io_opaque_issue(&req, IO_URING_F_UNLOCKED), IOU_COMPLETE);
+			KUNIT_EXPECT_EQ(test, req.cqe.res, -ESTALE);
+		}
+		if (op) {
+			mutex_lock(&f->ctx->uring_lock);
+			io_opaque_cleanup(&req);
+			mutex_unlock(&f->ctx->uring_lock);
+		}
+		req.flags = 0;
+	}
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.requests), 0);
+	xa_destroy(&f->ctx->opaque_stores);
+	io_opaque_cache_free(f->ctx);
 }
 
 static void pressure_discard_cursor(struct kunit *test)
@@ -649,6 +812,56 @@ static void pressure_release_before_enrollment(struct kunit *test)
 	pressure_expect_object(test, op);
 }
 
+static void pressure_cache_drain(void *store)
+{
+	io_opaque_unit_drain(store);
+}
+
+/* Cached destination units are outside capture admission and watermarks. */
+static void pressure_cache_rx_admission(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_store *store = &f->store;
+	struct io_opaque_req *op;
+	int i;
+
+	spin_lock_init(&store->transient_lock);
+	seqcount_spinlock_init(&store->transient_seq, &store->transient_lock);
+	io_opaque_unit_cache_init(store, 2, IO_OPAQUE_UNIT_ORDER);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, pressure_cache_drain, store), 0);
+	for (i = 0; i < 2; i++) {
+		struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, IO_OPAQUE_UNIT_ORDER);
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		io_opaque_unit_put(store, page);
+	}
+	KUNIT_ASSERT_EQ(test, store->cache.nr_idle, 2U);
+	/* The full cache holds more than the whole hard limit. */
+	store->config.hard_limit = 4 * PAGE_SIZE;
+	store->config.high_watermark = 3 * PAGE_SIZE;
+	store->config.low_watermark = PAGE_SIZE;
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_NORMAL);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, 2 * PAGE_SIZE, true));
+	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_NORMAL);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, PAGE_SIZE, true));
+	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_LOWMEM);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, PAGE_SIZE, true));
+	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, true));
+	io_opaque_uncharge(store, 4 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_NORMAL);
+	/* A real collection pass completes an object beside the full cache. */
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 64);
+	pressure_start(test, op);
+	pressure_send(test, 0x5c, 64);
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, 64);
+	KUNIT_EXPECT_EQ(test, op->data->length, 64ULL);
+	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 2U);
+	KUNIT_EXPECT_LE(test, atomic64_read(&store->bytes), (s64)store->config.hard_limit);
+}
+
 static struct kunit_case pressure_cases[] = {
 	KUNIT_CASE(pressure_retry_bytes),
 	KUNIT_CASE(pressure_retry_extents),
@@ -656,6 +869,11 @@ static struct kunit_case pressure_cases[] = {
 	KUNIT_CASE(pressure_release_extents),
 	KUNIT_CASE(pressure_buffered_take),
 	KUNIT_CASE(pressure_buffered_inspect),
+	KUNIT_CASE(pressure_available),
+	KUNIT_CASE(pressure_available_wait),
+	KUNIT_CASE(pressure_available_capture),
+	KUNIT_CASE(pressure_available_deferred_take),
+	KUNIT_CASE(pressure_available_prep),
 	KUNIT_CASE(pressure_discard_cursor),
 	KUNIT_CASE(pressure_discard_gap),
 	KUNIT_CASE(pressure_cancel_and_discard),
@@ -669,6 +887,7 @@ static struct kunit_case pressure_cases[] = {
 	KUNIT_CASE(pressure_stream_close),
 	KUNIT_CASE(pressure_impossible_prefix),
 	KUNIT_CASE(pressure_release_before_enrollment),
+	KUNIT_CASE(pressure_cache_rx_admission),
 	{}
 };
 

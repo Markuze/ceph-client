@@ -339,7 +339,11 @@ VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
 
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
-		put_page(backing->page);
+		/* A cached unit leaves the object charge; it is not payload held. */
+		if (backing->owned)
+			io_opaque_unit_put(store, backing->page);
+		else
+			put_page(backing->page);
 		kfree(container_of(backing, struct io_opaque_chunk, backing));
 		io_opaque_uncharge(store, charge);
 	} else {
@@ -538,6 +542,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	refcount_set(&store->refs, 1);
 	refcount_set(&store->users, 1);
 	store->config = cfg;
+	io_opaque_unit_cache_setup(store);
 	store->objects = kvcalloc(cfg.max_objects, sizeof(*store->objects),
 				  GFP_KERNEL_ACCOUNT);
 	store->streams = kvcalloc(cfg.max_streams, sizeof(*store->streams),
@@ -548,7 +553,9 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 		ret = -ENOMEM;
 		goto free_store;
 	}
-	ret = io_account_mem(ctx->user, ctx->mm_account, cfg.hard_limit >> PAGE_SHIFT);
+	/* Cached destination units sit outside the hard limit but not RLIMIT_MEMLOCK. */
+	ret = io_account_mem(ctx->user, ctx->mm_account,
+			     (cfg.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
 	if (ret)
 		goto free_store;
 	store->user = ctx->user ? get_uid(ctx->user) : NULL;
@@ -601,6 +608,8 @@ void io_opaque_stop(struct io_opaque_store *store)
 		WRITE_ONCE(store->dead, 1);
 	}
 	flush_delayed_work(&store->compact_work);
+	/* Retirement refuses units once dead is visible under the cache lock. */
+	io_opaque_unit_drain(store);
 	cancel_delayed_work_sync(&store->retry_work);
 	for (i = 0; i < store->config.max_streams; i++) {
 		struct io_opaque_stream *stream;
@@ -637,8 +646,9 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
 	WARN_ON_ONCE(atomic_read(&store->extents));
 	WARN_ON_ONCE(atomic_read(&store->requests));
+	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_unaccount_mem(store->user, store->mm,
-			 store->config.hard_limit >> PAGE_SHIFT);
+			 (store->config.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
 	obj_cgroup_put(store->objcg);
 	mem_cgroup_put(store->memcg);
 	if (store->mm)
@@ -776,6 +786,23 @@ VISIBLE_IF_KUNIT int io_opaque_available(struct io_opaque_stream *stream, u64 of
 	if (off != start)
 		return off - start;
 	return off < stream->next ? -ENODATA : 0;
+}
+
+/* AVAILABLE must not count bytes reserved by a pending decision, even if
+ * pressure has left that decision's prefix in the stream extents. */
+static int io_opaque_unclassified(struct io_opaque_stream *stream, u64 off, u64 len)
+{
+	struct rb_node *node;
+
+	for (node = rb_first_cached(&stream->decisions); node; node = rb_next(node)) {
+		struct io_opaque_req *decision = rb_entry(node, struct io_opaque_req, decision);
+
+		if (decision->offset > off) {
+			len = min(len, decision->offset - off);
+			break;
+		}
+	}
+	return io_opaque_available(stream, off, len);
 }
 
 static int io_opaque_snapshot(struct io_opaque_req *op)
@@ -979,7 +1006,10 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 	int ret;
 
 	list_for_each_entry_safe(op, next, &stream->reads, read) {
-		ret = stream->closed ? -ECANCELED : io_opaque_snapshot(op);
+		ret = stream->closed ? -ECANCELED :
+			op->op == IORING_OPAQUE_AVAILABLE ?
+			io_opaque_unclassified(stream, op->offset, op->length) :
+			io_opaque_snapshot(op);
 		if (!ret && !stream->eof && !stream->closed && !stream->error)
 			continue;
 		list_del_init(&op->read);
@@ -1687,7 +1717,8 @@ static struct io_opaque_store *io_opaque_get_store(struct io_kiocb *req, u32 id)
 
 static bool io_opaque_stream_op(u16 op)
 {
-	return op == IORING_OPAQUE_INSPECT || op == IORING_OPAQUE_RECV_OBJECT ||
+	return op == IORING_OPAQUE_INSPECT || op == IORING_OPAQUE_AVAILABLE ||
+	       op == IORING_OPAQUE_RECV_OBJECT ||
 	       op == IORING_OPAQUE_DISCARD || op == IORING_OPAQUE_STREAM_STAT ||
 	       op == IORING_OPAQUE_STREAM_CLOSE;
 }
@@ -1704,7 +1735,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -ENXIO;
 	if (READ_ONCE(sqe->fd) != -1 || READ_ONCE(sqe->rw_flags) ||
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
-	    cmd > IORING_OPAQUE_CREATE ||
+	    cmd > IORING_OPAQUE_AVAILABLE ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
 	control = cmd == IORING_OPAQUE_FREE || cmd == IORING_OPAQUE_STAT ||
@@ -1713,7 +1744,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	op->op = cmd;
-	if (cmd <= IORING_OPAQUE_DISCARD) {
+	if (cmd <= IORING_OPAQUE_DISCARD || cmd == IORING_OPAQUE_AVAILABLE) {
 		INIT_LIST_HEAD(&op->read);
 		RB_CLEAR_NODE(&op->decision);
 	}
@@ -1738,13 +1769,14 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	}
 	if (check_add_overflow(op->offset, (u64)op->length, &end))
 		return -EOVERFLOW;
-	if (cmd <= IORING_OPAQUE_READ_OBJECT) {
+	if (cmd <= IORING_OPAQUE_READ_OBJECT || cmd == IORING_OPAQUE_AVAILABLE) {
 		if (!op->length || op->length > INT_MAX)
 			return -EINVAL;
 		if ((cmd == IORING_OPAQUE_INSPECT || cmd == IORING_OPAQUE_READ_OBJECT) &&
 		    (op->length > IO_OPAQUE_READ_MAX || !op->addr))
 			return -EINVAL;
-		if ((cmd == IORING_OPAQUE_RECV_OBJECT || cmd == IORING_OPAQUE_DISCARD) && op->addr)
+		if ((cmd == IORING_OPAQUE_RECV_OBJECT || cmd == IORING_OPAQUE_DISCARD ||
+		     cmd == IORING_OPAQUE_AVAILABLE) && op->addr)
 			return -EINVAL;
 		if (cmd == IORING_OPAQUE_RECV_OBJECT &&
 		    (op->length > store->config.max_object_size ||
@@ -1827,7 +1859,7 @@ VISIBLE_IF_KUNIT int io_opaque_range_start(struct io_opaque_req *op)
 	guard(mutex)(&stream->lock);
 	if (stream->closed)
 		return -ECANCELED;
-	if (op->op == IORING_OPAQUE_INSPECT) {
+	if (op->op == IORING_OPAQUE_INSPECT || op->op == IORING_OPAQUE_AVAILABLE) {
 		for (node = rb_first_cached(&stream->decisions); node; node = rb_next(node)) {
 			struct io_opaque_req *other;
 
@@ -1845,7 +1877,8 @@ VISIBLE_IF_KUNIT int io_opaque_range_start(struct io_opaque_req *op)
 	io_opaque_wait(op, IO_OPAQUE_RANGE_WAIT);
 	io_opaque_stream_process(stream);
 	/* A decision, or an INSPECT still waiting for bytes, may let collection continue. */
-	if (op->op != IORING_OPAQUE_INSPECT || !list_empty(&op->read))
+	if ((op->op != IORING_OPAQUE_INSPECT && op->op != IORING_OPAQUE_AVAILABLE) ||
+	    !list_empty(&op->read))
 		io_opaque_wake_stream(stream);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
@@ -1884,7 +1917,7 @@ static int io_opaque_stat(struct io_opaque_req *op)
 }
 
 /* Construction is synchronous under the ring lock, like READ_OBJECT copies. */
-static int io_opaque_create_build(struct io_opaque_req *op)
+VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct mem_cgroup *old = set_active_memcg(store->memcg);
@@ -1893,13 +1926,12 @@ static int io_opaque_create_build(struct io_opaque_req *op)
 
 	while (done < op->length) {
 		u64 pages_left = DIV_ROUND_UP_ULL(op->length - done, PAGE_SIZE);
-		unsigned int order = min_t(unsigned int, IO_OPAQUE_MAX_ORDER,
-					   ilog2(pages_left));
 		struct io_opaque_extent *extent;
+		unsigned int order;
 		struct page *page;
 		u32 chunk, written = 0;
 
-		page = io_opaque_owned_page(&order);
+		page = io_opaque_dest_page(store, pages_left, &order);
 		if (!page) {
 			ret = -ENOMEM;
 			goto out;
@@ -1907,12 +1939,13 @@ static int io_opaque_create_build(struct io_opaque_req *op)
 		chunk = min_t(u64, op->length - done, PAGE_SIZE << order);
 		extent = io_opaque_extent_new(store, page, 0, chunk, done, true);
 		if (IS_ERR(extent)) {
-			put_page(page);
+			io_opaque_unit_put(store, page);
 			ret = PTR_ERR(extent);
 			goto out;
 		}
 		op->create_reserved -= page_size(page);
 		extent->backing->copied = true;
+		extent->backing->owned = true;
 		list_add_tail(&extent->list, &op->data->extents);
 		while (written < chunk) {
 			u32 bytes = min_t(u32, chunk - written, PAGE_SIZE);
@@ -1998,6 +2031,7 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		goto out;
 	switch (op->op) {
 	case IORING_OPAQUE_INSPECT:
+	case IORING_OPAQUE_AVAILABLE:
 	case IORING_OPAQUE_RECV_OBJECT:
 	case IORING_OPAQUE_DISCARD:
 		ret = io_opaque_range_start(op);
@@ -2185,7 +2219,7 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	/* Waiters have stopped accessing this request before cleanup. */
 	if (op->stream) {
 		mutex_lock(&op->stream->lock);
-		if (op->op <= IORING_OPAQUE_DISCARD) {
+		if (op->op <= IORING_OPAQUE_DISCARD || op->op == IORING_OPAQUE_AVAILABLE) {
 			list_del_init(&op->read);
 			if (!RB_EMPTY_NODE(&op->decision)) {
 				rb_erase_cached(&op->decision, &op->stream->decisions);

@@ -55,6 +55,8 @@ enum io_uring_opaque_op {
 	IORING_OPAQUE_SET_POLICY,
 	/* Copy userspace bytes into a new complete immutable object. */
 	IORING_OPAQUE_CREATE,
+	/* Nonconsuming contiguous byte count, without copying payload. */
+	IORING_OPAQUE_AVAILABLE,
 };
 
 /* IORING_OP_OPAQUE_OBJ_SEND: sqe->ioprio contains these flags. */

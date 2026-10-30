@@ -5,6 +5,7 @@
 #include <linux/bitmap.h>
 #include <linux/bvec.h>
 #include <linux/net.h>
+#include <linux/percpu.h>
 #include <linux/sizes.h>
 #include <linux/workqueue.h>
 #include <kunit/visibility.h>
@@ -20,6 +21,12 @@
 #define IO_OPAQUE_INDEX_BITS	14
 #define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
 #define IO_OPAQUE_GENERATION_MAX	(U64_MAX >> IO_OPAQUE_INDEX_BITS)
+/* Default destination unit: 32 KiB, the largest per-CPU cached buddy order. */
+#define IO_OPAQUE_UNIT_ORDER	(PAGE_SHIFT < 15 ? 15 - PAGE_SHIFT : 0)
+/* Cooling units examined per take after the idle list runs dry. */
+#define IO_OPAQUE_UNIT_PROBES	4
+/* A cooling unit still referenced after this long is released, not reused. */
+#define IO_OPAQUE_UNIT_COOL_MAX	HZ
 
 struct io_opaque_backing {
 	refcount_t refs;
@@ -28,6 +35,8 @@ struct io_opaque_backing {
 	u32 filled;
 	bool copied;
 	bool accounted;
+	/* Compaction or CREATE destination the unit cache may keep. */
+	bool owned;
 };
 
 struct io_opaque_extent {
@@ -100,6 +109,74 @@ struct io_opaque_stream {
 	bool hold_undecided;
 };
 
+/*
+ * Whole destination units whose last extent reference has dropped. Units
+ * are linked through page->lru of the compound head; page->private holds the
+ * retirement time of a cooling unit. Idle units have no other reference and
+ * are ready to write. Cooling units are still referenced elsewhere (TCP
+ * fragments, clones, retransmissions) and become idle once only the cache
+ * holds them. The cache keeps its units charged to the store owner's memcg
+ * but outside the hard limit.
+ */
+struct io_opaque_unit_cache {
+	spinlock_t lock;
+	struct list_head idle;		/* LIFO: most recently written first */
+	struct list_head cooling;	/* FIFO by retirement time */
+	u32 nr_idle;
+	u32 nr_cooling;
+	/* Fixed at store creation; a zero limit disables the cache. */
+	u32 limit;
+	u32 order;
+	/* Statistics, under lock. */
+	u64 hits;
+	u64 misses;
+	u64 cooled;
+	u64 cooling_hits;
+	u64 probes_failed;
+	u64 expired;
+	u64 trimmed;
+};
+
+/* Global counters, exported read-only under /sys/module/io_uring_opaque/. */
+enum io_opaque_stat_item {
+	IO_OPAQUE_STAT_CACHE_HITS,
+	IO_OPAQUE_STAT_CACHE_MISSES,
+	IO_OPAQUE_STAT_CACHE_FALLBACKS,
+	IO_OPAQUE_STAT_CACHE_REMOTE,
+	IO_OPAQUE_STAT_CACHE_RETIRED,
+	IO_OPAQUE_STAT_CACHE_COOLED,
+	IO_OPAQUE_STAT_CACHE_COOLING_HITS,
+	IO_OPAQUE_STAT_CACHE_PROBES_FAILED,
+	IO_OPAQUE_STAT_CACHE_EXPIRED,
+	IO_OPAQUE_STAT_CACHE_TRIMMED,
+	IO_OPAQUE_STAT_CACHE_DRAINED,
+	IO_OPAQUE_STAT_CACHED_BYTES,
+	IO_OPAQUE_STAT_COMPACT_INLINE,
+	IO_OPAQUE_STAT_COMPACT_WORKER,
+	IO_OPAQUE_STAT_COMPACT_AUTO,
+	IO_OPAQUE_STAT_COMPACT_BYTES,
+	IO_OPAQUE_STAT_NR,
+};
+
+struct io_opaque_stats {
+	u64 item[IO_OPAQUE_STAT_NR];
+};
+
+DECLARE_PER_CPU(struct io_opaque_stats, io_opaque_stats);
+
+static inline void io_opaque_count(enum io_opaque_stat_item item, u64 delta)
+{
+	this_cpu_add(io_opaque_stats.item[item], delta);
+}
+
+u64 io_opaque_stat_read(enum io_opaque_stat_item item);
+
+/* Evaluation tunables; module parameters, not ABI. */
+extern unsigned long io_opaque_cache_bytes;
+extern unsigned int io_opaque_unit_order;
+extern unsigned int io_opaque_inline_compact_max;
+extern bool io_opaque_copy_per_page;
+
 struct io_opaque_store {
 	refcount_t refs;
 	refcount_t users;
@@ -152,7 +229,14 @@ struct io_opaque_store {
 	unsigned long token_time;
 	unsigned long auto_at;
 	int dead;
+	struct io_opaque_unit_cache cache;
 };
+
+/* Locked-memory pages reserved for the unit cache at registration. */
+static inline unsigned long io_opaque_cache_pages(struct io_opaque_store *store)
+{
+	return (unsigned long)store->cache.limit << store->cache.order;
+}
 
 bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx);
 void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes);
@@ -178,6 +262,12 @@ void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);
 int io_opaque_vector(struct io_opaque_data *data);
 struct page *io_opaque_owned_page(unsigned int *order);
+void io_opaque_unit_cache_init(struct io_opaque_store *store, u32 limit, u32 order);
+void io_opaque_unit_cache_setup(struct io_opaque_store *store);
+void io_opaque_unit_put(struct io_opaque_store *store, struct page *page);
+void io_opaque_unit_drain(struct io_opaque_store *store);
+struct page *io_opaque_dest_page(struct io_opaque_store *store, u64 pages_left,
+				 unsigned int *order);
 u64 io_opaque_handle(u32 index, u64 generation);
 struct io_opaque_slot *io_opaque_lookup(struct io_opaque_store *store,
 					u64 handle);
@@ -220,5 +310,8 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 		    unsigned int offset, size_t length);
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 int io_opaque_send_acquire(struct io_opaque_req *op);
+int io_opaque_create_build(struct io_opaque_req *op);
+bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
+struct page *io_opaque_unit_take(struct io_opaque_store *store);
 #endif
 #endif
