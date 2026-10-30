@@ -83,7 +83,10 @@ struct io_opaque_stream_slot {
 struct io_opaque_tx {
 	struct rb_node node;
 	struct sock *sk;
+	/* Admitted requests that have not queued their whole frame; the head sends. */
 	struct list_head requests;
+	/* Requests between lookup and enqueue; the queue stays while any. */
+	unsigned int admitting;
 	bool failed;
 };
 
@@ -181,7 +184,7 @@ struct io_opaque_store {
 	refcount_t refs;
 	refcount_t users;
 	struct io_uring_opaque_config config;
-	/* Handles, candidates and TX queues; never held during copies or I/O. */
+	/* Handles and candidates; never held during copies or I/O. */
 	struct mutex tables;
 	struct io_opaque_slot *objects;
 	struct io_opaque_stream_slot *streams;
@@ -218,6 +221,8 @@ struct io_opaque_store {
 	atomic_t memory_mode;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
 	spinlock_t wait_lock;
+	/* TX queues: the tree, every queue's requests and failed flag. Never with tables. */
+	spinlock_t tx_lock;
 	struct list_head budget_waits;
 	struct list_head copies;
 	/* One dispatcher serializes manual and automatic copies. */

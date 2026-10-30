@@ -366,14 +366,18 @@ returns the positive queued prefix. MSG_DONTWAIT permits a short result. An inco
 even when its CQE reports a positive prefix, so a soft-linked follower is
 canceled before issue and does not claim SEND_LAST ownership.
 
-The store serializes admitted sends to each destination socket. If the head
+The store serializes admitted sends to each destination socket. A send leaves
+its queue when its whole frame is queued to TCP, not when the request is
+cleaned up, so the next send to that socket is the head as soon as it is
+admitted and normally issues in the same submission. If the head
 attempted TCP transmission and ends before queuing its entire frame, already
 admitted followers complete with
 ECANCELED rather than inserting another object's bytes after that prefix.
 A canceled follower that already claimed SEND_LAST still reports the consumed
-flag. Canceling a waiting follower does not interrupt an earlier send or cancel
-later followers, including when head cleanup promotes it before its own
-cleanup runs. Blocking
+flag; so does a send that claimed it while the head was failing. Canceling a
+waiting follower does not interrupt an earlier send or cancel
+later followers, including when the head's completion promotes it before its
+own cleanup runs. Blocking
 TCP retries run in io-wq without holding the ring submission lock.
 
 Each send has one application completion. This reports bytes queued to TCP,

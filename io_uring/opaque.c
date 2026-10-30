@@ -574,6 +574,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 #endif
 	mutex_init(&store->tables);
 	spin_lock_init(&store->wait_lock);
+	spin_lock_init(&store->tx_lock);
 	spin_lock_init(&store->transient_lock);
 	seqcount_spinlock_init(&store->transient_seq, &store->transient_lock);
 	INIT_LIST_HEAD(&store->budget_waits);
@@ -2355,7 +2356,10 @@ static int io_opaque_frame_import(struct io_opaque_req *op)
 VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
-	struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
+	struct io_opaque_slot *slot;
+
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_acquire, op);
+	slot = io_opaque_lookup(store, op->handle);
 
 	if (store->dead)
 		return -ESHUTDOWN;
@@ -2411,58 +2415,129 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	return 0;
 }
 
+static struct io_opaque_req *io_opaque_tx_head(struct io_opaque_tx *tx)
+{
+	return list_first_entry_or_null(&tx->requests, struct io_opaque_req, send);
+}
+
+/* Set under tx_lock, so that a release cannot pass a queued request by. */
+static void io_opaque_tx_park(struct io_opaque_req *op)
+{
+	guard(spinlock)(&op->store->wait_lock);
+	op->phase = IO_OPAQUE_SEND_WAIT;
+}
+
+static struct io_opaque_tx *io_opaque_tx_find(struct io_opaque_store *store,
+					      struct sock *sk,
+					      struct rb_node ***linkp,
+					      struct rb_node **parentp)
+{
+	struct rb_node **link = &store->txs.rb_node, *parent = NULL;
+	struct io_opaque_tx *tx = NULL;
+
+	lockdep_assert_held(&store->tx_lock);
+	while (*link) {
+		parent = *link;
+		tx = rb_entry(parent, struct io_opaque_tx, node);
+		if ((unsigned long)sk < (unsigned long)tx->sk)
+			link = &parent->rb_left;
+		else if ((unsigned long)sk > (unsigned long)tx->sk)
+			link = &parent->rb_right;
+		else
+			break;
+	}
+	/* On a miss these are the insertion point. */
+	*linkp = link;
+	*parentp = parent;
+	return *link ? tx : NULL;
+}
+
+/* A queue with no request and none arriving is dropped. */
+static void io_opaque_tx_unused(struct io_opaque_store *store, struct io_opaque_tx *tx)
+{
+	lockdep_assert_held(&store->tx_lock);
+	if (!list_empty(&tx->requests) || tx->admitting)
+		return;
+	rb_erase(&tx->node, &store->txs);
+	kfree(tx);
+}
+
 /*
  * Queue @op behind the frames already admitted for @sk. Returns 1 when @op is
- * the head and may send, 0 when it waits (its phase is set before tables is
- * dropped, so a release cannot miss it) or a negative errno. @op->req is not
- * used; the caller enrolls a waiting request for cancellation.
+ * the head and may send, 0 when it waits (its phase is set before tx_lock is
+ * dropped, so a release cannot miss it) or a negative errno. The handle is
+ * resolved between the two tx_lock sections, with tables held alone; a queue
+ * that fails in that window cancels @op afterwards. @op->req is not used; the
+ * caller enrolls a waiting request for cancellation.
  */
 VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk)
 {
 	struct io_opaque_store *store = op->store;
-	struct rb_node **link = &store->txs.rb_node, *parent = NULL;
-	struct io_opaque_tx *tx = NULL;
-	int ret;
+	struct io_opaque_tx *tx, *spare = NULL;
+	struct rb_node **link, *parent;
+	int ret = 0;
 
-	guard(mutex)(&store->tables);
-	if (!op->tx) {
-		while (*link) {
-			parent = *link;
-			tx = rb_entry(parent, struct io_opaque_tx, node);
-			if ((unsigned long)sk < (unsigned long)tx->sk)
-				link = &parent->rb_left;
-			else if ((unsigned long)sk > (unsigned long)tx->sk)
-				link = &parent->rb_right;
-			else
-				break;
-		}
-		if (!*link) {
-			tx = kzalloc_obj(*tx, GFP_KERNEL_ACCOUNT);
-			if (!tx)
-				return -ENOMEM;
-			tx->sk = sk;
-			INIT_LIST_HEAD(&tx->requests);
-		}
-		if (tx->failed)
-			return -ECANCELED;
-		ret = io_opaque_send_acquire(op);
-		if (ret) {
-			if (!*link)
-				kfree(tx);
-			return ret;
-		}
-		if (!*link) {
-			rb_link_node(&tx->node, parent, link);
-			rb_insert_color(&tx->node, &store->txs);
-		}
-		op->tx = tx;
-		list_add_tail(&op->send, &tx->requests);
+	spin_lock(&store->tx_lock);
+	tx = op->tx;
+	if (tx) {
+		/* A resumed or retried request keeps its place. */
+		ret = io_opaque_tx_head(tx) == op;
+		if (!ret)
+			io_opaque_tx_park(op);
+		spin_unlock(&store->tx_lock);
+		return ret;
 	}
-	if (list_first_entry(&op->tx->requests, struct io_opaque_req, send) == op)
-		return 1;
-	scoped_guard(spinlock, &store->wait_lock)
-		op->phase = IO_OPAQUE_SEND_WAIT;
-	return 0;
+	tx = io_opaque_tx_find(store, sk, &link, &parent);
+	if (!tx) {
+		spin_unlock(&store->tx_lock);
+		spare = kzalloc_obj(*spare, GFP_KERNEL_ACCOUNT);
+		if (!spare)
+			return -ENOMEM;
+		spare->sk = sk;
+		INIT_LIST_HEAD(&spare->requests);
+		spin_lock(&store->tx_lock);
+		/* A ring sharing the store may have created it meanwhile. */
+		tx = io_opaque_tx_find(store, sk, &link, &parent);
+		if (!tx) {
+			rb_link_node(&spare->node, parent, link);
+			rb_insert_color(&spare->node, &store->txs);
+			tx = spare;
+			spare = NULL;
+		}
+	}
+	if (tx->failed)
+		ret = -ECANCELED;
+	else
+		tx->admitting++;
+	spin_unlock(&store->tx_lock);
+	kfree(spare);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &store->tables)
+		ret = io_opaque_send_acquire(op);
+
+	spin_lock(&store->tx_lock);
+	tx->admitting--;
+	if (ret || tx->failed) {
+		bool pinned = !ret;
+
+		io_opaque_tx_unused(store, tx);
+		spin_unlock(&store->tx_lock);
+		if (!pinned)
+			return ret;
+		/* The head failed after the check: the pin goes, LAST stays consumed. */
+		io_opaque_data_put(store, op->data);
+		op->data = NULL;
+		return -ECANCELED;
+	}
+	op->tx = tx;
+	list_add_tail(&op->send, &tx->requests);
+	ret = io_opaque_tx_head(tx) == op;
+	if (!ret)
+		io_opaque_tx_park(op);
+	spin_unlock(&store->tx_lock);
+	return ret;
 }
 
 static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
@@ -2491,13 +2566,12 @@ VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req
 	struct io_opaque_req *next;
 	bool head;
 
-	guard(mutex)(&store->tables);
-	head = list_first_entry(&tx->requests, struct io_opaque_req, send) == op;
+	guard(spinlock)(&store->tx_lock);
+	head = io_opaque_tx_head(tx) == op;
 	list_del_init(&op->send);
 	op->tx = NULL;
 	if (list_empty(&tx->requests)) {
-		rb_erase(&tx->node, &store->txs);
-		kfree(tx);
+		io_opaque_tx_unused(store, tx);
 		return NULL;
 	}
 	if (!head)
@@ -2519,7 +2593,7 @@ VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req
 		}
 		return NULL;
 	}
-	next = list_first_entry(&tx->requests, struct io_opaque_req, send);
+	next = io_opaque_tx_head(tx);
 	guard(spinlock)(&store->wait_lock);
 	if (next->phase != IO_OPAQUE_SEND_WAIT)
 		return NULL;
@@ -2618,6 +2692,8 @@ finish:
 		req_set_fail(req);
 	if (op->progress)
 		ret = op->progress;
+	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
+	io_opaque_tx_put(op);
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	ret = IOU_COMPLETE;
 out:
