@@ -99,6 +99,18 @@ static inline atomic_t *io_zcrx_slot_uref(struct io_zcrx_slot slot)
 	return &slot.area->user_refs[slot.idx];
 }
 
+/*
+ * The zcrx offset of byte @off of a slot: the area token in the top bits and
+ * the byte offset in the area below it. The slot index shifts in 64 bits,
+ * because an area can hold more than 4 GiB.
+ */
+static inline u64 io_zcrx_slot_off(const struct io_zcrx_ifq *ifq,
+				   struct io_zcrx_slot slot, u32 off)
+{
+	return zcrx_area_id_to_token(slot.area->area_id) +
+	       ((u64)slot.idx << ifq->niov_shift) + off;
+}
+
 static int io_area_max_shift(struct io_zcrx_mem *mem)
 {
 	struct sg_table *sgt = mem->sgt;
@@ -1837,14 +1849,12 @@ int io_zcrx_ctrl(struct io_ring_ctx *ctx, void __user *arg, unsigned nr_args)
 	return -EOPNOTSUPP;
 }
 
-static bool io_zcrx_queue_cqe(struct io_kiocb *req, struct net_iov *niov,
+static bool io_zcrx_queue_cqe(struct io_kiocb *req, struct io_zcrx_slot slot,
 			      struct io_zcrx_ifq *ifq, int off, int len)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	struct io_uring_zcrx_cqe *rcqe;
-	struct io_zcrx_area *area;
 	struct io_uring_cqe *cqe;
-	u64 offset;
 
 	if (!io_defer_get_uncommited_cqe(ctx, &cqe))
 		return false;
@@ -1855,10 +1865,8 @@ static bool io_zcrx_queue_cqe(struct io_kiocb *req, struct net_iov *niov,
 	if (ctx->flags & IORING_SETUP_CQE_MIXED)
 		cqe->flags |= IORING_CQE_F_32;
 
-	area = io_zcrx_iov_to_area(niov);
-	offset = off + ((u64)net_iov_idx(niov) << ifq->niov_shift);
 	rcqe = (struct io_uring_zcrx_cqe *)(cqe + 1);
-	rcqe->off = offset + zcrx_area_id_to_token(area->area_id);
+	rcqe->off = io_zcrx_slot_off(ifq, slot, off);
 	rcqe->__pad = 0;
 	return true;
 }
@@ -1954,7 +1962,7 @@ static ssize_t io_zcrx_copy_chunk(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 
 		n = io_copy_page(&cc, src_page, src_offset, len);
 
-		if (!io_zcrx_queue_cqe(req, niov, ifq, 0, n)) {
+		if (!io_zcrx_queue_cqe(req, io_zcrx_niov_slot(niov), ifq, 0, n)) {
 			io_zcrx_return_niov(niov);
 			ret = -ENOSPC;
 			break;
@@ -2002,7 +2010,8 @@ static int io_zcrx_recv_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	if (!pp || pp->mp_ops != &io_uring_pp_zc_ops || io_pp_to_ifq(pp) != ifq)
 		return -EFAULT;
 
-	if (!io_zcrx_queue_cqe(req, niov, ifq, off + skb_frag_off(frag), len))
+	if (!io_zcrx_queue_cqe(req, io_zcrx_niov_slot(niov), ifq,
+			       off + skb_frag_off(frag), len))
 		return -ENOSPC;
 
 	/*
