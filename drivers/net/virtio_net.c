@@ -3109,6 +3109,44 @@ static void virtnet_update_settings(struct virtnet_info *vi)
 		vi->duplex = duplex;
 }
 
+static struct page_pool *virtnet_create_page_pool(struct virtnet_info *vi,
+						  struct receive_queue *rq)
+{
+	struct page_pool_params pp_params = { 0 };
+	struct device *dma_dev;
+
+	pp_params.order = 0;
+	pp_params.pool_size = virtqueue_get_vring_size(rq->vq);
+	pp_params.nid = dev_to_node(vi->vdev->dev.parent);
+	pp_params.netdev = vi->dev;
+	pp_params.napi = &rq->napi;
+
+	/* Use page_pool DMA mapping if backend supports DMA API.
+	 * DMA_SYNC_DEV is needed for non-coherent archs on recycle.
+	 */
+	dma_dev = virtqueue_dma_dev(rq->vq);
+	if (dma_dev) {
+		pp_params.dev = dma_dev;
+		pp_params.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
+		pp_params.dma_dir = DMA_FROM_DEVICE;
+		pp_params.max_len = PAGE_SIZE;
+		pp_params.offset = 0;
+	} else {
+		/* No DMA API (e.g., VDUSE): page_pool for allocation only. */
+		pp_params.flags = 0;
+	}
+
+	return page_pool_create(&pp_params);
+}
+
+static void virtnet_destroy_page_pool(struct receive_queue *rq)
+{
+	if (rq->page_pool) {
+		page_pool_destroy(rq->page_pool);
+		rq->page_pool = NULL;
+	}
+}
+
 static int virtnet_create_page_pools(struct virtnet_info *vi)
 {
 	int i, err;
@@ -3118,8 +3156,6 @@ static int virtnet_create_page_pools(struct virtnet_info *vi)
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		struct receive_queue *rq = &vi->rq[i];
-		struct page_pool_params pp_params = { 0 };
-		struct device *dma_dev;
 
 		if (rq->page_pool)
 			continue;
@@ -3127,47 +3163,20 @@ static int virtnet_create_page_pools(struct virtnet_info *vi)
 		if (rq->xsk_pool)
 			continue;
 
-		pp_params.order = 0;
-		pp_params.pool_size = virtqueue_get_vring_size(rq->vq);
-		pp_params.nid = dev_to_node(vi->vdev->dev.parent);
-		pp_params.netdev = vi->dev;
-		pp_params.napi = &rq->napi;
-
-		/* Use page_pool DMA mapping if backend supports DMA API.
-		 * DMA_SYNC_DEV is needed for non-coherent archs on recycle.
-		 */
-		dma_dev = virtqueue_dma_dev(rq->vq);
-		if (dma_dev) {
-			pp_params.dev = dma_dev;
-			pp_params.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
-			pp_params.dma_dir = DMA_FROM_DEVICE;
-			pp_params.max_len = PAGE_SIZE;
-			pp_params.offset = 0;
-			rq->use_page_pool_dma = true;
-		} else {
-			/* No DMA API (e.g., VDUSE): page_pool for allocation only. */
-			pp_params.flags = 0;
-			rq->use_page_pool_dma = false;
-		}
-
-		rq->page_pool = page_pool_create(&pp_params);
+		rq->page_pool = virtnet_create_page_pool(vi, rq);
 		if (IS_ERR(rq->page_pool)) {
 			err = PTR_ERR(rq->page_pool);
 			rq->page_pool = NULL;
 			goto err_cleanup;
 		}
+
+		rq->use_page_pool_dma = !!virtqueue_dma_dev(rq->vq);
 	}
 	return 0;
 
 err_cleanup:
-	while (--i >= 0) {
-		struct receive_queue *rq = &vi->rq[i];
-
-		if (rq->page_pool) {
-			page_pool_destroy(rq->page_pool);
-			rq->page_pool = NULL;
-		}
-	}
+	while (--i >= 0)
+		virtnet_destroy_page_pool(&vi->rq[i]);
 	return err;
 }
 
@@ -3175,14 +3184,8 @@ static void virtnet_destroy_page_pools(struct virtnet_info *vi)
 {
 	int i;
 
-	for (i = 0; i < vi->max_queue_pairs; i++) {
-		struct receive_queue *rq = &vi->rq[i];
-
-		if (rq->page_pool) {
-			page_pool_destroy(rq->page_pool);
-			rq->page_pool = NULL;
-		}
-	}
+	for (i = 0; i < vi->max_queue_pairs; i++)
+		virtnet_destroy_page_pool(&vi->rq[i]);
 }
 
 static int virtnet_open(struct net_device *dev)
