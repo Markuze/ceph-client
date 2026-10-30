@@ -272,16 +272,35 @@ static int page_pool_init(struct page_pool *pool,
 
 	xa_init_flags(&pool->dma_mapped, XA_FLAGS_ALLOC1);
 
-	if (pool->slow.flags & PP_FLAG_ALLOW_UNREADABLE_NETMEM) {
-		netdev_assert_locked(pool->slow.netdev);
+	if (pool->slow.flags & (PP_FLAG_ALLOW_UNREADABLE_NETMEM |
+				PP_FLAG_PRIVATE_HEADERS)) {
+		const struct pp_memory_provider_params *mpp;
+
+		/*
+		 * A driver can create its pools before it registers the
+		 * device, and no provider can be installed by then.
+		 */
+		netdev_assert_locked_or_invisible(pool->slow.netdev);
 		rxq = __netif_get_rx_queue(pool->slow.netdev,
 					   pool->slow.queue_idx);
-		pool->mp_priv = rxq->mp_params.mp_priv;
-		pool->mp_ops = rxq->mp_params.mp_ops;
+		mpp = &rxq->mp_params;
+
+		/* PP_FLAG_PRIVATE_HEADERS says only that no header sits in
+		 * a pool page. That is enough for a provider of readable
+		 * pages. A provider of unreadable memory needs the driver to
+		 * state PP_FLAG_ALLOW_UNREADABLE_NETMEM.
+		 */
+		if ((pool->slow.flags & PP_FLAG_ALLOW_UNREADABLE_NETMEM) ||
+		    (mpp->flags & PP_MP_F_READABLE)) {
+			pool->mp_priv = mpp->mp_priv;
+			pool->mp_ops = mpp->mp_ops;
+			pool->mp_readable = !!(mpp->flags & PP_MP_F_READABLE);
+		}
 	}
 
 	if (pool->mp_ops) {
-		if (!pool->dma_map || !pool->dma_sync) {
+		/* A provider of readable pages needs no DMA mapping. */
+		if (!pool->mp_readable && (!pool->dma_map || !pool->dma_sync)) {
 			err = -EOPNOTSUPP;
 			goto free_ptr_ring;
 		}
