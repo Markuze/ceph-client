@@ -39,27 +39,15 @@
 					 IORING_ZCRX_AREA_KERNEL)
 #define ZCRX_MAX_AREAS			1024
 
-#define IO_DMA_ATTR (DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
-
 static inline u32 zcrx_next_area_id(struct io_zcrx_ifq *zcrx)
 {
 	return zcrx->nr_areas;
-}
-
-static inline u64 zcrx_area_id_to_token(u32 area_id)
-{
-	return (u64)area_id << IORING_ZCRX_AREA_SHIFT;
 }
 
 /* The offset that maps the area of a MAIO instance, for this ring's zcrx id. */
 static inline u64 zcrx_area_mmap_offset(u32 zcrx_id)
 {
 	return IORING_MAP_OFF_ZCRX_AREA + ((u64)zcrx_id << IORING_OFF_ZCRX_SHIFT);
-}
-
-static inline struct io_zcrx_ifq *io_pp_to_ifq(struct page_pool *pp)
-{
-	return pp->mp_priv;
 }
 
 static inline struct io_zcrx_area *io_zcrx_iov_to_area(const struct net_iov *niov)
@@ -365,6 +353,10 @@ static void __io_zcrx_unmap_area(struct io_zcrx_ifq *ifq,
 
 	if (!area || !area->is_mapped)
 		return;
+	if (area->mem.is_kernel) {
+		io_zcrx_kmem_unmap(ifq, area);
+		return;
+	}
 	area->is_mapped = false;
 
 	if (area->nia.niovs) {
@@ -422,6 +414,7 @@ struct io_zcrx_args {
 };
 
 static const struct memory_provider_ops io_uring_pp_zc_ops;
+static const struct memory_provider_ops io_uring_pp_maio_ops;
 
 static bool io_zcrx_put_uref(struct io_zcrx_slot slot, unsigned int refs)
 {
@@ -505,6 +498,8 @@ static void io_zcrx_free_area(struct io_zcrx_ifq *ifq,
 		io_unaccount_mem(ifq->user, ifq->mm_account,
 				 area->mem.account_pages);
 
+	if (area->kmem)
+		io_zcrx_kmem_free_area(area);
 	kvfree(area->freelist);
 	kvfree(area->nia.niovs);
 	kvfree(area->user_refs);
@@ -615,6 +610,12 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 		atomic_set(&area->user_refs[i], 0);
 	}
 
+	if (area->mem.is_kernel) {
+		ret = io_zcrx_kmem_init_area(area);
+		if (ret)
+			goto err;
+	}
+
 	if (ifq->dev) {
 		ret = io_populate_area_dma(ifq, area);
 		if (ret)
@@ -673,13 +674,34 @@ static void io_zcrx_drop_netdev(struct io_zcrx_ifq *ifq)
 	ifq->netdev = NULL;
 }
 
+/*
+ * Remove the provider of a MAIO instance from the receive queues that have
+ * it. Each queue stops, drops its pool of area pages and starts again with
+ * an ordinary pool. The caller holds the netdev lock.
+ */
+static void zcrx_close_maio_queues(struct net_device *netdev,
+				   struct io_zcrx_ifq *ifq,
+				   const struct pp_memory_provider_params *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < ifq->nr_rxq; i++) {
+		/* The core refuses to remove a queue that has a provider. */
+		if (WARN_ON_ONCE(i >= netdev->real_num_rx_queues))
+			break;
+		netif_mp_close_rxq(netdev, i, p);
+	}
+	ifq->nr_rxq = 0;
+}
+
 static void io_close_queue(struct io_zcrx_ifq *ifq)
 {
 	struct net_device *netdev;
 	netdevice_tracker netdev_tracker;
 	struct pp_memory_provider_params p = {
-		.mp_ops = &io_uring_pp_zc_ops,
+		.mp_ops = ifq->maio ? &io_uring_pp_maio_ops : &io_uring_pp_zc_ops,
 		.mp_priv = ifq,
+		.flags = ifq->maio ? PP_MP_F_READABLE : 0,
 	};
 
 	scoped_guard(mutex, &ifq->pp_lock) {
@@ -690,7 +712,9 @@ static void io_close_queue(struct io_zcrx_ifq *ifq)
 
 	if (netdev) {
 		netdev_lock(netdev);
-		if (ifq->if_rxq != -1)
+		if (ifq->maio)
+			zcrx_close_maio_queues(netdev, ifq, &p);
+		else if (ifq->if_rxq != -1)
 			netif_mp_close_rxq(netdev, ifq->if_rxq, &p);
 
 		scoped_guard(mutex, &ifq->pp_lock)
@@ -699,13 +723,15 @@ static void io_close_queue(struct io_zcrx_ifq *ifq)
 		netdev_put(netdev, &netdev_tracker);
 	}
 	ifq->if_rxq = -1;
+	/* The device may have dropped the provider itself, see io_pp_uninstall(). */
+	ifq->nr_rxq = 0;
 }
 
 static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
 {
 	int i;
 
-	if (WARN_ON_ONCE(ifq->if_rxq != -1))
+	if (WARN_ON_ONCE(ifq->if_rxq != -1 || ifq->nr_rxq))
 		return;
 	if (WARN_ON_ONCE(ifq->netdev != NULL))
 		return;
@@ -726,7 +752,7 @@ static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
 	kfree(ifq);
 }
 
-static void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq)
+void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq)
 {
 	if (refcount_dec_and_test(&ifq->refs))
 		io_zcrx_ifq_free(ifq);
@@ -736,6 +762,11 @@ static void io_zcrx_return_slot_freelist(struct io_zcrx_slot slot)
 {
 	struct io_zcrx_area *area = slot.area;
 	struct io_zcrx_ifq *ifq = area->ifq;
+
+	if (area->mem.is_kernel) {
+		io_zcrx_kmem_return_slot(area, slot.idx);
+		return;
+	}
 
 	guard(spinlock_bh)(&ifq->alloc_lock);
 	if (WARN_ON_ONCE(area->free_count >= area->nia.num_niovs))
@@ -1016,6 +1047,74 @@ netdev_put_unlock:
 	return ret;
 }
 
+/*
+ * Install the provider on every receive queue of the device, in index order.
+ * The core restarts one queue at a time: it allocates new queue memory with
+ * a pool that binds the provider, stops the queue and returns the posted
+ * buffers to the old pool, and starts the queue from the area. If a queue
+ * fails, the core restores that queue, and this function removes the
+ * provider from the queues done before, in reverse order. The device is then
+ * as it was. The caller holds the netdev lock.
+ */
+static int zcrx_open_maio_queues(struct net_device *netdev,
+				 struct io_zcrx_ifq *ifq)
+{
+	struct pp_memory_provider_params mp_param = {
+		.mp_ops = &io_uring_pp_maio_ops,
+		.mp_priv = ifq,
+		.flags = PP_MP_F_READABLE,
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < netdev->real_num_rx_queues; i++) {
+		ret = netif_mp_open_rxq(netdev, i, &mp_param, NULL);
+		if (ret)
+			goto err_undo;
+		ifq->nr_rxq = i + 1;
+	}
+	return 0;
+
+err_undo:
+	while (i--)
+		netif_mp_close_rxq(netdev, i, &mp_param);
+	ifq->nr_rxq = 0;
+	return ret;
+}
+
+static int zcrx_register_maio_netdev(struct io_zcrx_ifq *ifq,
+				     struct io_uring_zcrx_ifq_reg *reg)
+{
+	int ret;
+
+	ifq->netdev = netdev_get_by_index_lock(current->nsproxy->net_ns,
+					       reg->if_idx);
+	if (!ifq->netdev)
+		return -ENODEV;
+
+	netdev_hold(ifq->netdev, &ifq->netdev_tracker, GFP_KERNEL);
+	ret = zcrx_open_maio_queues(ifq->netdev, ifq);
+	netdev_unlock(ifq->netdev);
+	return ret;
+}
+
+static int zcrx_register_maio(struct io_zcrx_ifq *ifq,
+			      struct io_uring_zcrx_ifq_reg *reg,
+			      struct io_uring_zcrx_area_reg *area)
+{
+	int ret;
+
+	/*
+	 * Allocate the area before the netdev lock is taken. The allocation
+	 * can take long for a large area. The area needs no device, because
+	 * the first page pool that maps DMA maps the area.
+	 */
+	ret = io_zcrx_create_area(ifq, area, reg);
+	if (ret)
+		return ret;
+	return zcrx_register_maio_netdev(ifq, reg);
+}
+
 static int zcrx_validate_notif_stats(struct io_zcrx_ifq *ifq,
 				     const struct io_uring_zcrx_ifq_reg *reg,
 				     const struct zcrx_event_desc *notif)
@@ -1083,9 +1182,6 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	/* A MAIO instance covers every receive queue, so no queue is named. */
 	if ((reg.flags & ZCRX_REG_MAIO) && reg.if_rxq)
 		return -EINVAL;
-	/* The device case needs the provider of readable pages. */
-	if ((reg.flags & ZCRX_REG_MAIO) && !(reg.flags & ZCRX_REG_NODEV))
-		return -EOPNOTSUPP;
 	if (reg.rq_entries > IO_RQ_MAX_ENTRIES) {
 		if (!(ctx->flags & IORING_SETUP_CLAMP))
 			return -EINVAL;
@@ -1151,7 +1247,10 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	ifq->kern_readable = !(area.flags & IORING_ZCRX_AREA_DMABUF);
 
 	if (!(reg.flags & ZCRX_REG_NODEV)) {
-		ret = zcrx_register_netdev(ifq, &reg, &area);
+		if (ifq->maio)
+			ret = zcrx_register_maio(ifq, &reg, &area);
+		else
+			ret = zcrx_register_netdev(ifq, &reg, &area);
 		if (ret)
 			goto err;
 	} else {
@@ -1358,9 +1457,8 @@ static bool zcrx_put_refill_slot(struct io_zcrx_slot slot, struct page_pool *pp,
 	return true;
 }
 
-static unsigned io_zcrx_ring_refill(struct page_pool *pp,
-				    struct io_zcrx_ifq *ifq,
-				    netmem_ref *netmems, unsigned to_alloc)
+unsigned int io_zcrx_ring_refill(struct page_pool *pp, struct io_zcrx_ifq *ifq,
+				 netmem_ref *netmems, unsigned int to_alloc)
 {
 	struct zcrx_rq *rq = &ifq->rq;
 	struct io_uring_zcrx_rqe *rqe;
@@ -1440,7 +1538,7 @@ static void zcrx_stat_add(__u64 *p, s64 v)
 	WRITE_ONCE(*p, READ_ONCE(*p) + v);
 }
 
-static void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned type)
+void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned int type)
 {
 	gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO;
 	u32 type_mask = 1 << type;
@@ -1569,12 +1667,27 @@ static void io_pp_uninstall(void *mp_priv, struct netdev_rx_queue *rxq)
 
 	p->mp_ops = NULL;
 	p->mp_priv = NULL;
+	p->flags = 0;
 }
 
 static const struct memory_provider_ops io_uring_pp_zc_ops = {
 	.alloc_netmems		= io_pp_zc_alloc_netmems,
 	.release_netmem		= io_pp_zc_release_netmem,
 	.init			= io_pp_zc_init,
+	.destroy		= io_pp_zc_destroy,
+	.nl_fill		= io_pp_nl_fill,
+	.uninstall		= io_pp_uninstall,
+};
+
+/*
+ * The provider of a MAIO instance. It hands out the pages of the kernel
+ * area, and ordinary pages when the area has no free page. The pages are
+ * readable, so the page pools of the device need no header split.
+ */
+static const struct memory_provider_ops io_uring_pp_maio_ops = {
+	.alloc_netmems		= io_pp_maio_alloc_netmems,
+	.release_netmem		= io_pp_maio_release_netmem,
+	.init			= io_pp_maio_init,
 	.destroy		= io_pp_zc_destroy,
 	.nl_fill		= io_pp_nl_fill,
 	.uninstall		= io_pp_uninstall,
