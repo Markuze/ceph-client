@@ -1146,8 +1146,11 @@ static void page_pool_empty_ring(struct page_pool *pool)
 
 	/* Empty recycle ring */
 	while ((netmem = (__force netmem_ref)ptr_ring_consume_bh(&pool->ring))) {
-		/* Verify the refcnt invariant of cached pages */
-		if (!(netmem_ref_count(netmem) == 1))
+		/* Verify the refcnt invariant of cached pages. A provider
+		 * of readable pages may map its pages into user space after
+		 * the pool cached them. Each mapping holds a reference.
+		 */
+		if (!pool->mp_readable && !(netmem_ref_count(netmem) == 1))
 			pr_crit("%s() page_pool refcnt %d violation\n",
 				__func__, netmem_ref_count(netmem));
 
