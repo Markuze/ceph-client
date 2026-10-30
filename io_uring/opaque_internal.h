@@ -310,6 +310,8 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 		    unsigned int offset, size_t length);
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 int io_opaque_send_acquire(struct io_opaque_req *op);
+int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
+struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);

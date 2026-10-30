@@ -770,6 +770,115 @@ static void opaque_send_versions(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/* Requests that only queue: no handle, no body and no io_kiocb behind them. */
+static void opaque_test_tx_op(struct io_opaque_req *op, struct io_opaque_store *store)
+{
+	memset(op, 0, sizeof(*op));
+	op->store = store;
+	op->total_length = 100;
+	INIT_LIST_HEAD(&op->wait);
+	INIT_LIST_HEAD(&op->cancel);
+	INIT_LIST_HEAD(&op->send);
+}
+
+/* The send queued its whole frame, or stopped after a byte of it. */
+static void opaque_test_tx_done(struct io_opaque_req *op, bool whole)
+{
+	op->tx_started = true;
+	op->progress = whole ? op->total_length : 1;
+}
+
+#define OPAQUE_TEST_WOKEN	4
+
+static struct {
+	struct io_opaque_req *op[OPAQUE_TEST_WOKEN];
+	int result[OPAQUE_TEST_WOKEN];
+	unsigned int nr;
+} opaque_woken;
+
+static void opaque_test_ready(struct io_opaque_req *op, int result)
+{
+	if (opaque_woken.nr < OPAQUE_TEST_WOKEN) {
+		opaque_woken.op[opaque_woken.nr] = op;
+		opaque_woken.result[opaque_woken.nr] = result;
+	}
+	opaque_woken.nr++;
+}
+
+/* A failing head wakes its followers; record them instead of queueing task work. */
+static void opaque_test_wakeups(struct kunit *test)
+{
+	memset(&opaque_woken, 0, sizeof(opaque_woken));
+	kunit_activate_static_stub(test, io_opaque_queue_ready, opaque_test_ready);
+}
+
+/* Frames leave a socket's queue in admission order; a short head fails the rest. */
+static void opaque_tx_order(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct sock *sk = kunit_kcalloc(test, 2, sizeof(*sk), GFP_KERNEL);
+	struct io_opaque_req a, b, c, d;
+
+	KUNIT_ASSERT_NOT_NULL(test, sk);
+	opaque_test_tx_op(&a, store);
+	opaque_test_tx_op(&b, store);
+	opaque_test_tx_op(&c, store);
+	opaque_test_tx_op(&d, store);
+	/* The first admission is the head; the next one waits behind it. */
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&a, &sk[0]), 1);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&b, &sk[0]), 0);
+	KUNIT_EXPECT_EQ(test, b.phase, IO_OPAQUE_SEND_WAIT);
+	KUNIT_ASSERT_NOT_NULL(test, a.tx);
+	KUNIT_EXPECT_PTR_EQ(test, a.tx, b.tx);
+	/* Another socket has its own queue. */
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&c, &sk[1]), 1);
+	KUNIT_EXPECT_PTR_NE(test, c.tx, a.tx);
+	/* A whole frame hands the queue to its follower, claimed for task work. */
+	opaque_test_tx_done(&a, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&a), &b);
+	KUNIT_EXPECT_EQ(test, b.phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_FALSE(test, b.canceled);
+	KUNIT_EXPECT_PTR_EQ(test, a.tx, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&a.send));
+	opaque_test_tx_done(&b, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&b), NULL);
+	opaque_test_tx_done(&c, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), NULL);
+	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+
+	/* A head that stopped short cancels everything admitted behind it. */
+	opaque_test_wakeups(test);
+	opaque_test_tx_op(&a, store);
+	opaque_test_tx_op(&b, store);
+	opaque_test_tx_op(&c, store);
+	opaque_test_tx_op(&d, store);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&a, &sk[0]), 1);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&b, &sk[0]), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&c, &sk[0]), 0);
+	opaque_test_tx_done(&a, false);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&a), NULL);
+	KUNIT_EXPECT_TRUE(test, b.canceled);
+	KUNIT_EXPECT_TRUE(test, c.canceled);
+	KUNIT_ASSERT_EQ(test, opaque_woken.nr, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_woken.op[0], &b);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_woken.op[1], &c);
+	KUNIT_EXPECT_EQ(test, opaque_woken.result[0], -ECANCELED);
+	KUNIT_EXPECT_EQ(test, opaque_woken.result[1], -ECANCELED);
+	/* Later frames are refused while the canceled followers are queued. */
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&d, &sk[0]), -ECANCELED);
+	KUNIT_EXPECT_PTR_EQ(test, d.tx, NULL);
+	/* Their own releases promote nobody: they were all claimed at once. */
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&b), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), NULL);
+	KUNIT_EXPECT_EQ(test, opaque_woken.nr, 2U);
+	/* The drained queue forgets the failure. */
+	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&d, &sk[0]), 1);
+	opaque_test_tx_done(&d, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&d), NULL);
+	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
+}
+
 static void opaque_inspection_windows(struct kunit *test)
 {
 	struct io_opaque_stream stream;
@@ -1809,6 +1918,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_last_compacted),
 	KUNIT_CASE(opaque_send_last_compact_race),
 	KUNIT_CASE(opaque_send_versions),
+	KUNIT_CASE(opaque_tx_order),
 	KUNIT_CASE(opaque_cache_miss_then_hit),
 	KUNIT_CASE(opaque_cache_cooling_probe),
 	KUNIT_CASE(opaque_cache_tx_clone),

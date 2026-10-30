@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Kernel-resident immutable TCP payloads. See userspace-api/io_uring-opaque. */
+#include <kunit/static_stub.h>
 #include <linux/bitmap.h>
 #include <linux/bvec.h>
 #include <linux/file.h>
@@ -711,17 +712,23 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 }
 
 /* The ring lock protects enrollment; wait_lock arbitrates remote wakeups. */
-void io_opaque_wait(struct io_opaque_req *op, enum io_opaque_phase phase)
+static void io_opaque_enroll(struct io_opaque_req *op)
 {
 	lockdep_assert_held(&op->req->ctx->uring_lock);
 	if (list_empty(&op->cancel))
 		list_add_tail(&op->cancel, &op->req->ctx->opaque_waits);
+}
+
+void io_opaque_wait(struct io_opaque_req *op, enum io_opaque_phase phase)
+{
+	io_opaque_enroll(op);
 	guard(spinlock)(&op->store->wait_lock);
 	op->phase = phase;
 }
 
 void io_opaque_queue_ready(struct io_opaque_req *op, int result)
 {
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_queue_ready, op, result);
 	guard(spinlock)(&op->store->wait_lock);
 	op->result = result;
 	op->phase = IO_OPAQUE_QUEUED;
@@ -2404,11 +2411,18 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	return 0;
 }
 
-static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
+/*
+ * Queue @op behind the frames already admitted for @sk. Returns 1 when @op is
+ * the head and may send, 0 when it waits (its phase is set before tables is
+ * dropped, so a release cannot miss it) or a negative errno. @op->req is not
+ * used; the caller enrolls a waiting request for cancellation.
+ */
+VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk)
 {
 	struct io_opaque_store *store = op->store;
 	struct rb_node **link = &store->txs.rb_node, *parent = NULL;
 	struct io_opaque_tx *tx = NULL;
+	int ret;
 
 	guard(mutex)(&store->tables);
 	if (!op->tx) {
@@ -2431,14 +2445,11 @@ static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
 		}
 		if (tx->failed)
 			return -ECANCELED;
-		{
-			int ret = io_opaque_send_acquire(op);
-
-			if (ret) {
-				if (!*link)
-					kfree(tx);
-				return ret;
-			}
+		ret = io_opaque_send_acquire(op);
+		if (ret) {
+			if (!*link)
+				kfree(tx);
+			return ret;
 		}
 		if (!*link) {
 			rb_link_node(&tx->node, parent, link);
@@ -2447,56 +2458,86 @@ static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
 		op->tx = tx;
 		list_add_tail(&op->send, &tx->requests);
 	}
-	if (list_first_entry(&op->tx->requests, struct io_opaque_req, send) != op) {
-		io_opaque_wait(op, IO_OPAQUE_SEND_WAIT);
-		return IOU_ISSUE_SKIP_COMPLETE;
-	}
+	if (list_first_entry(&op->tx->requests, struct io_opaque_req, send) == op)
+		return 1;
+	scoped_guard(spinlock, &store->wait_lock)
+		op->phase = IO_OPAQUE_SEND_WAIT;
 	return 0;
 }
 
-static void io_opaque_tx_put(struct io_opaque_req *op)
+static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
+{
+	int ret = io_opaque_tx_admit(op, sk);
+
+	if (ret < 0)
+		return ret;
+	if (ret)
+		return 0;
+	/* The ring lock keeps the wakeup from running before the request is listed. */
+	io_opaque_enroll(op);
+	return IOU_ISSUE_SKIP_COMPLETE;
+}
+
+/*
+ * Remove @op from its queue. A head that attempted TCP and ended short fails
+ * the queue: every follower is canceled and woken, and nothing is returned.
+ * Otherwise the follower that becomes head is returned with its phase already
+ * queued, for the caller to wake. Only the failure wakeups reach an io_kiocb.
+ */
+VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_tx *tx = op->tx;
 	struct io_opaque_req *next;
 	bool head;
 
-	if (!tx)
-		return;
 	guard(mutex)(&store->tables);
 	head = list_first_entry(&tx->requests, struct io_opaque_req, send) == op;
 	list_del_init(&op->send);
+	op->tx = NULL;
 	if (list_empty(&tx->requests)) {
 		rb_erase(&tx->node, &store->txs);
 		kfree(tx);
-	} else if (head) {
-		/* Only a send that attempted TCP can break the following frames. */
-		if (op->tx_started && op->progress != op->total_length) {
-			tx->failed = true;
-			list_for_each_entry(next, &tx->requests, send) {
-				bool queue;
-
-				scoped_guard(spinlock, &store->wait_lock) {
-					WRITE_ONCE(next->canceled, true);
-					queue = next->phase == IO_OPAQUE_SEND_WAIT;
-					if (queue)
-						next->phase = IO_OPAQUE_QUEUED;
-				}
-				if (queue)
-					io_opaque_queue_ready(next, -ECANCELED);
-			}
-			goto out;
-		}
-		next = list_first_entry(&tx->requests, struct io_opaque_req, send);
-		guard(spinlock)(&store->wait_lock);
-		if (next->phase == IO_OPAQUE_SEND_WAIT) {
-			next->phase = IO_OPAQUE_QUEUED;
-			next->req->io_task_work.func = io_opaque_resume;
-			io_req_task_work_add(next->req);
-		}
+		return NULL;
 	}
-out:
-	op->tx = NULL;
+	if (!head)
+		return NULL;
+	/* Only a send that attempted TCP can break the following frames. */
+	if (op->tx_started && op->progress != op->total_length) {
+		tx->failed = true;
+		list_for_each_entry(next, &tx->requests, send) {
+			bool queue;
+
+			scoped_guard(spinlock, &store->wait_lock) {
+				WRITE_ONCE(next->canceled, true);
+				queue = next->phase == IO_OPAQUE_SEND_WAIT;
+				if (queue)
+					next->phase = IO_OPAQUE_QUEUED;
+			}
+			if (queue)
+				io_opaque_queue_ready(next, -ECANCELED);
+		}
+		return NULL;
+	}
+	next = list_first_entry(&tx->requests, struct io_opaque_req, send);
+	guard(spinlock)(&store->wait_lock);
+	if (next->phase != IO_OPAQUE_SEND_WAIT)
+		return NULL;
+	next->phase = IO_OPAQUE_QUEUED;
+	return next;
+}
+
+static void io_opaque_tx_put(struct io_opaque_req *op)
+{
+	struct io_opaque_req *next;
+
+	if (!op->tx)
+		return;
+	next = io_opaque_tx_release(op);
+	if (next) {
+		next->req->io_task_work.func = io_opaque_resume;
+		io_req_task_work_add(next->req);
+	}
 }
 
 int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
