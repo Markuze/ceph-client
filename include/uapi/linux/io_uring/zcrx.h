@@ -105,6 +105,10 @@ enum zcrx_event_desc_flags {
 	ZCRX_EVENT_DESC_FLAG_STATS = 1 << 0,
 };
 
+/*
+ * The struct only grows at the end. IO_URING_QUERY_ZCRX_EVENT reports the size
+ * of the kernel, and registration needs that much room at stats_offset.
+ */
 struct zcrx_stats {
 	/*
 	 * The kernel copies a fragment of a socket buffer into buffers of the
@@ -114,6 +118,12 @@ struct zcrx_stats {
 	 */
 	__u64	copy_count;	/* cumulative fragments copied */
 	__u64	copy_bytes;	/* cumulative bytes copied */
+
+	/* The counters below count the events of a ZCRX_REG_MAIO instance. */
+	__u64	limbo_enter;	/* cumulative pages parked, an outsider held a reference */
+	__u64	limbo_leave;	/* cumulative parked pages that became free again */
+	__u64	fallback_pages;	/* cumulative ordinary pages given to a pool, the area was full */
+	__u64	exhaust_count;	/* cumulative times the area ran out, see ZCRX_EVENT_ALLOC_FAIL */
 };
 
 struct zcrx_event_desc {

@@ -167,6 +167,19 @@ void io_zcrx_kmem_release(struct io_zcrx_mem *mem)
  */
 #define IO_ZCRX_LIMBO_SCAN	(2 * PP_ALLOC_CACHE_REFILL)
 
+/*
+ * Add to a counter of the stats area of the application, if it has one. A
+ * counter has one writer at a time, because the writers hold ->alloc_lock.
+ */
+static void io_zcrx_maio_stat_add(struct io_zcrx_ifq *ifq, size_t offset,
+				  u64 n)
+{
+	lockdep_assert_held(&ifq->alloc_lock);
+
+	if (ifq->notif_stats)
+		zcrx_stat_add((u64 *)((char *)ifq->notif_stats + offset), n);
+}
+
 static inline struct io_zcrx_area *io_zcrx_maio_area(struct io_zcrx_ifq *ifq)
 {
 	/* The only area is created before the first pool binds. It never changes. */
@@ -364,6 +377,8 @@ void io_zcrx_kmem_return_slot(struct io_zcrx_area *area, u32 idx)
 	} else {
 		kmem->state[idx] = IO_ZCRX_KSLOT_LIMBO;
 		io_zcrx_limbo_push(area, idx);
+		io_zcrx_maio_stat_add(area->ifq,
+				      offsetof(struct zcrx_stats, limbo_enter), 1);
 	}
 }
 
@@ -384,6 +399,8 @@ static void io_zcrx_kmem_reclaim(struct io_zcrx_area *area, unsigned int want)
 		if (io_zcrx_page_is_quiet(area->mem.pages[idx])) {
 			kmem->state[idx] = IO_ZCRX_KSLOT_FREE;
 			area->freelist[area->free_count++] = idx;
+			io_zcrx_maio_stat_add(area->ifq,
+					      offsetof(struct zcrx_stats, limbo_leave), 1);
 			want--;
 		} else {
 			io_zcrx_limbo_push(area, idx);
@@ -530,8 +547,28 @@ static unsigned int io_zcrx_kmem_refill(struct page_pool *pp,
 	} else if (!ifq->maio_exhausted) {
 		ifq->maio_exhausted = true;
 		*exhausted = true;
+		io_zcrx_maio_stat_add(ifq,
+				      offsetof(struct zcrx_stats, exhaust_count), 1);
 	}
 	return allocated;
+}
+
+/*
+ * Give the queue ordinary pages, because the area has none. The pool may fill
+ * its cache with more pages than the one that it returns.
+ */
+static netmem_ref io_zcrx_maio_fallback(struct page_pool *pp,
+					struct io_zcrx_ifq *ifq, gfp_t gfp)
+{
+	netmem_ref netmem = net_mp_alloc_fallback(pp, gfp);
+
+	if (netmem) {
+		guard(spinlock_bh)(&ifq->alloc_lock);
+		io_zcrx_maio_stat_add(ifq,
+				      offsetof(struct zcrx_stats, fallback_pages),
+				      1 + pp->alloc.count);
+	}
+	return netmem;
 }
 
 /*
@@ -571,7 +608,7 @@ netmem_ref io_pp_maio_alloc_netmems(struct page_pool *pp, gfp_t gfp)
 		 * pages. Packets in them take the copy path.
 		 */
 		if (!allocated)
-			return net_mp_alloc_fallback(pp, gfp);
+			return io_zcrx_maio_fallback(pp, ifq, gfp);
 	}
 
 	io_zcrx_kmem_sync_for_device(pp, netmems, allocated);

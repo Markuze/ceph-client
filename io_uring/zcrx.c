@@ -1533,11 +1533,6 @@ static void zcrx_notif_tw(struct io_tw_req tw_req, io_tw_token_t tw)
 	kmem_cache_free(req_cachep, req);
 }
 
-static void zcrx_stat_add(__u64 *p, s64 v)
-{
-	WRITE_ONCE(*p, READ_ONCE(*p) + v);
-}
-
 void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned int type)
 {
 	gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO;

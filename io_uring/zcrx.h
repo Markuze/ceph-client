@@ -150,6 +150,11 @@ struct io_zcrx_ifq {
 	struct zcrx_stats		*notif_stats;
 };
 
+static inline void zcrx_stat_add(__u64 *p, s64 v)
+{
+	WRITE_ONCE(*p, READ_ONCE(*p) + v);
+}
+
 static inline u64 zcrx_area_id_to_token(u32 area_id)
 {
 	return (u64)area_id << IORING_ZCRX_AREA_SHIFT;
