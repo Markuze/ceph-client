@@ -2358,6 +2358,7 @@ static int io_opaque_frame_import(struct io_opaque_req *op)
 					    u64_to_user_ptr(frame.suffix), frame.suffix_length)))
 				return -EFAULT;
 			atomic64_add(bytes, &op->store->framing_copied);
+			io_opaque_count(IO_OPAQUE_STAT_FRAMING_COPIED, bytes);
 		}
 		op->prefix_length = frame.prefix_length;
 		op->suffix_length = frame.suffix_length;
@@ -2650,6 +2651,18 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 	}
 }
 
+/*
+ * A body of up to send_copy_max bytes is copied by TCP: below that a page
+ * reference and a fragment cost more than the copy. The object stays immutable
+ * and TCP keeps no reference to it, so nothing else about the send changes.
+ */
+VISIBLE_IF_KUNIT bool io_opaque_send_splices(const struct io_opaque_req *op)
+{
+	u32 max = READ_ONCE(io_opaque_send_copy_max);
+
+	return !max || op->length > max;
+}
+
 int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
@@ -2657,7 +2670,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct msghdr msg;
 	struct kvec vec;
 	u32 body_end;
-	bool body;
+	bool body, splice = false;
 	int ret;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
@@ -2694,7 +2707,9 @@ again:
 		msg.msg_flags |= MSG_MORE;
 	} else if (body) {
 		msg.msg_iter = op->iter;
-		msg.msg_flags |= MSG_SPLICE_PAGES;
+		splice = io_opaque_send_splices(op);
+		if (splice)
+			msg.msg_flags |= MSG_SPLICE_PAGES;
 		if (op->suffix_length)
 			msg.msg_flags |= MSG_MORE;
 	} else {
@@ -2708,8 +2723,11 @@ again:
 	ret = sock_sendmsg(sock, &msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (ret > 0) {
-		if (body)
+		if (body) {
 			op->iter = msg.msg_iter;
+			if (!splice)
+				io_opaque_count(IO_OPAQUE_STAT_BODY_COPIED, ret);
+		}
 		op->progress += ret;
 		if (op->progress < op->total_length && !iov_iter_count(&msg.msg_iter))
 			goto again;

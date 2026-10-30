@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
+#include <linux/file.h>
 #include <linux/highmem.h>
+#include <linux/inet.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
 #include <linux/mman.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
 #include <linux/random.h>
+#include <linux/rtnetlink.h>
 #include <linux/sched/user.h>
 #include <linux/skbuff.h>
 #include <linux/uaccess.h>
 #include <net/tcp.h>
 
 #include "io_uring.h"
+#include "mpscq.h"
 #include "opaque_internal.h"
 
 static void opaque_test_txs_free(void *store)
@@ -1458,6 +1463,7 @@ struct opaque_test_params {
 	unsigned long cache_bytes;
 	unsigned int unit_order;
 	unsigned int inline_compact_max;
+	unsigned int send_copy_max;
 	bool copy_per_page;
 };
 
@@ -1468,6 +1474,7 @@ static void opaque_test_params_restore(void *arg)
 	io_opaque_cache_bytes = saved->cache_bytes;
 	io_opaque_unit_order = saved->unit_order;
 	io_opaque_inline_compact_max = saved->inline_compact_max;
+	io_opaque_send_copy_max = saved->send_copy_max;
 	io_opaque_copy_per_page = saved->copy_per_page;
 }
 
@@ -1480,6 +1487,7 @@ static void opaque_test_params_save(struct kunit *test)
 	saved->cache_bytes = io_opaque_cache_bytes;
 	saved->unit_order = io_opaque_unit_order;
 	saved->inline_compact_max = io_opaque_inline_compact_max;
+	saved->send_copy_max = io_opaque_send_copy_max;
 	saved->copy_per_page = io_opaque_copy_per_page;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_params_restore,
 							saved), 0);
@@ -2025,6 +2033,11 @@ static void opaque_params_sysfs(struct kunit *test)
 {
 	const struct kernel_param *order = opaque_test_param("io_uring_opaque.unit_order");
 	const struct kernel_param *hits = opaque_test_param("io_uring_opaque.stat_cache_hits");
+	const struct kernel_param *copy_max = opaque_test_param("io_uring_opaque.send_copy_max");
+	const struct kernel_param *body_copied =
+		opaque_test_param("io_uring_opaque.stat_body_copied");
+	const struct kernel_param *framing_copied =
+		opaque_test_param("io_uring_opaque.stat_framing_copied");
 	struct kobject *kobj = kset_find_obj(module_kset, "io_uring_opaque");
 	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
 	u64 value;
@@ -2038,8 +2051,14 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, opaque_test_param("io_uring_opaque.inline_compact_max"));
 	KUNIT_EXPECT_NOT_NULL(test, opaque_test_param("io_uring_opaque.compact_copy_per_page"));
 	KUNIT_EXPECT_NOT_NULL(test, opaque_test_param("io_uring_opaque.stat_compact_bytes"));
+	KUNIT_ASSERT_NOT_NULL(test, copy_max);
+	KUNIT_ASSERT_NOT_NULL(test, body_copied);
+	KUNIT_ASSERT_NOT_NULL(test, framing_copied);
 	KUNIT_EXPECT_EQ(test, order->perm, (u16)0644);
+	KUNIT_EXPECT_EQ(test, copy_max->perm, (u16)0644);
 	KUNIT_EXPECT_EQ(test, hits->perm, (u16)0444);
+	KUNIT_EXPECT_EQ(test, body_copied->perm, (u16)0444);
+	KUNIT_EXPECT_EQ(test, framing_copied->perm, (u16)0444);
 	opaque_test_params_save(test);
 	KUNIT_EXPECT_EQ(test, order->ops->set("5", order), -EINVAL);
 	KUNIT_EXPECT_EQ(test, order->ops->set("4", order), 0);
@@ -2048,6 +2067,228 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_GT(test, hits->ops->get(buf, hits), 0);
 	KUNIT_EXPECT_EQ(test, kstrtou64(strim(buf), 10, &value), 0);
 	KUNIT_EXPECT_EQ(test, value, io_opaque_stat_read(IO_OPAQUE_STAT_CACHE_HITS));
+	/* The copy threshold takes effect at the next send; its counters are read-only. */
+	KUNIT_EXPECT_EQ(test, copy_max->ops->set("2048", copy_max), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_copy_max, 2048U);
+	KUNIT_EXPECT_EQ(test, body_copied->ops->set("1", body_copied), -EPERM);
+	KUNIT_EXPECT_EQ(test, framing_copied->ops->set("1", framing_copied), -EPERM);
+	io_opaque_count(IO_OPAQUE_STAT_BODY_COPIED, 7);
+	KUNIT_EXPECT_GT(test, body_copied->ops->get(buf, body_copied), 0);
+	KUNIT_EXPECT_EQ(test, kstrtou64(strim(buf), 10, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED));
+}
+
+/* Bodies up to send_copy_max are copied by TCP; zero splices every body. */
+static void opaque_send_copy_policy(struct kunit *test)
+{
+	static const u32 lengths[] = { 1, 1023, 1024, 1025, 4096, SZ_64K, INT_MAX };
+	struct io_opaque_req op = {};
+	unsigned int i;
+
+	opaque_test_params_save(test);
+	/* Off by default: no length is copied. */
+	io_opaque_send_copy_max = 0;
+	for (i = 0; i < ARRAY_SIZE(lengths); i++) {
+		op.length = lengths[i];
+		KUNIT_EXPECT_TRUE(test, io_opaque_send_splices(&op));
+	}
+	/* The threshold itself still copies; one byte more splices. */
+	io_opaque_send_copy_max = 1024;
+	for (i = 0; i < ARRAY_SIZE(lengths); i++) {
+		op.length = lengths[i];
+		KUNIT_EXPECT_EQ(test, io_opaque_send_splices(&op), lengths[i] > 1024);
+	}
+	io_opaque_send_copy_max = 1;
+	op.length = 1;
+	KUNIT_EXPECT_FALSE(test, io_opaque_send_splices(&op));
+	op.length = 2;
+	KUNIT_EXPECT_TRUE(test, io_opaque_send_splices(&op));
+	/* A threshold above every length copies everything. */
+	io_opaque_send_copy_max = UINT_MAX;
+	op.length = INT_MAX;
+	KUNIT_EXPECT_FALSE(test, io_opaque_send_splices(&op));
+}
+
+struct opaque_wire {
+	struct io_ring_ctx *ctx;
+	struct io_kiocb req[2];
+	struct socket *listener, *tx, *rx;
+	struct file *file;
+};
+
+static void opaque_wire_cleanup(void *arg)
+{
+	struct opaque_wire *w = arg;
+
+	if (w->file)
+		fput(w->file);
+	else if (w->tx)
+		sock_release(w->tx);
+	if (w->rx)
+		sock_release(w->rx);
+	if (w->listener)
+		sock_release(w->listener);
+}
+
+/* A TCP connection over loopback: sends go out of @tx's file, the test reads @rx. */
+static void opaque_wire_init(struct kunit *test, struct opaque_wire *w)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	int ret, i;
+
+	w->ctx = kunit_kzalloc(test, sizeof(*w->ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, w->ctx);
+	mutex_init(&w->ctx->uring_lock);
+	INIT_LIST_HEAD(&w->ctx->opaque_waits);
+	w->ctx->flags = IORING_SETUP_DEFER_TASKRUN;
+	mpscq_init(&w->ctx->work_list, &w->ctx->work_head);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_wire_cleanup, w), 0);
+	rtnl_lock();
+	ret = dev_change_flags(init_net.loopback_dev, IFF_UP, NULL);
+	rtnl_unlock();
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &w->listener);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ret = kernel_bind(w->listener, (struct sockaddr_unsized *)&addr, sizeof(addr));
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_EQ(test, kernel_listen(w->listener, 1), 0);
+	KUNIT_ASSERT_GT(test, kernel_getsockname(w->listener, (struct sockaddr *)&addr), 0);
+	ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &w->tx);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ret = kernel_connect(w->tx, (struct sockaddr_unsized *)&addr, sizeof(addr), 0);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_EQ(test, kernel_accept(w->listener, &w->rx, O_NONBLOCK), 0);
+	w->tx->sk->sk_sndtimeo = 5 * HZ;
+	w->rx->sk->sk_rcvtimeo = 5 * HZ;
+	w->file = sock_alloc_file(w->tx, 0, NULL);
+	if (IS_ERR(w->file)) {
+		ret = PTR_ERR(w->file);
+		w->file = NULL;
+		w->tx = NULL; /* sock_alloc_file released it. */
+		KUNIT_ASSERT_EQ(test, ret, 0);
+	}
+	for (i = 0; i < 2; i++) {
+		w->req[i].ctx = w->ctx;
+		w->req[i].file = w->file;
+	}
+}
+
+/* A TCP-held reference to a unit goes when its data is acknowledged. */
+static bool opaque_wire_unit_free(struct page *unit)
+{
+	int i;
+
+	for (i = 0; i < 100 && page_count(unit) != 1; i++)
+		msleep(20);
+	return page_count(unit) == 1;
+}
+
+/*
+ * Two back-to-back body-only sends over real TCP, spliced or copied. The queue
+ * is free as soon as each frame is queued, so neither send waits; the peer reads
+ * both ranges in order and TCP lets go of every page.
+ */
+static void opaque_send_loopback(struct kunit *test)
+{
+	static const struct {
+		u32 offset, length, copy_max;
+	} cases[] = {
+		{ 0, SZ_64K, 0 },	/* two whole units, spliced */
+		{ 0, SZ_64K, SZ_1M },	/* the same, copied by TCP */
+		{ 4196, 40000, 0 },	/* from inside a unit across to the next */
+		{ 4196, 40000, SZ_1M },
+		{ 1, 5000, 0 },
+		{ 1, 5000, 5000 },	/* the threshold itself copies */
+		{ 1, 5000, 4999 },	/* one byte over it splices */
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct io_opaque_req compact = {
+		.store = store, .data = data, .handle = io_opaque_handle(0, 9),
+	};
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 2 * SZ_64K, GFP_KERNEL);
+	struct page *units[3];
+	unsigned int c;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	opaque_test_cache(test, store, 4);
+	opaque_test_copy(data, source);
+	/* Publish the compacted copy, whose units are the compound pages TCP will see. */
+	store->objects[0].data = data;
+	store->objects[0].generation = 9;
+	store->nr_objects++;
+	__set_bit(0, store->object_used);
+	refcount_inc(&data->refs); /* compaction worker */
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+	KUNIT_ASSERT_EQ(test, opaque_test_pages(compact.replacement, units, 3), 3U);
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
+	io_opaque_data_put(store, compact.data);
+	io_opaque_compact_end(&compact);
+	opaque_wire_init(test, w);
+	for (c = 0; c < ARRAY_SIZE(cases); c++) {
+		u64 copied = io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED), expect = 0;
+		u32 length[2] = { cases[c].length, cases[c].length - 1 };
+		u32 offset[2] = { cases[c].offset, cases[c].offset + 1 };
+		u32 total = length[0] + length[1], done = 0;
+		struct io_opaque_req send[2];
+		struct msghdr msg = {};
+		struct kvec vec;
+		int i;
+
+		io_opaque_send_copy_max = cases[c].copy_max;
+		for (i = 0; i < 2; i++) {
+			send[i] = (struct io_opaque_req) {
+				.store = store, .req = &w->req[i], .op = U16_MAX,
+				.handle = compact.handle, .offset = offset[i],
+				.length = length[i],
+			};
+			INIT_LIST_HEAD(&send[i].wait);
+			INIT_LIST_HEAD(&send[i].cancel);
+			INIT_LIST_HEAD(&send[i].send);
+			w->req[i].async_data = &send[i];
+			if (cases[c].copy_max && length[i] <= cases[c].copy_max)
+				expect += length[i];
+			/* Not parked behind the first frame: it left its queue when queued. */
+			KUNIT_ASSERT_EQ(test, io_opaque_send(&w->req[i], IO_URING_F_UNLOCKED),
+					IOU_COMPLETE);
+			KUNIT_EXPECT_EQ(test, w->req[i].cqe.res, (s32)length[i]);
+			KUNIT_EXPECT_PTR_EQ(test, send[i].tx, NULL);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+		}
+		KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED) - copied,
+				expect);
+		/* The peer sees the first range, then the second. */
+		while (done < total) {
+			int ret;
+
+			vec.iov_base = got + done;
+			vec.iov_len = total - done;
+			ret = kernel_recvmsg(w->rx, &msg, &vec, 1, vec.iov_len, 0);
+			KUNIT_ASSERT_GT(test, ret, 0);
+			done += ret;
+		}
+		KUNIT_EXPECT_MEMEQ(test, got, source + offset[0], length[0]);
+		KUNIT_EXPECT_MEMEQ(test, got + length[0], source + offset[1], length[1]);
+		for (i = 0; i < 2; i++)
+			io_opaque_data_put(store, send[i].data);
+		/* TCP lets go of a spliced body once it is acknowledged. */
+		KUNIT_EXPECT_TRUE(test, opaque_wire_unit_free(units[0]));
+		KUNIT_EXPECT_TRUE(test, opaque_wire_unit_free(units[1]));
+	}
+	/* Handle and units go with the object. */
+	mutex_lock(&store->tables);
+	data = io_opaque_detach(store, &store->objects[0]);
+	mutex_unlock(&store->tables);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
 static void opaque_test_noop_work(struct work_struct *work)
@@ -2217,6 +2458,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_compact_cancel_units),
 	KUNIT_CASE(opaque_create_uses_cache),
 	KUNIT_CASE(opaque_compact_inline),
+	KUNIT_CASE(opaque_send_copy_policy),
+	KUNIT_CASE(opaque_send_loopback),
 	KUNIT_CASE(opaque_params_sysfs),
 	{}
 };

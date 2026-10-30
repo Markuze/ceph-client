@@ -357,7 +357,10 @@ and fails with ESTALE if another operation removes the handle first.
 
 One SQE, queue item, continuation cursor and CQE cover prefix, opaque body and
 suffix. The body uses the retained bvec array with ``MSG_SPLICE_PAGES``; private
-framing uses ordinary copied TCP sends. Internal send attempts advance across
+framing uses ordinary copied TCP sends. The ``send_copy_max`` evaluation
+parameter can make TCP copy a small body the same way instead: the object stays
+immutable and TCP keeps no reference to it, so nothing else about the send
+changes. Internal send attempts advance across
 these segments, setting MSG_MORE while segments remain. Partial progress resumes
 at the saved whole-frame cursor. Without MSG_DONTWAIT,
 the request continues until the complete frame is queued or an error/cancellation ends
@@ -647,13 +650,14 @@ under the same handle. Both send modes use the same compaction machinery.
 Evaluation parameters
 =====================
 
-The destination unit cache, the unit size, inline manual compaction and the
-compaction copy loop are selected by parameters under
+The destination unit cache, the unit size, inline manual compaction, the
+compaction copy loop and the send copy threshold are selected by parameters under
 ``/sys/module/io_uring_opaque/parameters/``, writable by root at run time or
 set on the kernel command line as ``io_uring_opaque.<name>=<value>``. They
 exist for measurement, are not ABI and may change or disappear. The defaults
-keep the behaviour without the cache and without inline compaction; the
-per-run copy is byte-identical to the page-split copy it replaces.
+keep the behaviour without the cache, without inline compaction and with every
+body spliced; the per-run copy is byte-identical to the page-split copy it
+replaces.
 
 ``cache_bytes`` (default 0)
     Per-store unit cache size in bytes, sampled when a store is registered;
@@ -668,6 +672,10 @@ per-run copy is byte-identical to the page-split copy it replaces.
 ``compact_copy_per_page`` (default N)
     Y selects the original compaction copy loop, which also cuts at every
     source and destination page. Read at each compaction.
+``send_copy_max`` (default 0)
+    Largest send body in bytes (``len``, without prefix or suffix) that TCP
+    copies instead of splicing page references; 0 splices every body. Read at
+    each send.
 
 The same directory holds read-only counters summed over all stores. They are
 cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
@@ -696,6 +704,9 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     the dispatcher, and automatic compactions started.
 ``stat_compact_bytes``
     Bytes copied into compaction destinations.
+``stat_framing_copied``, ``stat_body_copied``
+    Prefix and suffix bytes copied from user memory into request storage, and
+    body bytes TCP copied under ``send_copy_max``.
 
 Validation and reproduction
 ===========================

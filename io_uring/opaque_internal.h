@@ -162,6 +162,8 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_COMPACT_WORKER,
 	IO_OPAQUE_STAT_COMPACT_AUTO,
 	IO_OPAQUE_STAT_COMPACT_BYTES,
+	IO_OPAQUE_STAT_FRAMING_COPIED,
+	IO_OPAQUE_STAT_BODY_COPIED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -183,6 +185,7 @@ extern unsigned long io_opaque_cache_bytes;
 extern unsigned int io_opaque_unit_order;
 extern unsigned int io_opaque_inline_compact_max;
 extern bool io_opaque_copy_per_page;
+extern unsigned int io_opaque_send_copy_max;
 
 struct io_opaque_store {
 	refcount_t refs;
@@ -324,6 +327,7 @@ int io_opaque_send_acquire(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
+bool io_opaque_send_splices(const struct io_opaque_req *op);
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);

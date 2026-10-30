@@ -20,9 +20,10 @@
 
 /*
  * Evaluation tunables under /sys/module/io_uring_opaque/parameters/. They are
- * not ABI. The defaults keep the original behaviour: no unit cache and every
- * manual compaction on the dispatcher. cache_bytes and unit_order are sampled
- * when a store is registered; the others apply to each later compaction.
+ * not ABI. The defaults keep the original behaviour: no unit cache, every
+ * manual compaction on the dispatcher and every body spliced. cache_bytes and
+ * unit_order are sampled when a store is registered; the others apply to each
+ * later compaction or send.
  */
 unsigned long io_opaque_cache_bytes;
 module_param_named(cache_bytes, io_opaque_cache_bytes, ulong, 0644);
@@ -53,6 +54,11 @@ bool io_opaque_copy_per_page;
 module_param_named(compact_copy_per_page, io_opaque_copy_per_page, bool, 0644);
 MODULE_PARM_DESC(compact_copy_per_page,
 		 "Use the original page-split compaction copy instead of one copy per source run");
+
+unsigned int io_opaque_send_copy_max;
+module_param_named(send_copy_max, io_opaque_send_copy_max, uint, 0644);
+MODULE_PARM_DESC(send_copy_max,
+		 "Largest send body TCP copies instead of splicing page references (0 = always splice)");
 
 DEFINE_PER_CPU(struct io_opaque_stats, io_opaque_stats);
 
@@ -107,6 +113,8 @@ IO_OPAQUE_STAT_PARAM(stat_compact_inline, IO_OPAQUE_STAT_COMPACT_INLINE);
 IO_OPAQUE_STAT_PARAM(stat_compact_worker, IO_OPAQUE_STAT_COMPACT_WORKER);
 IO_OPAQUE_STAT_PARAM(stat_compact_auto, IO_OPAQUE_STAT_COMPACT_AUTO);
 IO_OPAQUE_STAT_PARAM(stat_compact_bytes, IO_OPAQUE_STAT_COMPACT_BYTES);
+IO_OPAQUE_STAT_PARAM(stat_framing_copied, IO_OPAQUE_STAT_FRAMING_COPIED);
+IO_OPAQUE_STAT_PARAM(stat_body_copied, IO_OPAQUE_STAT_BODY_COPIED);
 
 static void io_opaque_auto_compact(struct io_opaque_store *store);
 
