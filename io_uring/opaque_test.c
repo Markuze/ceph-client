@@ -14,6 +14,7 @@
 #include <linux/sched/user.h>
 #include <linux/skbuff.h>
 #include <linux/uaccess.h>
+#include <net/hotdata.h>
 #include <net/tcp.h>
 
 #include "io_uring.h"
@@ -1634,12 +1635,13 @@ static void opaque_cache_tx_clone(struct kunit *test)
 	opaque_test_copy(data, before);
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&op), 0);
 	KUNIT_ASSERT_EQ(test, opaque_test_pages(op.replacement, units, 3), 3U);
-	/* MSG_SPLICE_PAGES: one fragment and one page reference per 4 KiB. */
+	/* MSG_SPLICE_PAGES: one fragment and one page reference per unit. */
 	skb->ip_summed = CHECKSUM_PARTIAL;
 	iov_iter_bvec(&iter, ITER_SOURCE, op.replacement->bvec, op.replacement->nr, len);
 	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(skb, &iter, len), (ssize_t)len);
-	KUNIT_EXPECT_EQ(test, page_count(units[0]), 1 + (1 << IO_OPAQUE_UNIT_ORDER));
-	KUNIT_EXPECT_EQ(test, page_count(units[1]), 3);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 2);
+	KUNIT_EXPECT_EQ(test, page_count(units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(units[1]), 2);
 	clone = skb_clone(skb, GFP_KERNEL); /* transmission */
 	KUNIT_ASSERT_NOT_NULL(test, clone);
 	copy = pskb_copy(skb, GFP_KERNEL); /* retransmission of a cloned skb */
@@ -1667,6 +1669,199 @@ static void opaque_cache_tx_clone(struct kunit *test)
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+struct opaque_splice {
+	struct io_opaque_store *store;
+	struct io_opaque_data *data;
+	struct io_opaque_req op;
+	struct page *units[3];
+	struct sk_buff *skb;
+	struct iov_iter iter;
+	u8 *source;
+};
+
+/* The 80,000 byte object compacted into two units and a tail, with an empty skb. */
+static void opaque_splice_setup(struct kunit *test, struct opaque_splice *f)
+{
+	f->store = opaque_test_store(test);
+	f->data = opaque_sparse_data(test, f->store);
+	f->op = (struct io_opaque_req) { .store = f->store, .data = f->data };
+	f->skb = alloc_skb(0, GFP_KERNEL);
+	f->source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f->skb);
+	KUNIT_ASSERT_NOT_NULL(test, f->source);
+	opaque_test_cache(test, f->store, 4);
+	opaque_test_copy(f->data, f->source);
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&f->op), 0);
+	KUNIT_ASSERT_EQ(test, opaque_test_pages(f->op.replacement, f->units, 3), 3U);
+	f->skb->ip_summed = CHECKSUM_PARTIAL;
+	iov_iter_bvec(&f->iter, ITER_SOURCE, f->op.replacement->bvec, f->op.replacement->nr,
+		      80000);
+}
+
+static void opaque_splice_done(struct opaque_splice *f)
+{
+	io_opaque_data_put(f->store, f->op.replacement);
+	f->op.replacement = NULL;
+	io_opaque_compact_end(&f->op);
+	io_opaque_data_put(f->store, f->data);
+}
+
+/* A folio is one fragment and one page reference, however many calls extract it. */
+static void opaque_splice_folio_runs(struct kunit *test)
+{
+	size_t len = OPAQUE_TEST_UNIT + 2 * PAGE_SIZE, first = 5 * PAGE_SIZE;
+	struct opaque_splice f;
+	skb_frag_t *frag;
+
+	opaque_splice_setup(test, &f);
+	iov_iter_truncate(&f.iter, len);
+	/* The first call stops inside the first unit. */
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, first), (ssize_t)first);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	/* The rest of the unit extends that fragment; the next unit starts another. */
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, len - first),
+			(ssize_t)(len - first));
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	frag = &skb_shinfo(f.skb)->frags[0];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[0]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)OPAQUE_TEST_UNIT);
+	frag = &skb_shinfo(f.skb)->frags[1];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[1]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)(2 * PAGE_SIZE));
+	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)len);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+	kfree_skb(f.skb);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	opaque_splice_done(&f);
+}
+
+/* A range that starts inside a unit leaves a multi-page fragment at that offset. */
+static void opaque_splice_subrange_offset(struct kunit *test)
+{
+	size_t skip = PAGE_SIZE + 100, len = 40000, head = OPAQUE_TEST_UNIT - skip;
+	u8 *copy = kunit_kmalloc(test, len, GFP_KERNEL);
+	struct opaque_splice f;
+	skb_frag_t *frag;
+
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	opaque_splice_setup(test, &f);
+	/* What io_opaque_send_iter() does for op->offset and op->length. */
+	iov_iter_advance(&f.iter, skip);
+	iov_iter_truncate(&f.iter, len);
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, len), (ssize_t)len);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	frag = &skb_shinfo(f.skb)->frags[0];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[0]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), (unsigned int)skip);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)head);
+	frag = &skb_shinfo(f.skb)->frags[1];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[1]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)(len - head));
+	/* Readers walk a fragment page by page, from the page its offset lands in. */
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(f.skb, 0, copy, len), 0);
+	KUNIT_EXPECT_MEMEQ(test, copy, f.source + skip, len);
+	kfree_skb(f.skb);
+	opaque_splice_done(&f);
+}
+
+/* A fragment never crosses a folio: split pages stay one fragment and reference each. */
+static void opaque_splice_split_pages(struct kunit *test)
+{
+	size_t len = PAGE_SIZE << 4;
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+	struct page *page = alloc_pages(GFP_KERNEL, 4);
+	struct iov_iter iter;
+	struct bio_vec bv;
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	/* Sixteen physically contiguous pages that are sixteen folios. */
+	split_page(page, 4);
+	bvec_set_page(&bv, page, len, 0);
+	iov_iter_bvec(&iter, ITER_SOURCE, &bv, 1, len);
+	skb->ip_summed = CHECKSUM_PARTIAL;
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(skb, &iter, len), (ssize_t)len);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 16);
+	for (i = 0; i < 16; i++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+
+		KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), page + i);
+		KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+		KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)PAGE_SIZE);
+		KUNIT_EXPECT_EQ(test, page_count(page + i), 2);
+	}
+	kfree_skb(skb);
+	for (i = 0; i < 16; i++) {
+		KUNIT_EXPECT_EQ(test, page_count(page + i), 1);
+		__free_page(page + i);
+	}
+}
+
+/* Without checksum offload every page is summed in place, whatever the fragments. */
+static void opaque_splice_csum_none(struct kunit *test)
+{
+	size_t skip = 101, len = 2 * OPAQUE_TEST_UNIT - skip;
+	struct opaque_splice f;
+
+	opaque_splice_setup(test, &f);
+	f.skb->ip_summed = CHECKSUM_NONE;
+	f.skb->csum = 0;
+	/* An odd start makes every later page begin at an odd offset in the skb. */
+	iov_iter_advance(&f.iter, skip);
+	iov_iter_truncate(&f.iter, len);
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, len), (ssize_t)len);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	KUNIT_EXPECT_EQ(test, (__force u16)csum_fold(f.skb->csum),
+			(__force u16)csum_fold(csum_partial(f.source + skip, len, 0)));
+	kfree_skb(f.skb);
+	opaque_splice_done(&f);
+}
+
+static void opaque_test_frag_limit_restore(void *limit)
+{
+	net_hotdata.sysctl_max_skb_frags = (long)limit;
+}
+
+/* At the fragment limit a splice stops after the folios that fit and leaves the rest. */
+static void opaque_splice_frag_limit(struct kunit *test)
+{
+	size_t first = OPAQUE_TEST_UNIT, rest = 80000 - OPAQUE_TEST_UNIT;
+	long limit = net_hotdata.sysctl_max_skb_frags;
+	struct opaque_splice f;
+
+	opaque_splice_setup(test, &f);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_frag_limit_restore,
+							(void *)limit), 0);
+	net_hotdata.sysctl_max_skb_frags = 1;
+	/* The first unit is the one fragment that fits; the second would need another. */
+	KUNIT_EXPECT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, 80000), (ssize_t)first);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 1);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), rest);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	/* Nothing more fits: the next call says so and leaves the iterator alone. */
+	KUNIT_EXPECT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, 80000), (ssize_t)-EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), rest);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	/* One more fragment takes exactly the next unit. */
+	net_hotdata.sysctl_max_skb_frags = 2;
+	KUNIT_EXPECT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, 80000), (ssize_t)first);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), rest - first);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+	kfree_skb(f.skb);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	opaque_splice_done(&f);
 }
 
 /* A full cache frees further units; other orders are never cached. */
@@ -2450,6 +2645,11 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_cache_miss_then_hit),
 	KUNIT_CASE(opaque_cache_cooling_probe),
 	KUNIT_CASE(opaque_cache_tx_clone),
+	KUNIT_CASE(opaque_splice_folio_runs),
+	KUNIT_CASE(opaque_splice_subrange_offset),
+	KUNIT_CASE(opaque_splice_split_pages),
+	KUNIT_CASE(opaque_splice_csum_none),
+	KUNIT_CASE(opaque_splice_frag_limit),
 	KUNIT_CASE(opaque_cache_limit),
 	KUNIT_CASE(opaque_cache_age),
 	KUNIT_CASE(opaque_cache_accounting),
