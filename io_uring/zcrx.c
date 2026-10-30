@@ -2182,3 +2182,7 @@ int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	sock_rps_record_flow(sk);
 	return io_zcrx_tcp_recvmsg(req, ifq, sk, flags, issue_flags, len);
 }
+
+#ifdef CONFIG_IO_URING_ZCRX_KUNIT_TEST
+#include "zcrx_test.c"
+#endif
