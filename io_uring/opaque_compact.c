@@ -110,7 +110,8 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 			goto out;
 		}
 		chunk = min_t(u64, length - done, PAGE_SIZE << order);
-		extent = io_opaque_extent_new(store, page, 0, chunk, done, true);
+		extent = io_opaque_extent_new(store, page, 0, chunk, done,
+					      IO_OPAQUE_EXT_RESERVED);
 		if (IS_ERR(extent)) {
 			put_page(page);
 			ret = PTR_ERR(extent);

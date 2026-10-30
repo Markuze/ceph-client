@@ -21,6 +21,8 @@
 #define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
 #define IO_OPAQUE_GENERATION_MAX	(U64_MAX >> IO_OPAQUE_INDEX_BITS)
 
+struct io_zcrx_ifq;
+
 struct io_opaque_backing {
 	refcount_t refs;
 	struct page *page;
@@ -28,6 +30,13 @@ struct io_opaque_backing {
 	u32 filled;
 	bool copied;
 	bool accounted;
+	/* The page is in the area of the MAIO instance that the store binds. */
+	bool area;
+	/*
+	 * The reference to the page is a pool reference of that instance. The
+	 * last release goes through io_zcrx_maio_page_put(), not put_page().
+	 */
+	bool pool;
 };
 
 struct io_opaque_extent {
@@ -119,6 +128,13 @@ struct io_opaque_store {
 	struct mm_struct *mm;
 	struct mem_cgroup *memcg;
 	struct obj_cgroup *objcg;
+	/*
+	 * The MAIO instance that the store binds, or NULL. A bound store keeps
+	 * every byte in area pages. The store holds one reference to the
+	 * instance until io_opaque_free(), which runs after the last backing is
+	 * gone, so the area outlives all pages that a backing holds.
+	 */
+	struct io_zcrx_ifq *maio;
 	atomic64_t bytes;
 	atomic64_t copied;
 	atomic64_t compacted;
@@ -169,10 +185,14 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 	       store->config.reply_reserve;
 }
 
+/* Flags of io_opaque_extent_new(). */
+#define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store already */
+#define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
+
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
-					      bool reserved);
+					      unsigned int flags);
 struct io_opaque_data *io_opaque_data_alloc(void);
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);

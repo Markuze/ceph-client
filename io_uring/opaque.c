@@ -20,6 +20,7 @@
 #include "opaque_internal.h"
 #include "rsrc.h"
 #include "tw.h"
+#include "zcrx.h"
 
 bool io_opaque_cache_init(struct io_ring_ctx *ctx)
 {
@@ -252,8 +253,11 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
-					      bool reserved)
+					      unsigned int flags)
 {
+	bool reserved = flags & IO_OPAQUE_EXT_RESERVED;
+	/* The memory cgroup pays for a page only if no other owner does. */
+	bool memcg = !(flags & (IO_OPAQUE_EXT_RESERVED | IO_OPAQUE_EXT_NO_MEMCG));
 	struct io_opaque_chunk *chunk;
 	u64 charge = page_size(compound_head(page));
 
@@ -261,18 +265,18 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 		return ERR_PTR(-ENOBUFS);
 	if (!reserved && !io_opaque_charge(store, charge, true))
 		goto no_space;
-	if (!reserved && io_opaque_memcg_charge(store, charge))
+	if (memcg && io_opaque_memcg_charge(store, charge))
 		goto no_memory;
 	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
 	if (!chunk) {
-		if (!reserved)
+		if (memcg)
 			io_opaque_memcg_uncharge(store, charge);
 		goto no_memory;
 	}
 	refcount_set(&chunk->backing.refs, 1);
 	chunk->backing.page = compound_head(page);
 	chunk->backing.charge = charge;
-	chunk->backing.accounted = !reserved && store->objcg;
+	chunk->backing.accounted = memcg && store->objcg;
 	chunk->extent.backing = &chunk->backing;
 	chunk->extent.start = start;
 	chunk->extent.offset = offset + (page - compound_head(page)) * PAGE_SIZE;
@@ -304,7 +308,15 @@ VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
 
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
-		put_page(backing->page);
+		/*
+		 * A pool reference of a bound store ends in the instance. The
+		 * store holds its own reference to the instance until every
+		 * backing is gone, so the call is valid here.
+		 */
+		if (backing->pool)
+			io_zcrx_maio_page_put(store->maio, backing->page);
+		else
+			put_page(backing->page);
 		kfree(container_of(backing, struct io_opaque_chunk, backing));
 		io_opaque_uncharge(store, charge);
 	} else {
@@ -975,9 +987,106 @@ static struct io_opaque_extent *io_opaque_capture_tail(struct io_opaque_stream *
 	return list_last_entry_or_null(list, struct io_opaque_extent, list);
 }
 
-static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
-			    u32 offset, u32 length, bool take_ref, bool copied)
+/*
+ * How the capture holds the page of a new backing. The last two kinds exist
+ * only for a store that binds a MAIO instance.
+ */
+enum io_opaque_hold {
+	/* A page reference, taken here. */
+	IO_OPAQUE_HOLD_PAGE,
+	/*
+	 * A page reference to an area page, taken here, when no pool reference
+	 * is possible. Either no pool of the instance owns the page, or the skb
+	 * holds only a page reference to it. The page is an outsider page for
+	 * the area. For example, the process may have passed it to a send as
+	 * user memory, and the send came back over loopback. The bytes are
+	 * visible through the mapping, so the backing counts as in the area.
+	 * If a pool owns the page when it returns, the instance parks the page
+	 * in limbo until this reference ends.
+	 */
+	IO_OPAQUE_HOLD_AREA,
+	/*
+	 * A pool reference to an area page, taken here. A pool of the instance
+	 * owns the page.
+	 */
+	IO_OPAQUE_HOLD_POOL,
+	/*
+	 * A copy page. The reference of the caller passes to the backing. The
+	 * page is a page of the area if the store binds an instance.
+	 */
+	IO_OPAQUE_HOLD_COPY,
+};
+
+/*
+ * Decide how a store holds a page that an skb carries. Return false if the
+ * capture must copy the bytes.
+ *
+ * A store without an instance holds every page by a page reference. A store
+ * with an instance keeps all its bytes in the area, so that the process sees
+ * them through its mapping:
+ *
+ * - A page outside the area is copied. This includes a fallback page, which
+ *   a pool of the instance got from the page allocator.
+ * - An area page that a pool of the instance owns is held by a pool reference.
+ *   The pool reference keeps the page out of the pool. When the last holder
+ *   drops it, the page goes back to the pool and not to limbo. A pool
+ *   reference is valid only if the skb holds one too. The pool then owns the
+ *   page for as long as the skb lives, and a concurrent release cannot happen
+ *   between the test and the reference. An skb that is not marked for page pool
+ *   recycling holds a page reference. The pool can release the page at any
+ *   time, so the page counts as an outsider page.
+ * - Any other area page is held by a page reference.
+ *
+ * The kernel never parses the bytes of an object, and nothing in this file
+ * relies on them staying constant. The process can write them through the
+ * mapping. A length or a checksum is never read from them.
+ */
+static bool io_opaque_retain(struct io_opaque_store *store,
+			     const struct sk_buff *skb, struct page *page,
+			     enum io_opaque_hold *hold)
 {
+	u64 off;
+
+	if (!store->maio) {
+		*hold = IO_OPAQUE_HOLD_PAGE;
+		return true;
+	}
+	if (!io_zcrx_maio_page_off(store->maio, page, &off))
+		return false;
+	if (skb->pp_recycle && io_zcrx_maio_page_owned(store->maio, page))
+		*hold = IO_OPAQUE_HOLD_POOL;
+	else
+		*hold = IO_OPAQUE_HOLD_AREA;
+	return true;
+}
+
+/*
+ * Take a page for the bytes that the capture copies. A bound store takes a
+ * free page of the area, and the area has none when it is empty. Another store
+ * allocates a page. The caller owns the reference to the page.
+ */
+static struct page *io_opaque_copy_page(struct io_opaque_store *store)
+{
+	u64 off;
+
+	if (store->maio)
+		return io_zcrx_maio_copy_page(store->maio, &off);
+	return alloc_page(GFP_KERNEL_ACCOUNT);
+}
+
+static void io_opaque_copy_page_put(struct io_opaque_store *store,
+				    struct page *page)
+{
+	if (store->maio)
+		io_zcrx_maio_page_put(store->maio, page);
+	else
+		put_page(page);
+}
+
+static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
+			    u32 offset, u32 length, enum io_opaque_hold hold)
+{
+	bool copied = hold == IO_OPAQUE_HOLD_COPY;
 	struct io_opaque_req *op = io_opaque_capture_keep(stream);
 	struct list_head *list = &stream->extents;
 	struct io_opaque_extent *extent, *tail;
@@ -1017,17 +1126,34 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 		refcount_inc(&extent->backing->refs);
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
+		bool bound = !!stream->store->maio;
+		unsigned int flags = 0;
 
 		/* Leave room for dense copies of a private KEEP's remaining bytes. */
 		if (!copied && op && op->data->charge + stream->need_bytes + left >
 		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
-		extent = io_opaque_extent_new(stream->store, page, offset, length, start, copied);
+		/*
+		 * The caller charged a copy page. The memory cgroup of the
+		 * store does not pay for an area page, because the area was
+		 * allocated and accounted when the instance was registered.
+		 */
+		if (copied)
+			flags = IO_OPAQUE_EXT_RESERVED;
+		else if (hold != IO_OPAQUE_HOLD_PAGE)
+			flags = IO_OPAQUE_EXT_NO_MEMCG;
+		extent = io_opaque_extent_new(stream->store, page, offset, length, start, flags);
 		if (IS_ERR(extent))
 			return PTR_ERR(extent);
-		if (take_ref)
+		if (hold == IO_OPAQUE_HOLD_POOL)
+			io_zcrx_maio_page_get(stream->store->maio, page);
+		else if (!copied)
 			get_page(page);
 		extent->backing->copied = copied;
+		/* A bound store copies every byte outside the area into it. */
+		extent->backing->area = hold == IO_OPAQUE_HOLD_AREA ||
+					hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
+		extent->backing->pool = hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
 		new_backing = true;
 	}
 	list_add_tail(&extent->list, list);
@@ -1055,6 +1181,7 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 	bool copy_frags;
 	struct sk_buff *child;
 	u64 retain_limit = io_opaque_rx_limit(stream->store);
+	enum io_opaque_hold hold;
 	u32 chunk;
 	int i, ret = -EFAULT;
 
@@ -1069,10 +1196,11 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 			struct page *page = virt_to_page(data);
 
 			/* A compound allocation larger than the limit can never fit. */
-			if (page_size(compound_head(page)) > retain_limit)
+			if (page_size(compound_head(page)) > retain_limit ||
+			    !io_opaque_retain(stream->store, skb, page, &hold))
 				goto copy;
 			ret = io_opaque_append(stream, page, offset_in_page(data),
-					       chunk, true, false);
+					       chunk, hold);
 		} else {
 			goto copy;
 		}
@@ -1089,10 +1217,11 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 			continue;
 		}
 		chunk = min(start + size - offset, len);
-		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit)
+		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit ||
+		    !io_opaque_retain(stream->store, skb, skb_frag_page(frag), &hold))
 			goto copy;
 		ret = io_opaque_append(stream, skb_frag_page(frag),
-				       skb_frag_off(frag) + offset - start, chunk, true, false);
+				       skb_frag_off(frag) + offset - start, chunk, hold);
 		if (ret == -ENOBUFS)
 			goto copy;
 		goto head_done;
@@ -1123,7 +1252,13 @@ copy:
 			stream->need_bytes = PAGE_SIZE;
 			if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
 				return -ENOBUFS;
-			page = alloc_page(GFP_KERNEL_ACCOUNT);
+			/*
+			 * An empty area fails like a failed allocation. The
+			 * collector then waits IO_OPAQUE_ALLOC_RETRY_MS and
+			 * retries, and the stream and its captured prefix stay
+			 * as they are.
+			 */
+			page = io_opaque_copy_page(stream->store);
 			if (!page) {
 				io_opaque_uncharge(stream->store, PAGE_SIZE);
 				return -ENOMEM;
@@ -1134,9 +1269,9 @@ copy:
 		ret = skb_copy_bits(skb, offset, mapped + pos, chunk);
 		kunmap_local(mapped);
 		if (!ret)
-			ret = io_opaque_append(stream, page, pos, chunk, false, true);
+			ret = io_opaque_append(stream, page, pos, chunk, IO_OPAQUE_HOLD_COPY);
 		if (ret < 0 && allocated) {
-			put_page(page);
+			io_opaque_copy_page_put(stream->store, page);
 			io_opaque_uncharge(stream->store, PAGE_SIZE);
 		}
 	}

@@ -353,7 +353,7 @@ static void opaque_split_shared_charge(struct kunit *test)
 	LIST_HEAD(extents);
 
 	KUNIT_ASSERT_NOT_NULL(test, page);
-	left = io_opaque_extent_new(store, page, 0, 128, 0, false);
+	left = io_opaque_extent_new(store, page, 0, 128, 0, 0);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(left));
 	list_add(&left->list, &extents);
 	right = io_opaque_extent_split(store, left, 64);
@@ -382,7 +382,7 @@ static void opaque_keep_restore(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, page);
 	opaque_test_stream(&stream, store);
 	mutex_init(&stream.lock);
-	extent = io_opaque_extent_new(store, page, 0, 8, 0, false);
+	extent = io_opaque_extent_new(store, page, 0, 8, 0, 0);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
 	list_add(&extent->list, &stream.extents);
 	stream.next = 8;
@@ -418,7 +418,7 @@ static struct io_opaque_data *opaque_sparse_data(struct kunit *test,
 		mapped = kmap_local_page(page);
 		memset(mapped, i, 2000);
 		kunmap_local(mapped);
-		extent = io_opaque_extent_new(store, page, 0, 2000, i * 2000, false);
+		extent = io_opaque_extent_new(store, page, 0, 2000, i * 2000, 0);
 		KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
 		list_add_tail(&extent->list, &data->extents);
 		data->length += 2000;
