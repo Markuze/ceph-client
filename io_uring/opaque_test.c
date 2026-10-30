@@ -1864,6 +1864,92 @@ static void opaque_splice_frag_limit(struct kunit *test)
 	opaque_splice_done(&f);
 }
 
+/* A bvec iterator is walked by segment: skips, empty and adjacent segments, resumption. */
+static void opaque_splice_bvec_segments(struct kunit *test)
+{
+	size_t len = 4096 + 8192 + 5000 + 100, first = 6000, second = 7000;
+	size_t rest = len - first - second;
+	u8 *copy = kunit_kmalloc(test, len, GFP_KERNEL);
+	struct opaque_splice f;
+	struct bio_vec bv[5];
+	skb_frag_t *frag;
+
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	opaque_splice_setup(test, &f);
+	/* Two segments of one folio in a row, an empty one, two more of the next folio. */
+	bvec_set_page(&bv[0], f.units[0], 4096, 0);
+	bvec_set_page(&bv[1], f.units[0], 8192, 4096);
+	bvec_set_page(&bv[2], f.units[1], 0, 0);
+	bvec_set_page(&bv[3], f.units[1], 5000, 300);
+	bvec_set_page(&bv[4], f.units[1], 100, 5300);
+	iov_iter_bvec(&f.iter, ITER_SOURCE, bv, ARRAY_SIZE(bv), len);
+	/* The first call ends inside the second segment, the next resumes there. */
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, first), (ssize_t)first);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 1);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), len - first);
+	/* It finishes the folio, skips the empty segment and starts the next folio. */
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, second), (ssize_t)second);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), rest);
+	/* A limit above what is left stops at the end of the iterator. */
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(f.skb, &f.iter, SZ_64K), (ssize_t)rest);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), 0UL);
+	/* Adjacent segments of a folio extend one fragment; the next folio starts another. */
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	frag = &skb_shinfo(f.skb)->frags[0];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[0]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), 4096U + 8192U);
+	frag = &skb_shinfo(f.skb)->frags[1];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[1]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 300U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), 5100U);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)len);
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(f.skb, 0, copy, len), 0);
+	KUNIT_EXPECT_MEMEQ(test, copy, f.source, 4096 + 8192);
+	KUNIT_EXPECT_MEMEQ(test, copy + 4096 + 8192, f.source + OPAQUE_TEST_UNIT + 300, 5100);
+	kfree_skb(f.skb);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	opaque_splice_done(&f);
+}
+
+/* Other iterators go through the page array, and a folio is still one fragment. */
+static void opaque_splice_kvec_runs(struct kunit *test)
+{
+	size_t skip = 100, size = PAGE_SIZE << 4, len = size - 2 * skip;
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, 4);
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+	u8 *copy = kunit_kmalloc(test, len, GFP_KERNEL);
+	struct iov_iter iter;
+	struct kvec kv;
+	skb_frag_t *frag;
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	get_random_bytes(page_address(page), size);
+	kv.iov_base = page_address(page) + skip;
+	kv.iov_len = len;
+	iov_iter_kvec(&iter, ITER_SOURCE, &kv, 1, len);
+	skb->ip_summed = CHECKSUM_PARTIAL;
+	KUNIT_ASSERT_EQ(test, skb_splice_from_iter(skb, &iter, len), (ssize_t)len);
+	/* The page array holds eight pages: two batches of the same folio make one fragment. */
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 1);
+	frag = &skb_shinfo(skb)->frags[0];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), page);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), (unsigned int)skip);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)len);
+	KUNIT_EXPECT_EQ(test, page_count(page), 2);
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(skb, 0, copy, len), 0);
+	KUNIT_EXPECT_MEMEQ(test, copy, page_address(page) + skip, len);
+	kfree_skb(skb);
+	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+	__free_pages(page, 4);
+}
+
 /* A full cache frees further units; other orders are never cached. */
 static void opaque_cache_limit(struct kunit *test)
 {
@@ -2650,6 +2736,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_splice_split_pages),
 	KUNIT_CASE(opaque_splice_csum_none),
 	KUNIT_CASE(opaque_splice_frag_limit),
+	KUNIT_CASE(opaque_splice_bvec_segments),
+	KUNIT_CASE(opaque_splice_kvec_runs),
 	KUNIT_CASE(opaque_cache_limit),
 	KUNIT_CASE(opaque_cache_age),
 	KUNIT_CASE(opaque_cache_accounting),

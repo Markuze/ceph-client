@@ -7440,6 +7440,57 @@ static void skb_splice_csum_range(struct sk_buff *skb, struct page *page,
 	}
 }
 
+/*
+ * Splice from an ITER_BVEC by walking its segments: there is no page array to
+ * fill, and a run of one folio costs one sendpage_ok(), one fragment and one
+ * reference however many pages it spans.
+ */
+static ssize_t skb_splice_from_bvec(struct sk_buff *skb, struct iov_iter *iter,
+				    ssize_t maxsize, size_t frag_limit)
+{
+	const struct bio_vec *bv = iter->bvec;
+	size_t skip = iter->iov_offset;
+	ssize_t spliced = 0, ret = 0;
+	unsigned long seg;
+
+	maxsize = min_t(ssize_t, maxsize, iter->count);
+	for (seg = 0; seg < iter->nr_segs && maxsize > 0; seg++, skip = 0) {
+		size_t boff = bv[seg].bv_offset + skip;
+		size_t blen = min_t(size_t, bv[seg].bv_len - skip, maxsize);
+
+		while (blen) {
+			struct page *page = bv[seg].bv_page + (boff >> PAGE_SHIFT);
+			struct folio *folio = page_folio(page);
+			size_t foff = folio_page_idx(folio, page) * PAGE_SIZE +
+				      offset_in_page(boff);
+			size_t part = min(blen, folio_size(folio) - foff);
+
+			ret = -EIO;
+			if (WARN_ON_ONCE(!sendpage_ok(folio_page(folio, 0))))
+				goto out;
+
+			ret = skb_append_pagefrags(skb, folio_page(folio, 0), foff,
+						   part, frag_limit);
+			if (ret < 0)
+				goto out;
+
+			if (skb->ip_summed == CHECKSUM_NONE)
+				skb_splice_csum_range(skb, page, offset_in_page(boff),
+						      part, skb->len + spliced);
+
+			boff += part;
+			blen -= part;
+			spliced += part;
+			maxsize -= part;
+		}
+	}
+
+out:
+	iov_iter_advance(iter, spliced);
+	skb_len_add(skb, spliced);
+	return spliced ?: ret;
+}
+
 /**
  * skb_splice_from_iter - Splice (or copy) pages to skbuff
  * @skb: The buffer to add pages to
@@ -7450,7 +7501,8 @@ static void skb_splice_csum_range(struct sk_buff *skb, struct page *page,
  * extracts pages from an iterator and adds them to the socket buffer if
  * possible, copying them to fragments if not possible (such as if they're slab
  * pages).  Consecutive pages of one folio are added as a single fragment that
- * holds one reference on the folio.
+ * holds one reference on the folio.  A bvec iterator is walked directly,
+ * without extracting a page array.
  *
  * Returns the amount of data spliced/copied or -EMSGSIZE if there's
  * insufficient space in the buffer to transfer anything.
@@ -7462,6 +7514,9 @@ ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 	struct page *pages[8], **ppages = pages;
 	ssize_t spliced = 0, ret = 0;
 	unsigned int i, nr_pages;
+
+	if (iov_iter_is_bvec(iter))
+		return skb_splice_from_bvec(skb, iter, maxsize, frag_limit);
 
 	while (iter->count > 0) {
 		ssize_t space, nr, len;
