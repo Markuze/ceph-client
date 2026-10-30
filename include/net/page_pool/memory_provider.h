@@ -23,6 +23,10 @@ bool net_mp_niov_set_dma_addr(struct net_iov *niov, dma_addr_t addr);
 void net_mp_niov_set_page_pool(struct page_pool *pool, struct net_iov *niov);
 void net_mp_niov_clear_page_pool(struct net_iov *niov);
 
+bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr);
+void net_mp_page_set_page_pool(struct page_pool *pool, struct page *page);
+void net_mp_page_clear_page_pool(struct page *page);
+
 int netif_mp_open_rxq(struct net_device *dev, unsigned int rxq_idx,
 		      const struct pp_memory_provider_params *p,
 		      struct netlink_ext_ack *extack);

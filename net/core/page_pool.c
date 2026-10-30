@@ -1381,3 +1381,30 @@ void net_mp_niov_clear_page_pool(struct net_iov *niov)
 
 	page_pool_clear_pp_info(netmem);
 }
+
+bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr)
+{
+	return page_pool_set_dma_addr_netmem(page_to_netmem(page), addr);
+}
+
+/* Associate a page that a memory provider owns with a page pool. Should
+ * follow with a matching net_mp_page_clear_page_pool(). Only the allocation
+ * side of the pool may call it, as for net_mp_niov_set_page_pool().
+ */
+void net_mp_page_set_page_pool(struct page_pool *pool, struct page *page)
+{
+	netmem_ref netmem = page_to_netmem(page);
+
+	page_pool_set_pp_info(pool, netmem);
+
+	pool->pages_state_hold_cnt++;
+	trace_page_pool_state_hold(pool, netmem, pool->pages_state_hold_cnt);
+}
+
+/* Disassociate a page from a page pool. Should only be used in the
+ * ->release_netmem() path.
+ */
+void net_mp_page_clear_page_pool(struct page *page)
+{
+	page_pool_clear_pp_info(page_to_netmem(page));
+}
