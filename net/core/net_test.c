@@ -370,10 +370,160 @@ static void ip_tunnel_flags_test_run(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, __ipt_flag_op(bitmap_equal, exp, out));
 }
 
+/* Zerocopy: the copy of skb_orphan_frags() and skb_orphan_frags_rx() */
+
+#define ZCOPY_TEST_FRAGS	2
+#define ZCOPY_TEST_FRAG_LEN	100
+
+/* A zerocopy provider that counts the completions of its ubuf_info. */
+struct zcopy_test_ubuf {
+	struct ubuf_info	uarg;
+	unsigned int		completes;
+	unsigned int		copies;
+	unsigned int		released;
+};
+
+static void zcopy_test_complete(struct sk_buff *skb, struct ubuf_info *uarg,
+				bool success)
+{
+	struct zcopy_test_ubuf *t = container_of(uarg, struct zcopy_test_ubuf, uarg);
+
+	t->completes++;
+	if (!success)
+		t->copies++;
+	if (refcount_dec_and_test(&uarg->refcnt))
+		t->released++;
+}
+
+static const struct ubuf_info_ops zcopy_test_ops = {
+	.complete	= zcopy_test_complete,
+};
+
+struct zcopy_orphan_case {
+	const char	*name;
+	u8		flags;		/* the provider's flags */
+	bool		rx;		/* skb_orphan_frags_rx(), else skb_orphan_frags() */
+	bool		clone;		/* the consumer holds a clone, as a tap does */
+	bool		keeps;		/* the frags stay where they are */
+};
+
+/*
+ * skb_clone() orphans the frags of the original unless SKBFL_DONT_ORPHAN is
+ * set, so that a clone of an skb without it is a copy already, and a copy of
+ * a clone goes through pskb_expand_head(), which orphans them again. io_uring
+ * and MSG_ZEROCOPY set the flag; the cases that have it are the ones cloned.
+ */
+static const struct zcopy_orphan_case zcopy_orphan_cases[] = {
+	/* A provider that waits for its completion: both copy, as ever. */
+	{ "none_tx", SKBFL_ZEROCOPY_FRAG, false, false, false },
+	{ "none_rx", SKBFL_ZEROCOPY_FRAG, true, false, false },
+	/* SKBFL_DONT_ORPHAN waives the copy on the transmit path only. */
+	{ "dont_orphan_tx", SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN, false, true, true },
+	{ "dont_orphan_rx", SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN, true, true, false },
+	/* SKBFL_DONT_ORPHAN_RX waives it on the receive path only. */
+	{ "rx_waiver_tx", SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN_RX, false, false, false },
+	{ "rx_waiver_rx", SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN_RX, true, false, true },
+	/* Both flags, as a provider with no notification sets them. */
+	{ "both_tx", SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX, false,
+	  true, true },
+	{ "both_rx", SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX, true,
+	  true, true },
+};
+
+static void zcopy_orphan_case_to_desc(const struct zcopy_orphan_case *c, char *desc)
+{
+	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
+}
+
+KUNIT_ARRAY_PARAM(zcopy_orphan, zcopy_orphan_cases, zcopy_orphan_case_to_desc);
+
+/* An skb of ZCOPY_TEST_FRAGS page fragments, frag i filled with the byte i + 1. */
+static struct sk_buff *zcopy_test_skb(struct kunit *test)
+{
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	for (i = 0; i < ZCOPY_TEST_FRAGS; i++) {
+		struct page *page = alloc_page(GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		memset(page_address(page), i + 1, PAGE_SIZE);
+		skb_add_rx_frag(skb, i, page, 0, ZCOPY_TEST_FRAG_LEN, PAGE_SIZE);
+	}
+	return skb;
+}
+
+static void zcopy_orphan_test(struct kunit *test)
+{
+	const struct zcopy_orphan_case *c = test->param_value;
+	struct zcopy_test_ubuf t = { .uarg = { .ops = &zcopy_test_ops, .flags = c->flags } };
+	struct page *page[ZCOPY_TEST_FRAGS];
+	struct sk_buff *skb = zcopy_test_skb(test), *consumer = skb;
+	u8 want[ZCOPY_TEST_FRAGS * ZCOPY_TEST_FRAG_LEN], data[sizeof(want)];
+	/* A copy completes the provider once, and so does the release of the shinfo it left. */
+	unsigned int completes = c->keeps ? 1 : 1 + c->clone;
+	unsigned int i;
+
+	for (i = 0; i < sizeof(want); i++)
+		want[i] = i / ZCOPY_TEST_FRAG_LEN + 1;
+	for (i = 0; i < ZCOPY_TEST_FRAGS; i++)
+		page[i] = skb_frag_page(&skb_shinfo(skb)->frags[i]);
+	refcount_set(&t.uarg.refcnt, 1);
+	skb_zcopy_init(skb, &t.uarg);
+	KUNIT_ASSERT_PTR_EQ(test, skb_zcopy(skb), &t.uarg);
+	if (c->clone) {
+		consumer = skb_clone(skb, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, consumer);
+		KUNIT_ASSERT_TRUE(test, skb_cloned(consumer));
+	}
+
+	KUNIT_EXPECT_EQ(test, c->rx ? skb_orphan_frags_rx(consumer, GFP_KERNEL) :
+				      skb_orphan_frags(consumer, GFP_KERNEL), 0);
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(consumer, 0, data, sizeof(data)), 0);
+	KUNIT_EXPECT_MEMEQ(test, data, want, sizeof(want));
+	if (c->keeps) {
+		/* Left as it was: the ubuf_info is still the consumer's, with its bits. */
+		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(consumer), &t.uarg);
+		KUNIT_EXPECT_EQ(test, skb_shinfo(consumer)->flags & c->flags, (int)c->flags);
+		KUNIT_ASSERT_EQ(test, skb_shinfo(consumer)->nr_frags, ZCOPY_TEST_FRAGS);
+		for (i = 0; i < ZCOPY_TEST_FRAGS; i++)
+			KUNIT_EXPECT_PTR_EQ(test,
+					    skb_frag_page(&skb_shinfo(consumer)->frags[i]),
+					    page[i]);
+		KUNIT_EXPECT_EQ(test, t.completes, 0U);
+	} else {
+		/* Copied: new pages, no bit left, the provider told once that it was copied. */
+		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(consumer), NULL);
+		KUNIT_EXPECT_EQ(test, skb_shinfo(consumer)->flags & SKBFL_ALL_ZEROCOPY, 0);
+		/* The bytes of both fragments fit one page. */
+		KUNIT_ASSERT_EQ(test, skb_shinfo(consumer)->nr_frags, 1);
+		for (i = 0; i < ZCOPY_TEST_FRAGS; i++)
+			KUNIT_EXPECT_PTR_NE(test,
+					    skb_frag_page(&skb_shinfo(consumer)->frags[0]),
+					    page[i]);
+		KUNIT_EXPECT_EQ(test, t.completes, 1U);
+		KUNIT_EXPECT_EQ(test, t.copies, 1U);
+	}
+
+	/* The consumer lets go of what it holds; the last holder completes the provider. */
+	consume_skb(consumer);
+	if (c->clone) {
+		KUNIT_EXPECT_EQ(test, t.completes, c->keeps ? 0U : 1U);
+		consume_skb(skb);
+	}
+	KUNIT_EXPECT_EQ(test, t.completes, completes);
+	KUNIT_EXPECT_EQ(test, t.copies, c->keeps ? 0U : 1U);
+	/* Nothing holds the provider any more, and it was let go of once. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&t.uarg.refcnt), 0U);
+	KUNIT_EXPECT_EQ(test, t.released, 1U);
+}
+
 static struct kunit_case net_test_cases[] = {
 	KUNIT_CASE_PARAM(gso_test_func, gso_test_gen_params),
 	KUNIT_CASE_PARAM(ip_tunnel_flags_test_run,
 			 ip_tunnel_flags_test_gen_params),
+	KUNIT_CASE_PARAM(zcopy_orphan_test, zcopy_orphan_gen_params),
 	{ },
 };
 

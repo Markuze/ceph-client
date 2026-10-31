@@ -522,11 +522,23 @@ enum {
 	 * use frags only up until ubuf_info is released
 	 */
 	SKBFL_MANAGED_FRAG_REFS = BIT(4),
+
+	/* The completion of the ubuf_info is not a notification that anyone
+	 * waits for: all it does is let go of the memory the frags point to,
+	 * and that memory does not change for as long as the ubuf_info is
+	 * referenced. skb_orphan_frags_rx() then need not copy the frags of an
+	 * skb that loops to the receive path: its consumer may hold the skb,
+	 * and with it the ubuf_info and the memory, for as long as it likes,
+	 * as it may hold an skb whose pages were spliced. A provider whose
+	 * owner waits for the completion must not set it.
+	 */
+	SKBFL_DONT_ORPHAN_RX = BIT(5),
 };
 
 #define SKBFL_ZEROCOPY_FRAG	(SKBFL_ZEROCOPY_ENABLE | SKBFL_SHARED_FRAG)
 #define SKBFL_ALL_ZEROCOPY	(SKBFL_ZEROCOPY_FRAG | SKBFL_PURE_ZEROCOPY | \
-				 SKBFL_DONT_ORPHAN | SKBFL_MANAGED_FRAG_REFS)
+				 SKBFL_DONT_ORPHAN | SKBFL_MANAGED_FRAG_REFS | \
+				 SKBFL_DONT_ORPHAN_RX)
 
 struct ubuf_info_ops {
 	void (*complete)(struct sk_buff *, struct ubuf_info *,
@@ -3427,10 +3439,14 @@ static inline int skb_orphan_frags(struct sk_buff *skb, gfp_t gfp_mask)
 	return skb_copy_ubufs(skb, gfp_mask);
 }
 
-/* Frags must be orphaned, even if refcounted, if skb might loop to rx path */
+/* Frags must be orphaned, even if refcounted, if skb might loop to rx path,
+ * unless the provider of the ubuf_info waived the copy: SKBFL_DONT_ORPHAN_RX.
+ */
 static inline int skb_orphan_frags_rx(struct sk_buff *skb, gfp_t gfp_mask)
 {
 	if (likely(!skb_zcopy(skb)))
+		return 0;
+	if (skb_shinfo(skb)->flags & SKBFL_DONT_ORPHAN_RX)
 		return 0;
 	return skb_copy_ubufs(skb, gfp_mask);
 }

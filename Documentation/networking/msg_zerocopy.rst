@@ -245,6 +245,17 @@ acceptable. For this reason all packets generated with MSG_ZEROCOPY
 that are looped to a local socket will incur a deferred copy. This
 includes looping onto packet sockets (e.g., tcpdump) and tun devices.
 
+A zerocopy provider whose completion is not a notification that anyone
+waits for has no latency to bound. If all its completion does is let go
+of the memory its skbs reference, and that memory does not change for as
+long as the ubuf_info is referenced, it can set SKBFL_DONT_ORPHAN_RX in
+the flags of the ubuf_info. skb_orphan_frags_rx() then leaves its skbs
+alone, and a packet socket, a tun device or a local socket can hold the
+skb, and the memory, for as long as it likes, as it can hold an skb
+whose pages were added with MSG_SPLICE_PAGES. MSG_ZEROCOPY does not set
+the flag: its completion is the notification that the application waits
+for.
+
 For VSOCK:
 Data path sent to local sockets is the same as for non-local sockets.
 

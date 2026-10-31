@@ -1991,6 +1991,10 @@ static int skb_zerocopy_clone(struct sk_buff *nskb, struct sk_buff *orig,
  *	It will copy all frags into kernel and drop the reference
  *	to userspace pages.
  *
+ *	skb_orphan_frags_rx() calls it for every zerocopy skb that is
+ *	looped to a local consumer, unless the provider of the skb's
+ *	ubuf_info set SKBFL_DONT_ORPHAN_RX.
+ *
  *	If this function is called from an interrupt gfp_mask() must be
  *	%GFP_ATOMIC.
  *
