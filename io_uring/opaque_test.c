@@ -4883,9 +4883,15 @@ static void opaque_vector_anchors(struct kunit *test)
 			KUNIT_EXPECT_PTR_EQ(test, data->anchor, NULL);
 		} else {
 			KUNIT_ASSERT_NOT_NULL(test, data->anchor);
-			/* Right after the segments, in their allocation. */
+			/*
+			 * After the segments, at the next multiple of eight bytes, in
+			 * their allocation: an odd count must not leave them short of it.
+			 */
 			KUNIT_EXPECT_PTR_EQ(test, (void *)data->anchor,
-					    (void *)(data->bvec + data->nr));
+					    (void *)data->bvec +
+					    ALIGN(data->nr * sizeof(*data->bvec), sizeof(u64)));
+			KUNIT_EXPECT_TRUE(test,
+					  IS_ALIGNED((unsigned long)data->anchor, sizeof(u64)));
 			for (k = 0; k < DIV_ROUND_UP(sizes[i], IO_OPAQUE_SEEK_STRIDE); k++)
 				KUNIT_EXPECT_EQ(test, data->anchor[k],
 						opaque_seg_pos(data, k * IO_OPAQUE_SEEK_STRIDE));

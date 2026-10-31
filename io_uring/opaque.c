@@ -461,13 +461,16 @@ void io_opaque_data_put(struct io_opaque_store *store,
  * Build the version's segments, and for a version of more than
  * IO_OPAQUE_SEEK_STRIDE of them the anchors that find one without walking
  * from the first, in one allocation. Both are made once, when the version is,
- * and never change.
+ * and never change. The anchors follow the segments at the next multiple of
+ * eight bytes: a segment is 16 bytes, but only 12 on 32 bits, where an odd
+ * number of them would leave the anchors four-byte aligned.
  */
 int io_opaque_vector(struct io_opaque_data *data)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
 	u32 nr = 0, anchors;
+	size_t bytes;
 	u64 at = 0;
 
 	data->charge = 0;
@@ -478,12 +481,14 @@ int io_opaque_vector(struct io_opaque_data *data)
 		previous = extent->backing;
 	}
 	anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
-	data->bvec = kvmalloc(size_add(array_size(nr, sizeof(*data->bvec)),
-				       array_size(anchors, sizeof(*data->anchor))),
+	/* Where the anchors start. An overflow saturates, and the allocation fails. */
+	bytes = size_add(array_size(nr, sizeof(*data->bvec)), sizeof(*data->anchor) - 1);
+	bytes &= ~(sizeof(*data->anchor) - 1);
+	data->bvec = kvmalloc(size_add(bytes, array_size(anchors, sizeof(*data->anchor))),
 			      GFP_KERNEL_ACCOUNT);
 	if (!data->bvec)
 		return -ENOMEM;
-	data->anchor = anchors ? (u64 *)(data->bvec + nr) : NULL;
+	data->anchor = anchors ? (void *)data->bvec + bytes : NULL;
 	data->nr = nr;
 	nr = 0;
 	list_for_each_entry(extent, &data->extents, list) {
