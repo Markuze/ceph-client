@@ -524,8 +524,11 @@ more than one flow, for example when ``virtio_net`` puts several receive
 buffers in one page. A send that references the page transmits the bytes that
 are present when TCP builds the segment. This is the integrity power of
 packet injection, which ``CAP_NET_ADMIN`` and ``CAP_NET_RAW`` grant. The
-process can map nothing except the area. The kernel never parses a header from
-an area page, so a write cannot change how the kernel parses a packet.
+process can map nothing except the area. No other process can map an area
+page: the kernel marks every area page from its allocation until the page
+allocator frees it, and ``TCP_ZEROCOPY_RECEIVE`` copies a marked page instead
+of mapping it. The kernel never parses a header from an area page, so a write
+cannot change how the kernel parses a packet.
 
 The kernel checks the privilege at registration. An import keeps the privilege
 decision of the exporter. An unprivileged process cannot use the mode. A guest
@@ -541,10 +544,8 @@ Limits
 * The kernel allocates the whole area at registration.
 * An instance covers the queues that the device has at registration. The
   kernel refuses a request to set the channel count while the instance exists.
-* Another process can map an area page, for example with
-  ``TCP_ZEROCOPY_RECEIVE``. The provider counts such a PTE as a PTE of the
-  mapping of the area. It can reuse the page while the other process still
-  maps it.
+* ``TCP_ZEROCOPY_RECEIVE`` copies the bytes that arrive in area pages, for
+  every socket on the device. It maps only bytes in fallback pages.
 * The ``netdevsim`` aid is for tests.
 
 Testing

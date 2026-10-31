@@ -184,8 +184,10 @@ static inline struct io_zcrx_ifq *io_pp_to_ifq(struct page_pool *pp)
  * later. A false "quiet" would let a device write a page that an outsider
  * still reads, and the checks exclude it.
  *
- * A mapping of the page by another process counts as a mapping of the area.
- * The caller cannot tell the two apart.
+ * Every PTE of an area page belongs to a mapping of the area, so the count is
+ * exact. The kernel maps an area page nowhere else: TCP_ZEROCOPY_RECEIVE
+ * copies it, see net_mp_page_nomap(), and fork() does not copy the mapping. A
+ * process that maps the area through an imported instance maps the area too.
  */
 static inline bool io_zcrx_page_is_quiet(struct page *page)
 {

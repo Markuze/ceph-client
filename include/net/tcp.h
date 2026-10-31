@@ -530,6 +530,9 @@ void tcp_data_ready(struct sock *sk);
 #ifdef CONFIG_MMU
 int tcp_mmap(struct file *file, struct socket *sock,
 	     struct vm_area_struct *vma);
+#if IS_ENABLED(CONFIG_KUNIT)
+bool tcp_can_map_frag(const skb_frag_t *frag);
+#endif
 #endif
 void tcp_parse_options(const struct net *net, const struct sk_buff *skb,
 		       struct tcp_options_received *opt_rx,

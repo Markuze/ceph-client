@@ -128,10 +128,14 @@ int io_zcrx_kmem_import(struct io_zcrx_ifq *ifq, struct io_zcrx_mem *mem,
 
 	/*
 	 * The allocator leaves list poison where a page pool keeps its pool
-	 * pointer. A page that no pool owns must show a null pointer.
+	 * pointer. A page that no pool owns must show a null pointer. Only the
+	 * mapping of the area may map an area page, so mark each page before
+	 * anyone else can reach it, see net_mp_page_set_nomap().
 	 */
-	for (i = 0; i < nr_pages; i++)
+	for (i = 0; i < nr_pages; i++) {
 		net_mp_page_clear_page_pool(pages[i]);
+		net_mp_page_set_nomap(pages[i]);
+	}
 
 	mem->pages = pages;
 	mem->size = area_reg->len;
