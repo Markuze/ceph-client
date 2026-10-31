@@ -3329,48 +3329,14 @@ static void virtnet_destroy_page_pools(struct virtnet_info *vi)
 		virtnet_destroy_page_pool(&vi->rq[i]);
 }
 
-/* Return every posted buffer of @rq to its pool and destroy the pool.
+/* Give @rq the pool that fits the provider of the queue now. A pool stays as
+ * it is when it fits. Otherwise the provider came or went while the interface
+ * was down, or the device came back from a suspend while the interface was
+ * closed: destroy the pool and create one that fits.
  *
- * The caller holds dev->lock, and NAPI of the queue is off. On an error the
- * queue keeps its pool. The ring is already empty if only the last step of
- * the reset failed.
- */
-static int virtnet_release_page_pool(struct virtnet_info *vi,
-				     struct receive_queue *rq)
-{
-	int err;
-
-	err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
-	if (err) {
-		netdev_err(vi->dev, "reset rx fail: rx queue index: %d err: %d\n",
-			   (int)(rq - vi->rq), err);
-		return err;
-	}
-
-	page_pool_disable_direct_recycling(rq->page_pool);
-	virtnet_destroy_page_pool(rq);
-
-	return 0;
-}
-
-/* A pool that binds a memory provider lives only while the interface is up.
- * The core expects such a pool to die in ndo_stop, and the provider can go
- * away while the interface is down. The other pools live as long as the
- * device. virtnet_open() creates the pool again.
- */
-static void virtnet_release_provider_pools(struct virtnet_info *vi)
-{
-	int i;
-
-	for (i = 0; i < vi->max_queue_pairs; i++)
-		if (vi->rq[i].private_headers)
-			virtnet_release_page_pool(vi, &vi->rq[i]);
-}
-
-/* Give @rq the pool that fits the provider of the queue now. A pool stays
- * as it is when it fits. Otherwise the pool is a leftover: virtnet_close()
- * could not release it, or the device came back from a suspend while the
- * interface was closed.
+ * As in ndo_queue_stop(), the buffers of the old pool stay in the ring unless
+ * the device uses the DMA API, see "Receive queue management API". The caller
+ * holds dev->lock, and NAPI of the queue is off.
  */
 static int virtnet_sync_page_pool(struct virtnet_info *vi,
 				  struct receive_queue *rq)
@@ -3379,9 +3345,16 @@ static int virtnet_sync_page_pool(struct virtnet_info *vi,
 
 	if (rq->page_pool &&
 	    rq->private_headers != virtnet_rq_has_readable_provider(vi, rq)) {
-		err = virtnet_release_page_pool(vi, rq);
-		if (err)
-			return err;
+		if (rq->use_page_pool_dma) {
+			err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf,
+					      NULL);
+			if (err) {
+				netdev_err(vi->dev, "reset rx fail: rx queue index: %d err: %d\n",
+					   (int)(rq - vi->rq), err);
+				return err;
+			}
+		}
+		virtnet_destroy_page_pool(rq);
 	}
 
 	return virtnet_setup_page_pool(vi, rq);
@@ -3392,16 +3365,13 @@ static int virtnet_open(struct net_device *dev)
 	struct virtnet_info *vi = netdev_priv(dev);
 	int i, err;
 
-	/* virtnet_close() released the pool of each queue that binds a memory
-	 * provider. Create it again before the first fill, so that it binds
-	 * the provider that the queue has now. Replace a pool that does not
-	 * fit the provider. All other queues keep their pool, and this loop
-	 * does nothing for them.
+	/* Before the first fill, give each queue a pool that binds the
+	 * provider that the queue has now, or none. A pool that fits stays.
 	 */
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		err = virtnet_sync_page_pool(vi, &vi->rq[i]);
 		if (err)
-			goto err_pools;
+			return err;
 	}
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
@@ -3432,8 +3402,6 @@ err_enable_qp:
 		virtnet_disable_queue_pair(vi, i);
 		virtnet_cancel_dim(vi, &vi->rq[i].dim);
 	}
-err_pools:
-	virtnet_release_provider_pools(vi);
 
 	return err;
 }
@@ -4045,9 +4013,10 @@ static int virtnet_close(struct net_device *dev)
 
 	netif_carrier_off(dev);
 
-	/* NAPI is off and XDP no longer uses the pools. */
-	virtnet_release_provider_pools(vi);
-
+	/* Keep every pool, also one that binds a memory provider. Its buffers
+	 * stay in the ring. If the provider goes away while the interface is
+	 * down, virtnet_open() replaces the pool.
+	 */
 	return 0;
 }
 
@@ -5986,6 +5955,23 @@ static const struct netdev_stat_ops virtnet_stat_ops = {
  * holds dev->lock from the first call to the last. NAPI of the queue is
  * off from the stop to the start.
  *
+ * If the device does not use the DMA API, the replacement does not reset
+ * the virtqueue. The buffers that the old pool posted stay in the ring, and
+ * the device fills them as before. Each one returns to the old pool when the
+ * stack frees it: the driver and the skb recycling put a page into the pool
+ * of the page, not of the queue. The new pool fills the slots that the
+ * device frees. page_pool_destroy() of the old pool waits for its pages in
+ * the background. A reset depends on the device: a host that offers
+ * VIRTIO_F_RING_RESET and then does not restart the queue leaves the queue
+ * without receive until the device is reset, with no error that the driver
+ * can see.
+ *
+ * If the device uses the DMA API, the pool maps its pages, and
+ * page_pool_destroy() unmaps every page that the pool mapped, also a page
+ * that is still posted. The device would then write to an unmapped address.
+ * ndo_queue_stop() returns the posted buffers with a reset of the virtqueue
+ * first, which needs VIRTIO_F_RING_RESET.
+ *
  * ndo_queue_mem_alloc() creates the pool, because the core looks for the
  * new pool of a queue with a memory provider before it stops the queue.
  * It also registers the pool with XDP, because that step can fail.
@@ -6025,6 +6011,14 @@ static int virtnet_queue_mem_alloc(struct net_device *dev,
 	 */
 	if (rq->xsk_pool)
 		return -EBUSY;
+
+	/* The pools of a device that uses the DMA API unmap their pages when
+	 * they are destroyed. ndo_queue_stop() must then take every posted
+	 * buffer back with a reset of the virtqueue first.
+	 */
+	if (rq->use_page_pool_dma &&
+	    !virtio_has_feature(vi->vdev, VIRTIO_F_RING_RESET))
+		return -EOPNOTSUPP;
 
 	/* Create the pool without a NAPI instance. The queue still runs on
 	 * its old pool, and its NAPI is on. page_pool_destroy() warns if the
@@ -6070,22 +6064,23 @@ static int virtnet_queue_stop(struct net_device *dev, void *per_queue_mem,
 
 	virtnet_rx_pause(vi, rq);
 
-	/* Return every posted buffer to the old pool. Skbs in flight hold
-	 * their own pool references and return their pages later. The core
-	 * destroys the old pool after the start, and the destroy does not
-	 * wait for them.
+	/* Without the DMA API the posted buffers stay in the ring, see above.
+	 * With it, return them to the old pool before its destroy unmaps them.
+	 * Skbs in flight hold their own pool references either way.
 	 */
-	err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
-	if (err) {
-		netdev_err(dev, "reset rx fail: rx queue index: %d err: %d\n",
-			   idx, err);
-		virtnet_rx_resume(vi, rq, true);
-		return err;
+	if (rq->use_page_pool_dma) {
+		err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
+		if (err) {
+			netdev_err(dev, "reset rx fail: rx queue index: %d err: %d\n",
+				   idx, err);
+			virtnet_rx_resume(vi, rq, true);
+			return err;
+		}
 	}
 
-	/* NAPI is off and the ring is empty, so the old pool has no direct
-	 * recycling user left. Keep the pool registered with XDP, because
-	 * the core may start it again.
+	/* NAPI is off, so the old pool has no direct recycling user left: its
+	 * pages that come back from now on go to its ring. Keep the pool
+	 * registered with XDP, because the core may start it again.
 	 */
 	page_pool_disable_direct_recycling(rq->page_pool);
 	xdp_rxq_info_detach_mem_model(&rq->xdp_rxq);
@@ -7329,11 +7324,11 @@ static int virtnet_probe(struct virtio_device *vdev)
 	 * Offer it only for the mergeable buffer mode. The big packets mode
 	 * has no page pool. The small buffer mode builds every skb over the
 	 * page, so it cannot keep a header out of a page that another party
-	 * writes. The restart resets the virtqueue, which needs
+	 * writes. The replacement resets the virtqueue only if the device uses
+	 * the DMA API, and ndo_queue_mem_alloc() refuses such a device without
 	 * VIRTIO_F_RING_RESET.
 	 */
-	if (vi->mergeable_rx_bufs &&
-	    virtio_has_feature(vdev, VIRTIO_F_RING_RESET))
+	if (vi->mergeable_rx_bufs)
 		dev->queue_mgmt_ops = &virtnet_queue_mgmt_ops;
 
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_HASH_REPORT))
