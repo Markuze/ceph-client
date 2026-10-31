@@ -2310,15 +2310,16 @@ static void io_opaque_send_iter(struct io_opaque_req *op)
 	iov_iter_truncate(&op->iter, op->length);
 }
 
-/* Snapshot framing before TX admission can consume a LAST handle. */
+/*
+ * Snapshot framing before TX admission can consume a LAST handle. Only a send
+ * with a frame gets here: one without is resolved at prep.
+ */
 static int io_opaque_frame_import(struct io_opaque_req *op)
 {
 	struct io_uring_opaque_frame frame = {};
 	u32 size, bytes, charge;
 	int ret;
 
-	if (op->resolved)
-		return 0;
 	op->total_length = op->length;
 	if (op->addr) {
 		if (get_user(size, (u32 __user *)op->addr))
@@ -2369,6 +2370,18 @@ static int io_opaque_frame_import(struct io_opaque_req *op)
 		return -EINVAL;
 	op->resolved = true;
 	return 0;
+}
+
+/*
+ * A send without a frame reads nothing from user memory at first issue: its
+ * total is its body, which prep already checked to be positive.
+ */
+VISIBLE_IF_KUNIT void io_opaque_send_resolve(struct io_opaque_req *op)
+{
+	if (op->addr)
+		return;
+	op->total_length = op->length;
+	op->resolved = true;
 }
 
 VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
@@ -2430,6 +2443,7 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if ((!op->length && !op->addr) || op->length > INT_MAX ||
 	    check_add_overflow(op->offset, (u64)op->length, &end))
 		return -EINVAL;
+	io_opaque_send_resolve(op);
 	return 0;
 }
 
@@ -2682,9 +2696,11 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 		ret = -ESHUTDOWN;
 		goto finish;
 	}
-	ret = io_opaque_frame_import(op);
-	if (ret)
-		goto finish;
+	if (!op->resolved) {
+		ret = io_opaque_frame_import(op);
+		if (ret)
+			goto finish;
+	}
 	ret = io_opaque_tx_enter(op, sock->sk);
 	if (ret)
 		goto out;

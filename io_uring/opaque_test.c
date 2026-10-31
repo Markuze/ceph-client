@@ -2359,6 +2359,112 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, value, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED));
 }
 
+/* A ring context that preps OBJ_SEND requests for @store, which it knows as store 1. */
+struct opaque_prep {
+	struct io_ring_ctx *ctx;
+	struct io_opaque_store *store;
+	struct io_kiocb req;
+	struct io_uring_sqe sqe;
+};
+
+static void opaque_prep_cleanup(void *arg)
+{
+	struct opaque_prep *p = arg;
+
+	xa_destroy(&p->ctx->opaque_stores);
+	io_opaque_cache_free(p->ctx);
+}
+
+static void opaque_prep_init(struct kunit *test, struct opaque_prep *p,
+			     struct io_opaque_store *store)
+{
+	p->ctx = kunit_kzalloc(test, sizeof(*p->ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p->ctx);
+	mutex_init(&p->ctx->uring_lock);
+	INIT_LIST_HEAD(&p->ctx->opaque_waits);
+	xa_init(&p->ctx->opaque_stores);
+	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(p->ctx));
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_prep_cleanup, p), 0);
+	store->config.max_requests = 8;
+	KUNIT_ASSERT_EQ(test, xa_err(xa_store(&p->ctx->opaque_stores, 1, store, GFP_KERNEL)), 0);
+	p->store = store;
+	p->req = (struct io_kiocb) { .ctx = p->ctx, .opcode = IORING_OP_OPAQUE_OBJ_SEND };
+	p->sqe = (struct io_uring_sqe) { .opaque_store_id = 1 };
+}
+
+/* Prep the SQE in @p->sqe; the request, if one was made, is left for opaque_prep_done(). */
+static int opaque_prep_send(struct opaque_prep *p, struct io_opaque_req **op)
+{
+	int ret = io_opaque_send_prep(&p->req, &p->sqe);
+
+	*op = p->req.async_data;
+	return ret;
+}
+
+/* Request cleanup, as the core runs it after the request completes or fails prep. */
+static void opaque_prep_done(struct opaque_prep *p)
+{
+	if (p->req.async_data) {
+		mutex_lock(&p->ctx->uring_lock);
+		io_opaque_cleanup(&p->req);
+		mutex_unlock(&p->ctx->uring_lock);
+	}
+	p->req.flags = 0;
+}
+
+/*
+ * A send without a frame is resolved when it is prepared, so its first issue
+ * has nothing to import. One with a frame address waits for that issue, where
+ * the frame is read and the total is known.
+ */
+static void opaque_send_resolve(struct kunit *test)
+{
+	static const struct {
+		u64 off, addr3;
+		u32 len;
+		int result;
+		bool resolved;
+	} cases[] = {
+		{ 0, 0, 1, 0, true },
+		{ 5, 0, 100, 0, true },
+		{ 0, 0, INT_MAX, 0, true },
+		{ 0, 0x1000, 100, 0, false },	/* body and frame */
+		{ 0, 0x1000, 0, 0, false },	/* a reply made of a frame alone */
+		{ 0, 0, 0, -EINVAL, false },	/* nothing to send */
+		{ 0, 0, (u32)INT_MAX + 1, -EINVAL, false },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_prep *p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	struct io_opaque_req *op;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	opaque_prep_init(test, p, store);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		u64 framing = io_opaque_stat_read(IO_OPAQUE_STAT_FRAMING_COPIED);
+
+		p->sqe.addr = io_opaque_handle(0, 9);
+		p->sqe.off = cases[i].off;
+		p->sqe.addr3 = cases[i].addr3;
+		p->sqe.len = cases[i].len;
+		KUNIT_EXPECT_EQ(test, opaque_prep_send(p, &op), cases[i].result);
+		if (!cases[i].result) {
+			u32 total = cases[i].len;
+
+			KUNIT_ASSERT_NOT_NULL(test, op);
+			KUNIT_EXPECT_EQ(test, op->resolved, cases[i].resolved);
+			if (!cases[i].resolved)
+				total = 0;
+			KUNIT_EXPECT_EQ(test, op->total_length, total);
+			KUNIT_EXPECT_EQ(test, op->length, cases[i].len);
+		}
+		/* Prep reads no user memory. */
+		KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_FRAMING_COPIED), framing);
+		opaque_prep_done(p);
+	}
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+}
+
 /* Bodies up to send_copy_max are copied by TCP; zero splices every body. */
 static void opaque_send_copy_policy(struct kunit *test)
 {
@@ -2515,6 +2621,7 @@ static void opaque_send_loopback(struct kunit *test)
 	opaque_wire_init(test, w);
 	for (c = 0; c < ARRAY_SIZE(cases); c++) {
 		u64 copied = io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED), expect = 0;
+		u64 framing = io_opaque_stat_read(IO_OPAQUE_STAT_FRAMING_COPIED);
 		u32 length[2] = { cases[c].length, cases[c].length - 1 };
 		u32 offset[2] = { cases[c].offset, cases[c].offset + 1 };
 		u32 total = length[0] + length[1], done = 0;
@@ -2534,6 +2641,10 @@ static void opaque_send_loopback(struct kunit *test)
 			INIT_LIST_HEAD(&send[i].cancel);
 			INIT_LIST_HEAD(&send[i].send);
 			w->req[i].async_data = &send[i];
+			/* Prep resolves a body-only send: issue has no frame to import. */
+			io_opaque_send_resolve(&send[i]);
+			KUNIT_ASSERT_TRUE(test, send[i].resolved);
+			KUNIT_EXPECT_EQ(test, send[i].total_length, length[i]);
 			if (cases[c].copy_max && length[i] <= cases[c].copy_max)
 				expect += length[i];
 			/* Not parked behind the first frame: it left its queue when queued. */
@@ -2545,6 +2656,7 @@ static void opaque_send_loopback(struct kunit *test)
 		}
 		KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED) - copied,
 				expect);
+		KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_FRAMING_COPIED), framing);
 		/* The peer sees the first range, then the second. */
 		while (done < total) {
 			int ret;
@@ -2746,6 +2858,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_compact_cancel_units),
 	KUNIT_CASE(opaque_create_uses_cache),
 	KUNIT_CASE(opaque_compact_inline),
+	KUNIT_CASE(opaque_send_resolve),
 	KUNIT_CASE(opaque_send_copy_policy),
 	KUNIT_CASE(opaque_send_loopback),
 	KUNIT_CASE(opaque_params_sysfs),
