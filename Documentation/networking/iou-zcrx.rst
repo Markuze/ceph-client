@@ -405,15 +405,13 @@ buffer. An *outsider page* is a page of the area that no pool owns, for
 example user memory that the process sent with ``SEND_ZC``. The kernel copies
 it too.
 
-The two copy counters of ``struct zcrx_stats`` count copies of fragments.
-``copy_count`` is the number of fragments that the kernel copied, in whole or
-in part. It does not count CQEs. A fragment can need several copy pages and
-post several CQEs. A fragment of 20580 bytes posts 6 CQEs and adds 1 to
-``copy_count``. ``copy_bytes`` is the number of bytes copied. The bytes that
-the kernel copies from the head of a socket buffer are in neither counter.
-They fire no event. The event ``ZCRX_EVENT_COPY`` fires after a copy of a
-fragment. It does not fire again until the process arms it with
-``ZCRX_CTRL_ARM_EVENT``.
+The two copy counters of ``struct zcrx_stats`` count copies. A copy takes
+the bytes of one fragment, or of the linear part, of one socket buffer, in
+whole or in part. ``copy_count`` is the number of copies. It does not count
+CQEs. A copy can need several copy pages and post several CQEs. A fragment of
+20580 bytes posts 6 CQEs and adds 1 to ``copy_count``. ``copy_bytes`` is the
+number of bytes copied. The event ``ZCRX_EVENT_COPY`` fires after a copy. It
+does not fire again until the process arms it with ``ZCRX_CTRL_ARM_EVENT``.
 
 Exhaustion
 ----------

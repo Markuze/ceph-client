@@ -1993,6 +1993,15 @@ static ssize_t io_zcrx_copy_chunk(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 		copied += n;
 	}
 
+	/* One call is one copy for the counters and one event. */
+	if (copied) {
+		if (ifq->notif_stats) {
+			zcrx_stat_add(&ifq->notif_stats->copy_count, 1);
+			zcrx_stat_add(&ifq->notif_stats->copy_bytes, copied);
+		}
+		zcrx_send_notif(ifq, ZCRX_EVENT_COPY);
+	}
+
 	return copied ? copied : ret;
 }
 
@@ -2000,18 +2009,8 @@ static int io_zcrx_copy_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 			     const skb_frag_t *frag, int off, int len)
 {
 	struct page *page = skb_frag_page(frag);
-	int ret;
 
-	ret = io_zcrx_copy_chunk(req, ifq, page, off + skb_frag_off(frag), len);
-	if (ret > 0) {
-		if (ifq->notif_stats) {
-			zcrx_stat_add(&ifq->notif_stats->copy_count, 1);
-			zcrx_stat_add(&ifq->notif_stats->copy_bytes, ret);
-		}
-		zcrx_send_notif(ifq, ZCRX_EVENT_COPY);
-	}
-
-	return ret;
+	return io_zcrx_copy_chunk(req, ifq, page, off + skb_frag_off(frag), len);
 }
 
 /**

@@ -111,12 +111,12 @@ enum zcrx_event_desc_flags {
  */
 struct zcrx_stats {
 	/*
-	 * The kernel copies a fragment of a socket buffer into buffers of the
-	 * area and posts one CQE for each buffer it fills. copy_count counts
-	 * the copied fragments and copy_bytes counts the copied bytes. Neither
-	 * counts CQEs.
+	 * The kernel copies the bytes of a fragment of a socket buffer, or of
+	 * its linear part, into buffers of the area. It posts one CQE for each
+	 * buffer it fills. copy_count counts these copies, and copy_bytes
+	 * counts the copied bytes. Neither counts CQEs.
 	 */
-	__u64	copy_count;	/* cumulative fragments copied */
+	__u64	copy_count;	/* cumulative copies of a fragment or of a linear part */
 	__u64	copy_bytes;	/* cumulative bytes copied */
 
 	/* The counters below count the events of a ZCRX_REG_MAIO instance. */

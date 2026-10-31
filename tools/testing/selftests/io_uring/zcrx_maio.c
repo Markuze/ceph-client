@@ -41,7 +41,7 @@
 
 #include "../kselftest.h"
 
-#define PLAN			17
+#define PLAN			18
 #define AREA_PAGES		64
 #define RQ_ENTRIES		64
 #define RQ_REGION_SIZE		8192
@@ -1794,6 +1794,56 @@ static void test_netdevsim_exhaust(void)
 	ksft_test_result_pass("netdevsim: a full area, ordinary pages, host keeps receiving\n");
 }
 
+/*
+ * 13. The payload is in the linear part of the socket buffers. Port A has no
+ * instance, so its receive path passes the linear skbs of the peer to the
+ * stack, and each skb holds its payload in the head. An instance without a
+ * device copies the bytes. The copies of heads count like the copies of
+ * fragments: copy_count, copy_bytes and the event follow them.
+ */
+static void test_netdevsim_head(void)
+{
+	const size_t len = 40000;
+	struct zcrx_stats *st;
+	struct rx rx = {};
+	struct zcrx z;
+	struct pair pr;
+	struct ring r;
+	int sock, listener;
+	uint16_t port;
+
+	if (!pair_create(&pr, 205, 206)) {
+		ksft_test_result_skip("netdevsim ports or network namespaces are not available\n");
+		return;
+	}
+	require(!ring_init(&r, IORING_SETUP_CQE32), "ring for the head test");
+	zcrx_prepare(&z, &r, ZCRX_REG_MAIO | ZCRX_REG_NODEV, 0, DEV_AREA_PAGES);
+	zcrx_want_events(&z, 1U << ZCRX_EVENT_COPY);
+	require(!zcrx_do_register(&z), "register an instance without a device");
+	z.map = map_area(&r, z.area.mmap_offset, z.area.len, PROT_READ | PROT_WRITE, MAP_SHARED);
+	require(z.map != MAP_FAILED, "map the area for the head test");
+	st = zcrx_stats(&z);
+
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	rx_start(&r, &rx, &z, sock);
+	send_stream(pr.peer.socks[0], 0, len, 9);
+	rx_wait(&r, &rx, len);
+	require(rx.bytes == len, "all the bytes arrive");
+	rx_check_copies(&z, &rx, 0, 0, 9);
+	require(stat_read(&st->copy_bytes) == len, "copy_bytes counts the bytes of the heads");
+	require(stat_read(&st->copy_count) >= 1 && stat_read(&st->copy_count) <= rx.nr_data,
+		"copy_count counts the copies of the heads");
+	require(rx.nr_event[ZCRX_EVENT_COPY] == 1, "the copy event fires for heads");
+
+	close(sock);
+	close(listener);
+	zcrx_close(&z);
+	ring_exit(&r);
+	pair_destroy(&pr);
+	ksft_test_result_pass("netdevsim: copies of the head of a socket buffer count\n");
+}
+
 /* 9. A device without the queue API cannot take the provider. */
 static void test_loopback(struct ring *r)
 {
@@ -1922,6 +1972,7 @@ int main(void)
 	test_netdevsim_rx();
 	test_netdevsim_foreign();
 	test_netdevsim_exhaust();
+	test_netdevsim_head();
 	/* The last test closes the first ring. */
 	test_export_import(&r);
 
