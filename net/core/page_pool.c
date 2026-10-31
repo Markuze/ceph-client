@@ -1410,6 +1410,21 @@ bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr)
 	return page_pool_set_dma_addr_netmem(page_to_netmem(page), addr);
 }
 
+/* Prepare a page that a memory provider got from the page allocator. The
+ * allocator leaves list pointers, for example LIST_POISON1, in the words that
+ * hold pp_magic and pp. Clear them, so that the page shows no pool and
+ * page_pool_set_pp_info() can stamp it later. The words hold no pool state
+ * yet, so do not check them, as net_mp_page_clear_page_pool() does: list
+ * poison sets bits of the DMA index in pp_magic.
+ */
+void net_mp_page_init(struct page *page)
+{
+	netmem_ref netmem = page_to_netmem(page);
+
+	netmem_to_nmdesc(netmem)->pp_magic = 0;
+	netmem_set_pp(netmem, NULL);
+}
+
 /* Associate a page that a memory provider owns with a page pool. Should
  * follow with a matching net_mp_page_clear_page_pool(). Only the allocation
  * side of the pool may call it, as for net_mp_niov_set_page_pool().
