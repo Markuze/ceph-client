@@ -504,7 +504,10 @@ Drivers differ in how they meet the contract:
   dissector finds no header beyond the Ethernet header, it copies the frame,
   up to 128 bytes. Headers longer than 128 bytes stay partly in the page. The
   stack pulls the rest into the head with ``pskb_may_pull()``. This is a
-  copy. The stack never parses a header in place in the page.
+  copy. The stack never parses a header in place in the page. The driver
+  reads the virtio-net header of such a page once, into a private copy, and
+  uses only the copy. It drops a buffer whose copy has ``num_buffers`` 0 or
+  larger than the ring.
 * ``virtio_net`` replaces the pool of a queue without a reset of the
   virtqueue if the device does not use the DMA API. The buffers of the old
   pool stay in the ring and return to that pool when the stack frees them.

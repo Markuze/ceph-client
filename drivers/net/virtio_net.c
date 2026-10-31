@@ -900,22 +900,23 @@ static bool virtnet_page_private(const struct receive_queue *rq,
 	return __netmem_get_pp(page_to_netmem(page))->mp_ops;
 }
 
-/* Called from bottom half context */
+/* Called from bottom half context. @vhdr is the virtio-net header of the
+ * buffer: in the page, or a private copy of it, see virtnet_rx_hdr().
+ */
 static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 				   struct receive_queue *rq,
 				   struct page *page, unsigned int offset,
 				   unsigned int len, unsigned int truesize,
-				   unsigned int headroom)
+				   unsigned int headroom, const void *vhdr)
 {
 	struct sk_buff *skb;
 	struct virtio_net_common_hdr *hdr;
 	unsigned int copy, hdr_len, hdr_padded_len;
 	struct page *page_to_free = NULL;
 	int tailroom, shinfo_size;
-	char *p, *hdr_p, *buf;
+	char *p, *buf;
 
 	p = page_address(page) + offset;
-	hdr_p = p;
 
 	hdr_len = vi->hdr_len;
 	if (vi->mergeable_rx_bufs)
@@ -1012,7 +1013,7 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 
 ok:
 	hdr = skb_vnet_common_hdr(skb);
-	memcpy(hdr, hdr_p, hdr_len);
+	memcpy(hdr, vhdr, hdr_len);
 	if (page_to_free)
 		virtnet_put_page(rq, page_to_free, true);
 
@@ -2106,7 +2107,8 @@ static struct sk_buff *receive_big(struct net_device *dev,
 		goto err;
 	}
 
-	skb = page_to_skb(vi, rq, page, 0, len, PAGE_SIZE, 0);
+	skb = page_to_skb(vi, rq, page, 0, len, PAGE_SIZE, 0,
+			  page_address(page));
 	u64_stats_add(&stats->bytes, len - vi->hdr_len);
 	if (unlikely(!skb))
 		goto err;
@@ -2469,12 +2471,13 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 					 struct virtnet_info *vi,
 					 struct receive_queue *rq,
 					 void *buf,
+					 struct virtio_net_common_hdr *vhdr,
 					 void *ctx,
 					 unsigned int len,
 					 unsigned int *xdp_xmit,
 					 struct virtnet_rq_stats *stats)
 {
-	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
+	struct virtio_net_hdr_mrg_rxbuf *hdr = &vhdr->mrg_hdr;
 	int num_buf = virtio16_to_cpu(vi->vdev, hdr->num_buffers);
 	struct page *page = virt_to_head_page(buf);
 	int offset = buf - page_address(page);
@@ -2495,6 +2498,14 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 		rcu_read_lock();
 		xdp_prog = rcu_dereference(rq->xdp_prog);
 		if (xdp_prog) {
+			/* XDP reads the headers in place. A page of a provider
+			 * pool can stay posted after the provider went away,
+			 * and no header may be parsed in it: drop the packet.
+			 */
+			if (unlikely((void *)vhdr != buf)) {
+				rcu_read_unlock();
+				goto err_skb;
+			}
 			head_skb = receive_mergeable_xdp(dev, vi, rq, xdp_prog, buf, ctx,
 							 len, xdp_xmit, stats);
 			rcu_read_unlock();
@@ -2503,7 +2514,8 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 		rcu_read_unlock();
 	}
 
-	head_skb = page_to_skb(vi, rq, page, offset, len, truesize, headroom);
+	head_skb = page_to_skb(vi, rq, page, offset, len, truesize, headroom,
+			       vhdr);
 	curr_skb = head_skb;
 
 	if (unlikely(!curr_skb))
@@ -2632,6 +2644,33 @@ frame_err:
 	dev_kfree_skb(skb);
 }
 
+/* Return the virtio-net header of a mergeable receive buffer, or NULL if the
+ * header is not valid. Another party can write a page of a provider pool, so
+ * the driver reads the header of such a page once, into @copy, and uses only
+ * the copy: for the flags, for num_buffers and for the header that the stack
+ * gets in skb->cb. Without the copy a write between two reads would change a
+ * field after the driver used it. num_buffers is then also bounded: a packet
+ * cannot have more buffers than the ring, and it has at least one.
+ */
+static struct virtio_net_common_hdr *
+virtnet_rx_hdr(const struct virtnet_info *vi, const struct receive_queue *rq,
+	       void *buf, struct virtio_net_common_hdr *copy)
+{
+	unsigned int num_buf;
+
+	if (!virtnet_page_private(rq, virt_to_head_page(buf)))
+		return buf;
+
+	memcpy(copy, buf, vi->hdr_len);
+	/* Make the compiler read the copy, not the page again. */
+	barrier();
+
+	num_buf = virtio16_to_cpu(vi->vdev, copy->mrg_hdr.num_buffers);
+	if (unlikely(!num_buf || num_buf > virtqueue_get_vring_size(rq->vq)))
+		return NULL;
+	return copy;
+}
+
 static void receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
 			void *buf, unsigned int len, void **ctx,
 			unsigned int *xdp_xmit,
@@ -2668,9 +2707,20 @@ static void receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
 	 */
 
 	if (vi->mergeable_rx_bufs) {
-		flags = ((struct virtio_net_common_hdr *)buf)->hdr.flags;
-		skb = receive_mergeable(dev, vi, rq, buf, ctx, len, xdp_xmit,
-					stats);
+		struct virtio_net_common_hdr copy, *hdr = buf;
+
+		if (unlikely(rq->provider_pages)) {
+			hdr = virtnet_rx_hdr(vi, rq, buf, &copy);
+			if (unlikely(!hdr)) {
+				pr_debug("%s: rx error: bad num_buffers\n", dev->name);
+				DEV_STATS_INC(dev, rx_length_errors);
+				virtnet_rq_free_buf(vi, rq, buf);
+				return;
+			}
+		}
+		flags = hdr->hdr.flags;
+		skb = receive_mergeable(dev, vi, rq, buf, hdr, ctx, len,
+					xdp_xmit, stats);
 	} else if (vi->big_packets) {
 		void *p = page_address((struct page *)buf);
 
