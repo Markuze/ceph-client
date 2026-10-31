@@ -4464,6 +4464,22 @@ struct opaque_resume {
 	u8 *src[3], *want, *got;
 };
 
+/*
+ * The steps a seek takes from segment @from to segment @to of a version of @nr
+ * segments: up to a stride by walking, then, if that was not enough and the
+ * version has anchors, a jump to the last anchor at or before the target when
+ * that is ahead, and a walk from there.
+ */
+static u32 opaque_seek_steps(u32 from, u32 to, u32 nr)
+{
+	u32 first = min(to - from, (u32)IO_OPAQUE_SEEK_STRIDE), at = from + first;
+
+	if (at == to || nr <= IO_OPAQUE_SEEK_STRIDE)
+		return to - from;
+	at = max(at, to / IO_OPAQUE_SEEK_STRIDE * IO_OPAQUE_SEEK_STRIDE);
+	return first + to - at;
+}
+
 /* One vector of the steps: where its ranges start, how far it walked, and what it reads. */
 static void opaque_resume_run(struct kunit *test, struct opaque_resume *r,
 			      const struct opaque_step *step, u32 nr)
@@ -4484,8 +4500,9 @@ static void opaque_resume_run(struct kunit *test, struct opaque_resume *r,
 		};
 		memcpy(r->want + total, r->src[o] + off, step[i].len);
 		total += step[i].len;
-		/* A resumed walk is the distance from the last start, else from the first. */
-		expect += step[i].resumes ? step[i].seg - step[i - 1].seg : step[i].seg;
+		/* A resumed walk begins at the last start, else at the first segment. */
+		expect += opaque_seek_steps(step[i].resumes ? step[i - 1].seg : 0, step[i].seg,
+					    r->obj[o]->nr);
 	}
 	op = opaque_vec_new(test, r->store, ent, nr, 0);
 	/* Room enough that admission does not grow the block and walk twice. */
@@ -4573,8 +4590,9 @@ static void opaque_send_vec_resume(struct kunit *test)
 
 	/*
 	 * Fifty one-byte ranges at the end of an object of 200 extents: in
-	 * ascending order the object is walked once, and in descending order
-	 * once for each range.
+	 * ascending order the way to the first is found through the anchors and
+	 * each range after it is a step on, and in descending order every range
+	 * starts again and is found through the anchors, a stride and a bit each.
 	 */
 	run = kunit_kcalloc(test, 50, sizeof(*run), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, run);
@@ -4592,6 +4610,232 @@ static void opaque_send_vec_resume(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&r->store->extents), 0);
+}
+
+/*
+ * A version of more segments than a stride has anchors, one per stride, each
+ * the byte at which its segment starts; a smaller one has none. They share the
+ * allocation of the segments, so putting the version frees them (KASAN would
+ * see otherwise).
+ */
+static void opaque_vector_anchors(struct kunit *test)
+{
+	static const u32 sizes[] = { 1, 15, 16, 17, 32, 33, 400 };
+	struct io_opaque_store *store = opaque_test_big_store(test);
+	unsigned int i;
+	u32 k;
+
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		struct io_opaque_data *data = opaque_varied_data(test, store, sizes[i]);
+
+		KUNIT_ASSERT_EQ(test, data->nr, sizes[i]);
+		if (sizes[i] <= IO_OPAQUE_SEEK_STRIDE) {
+			KUNIT_EXPECT_PTR_EQ(test, data->anchor, NULL);
+		} else {
+			KUNIT_ASSERT_NOT_NULL(test, data->anchor);
+			/* Right after the segments, in their allocation. */
+			KUNIT_EXPECT_PTR_EQ(test, (void *)data->anchor,
+					    (void *)(data->bvec + data->nr));
+			for (k = 0; k < DIV_ROUND_UP(sizes[i], IO_OPAQUE_SEEK_STRIDE); k++)
+				KUNIT_EXPECT_EQ(test, data->anchor[k],
+						opaque_seg_pos(data, k * IO_OPAQUE_SEEK_STRIDE));
+		}
+		io_opaque_data_put(store, data);
+	}
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * Whatever the ranges are, finding where they start is bounded: the most
+ * entries a vector holds, alternating between two large objects or going back
+ * in one, cost a stride and a bit each, and not the object each. Ranges that
+ * follow each other cost a step each, the anchors not being touched.
+ */
+static void opaque_send_vec_seek_bound(struct kunit *test)
+{
+	const u32 objs = 400, nr = IORING_OPAQUE_SEND_VEC_MAX;
+	struct io_opaque_store *store = opaque_test_big_store(test);
+	struct io_opaque_data *obj[2] = {
+		opaque_varied_data(test, store, objs), opaque_varied_data(test, store, objs),
+	};
+	struct io_uring_opaque_send_entry *ent = kunit_kcalloc(test, nr, sizeof(*ent), GFP_KERNEL);
+	const u32 last = objs - 1;
+	struct io_opaque_req *op;
+	u64 walked;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ent);
+	opaque_test_publish(store, 0, 9, obj[0]);
+	opaque_test_publish(store, 1, 7, obj[1]);
+
+	/* Alternating objects, each at its last segment: every range starts the walk again. */
+	for (i = 0; i < nr; i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = io_opaque_handle(i % 2, i % 2 ? 7 : 9),
+			.off = opaque_seg_pos(obj[i % 2], last), .len = 1,
+		};
+	op = opaque_vec_new(test, store, ent, nr, 0);
+	walked = atomic_long_read(&io_opaque_vec_stepped);
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+	walked = atomic_long_read(&io_opaque_vec_stepped) - walked;
+	KUNIT_EXPECT_EQ(test, walked, (u64)nr * opaque_seek_steps(0, last, objs));
+	KUNIT_EXPECT_LT(test, walked, (u64)nr * 2 * IO_OPAQUE_SEEK_STRIDE);
+	opaque_vec_expect_cursor(test, op);
+	io_opaque_vec_release(op);
+
+	/* Back and forth in one object: the way back starts again, the way forward resumes. */
+	for (i = 0; i < nr; i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = io_opaque_handle(0, 9),
+			.off = i % 2 ? 0 : opaque_seg_pos(obj[0], last), .len = 1,
+		};
+	op = opaque_vec_new(test, store, ent, nr, 0);
+	walked = atomic_long_read(&io_opaque_vec_stepped);
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+	walked = atomic_long_read(&io_opaque_vec_stepped) - walked;
+	KUNIT_EXPECT_EQ(test, walked, (u64)nr / 2 * opaque_seek_steps(0, last, objs));
+	opaque_vec_expect_cursor(test, op);
+	io_opaque_vec_release(op);
+
+	/* One range on from the last, from the start: a step each, no jump. */
+	for (i = 0; i < 300; i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = io_opaque_handle(1, 7),
+			.off = opaque_seg_pos(obj[1], i), .len = 1,
+		};
+	op = opaque_vec_new(test, store, ent, 300, 0);
+	walked = atomic_long_read(&io_opaque_vec_stepped);
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+	walked = atomic_long_read(&io_opaque_vec_stepped) - walked;
+	KUNIT_EXPECT_EQ(test, walked, 299ULL);
+	opaque_vec_expect_cursor(test, op);
+	io_opaque_vec_release(op);
+
+	for (i = 0; i < ARRAY_SIZE(obj); i++) {
+		mutex_lock(&store->tables);
+		io_opaque_data_put(store, io_opaque_detach(store, &store->objects[i]));
+		mutex_unlock(&store->tables);
+	}
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * Counting the segments of the ranges stops once the limit is passed: a range
+ * over a whole large object, or one that crosses the limit, counts as many as
+ * it takes to know, and the vector fails having pinned and removed nothing.
+ */
+static void opaque_send_vec_count_cap(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_big_store(test);
+	struct io_opaque_data *data = opaque_varied_data(test, store, 400);
+	const u64 start = opaque_seg_pos(data, 100);
+	struct io_uring_opaque_send_entry ent[2] = {
+		{ .handle = io_opaque_handle(0, 9), .off = start,
+		  .len = opaque_seg_pos(data, 108) - start },
+		{ .handle = io_opaque_handle(0, 9), .off = 0, .len = data->length },
+	};
+	struct io_opaque_req *op;
+	unsigned int last;
+	unsigned long limit;
+	long counted;
+
+	opaque_test_publish(store, 0, 9, data);
+	limit = io_opaque_send_vec_segs;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_vec_segs_restore,
+							(void *)limit), 0);
+	io_opaque_send_vec_segs = 10;
+	for (last = 0; last < 2; last++) {
+		u16 flags = last ? IORING_OPAQUE_SEND_LAST : 0;
+
+		/* The whole object, 400 segments, with room for ten: eleven are counted. */
+		op = opaque_vec_new(test, store, &ent[1], 1, flags);
+		counted = atomic_long_read(&io_opaque_vec_counted);
+		mutex_lock(&store->tables);
+		KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(op), -EMSGSIZE);
+		mutex_unlock(&store->tables);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_vec_counted) - counted, 11L);
+		/* Eight fit; the second range crosses the limit after three more. */
+		op = opaque_vec_new(test, store, ent, 2, flags);
+		counted = atomic_long_read(&io_opaque_vec_counted);
+		mutex_lock(&store->tables);
+		KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(op), -EMSGSIZE);
+		mutex_unlock(&store->tables);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_vec_counted) - counted, 11L);
+		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		KUNIT_EXPECT_FALSE(test, op->consumed);
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, data);
+	}
+	/* At the limit exactly, all of it is counted and the vector goes. */
+	io_opaque_send_vec_segs = 8;
+	op = opaque_vec_new(test, store, ent, 1, 0);
+	opaque_vec_room(test, op, 8);
+	counted = atomic_long_read(&io_opaque_vec_counted);
+	KUNIT_EXPECT_EQ(test, opaque_vec_admit(op), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_vec_counted) - counted, 8L);
+	io_opaque_vec_release(op);
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * A send of one range puts its cursor at the segment that holds it, found as
+ * a vector's ranges are, and not by advancing an iterator over the segments
+ * before it: the cursor reads the same bytes, starts in the same segment, and
+ * the walk to it is bounded.
+ */
+static void opaque_send_single_seek(struct kunit *test)
+{
+	static const struct {
+		u32 seg, delta, len;
+	} cases[] = {
+		{ 0, 0, 100 }, { 0, 50, 100 }, { 7, 3, 500 }, { 20, 0, 1 }, { 21, 90, 700 },
+		{ 250, 5, 3000 }, { 399, 0, 1 }, { 399, 5, 50 },
+	};
+	struct io_opaque_store *store = opaque_test_big_store(test);
+	struct io_opaque_data *data = opaque_varied_data(test, store, 400);
+	u8 *source = kunit_kmalloc(test, data->length, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 4096, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_copy(data, source);
+	opaque_test_publish(store, 0, 9, data);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		u64 off = opaque_seg_pos(data, cases[i].seg) + cases[i].delta, walked;
+		struct io_opaque_req *op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, op);
+		op->store = store;
+		op->handle = io_opaque_handle(0, 9);
+		op->offset = off;
+		op->length = min(cases[i].len, (u32)(data->length - off));
+		walked = atomic_long_read(&io_opaque_vec_stepped);
+		mutex_lock(&store->tables);
+		KUNIT_ASSERT_EQ(test, io_opaque_send_acquire(op), 0);
+		mutex_unlock(&store->tables);
+		walked = atomic_long_read(&io_opaque_vec_stepped) - walked;
+		KUNIT_EXPECT_EQ(test, walked, (u64)opaque_seek_steps(0, cases[i].seg, 400));
+		KUNIT_EXPECT_PTR_EQ(test, op->iter.bvec, data->bvec + cases[i].seg);
+		KUNIT_EXPECT_EQ(test, op->iter.iov_offset, (size_t)cases[i].delta);
+		KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)op->length);
+		KUNIT_EXPECT_EQ(test, copy_from_iter(got, op->length, &op->iter),
+				(size_t)op->length);
+		KUNIT_EXPECT_MEMEQ(test, got, source + off, op->length);
+		io_opaque_data_put(store, op->data);
+	}
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
 /*
@@ -5331,6 +5575,10 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_loopback),
 	KUNIT_CASE(opaque_send_vec_admit_fail),
 	KUNIT_CASE(opaque_send_vec_resume),
+	KUNIT_CASE(opaque_vector_anchors),
+	KUNIT_CASE(opaque_send_vec_seek_bound),
+	KUNIT_CASE(opaque_send_vec_count_cap),
+	KUNIT_CASE(opaque_send_single_seek),
 	KUNIT_CASE(opaque_send_vec_grow_retry),
 	KUNIT_CASE(opaque_send_vec_build_pinned),
 	KUNIT_CASE(opaque_send_vec_prep),

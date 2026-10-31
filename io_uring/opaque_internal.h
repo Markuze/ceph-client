@@ -31,6 +31,13 @@
 #define IO_OPAQUE_TX_IDLE_MAX	64
 /* Backing segments all ranges of one vectored send may span; more is EMSGSIZE. */
 #define IO_OPAQUE_SEND_VEC_SEGS	4096
+/*
+ * A version of more segments than this records where every this-many-th of
+ * them starts, so that a range is found with a walk of about this many steps
+ * and a binary search, however large the version is and wherever the walk
+ * began. A smaller one is walked, which is as short.
+ */
+#define IO_OPAQUE_SEEK_STRIDE	16
 
 /* What io_opaque_tx_join() returns besides an error. */
 /* Queued behind another frame and parked, with its references taken. */
@@ -70,6 +77,12 @@ struct io_opaque_data {
 	refcount_t refs;
 	struct list_head extents;
 	struct bio_vec *bvec;
+	/*
+	 * Where segments 0, IO_OPAQUE_SEEK_STRIDE, twice that and so on start,
+	 * as bytes into the object, when it has more than that many segments;
+	 * else NULL. It is allocated with bvec and freed with it.
+	 */
+	u64 *anchor;
 	u64 length;
 	u64 charge;
 	u32 nr;
@@ -241,10 +254,13 @@ struct io_opaque_store {
 	refcount_t users;
 	struct io_uring_opaque_config config;
 	/*
-	 * Handles and candidates; never held during copies or I/O. Attach and
-	 * the admission of a send take it with the socket owned, so nothing may
-	 * take a socket lock while holding it, or wait for anything that holds
-	 * one for long.
+	 * Handles and candidates; never held during copies or I/O, and for a time
+	 * that the request bounds: what admission does under it is a lookup per
+	 * entry, the segments its ranges span up to the limit, and for each range
+	 * a walk that the version's anchors keep to about two strides and a
+	 * binary search. Attach and the admission of a send take it with the
+	 * socket owned, so nothing may take a socket lock while holding it, or
+	 * wait for anything that holds one for long.
 	 */
 	struct mutex tables;
 	struct io_opaque_slot *objects;
@@ -390,6 +406,7 @@ void io_opaque_vec_build(struct io_opaque_req *op);
 int io_opaque_vec_finish(struct io_opaque_req *op, int ret);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_stepped;
+extern atomic_long_t io_opaque_vec_counted;
 int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk);
 int io_opaque_tx_settle_head(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);

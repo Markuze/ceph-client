@@ -394,11 +394,18 @@ void io_opaque_data_put(struct io_opaque_store *store,
 	}
 }
 
+/*
+ * Build the version's segments, and for a version of more than
+ * IO_OPAQUE_SEEK_STRIDE of them the anchors that find one without walking
+ * from the first, in one allocation. Both are made once, when the version is,
+ * and never change.
+ */
 int io_opaque_vector(struct io_opaque_data *data)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
-	u32 nr = 0;
+	u32 nr = 0, anchors;
+	u64 at = 0;
 
 	data->charge = 0;
 	list_for_each_entry(extent, &data->extents, list) {
@@ -407,14 +414,22 @@ int io_opaque_vector(struct io_opaque_data *data)
 			data->charge += extent->backing->charge;
 		previous = extent->backing;
 	}
-	data->bvec = kvmalloc_objs(*data->bvec, nr, GFP_KERNEL_ACCOUNT);
+	anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
+	data->bvec = kvmalloc(size_add(array_size(nr, sizeof(*data->bvec)),
+				       array_size(anchors, sizeof(*data->anchor))),
+			      GFP_KERNEL_ACCOUNT);
 	if (!data->bvec)
 		return -ENOMEM;
+	data->anchor = anchors ? (u64 *)(data->bvec + nr) : NULL;
 	data->nr = nr;
 	nr = 0;
-	list_for_each_entry(extent, &data->extents, list)
+	list_for_each_entry(extent, &data->extents, list) {
+		if (anchors && !(nr % IO_OPAQUE_SEEK_STRIDE))
+			data->anchor[nr / IO_OPAQUE_SEEK_STRIDE] = at;
 		bvec_set_page(&data->bvec[nr++], extent->backing->page,
 			      extent->length, extent->offset);
+		at += extent->length;
+	}
 	return 0;
 }
 
@@ -2423,12 +2438,16 @@ VISIBLE_IF_KUNIT void io_opaque_send_resolve(struct io_opaque_req *op)
 /* A variable under KUnit, so that a test reaches the limit with a few segments. */
 unsigned int io_opaque_send_vec_segs = IO_OPAQUE_SEND_VEC_SEGS;
 #define IO_OPAQUE_VEC_SEGS_LIMIT	io_opaque_send_vec_segs
-/* Segments that admission stepped over to find where ranges start, for a test to read. */
+/* Segments that admission walked over to find where ranges start, for a test to read. */
 atomic_long_t io_opaque_vec_stepped = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_VEC_STEPPED(n)	atomic_long_add((n), &io_opaque_vec_stepped)
+/* Segments that admission counted in the ranges, for a test to read. */
+atomic_long_t io_opaque_vec_counted = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_VEC_COUNTED(n)	atomic_long_add((n), &io_opaque_vec_counted)
 #else
 #define IO_OPAQUE_VEC_SEGS_LIMIT	IO_OPAQUE_SEND_VEC_SEGS
 #define IO_OPAQUE_VEC_STEPPED(n)	((void)(n))
+#define IO_OPAQUE_VEC_COUNTED(n)	((void)(n))
 #endif
 
 /*
@@ -2580,15 +2599,47 @@ static void io_opaque_vec_cleanup(struct io_opaque_req *op)
  * @off is. @seg is a segment of the object that starts @pos bytes in and not
  * after the one wanted: the walk goes on from there, and leaves @seg and @pos
  * at the start of the segment it found.
+ *
+ * A segment within IO_OPAQUE_SEEK_STRIDE steps is walked to, which is all that
+ * a range after the previous one in the same object ever takes. A farther one
+ * is reached by jumping to the last anchor that is at or before @off, if that
+ * is ahead of where the walk is, and walking on from it: under a stride more.
+ * No seek takes more than two strides and a binary search over the anchors,
+ * wherever it starts, however large the object is, and so a vector of any
+ * ranges keeps tables for a time that its entries bound.
  */
 static u32 io_opaque_vec_seek(const struct io_opaque_data *data, u64 off, u32 *seg, u64 *pos)
 {
 	const struct bio_vec *src = data->bvec;
-	u32 i = *seg;
+	u32 i = *seg, steps = 0;
 	u64 at = *pos;
 
-	while (i < data->nr && at + src[i].bv_len <= off)
+	while (steps < IO_OPAQUE_SEEK_STRIDE && i < data->nr && at + src[i].bv_len <= off) {
 		at += src[i++].bv_len;
+		steps++;
+	}
+	if (data->anchor && i < data->nr && at + src[i].bv_len <= off) {
+		u32 lo = 0, hi = DIV_ROUND_UP(data->nr, IO_OPAQUE_SEEK_STRIDE) - 1;
+
+		/* The last anchor that starts at or before @off; the first always does. */
+		while (lo < hi) {
+			u32 mid = lo + (hi - lo + 1) / 2;
+
+			if (data->anchor[mid] <= off)
+				lo = mid;
+			else
+				hi = mid - 1;
+		}
+		if (data->anchor[lo] > at) {
+			i = lo * IO_OPAQUE_SEEK_STRIDE;
+			at = data->anchor[lo];
+		}
+	}
+	while (i < data->nr && at + src[i].bv_len <= off) {
+		at += src[i++].bv_len;
+		steps++;
+	}
+	IO_OPAQUE_VEC_STEPPED(steps);
 	*seg = i;
 	*pos = at;
 	return off - at;
@@ -2598,11 +2649,13 @@ static u32 io_opaque_vec_seek(const struct io_opaque_data *data, u64 off, u32 *s
  * The segments of the range of @len bytes that starts @skip bytes into segment
  * @seg of @data, as a cursor over the whole object would visit them: the first
  * starts inside its extent, the last ends inside its own. They are stored at
- * @bv unless it is NULL; the count is returned. The range must lie within the
+ * @bv, and all of them counted, unless it is NULL: then only the count is
+ * wanted, and it stops at @room + 1, since a caller that has room for no more
+ * has no use for how many more there are. The range must lie within the
  * object.
  */
 static u32 io_opaque_vec_span(const struct io_opaque_data *data, u32 seg, u32 skip, u32 len,
-			      struct bio_vec *bv)
+			      struct bio_vec *bv, u64 room)
 {
 	const struct bio_vec *src = data->bvec;
 	u32 n = 0;
@@ -2616,6 +2669,8 @@ static u32 io_opaque_vec_span(const struct io_opaque_data *data, u32 seg, u32 sk
 			bv[n].bv_len = take;
 		}
 		n++;
+		if (!bv && n > room)
+			break;
 		len -= take;
 		skip = 0;
 		seg++;
@@ -2656,12 +2711,15 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
 	op->data = NULL;
 }
 
-/* Point the send's cursor at the range it selects within @len bytes of @bv. */
+/*
+ * Point the send's cursor at the range it selects: @len bytes in @nr segments
+ * from @bv, of which the range starts @skip bytes in and lasts for op->length.
+ */
 static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *bv,
-				unsigned int nr, size_t len)
+				unsigned int nr, size_t len, size_t skip)
 {
 	iov_iter_bvec(&op->iter, ITER_SOURCE, bv, nr, len);
-	iov_iter_advance(&op->iter, op->offset);
+	iov_iter_advance(&op->iter, skip);
 	iov_iter_truncate(&op->iter, op->length);
 }
 
@@ -2673,17 +2731,22 @@ static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *
  * walking the segments of its version, and an entry that follows another in
  * the same version, not before the segment that one started in, walks on from
  * there instead of from the first: ranges in ascending order walk each object
- * once. A block with too few segments is not grown here, as that allocates; the
- * number needed is returned, and io_opaque_vec_finish() grows the block and
- * asks again. Pass two takes the references and looks nothing up: pass one
- * recorded every version in pin[], and tables has been held since. A LAST
- * vector detaches each handle at its first entry, and an entry that repeats
- * the handle takes one more reference on the version it found. Any other
- * vector takes one reference for each run of entries that name the same
- * handle (see io_opaque_vec_owns()), so eight ranges of one object cost one
- * reference, and a handle that returns after another one pins again. Nothing
- * can fail from there on. The cursor over the combined segments is
- * io_opaque_vec_build()'s, once tables is dropped.
+ * once. One that is more than a stride from where the walk is jumps to the
+ * version's anchors (see io_opaque_vec_seek()), so that ranges that go back
+ * or alternate between large objects cost a few dozen steps each, not an
+ * object. Counting the segments of the ranges stops as soon as the limit is
+ * passed. What tables is held for is therefore bounded by the entries and the
+ * limit, whatever the ranges. A block with too few segments is not grown here,
+ * as that allocates; the number needed is returned, and io_opaque_vec_finish()
+ * grows the block and asks again. Pass two takes the references and looks
+ * nothing up: pass one recorded every version in pin[], and tables has been
+ * held since. A LAST vector detaches each handle at its first entry, and an
+ * entry that repeats the handle takes one more reference on the version it
+ * found. Any other vector takes one reference for each run of entries that
+ * name the same handle (see io_opaque_vec_owns()), so eight ranges of one
+ * object cost one reference, and a handle that returns after another one pins
+ * again. Nothing can fail from there on. The cursor over the combined segments
+ * is io_opaque_vec_build()'s, once tables is dropped.
  */
 static int io_opaque_vec_acquire(struct io_opaque_req *op)
 {
@@ -2701,7 +2764,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 		const struct io_uring_opaque_send_entry *ent = &vec->ent[i];
 		struct io_opaque_slot *slot = io_opaque_lookup(store, ent->handle);
 		struct io_opaque_data *data;
-		u32 from, skip;
+		u32 skip, n;
 
 		ret = io_opaque_send_range(slot, ent->off, ent->len);
 		if (ret)
@@ -2712,12 +2775,13 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 			seg = 0;
 			pos = 0;
 		}
-		from = seg;
 		skip = io_opaque_vec_seek(data, ent->off, &seg, &pos);
-		IO_OPAQUE_VEC_STEPPED(seg - from);
 		vec->start[i].seg = seg;
 		vec->start[i].skip = skip;
-		segs += io_opaque_vec_span(data, seg, skip, ent->len, NULL);
+		n = io_opaque_vec_span(data, seg, skip, ent->len, NULL,
+				       IO_OPAQUE_VEC_SEGS_LIMIT - segs);
+		IO_OPAQUE_VEC_COUNTED(n);
+		segs += n;
 		if (segs > IO_OPAQUE_VEC_SEGS_LIMIT)
 			return -EMSGSIZE;
 		/* Not yet a reference: pass two takes it, and a repeated handle needs it. */
@@ -2761,9 +2825,9 @@ VISIBLE_IF_KUNIT void io_opaque_vec_build(struct io_opaque_req *op)
 	lockdep_assert_not_held(&op->store->tables);
 	for (i = 0; i < vec->nr; i++)
 		filled += io_opaque_vec_span(vec->pin[i], vec->start[i].seg, vec->start[i].skip,
-					     vec->ent[i].len, vec->bv + filled);
+					     vec->ent[i].len, vec->bv + filled, U64_MAX);
 	vec->nr_segs = filled;
-	io_opaque_send_iter(op, vec->bv, filled, op->length);
+	io_opaque_send_iter(op, vec->bv, filled, op->length, 0);
 }
 
 /*
@@ -2778,6 +2842,8 @@ VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
 	struct io_opaque_store *store = op->store;
 	bool last = op->send_flags & IORING_OPAQUE_SEND_LAST;
 	struct io_opaque_slot *slot;
+	u64 pos = 0;
+	u32 seg = 0, skip;
 	int ret;
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_acquire, op);
@@ -2795,7 +2861,10 @@ VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
 	op->data = io_opaque_send_pin(store, slot, last);
 	if (last)
 		op->consumed = true;
-	io_opaque_send_iter(op, op->data->bvec, op->data->nr, op->data->length);
+	/* The cursor starts at the segment that holds the range, found as a vector's are. */
+	skip = io_opaque_vec_seek(op->data, op->offset, &seg, &pos);
+	io_opaque_send_iter(op, op->data->bvec + seg, op->data->nr - seg, op->data->length - pos,
+			    skip);
 	return 0;
 }
 
