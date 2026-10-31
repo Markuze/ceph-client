@@ -3418,8 +3418,9 @@ VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct i
  * for each part, with the ring lock dropped around it.
  *
  * Under IO_URING_F_UNLOCKED the ring lock is dropped before the socket is
- * taken and held again once it is released; an inline issue holds it
- * throughout, as it holds it across sock_sendmsg().
+ * taken, and an issue that owned the socket returns without taking it again,
+ * as io-wq expects; an inline issue holds it throughout, as it holds it across
+ * sock_sendmsg().
  */
 int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 {
@@ -3429,7 +3430,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct msghdr msg;
 	struct kvec vec;
 	u32 body_end;
-	bool body = false, splice = false, fresh, owned = false;
+	bool body = false, splice = false, fresh, left, owned = false;
 	int ret;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
@@ -3558,23 +3559,27 @@ finish:
 		ret = op->progress;
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
+	/* The references go with the socket, the last of a version after it. */
+	left = owned && io_opaque_send_unpin_cheap(op);
+	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
-		/* The references go with the socket, the last of a version after it. */
-		bool left = io_opaque_send_unpin_cheap(op);
-
+		/*
+		 * Nothing is left for the ring lock, which an io-wq issue dropped
+		 * for the socket and an inline one still holds: taking it only to
+		 * give it up would be a round trip for the caller.
+		 */
 		release_sock(sk);
 		if (left)
 			io_opaque_send_unpin(op);
-		io_ring_submit_lock(req->ctx, issue_flags);
+		return IOU_COMPLETE;
 	}
-	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	ret = IOU_COMPLETE;
 	goto out;
 leave:
-	/* Hand the ring lock back; whatever the request still holds, it keeps. */
+	/* The request keeps whatever it still holds, and the ring lock is as the caller left it. */
 	if (owned) {
 		release_sock(sk);
-		io_ring_submit_lock(req->ctx, issue_flags);
+		return ret;
 	}
 out:
 	io_ring_submit_unlock(req->ctx, issue_flags);
