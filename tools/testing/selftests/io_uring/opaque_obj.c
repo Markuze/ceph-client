@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/ethtool.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/opaque.h>
+#include <linux/sockios.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <poll.h>
@@ -4157,7 +4161,9 @@ static bool maio_ok;
 /* Why the probe failed. -EOPNOTSUPP: no zero-copy receive. -EPERM: no CAP_NET_ADMIN. */
 static int maio_err;
 
-static int maio_register(struct ring *r, struct maio *z, unsigned int pages)
+/* Register an instance on the device @ifindex, or without a device if it is 0. */
+static int maio_register_on(struct ring *r, struct maio *z, unsigned int ifindex,
+			    unsigned int pages)
 {
 	int ret;
 
@@ -4165,8 +4171,9 @@ static int maio_register(struct ring *r, struct maio *z, unsigned int pages)
 	z->rd.size = MAIO_RQ_REGION_SIZE;
 	z->area.len = (uint64_t)pages * sysconf(_SC_PAGESIZE);
 	z->area.flags = IORING_ZCRX_AREA_KERNEL;
+	z->reg.if_idx = ifindex;
 	z->reg.rq_entries = MAIO_RQ_ENTRIES;
-	z->reg.flags = ZCRX_REG_MAIO | ZCRX_REG_NODEV;
+	z->reg.flags = ZCRX_REG_MAIO | (ifindex ? 0 : ZCRX_REG_NODEV);
 	z->reg.area_ptr = (uintptr_t)&z->area;
 	z->reg.region_ptr = (uintptr_t)&z->rd;
 	ret = syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_ZCRX_IFQ, &z->reg, 1);
@@ -4174,6 +4181,11 @@ static int maio_register(struct ring *r, struct maio *z, unsigned int pages)
 		return -errno;
 	z->id = z->reg.zcrx_id;
 	return 0;
+}
+
+static int maio_register(struct ring *r, struct maio *z, unsigned int pages)
+{
+	return maio_register_on(r, z, 0, pages);
 }
 
 static void maio_map(struct ring *r, struct maio *z)
@@ -4908,6 +4920,452 @@ static void set_test_timeout(void)
 	alarm(seconds);
 }
 
+/*
+ * Stores that bind an instance on a netdevsim port. Port A has the instance.
+ * Its peer B, and the TCP sockets that send through B, are in a namespace of
+ * their own, so that the frames cross the devices. The pool of port A puts the
+ * payload of each frame into a page of the area, as a driver with private
+ * headers does. The fixture follows zcrx_maio.c. Without netdevsim, network
+ * namespaces or root, the tests skip.
+ */
+#define LOCAL_ADDR		"10.77.0.1"
+#define PEER_ADDR		"10.77.0.2"
+#define PEER_SOCKETS		2
+
+struct peer {
+	unsigned int id;		/* netdevsim device id of the peer */
+	unsigned int ifindex;		/* in the namespace of the peer */
+	int netns;			/* a file descriptor of that namespace */
+	int socks[PEER_SOCKETS];	/* TCP sockets in that namespace */
+	int err;
+};
+
+struct pair {
+	unsigned int id;		/* netdevsim device id of port A */
+	char name[IFNAMSIZ];
+	unsigned int ifindex;
+	struct peer peer;
+};
+
+static int sysfs_write(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY), ret;
+
+	if (fd < 0)
+		return -errno;
+	ret = write(fd, text, strlen(text));
+	ret = ret < 0 ? -errno : 0;
+	close(fd);
+	return ret;
+}
+
+static bool nsim_create(unsigned int id, unsigned int queues, char name[IFNAMSIZ])
+{
+	char path[128], text[64];
+	struct dirent *de;
+	DIR *dir;
+	int ret;
+
+	snprintf(text, sizeof(text), "%u 1 %u", id, queues);
+	ret = sysfs_write("/sys/bus/netdevsim/new_device", text);
+	if (ret)
+		return false;
+	snprintf(path, sizeof(path), "/sys/bus/netdevsim/devices/netdevsim%u/net", id);
+	dir = opendir(path);
+	if (!dir)
+		return false;
+	name[0] = 0;
+	while ((de = readdir(dir)))
+		if (de->d_name[0] != '.')
+			snprintf(name, IFNAMSIZ, "%.*s", IFNAMSIZ - 1, de->d_name);
+	closedir(dir);
+	return name[0];
+}
+
+static void nsim_destroy(unsigned int id)
+{
+	char text[32];
+
+	snprintf(text, sizeof(text), "%u", id);
+	sysfs_write("/sys/bus/netdevsim/del_device", text);
+}
+
+static int link_up(const char *name)
+{
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	ret = ioctl(s, SIOCGIFFLAGS, &ifr);
+	if (!ret) {
+		ifr.ifr_flags |= IFF_UP;
+		ret = ioctl(s, SIOCSIFFLAGS, &ifr);
+	}
+	close(s);
+	return ret ? -errno : 0;
+}
+
+static int set_addr(const char *name, const char *addr)
+{
+	struct sockaddr_in *sin;
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	sin->sin_family = AF_INET;
+	inet_pton(AF_INET, addr, &sin->sin_addr);
+	ret = ioctl(s, SIOCSIFADDR, &ifr);
+	if (!ret) {
+		inet_pton(AF_INET, "255.255.255.0", &sin->sin_addr);
+		ret = ioctl(s, SIOCSIFNETMASK, &ifr);
+	}
+	close(s);
+	return ret ? -errno : 0;
+}
+
+/* Without TSO the stack sends one frame per segment. */
+static int tso_set(const char *name, bool on)
+{
+	struct ethtool_value eval = { .cmd = ETHTOOL_STSO, .data = on };
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	ifr.ifr_data = (void *)&eval;
+	ret = ioctl(s, SIOCETHTOOL, &ifr);
+	close(s);
+	return ret ? -errno : 0;
+}
+
+/* The name of the last device in this namespace that is not the loopback device. */
+static bool first_nonlo(char name[IFNAMSIZ])
+{
+	struct if_nameindex *list, *e;
+
+	name[0] = 0;
+	list = if_nameindex();
+	for (e = list; e && e->if_index; e++)
+		if (strcmp(e->if_name, "lo"))
+			snprintf(name, IFNAMSIZ, "%s", e->if_name);
+	if_freenameindex(list);
+	return name[0];
+}
+
+/*
+ * The network namespace belongs to a thread. unshare() gives this thread a
+ * namespace of its own, and netdevsim creates a device in the namespace of the
+ * task that asks for it. The sockets keep the namespace after the thread ends.
+ */
+static void *peer_thread(void *arg)
+{
+	struct peer *p = arg;
+	char name[IFNAMSIZ], text[32];
+	int i;
+
+	p->err = -1;
+	if (unshare(CLONE_NEWNET))
+		return NULL;
+	snprintf(text, sizeof(text), "%u 1 1", p->id);
+	if (sysfs_write("/sys/bus/netdevsim/new_device", text))
+		return NULL;
+	if (!first_nonlo(name) || set_addr(name, PEER_ADDR) || tso_set(name, false) ||
+	    link_up(name))
+		return NULL;
+	p->ifindex = if_nametoindex(name);
+	p->netns = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+	for (i = 0; i < PEER_SOCKETS; i++)
+		p->socks[i] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (!p->ifindex || p->netns < 0)
+		return NULL;
+	p->err = 0;
+	return NULL;
+}
+
+/* Return false if the fixture is not available. */
+static bool pair_create(struct pair *pr, unsigned int id_a, unsigned int id_b)
+{
+	char text[64];
+	pthread_t th;
+	int ns_a, ret;
+
+	memset(pr, 0, sizeof(*pr));
+	pr->id = id_a;
+	pr->peer.id = id_b;
+	pr->peer.netns = -1;
+	if (!nsim_create(id_a, 1, pr->name))
+		return false;
+	pr->ifindex = if_nametoindex(pr->name);
+	if (!pr->ifindex || set_addr(pr->name, LOCAL_ADDR) || link_up(pr->name))
+		goto err_a;
+	if (pthread_create(&th, NULL, peer_thread, &pr->peer))
+		goto err_a;
+	pthread_join(th, NULL);
+	if (pr->peer.err)
+		goto err_b;
+
+	ns_a = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+	snprintf(text, sizeof(text), "%d:%u %d:%u", ns_a, pr->ifindex,
+		 pr->peer.netns, pr->peer.ifindex);
+	ret = sysfs_write("/sys/bus/netdevsim/link_device", text);
+	close(ns_a);
+	if (!ret)
+		return true;
+err_b:
+	nsim_destroy(id_b);
+err_a:
+	nsim_destroy(id_a);
+	return false;
+}
+
+static void pair_destroy(struct pair *pr)
+{
+	int i;
+
+	for (i = 0; i < PEER_SOCKETS; i++)
+		close(pr->peer.socks[i]);
+	close(pr->peer.netns);
+	nsim_destroy(pr->id);
+	nsim_destroy(pr->peer.id);
+}
+
+static int listen_local(uint16_t *port)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET };
+	socklen_t len = sizeof(addr);
+	int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+	require(s >= 0, "listen socket");
+	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
+	require(!bind(s, (void *)&addr, len), "bind the listen socket to port A");
+	require(!getsockname(s, (void *)&addr, &len), "getsockname");
+	require(!listen(s, 4), "listen");
+	*port = ntohs(addr.sin_port);
+	return s;
+}
+
+/* Connect a socket of the peer to port A and return the accepted socket. */
+static int connect_peer(struct pair *pr, int idx, int listener, uint16_t port)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+	int fd;
+
+	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
+	alarm(120);
+	require(!connect(pr->peer.socks[idx], (void *)&addr, sizeof(addr)),
+		"connect the peer to port A");
+	fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+	require(fd >= 0, "accept the connection of the peer");
+	alarm(0);
+	return fd;
+}
+
+/*
+ * Register an instance on port A and a store that binds it. Return false, with
+ * the fixture gone, if the port cannot take an instance.
+ */
+static bool maio_port(struct pair *pr, struct ring *r, struct maio *z, unsigned int pages,
+		      struct io_uring_opaque_config cfg, uint32_t *bound)
+{
+	int ret;
+
+	if (!maio_ok) {
+		ksft_test_result_skip("MAIO mode is unavailable\n");
+		return false;
+	}
+	if (!pair_create(pr, 300, 301)) {
+		ksft_test_result_skip("netdevsim ports in two namespaces are unavailable\n");
+		return false;
+	}
+	require(!ring_init(r, IORING_SETUP_CQE32), "ring for the port");
+	ret = maio_register_on(r, z, pr->ifindex, pages);
+	if (ret == -EOPNOTSUPP || ret == -ENODEV) {
+		ksft_test_result_skip("the port takes no MAIO instance: %d\n", ret);
+		ring_exit(r);
+		pair_destroy(pr);
+		return false;
+	}
+	require(!ret, "MAIO instance on the port");
+	maio_map(r, z);
+	require(!maio_store(r, cfg, z->id, bound), "store bound to the instance of the port");
+	return true;
+}
+
+/* Wait until the store holds no payload. A consuming send frees its backing a little late. */
+static void maio_drained(struct ring *r, uint32_t context)
+{
+	struct io_uring_opaque_stat stat;
+	unsigned int i;
+
+	for (i = 0; i < 500; i++) {
+		require(!cmd_res(r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat),
+			"store stat");
+		if (!stat.backing_bytes && !stat.extents && !stat.objects)
+			return;
+		usleep(10000);
+	}
+	require(false, "the store drains");
+}
+
+/*
+ * The pool pages of the port carry the payload, so the store holds them by
+ * pool reference and copies no byte. Each segment of the stream is one extent.
+ * 300 objects of 16 KiB cycle through an area of 128 pages. The objects with an
+ * even number are freed, and the others go back to the peer with a consuming
+ * send. The peer reads the bytes that it wrote.
+ */
+static void test_maio_device(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 16384;
+	struct io_uring_opaque_extent vec[64];
+	struct io_uring_opaque_stat stat;
+	unsigned char *data, *got;
+	uint64_t stream, handle, cursor = 0;
+	socklen_t optlen = sizeof(int);
+	unsigned int nr, round;
+	struct event event;
+	uint16_t port;
+	uint32_t bound;
+	struct maio z;
+	struct ring r;
+	struct pair pr;
+	int sock, listener, mss;
+
+	if (!maio_port(&pr, &r, &z, 128, cfg, &bound))
+		return;
+	data = malloc(2 * length);
+	require(data, "buffers");
+	got = data + length;
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	require(!getsockopt(pr.peer.socks[0], IPPROTO_TCP, TCP_MAXSEG, &mss, &optlen) && mss > 0,
+		"segment size of the peer");
+	stream = attach(&r, bound, sock, next_tag++);
+
+	for (round = 0; round < 300; round++) {
+		uint64_t tag;
+
+		maio_pattern(data, length, round);
+		tag = cmd_stage(&r, bound, IORING_OPAQUE_RECV_OBJECT, stream, cursor, length, NULL);
+		submit_only(&r);
+		write_all(pr.peer.socks[0], data, length);
+		require(maio_poll(&r, tag, 20000, &event) && event.res == (int)length,
+			"object from the port");
+		cursor += length;
+		handle = event.extra[0];
+		require(event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED, "the object is mapped");
+		nr = maio_gather(&r, bound, &z, handle, length, got, vec, ARRAY_SIZE(vec));
+		require(nr == (length + mss - 1) / mss, "one extent for each segment");
+		require(!memcmp(got, data, length), "bytes through the mapping");
+		if (round & 1) {
+			tag = send_stage_flags(&r, bound, sock, handle, 0, length,
+					       IORING_OPAQUE_SEND_LAST, 0, 0);
+			require(wait_tag(&r, tag).res == (int)length, "consuming send to the peer");
+			read_all(pr.peer.socks[0], got, length);
+			require(!memcmp(got, data, length), "the peer reads the bytes back");
+		} else {
+			maio_end(&r, bound, IORING_OPAQUE_FREE, handle);
+		}
+	}
+	require(!cmd_res(&r, bound, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat), "store stat");
+	require(!stat.copied_bytes, "no byte is copied");
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_drained(&r, bound);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(sock);
+	close(listener);
+	pair_destroy(&pr);
+	free(data);
+	ksft_test_result_pass("store on a port: 300 objects, pool references, no copy\n");
+}
+
+/*
+ * The area of 64 pages is too small for the stream. A segment takes a whole
+ * page of the pool, so the objects use up the area. An object that needs
+ * another page waits and keeps what it has. It finishes after the process
+ * frees an object.
+ */
+static void test_maio_device_small(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 32768;
+	const unsigned int objects = 4;
+	struct io_uring_opaque_extent vec[64];
+	unsigned char *data, *got;
+	uint64_t stream, handle[4], tag[4], cursor = 0;
+	unsigned int i, j, waiting = 0;
+	bool done[4] = {};
+	struct event event;
+	uint16_t port;
+	uint32_t bound;
+	struct maio z;
+	struct ring r;
+	struct pair pr;
+	int sock, listener;
+
+	if (!maio_port(&pr, &r, &z, 64, cfg, &bound))
+		return;
+	data = malloc((objects + 1) * length);
+	require(data, "buffers");
+	got = data + objects * length;
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	stream = attach(&r, bound, sock, next_tag++);
+
+	for (i = 0; i < objects; i++) {
+		maio_pattern(data + i * length, length, 5 + i);
+		tag[i] = cmd_stage(&r, bound, IORING_OPAQUE_RECV_OBJECT, stream, cursor,
+				   length, NULL);
+		cursor += length;
+	}
+	submit_only(&r);
+	write_all(pr.peer.socks[0], data, objects * length);
+
+	/* The first objects find pages. Later ones may wait for the process. */
+	for (i = 0; i < objects; i++) {
+		done[i] = maio_poll(&r, tag[i], i < 2 ? 20000 : 1500, &event);
+		if (done[i]) {
+			require(event.res == (int)length, "object result");
+			handle[i] = event.extra[0];
+		} else {
+			waiting++;
+		}
+	}
+	require(waiting, "an object waits for a page of the area");
+
+	/* Free the finished objects in turn. The waiting ones finish. */
+	for (i = 0; i < objects; i++) {
+		if (!done[i]) {
+			require(maio_poll(&r, tag[i], 30000, &event), "a waiting object finishes");
+			require(event.res == (int)length, "late object result");
+			handle[i] = event.extra[0];
+			done[i] = true;
+		}
+		maio_gather(&r, bound, &z, handle[i], length, got, vec, ARRAY_SIZE(vec));
+		require(!memcmp(got, data + i * length, length), "object bytes");
+		maio_end(&r, bound, IORING_OPAQUE_FREE, handle[i]);
+		for (j = i + 1; j < objects; j++) {
+			if (done[j] || !maio_poll(&r, tag[j], 1000, &event))
+				continue;
+			require(event.res == (int)length, "next object result");
+			handle[j] = event.extra[0];
+			done[j] = true;
+		}
+	}
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_drained(&r, bound);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(sock);
+	close(listener);
+	pair_destroy(&pr);
+	free(data);
+	ksft_test_result_pass("store on a port: a full area makes an object wait for a free\n");
+}
+
 int main(void)
 {
 	struct ring r, imported;
@@ -4952,7 +5410,7 @@ int main(void)
 		maio_ok = !maio_err;
 		ring_exit(&probe);
 	}
-	ksft_set_plan(107);
+	ksft_set_plan(109);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	tcp_pair(source);
 	tcp_pair(target);
@@ -5230,5 +5688,7 @@ int main(void)
 	test_maio_recycle(cfg);
 	test_maio_instance_first(cfg);
 	test_maio_store_first(cfg);
+	test_maio_device(cfg);
+	test_maio_device_small(cfg);
 	ksft_finished();
 }
