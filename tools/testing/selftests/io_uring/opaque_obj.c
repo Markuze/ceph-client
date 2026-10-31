@@ -1237,6 +1237,23 @@ static void *send_cancel_follower(void *arg)
 			if (i % 8 == 4) {
 				while (!__atomic_load_n(&race->head_done, __ATOMIC_ACQUIRE))
 					sched_yield();
+				/*
+				 * The unacknowledged tail of the head fills the small
+				 * send buffer, so the promoted follower usually waits
+				 * for write space and the cancel below wins; on some
+				 * SMP guests no round sends it. Every other such round
+				 * waits until the drain has acknowledged the head, so
+				 * that the follower is sent at its first issue.
+				 */
+				while (i % 16 == 4) {
+					int unacked;
+
+					require(!ioctl(race->target[0], SIOCOUTQ, &unacked),
+						"race unacknowledged bytes");
+					if (!unacked)
+						break;
+					sched_yield();
+				}
 				enter(&r, 0);
 			}
 			end.opcode = IORING_OP_ASYNC_CANCEL;
