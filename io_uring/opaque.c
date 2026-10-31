@@ -94,13 +94,20 @@ atomic_long_t io_opaque_budget_wakes = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_BUDGET_WAKE()	((void)0)
 #endif
 
-static void io_opaque_wake_budget(struct io_opaque_store *store)
+/*
+ * Let in the waiters for budget that the budget lets go on, at most
+ * IO_OPAQUE_WAKE_BATCH of them in a hold of wait_lock. Those left over are for
+ * the retry work, and that is why this says whether there were any: a caller
+ * that wants them in now repeats it. The work comes a jiffy later, or as late
+ * as a timer that is already pending, which queueing never moves earlier.
+ */
+static bool io_opaque_wake_budget(struct io_opaque_store *store)
 {
 	struct io_opaque_req *op, *next;
 	unsigned long delay = MAX_JIFFY_OFFSET;
 	unsigned long now = jiffies;
 	unsigned int woken = 0;
-	bool stopped;
+	bool stopped, more = false;
 
 	IO_OPAQUE_BUDGET_WAKE();
 	guard(spinlock)(&store->wait_lock);
@@ -117,6 +124,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 				continue;
 			if (woken == IO_OPAQUE_WAKE_BATCH) {
 				delay = 1;
+				more = true;
 				continue;
 			}
 		}
@@ -128,6 +136,14 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 	}
 	if (!stopped && delay != MAX_JIFFY_OFFSET)
 		queue_delayed_work(system_dfl_wq, &store->retry_work, delay);
+	return more;
+}
+
+/* As io_opaque_wake_budget(), until the batch leaves nobody behind. */
+static void io_opaque_wake_budget_all(struct io_opaque_store *store)
+{
+	while (io_opaque_wake_budget(store))
+		;
 }
 
 VISIBLE_IF_KUNIT void io_opaque_retry_work(struct work_struct *work)
@@ -201,10 +217,16 @@ bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
 	}
 }
 
-void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes)
+/* Give bytes back to the store, and let nobody in on them yet. */
+static void io_opaque_uncharge_quiet(struct io_opaque_store *store, u64 bytes)
 {
 	atomic64_sub(bytes, &store->bytes);
 	io_opaque_memory_mode(store);
+}
+
+void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes)
+{
+	io_opaque_uncharge_quiet(store, bytes);
 	io_opaque_wake_budget(store);
 }
 
@@ -390,9 +412,11 @@ VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
 
 /*
  * Free the extents of @list. What they held is returned to the store in one
- * step, and the waiters for budget are looked at once: each look takes
+ * step, and the waiters for budget are looked at in one go: each look takes
  * wait_lock and walks the list of them, which for the 700 extents of a 1 MB
- * object that is not a single mapping was 700 times.
+ * object that is not a single mapping was 700 times. The look is repeated
+ * while it leaves ready waiters behind, as the many that it replaces would
+ * have, so that they are let in by the free and not by the retry work.
  */
 VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
 					     struct list_head *list)
@@ -406,9 +430,9 @@ VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
 		any = true;
 	}
 	if (charge)
-		io_opaque_uncharge(store, charge);
-	else if (any)
-		io_opaque_wake_budget(store);
+		io_opaque_uncharge_quiet(store, charge);
+	if (any)
+		io_opaque_wake_budget_all(store);
 }
 
 struct io_opaque_data *io_opaque_data_alloc(void)

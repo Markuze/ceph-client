@@ -6551,6 +6551,83 @@ static void opaque_send_locked_blocking(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/* The wake-ups of a socket that waiters for budget are waiting on, counted. */
+struct opaque_budget_watch {
+	struct sock *sk;
+	wait_queue_entry_t entry;
+};
+
+static unsigned int opaque_budget_wakes_seen;
+
+static int opaque_budget_wake_fn(wait_queue_entry_t *entry, unsigned int mode, int flags,
+				 void *key)
+{
+	opaque_budget_wakes_seen++;
+	return 0;
+}
+
+static void opaque_budget_watch_stop(void *arg)
+{
+	struct opaque_budget_watch *watch = arg;
+
+	remove_wait_queue(sk_sleep(watch->sk), &watch->entry);
+}
+
+/*
+ * Freeing a version lets in every waiter for budget that the budget it gives
+ * back lets go on, and not only the first batch of them: a wake takes at most
+ * IO_OPAQUE_WAKE_BATCH, and the rest, left to the retry work, may wait for a
+ * timer that is a long way off, as freeing the extents one by one never made
+ * them. Seventy-two ready waiters are three batches, and are all woken by
+ * the free itself, in three looks and no more.
+ */
+static void opaque_extents_free_wakes_all(struct kunit *test)
+{
+	const unsigned int nr = 2 * IO_OPAQUE_WAKE_BATCH + 8;
+	struct opaque_budget_watch *watch = kunit_kzalloc(test, sizeof(*watch), GFP_KERNEL);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct io_opaque_stream *stream = kunit_kzalloc(test, sizeof(*stream), GFP_KERNEL);
+	struct io_opaque_req *ops = kunit_kcalloc(test, nr, sizeof(*ops), GFP_KERNEL);
+	long looks = atomic_long_read(&io_opaque_budget_wakes);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, watch);
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, stream);
+	KUNIT_ASSERT_NOT_NULL(test, ops);
+	opaque_wire_init(test, w);
+	/* The batch limit arms the retry work, which is not for this test to run. */
+	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_cancel_work,
+							&store->retry_work), 0);
+	opaque_test_stream(stream, store);
+	watch->sk = w->tx->sk;
+	init_waitqueue_func_entry(&watch->entry, opaque_budget_wake_fn);
+	add_wait_queue(sk_sleep(watch->sk), &watch->entry);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_budget_watch_stop, watch), 0);
+	for (i = 0; i < nr; i++) {
+		ops[i].store = store;
+		ops[i].req = &w->req[0];
+		ops[i].stream = stream;
+		ops[i].phase = IO_OPAQUE_BUDGET_POLL;
+		ops[i].retry_at = jiffies;
+		INIT_LIST_HEAD(&ops[i].wait);
+		INIT_LIST_HEAD(&ops[i].cancel);
+		list_add_tail(&ops[i].wait, &store->budget_waits);
+	}
+	opaque_budget_wakes_seen = 0;
+
+	/* The version's forty extents go, and the budget they held with them. */
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, opaque_budget_wakes_seen, nr);
+	KUNIT_EXPECT_TRUE(test, list_empty(&store->budget_waits));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - looks, 3L);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_reservation_unwind),
 	KUNIT_CASE(opaque_create_publish_revalidate),
@@ -6639,6 +6716,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_prep),
 	KUNIT_CASE(opaque_policy_chunks),
 	KUNIT_CASE(opaque_extents_free_wakes_once),
+	KUNIT_CASE(opaque_extents_free_wakes_all),
 	KUNIT_CASE(opaque_params_sysfs),
 	{}
 };
