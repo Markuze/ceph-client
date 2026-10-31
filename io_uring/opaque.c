@@ -28,9 +28,15 @@ bool io_opaque_cache_init(struct io_ring_ctx *ctx)
 				   sizeof(struct io_opaque_req), sizeof(struct io_opaque_req));
 }
 
+/* Frees a request left in the cache: everything it owns is released already. */
+static void io_opaque_req_destroy(const void *entry)
+{
+	kfree(entry);
+}
+
 void io_opaque_cache_free(struct io_ring_ctx *ctx)
 {
-	io_alloc_cache_free(&ctx->opaque_cache, kfree);
+	io_alloc_cache_free(&ctx->opaque_cache, io_opaque_req_destroy);
 }
 
 static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw);
@@ -727,6 +733,13 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 	INIT_LIST_HEAD(&op->cancel);
 	req->flags |= REQ_F_NEED_CLEANUP;
 	return op;
+}
+
+/* A finished request goes back to its ring's cache, or is freed when that is full. */
+static void io_opaque_req_free(struct io_ring_ctx *ctx, struct io_opaque_req *op)
+{
+	if (!io_alloc_cache_put(&ctx->opaque_cache, op))
+		kvfree(op);
 }
 
 /* The ring lock protects enrollment; wait_lock arbitrates remote wakeups. */
@@ -2286,7 +2299,7 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	if (op->counted)
 		atomic_dec(&store->requests);
 	lockdep_assert_held(&req->ctx->uring_lock);
-	io_cache_free(&req->ctx->opaque_cache, op);
+	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
 }
 
@@ -2300,14 +2313,6 @@ void io_opaque_fail(struct io_kiocb *req)
 		if (op->consumed)
 			req->cqe.flags |= IORING_CQE_F_OPAQUE_CONSUMED;
 	}
-}
-
-static void io_opaque_send_iter(struct io_opaque_req *op)
-{
-	iov_iter_bvec(&op->iter, ITER_SOURCE, op->data->bvec, op->data->nr,
-		      op->data->length);
-	iov_iter_advance(&op->iter, op->offset);
-	iov_iter_truncate(&op->iter, op->length);
 }
 
 /*
@@ -2384,10 +2389,52 @@ VISIBLE_IF_KUNIT void io_opaque_send_resolve(struct io_opaque_req *op)
 	op->resolved = true;
 }
 
+/* The handle must hold a version, and the range must lie within it. */
+static int io_opaque_send_range(const struct io_opaque_slot *slot, u64 off, u32 len)
+{
+	if (!slot || !slot->data)
+		return -ESTALE;
+	if (off > slot->data->length || len > slot->data->length - off)
+		return -ERANGE;
+	return 0;
+}
+
+/*
+ * Take a send's reference on the version @slot holds: the table reference when
+ * the send is LAST, which also removes the handle, else an extra one. Under
+ * tables, after io_opaque_send_range().
+ */
+static struct io_opaque_data *io_opaque_send_pin(struct io_opaque_store *store,
+						 struct io_opaque_slot *slot, bool last)
+{
+	if (last)
+		return io_opaque_detach(store, slot);
+	refcount_inc(&slot->data->refs);
+	return slot->data;
+}
+
+/* Drop the reference a send took at admission; a no-op when it took none. */
+static void io_opaque_send_unpin(struct io_opaque_req *op)
+{
+	io_opaque_data_put(op->store, op->data);
+	op->data = NULL;
+}
+
+/* Point the send's cursor at the range it selects within @len bytes of @bv. */
+static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *bv,
+				unsigned int nr, size_t len)
+{
+	iov_iter_bvec(&op->iter, ITER_SOURCE, bv, nr, len);
+	iov_iter_advance(&op->iter, op->offset);
+	iov_iter_truncate(&op->iter, op->length);
+}
+
 VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
+	bool last = op->send_flags & IORING_OPAQUE_SEND_LAST;
 	struct io_opaque_slot *slot;
+	int ret;
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_acquire, op);
 	slot = io_opaque_lookup(store, op->handle);
@@ -2396,19 +2443,13 @@ VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
 		return -ESHUTDOWN;
 	if (!op->length)
 		return 0;
-	if (!slot || !slot->data)
-		return -ESTALE;
-	if (op->offset > slot->data->length ||
-	    op->length > slot->data->length - op->offset)
-		return -ERANGE;
-	if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
-		op->data = io_opaque_detach(store, slot);
+	ret = io_opaque_send_range(slot, op->offset, op->length);
+	if (ret)
+		return ret;
+	op->data = io_opaque_send_pin(store, slot, last);
+	if (last)
 		op->consumed = true;
-	} else {
-		op->data = slot->data;
-		refcount_inc(&op->data->refs);
-	}
-	io_opaque_send_iter(op);
+	io_opaque_send_iter(op, op->data->bvec, op->data->nr, op->data->length);
 	return 0;
 }
 
@@ -2578,8 +2619,7 @@ VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *s
 		if (!pinned)
 			return ret;
 		/* The head failed after the check: the pin goes, LAST stays consumed. */
-		io_opaque_data_put(store, op->data);
-		op->data = NULL;
+		io_opaque_send_unpin(op);
 		return -ECANCELED;
 	}
 	op->tx = tx;
