@@ -41,7 +41,7 @@
 
 #include "../kselftest.h"
 
-#define PLAN			18
+#define PLAN			19
 #define AREA_PAGES		64
 #define RQ_ENTRIES		64
 #define RQ_REGION_SIZE		8192
@@ -1857,6 +1857,139 @@ static void test_netdevsim_head(void)
 	ksft_test_result_pass("netdevsim: copies of the head of a socket buffer count\n");
 }
 
+/*
+ * 19. The locked memory charge of an instance goes back with its last user,
+ * also while the instance lives on. A socket that holds unread frames in area
+ * pages keeps a page pool of the instance, and the pool keeps the instance,
+ * as the receive buffers that virtio_net leaves in its ring do. The users are
+ * the registering ring, the rings that import the instance, its exported files
+ * and the stores that bind it. The child runs without CAP_IPC_LOCK, under a
+ * limit that has room for one instance.
+ */
+#define CHARGE_PAGES		1024
+/* Few enough frames that TCP keeps them in their pages and does not collapse them. */
+#define CHARGE_BYTES		16384
+
+/* Register an instance. The exit of a ring is asynchronous, so retry while the limit is full. */
+static int charge_register(struct ring *r, struct zcrx *z, unsigned int flags,
+			   unsigned int ifindex)
+{
+	int ret = -ENOMEM, i;
+
+	for (i = 0; i < 100 && ret == -ENOMEM; i++) {
+		if (i)
+			usleep(50 * 1000);
+		zcrx_prepare(z, r, flags, ifindex, CHARGE_PAGES);
+		ret = zcrx_do_register(z);
+	}
+	return ret;
+}
+
+static int charge_child(struct pair *pr, int listener, uint16_t port)
+{
+	rlim_t limit = (rlim_t)CHARGE_PAGES * page_size * 3 / 2;
+	struct rlimit lim = { .rlim_cur = limit, .rlim_max = limit };
+	struct zcrx_ctrl ctrl = { .op = ZCRX_CTRL_EXPORT };
+	struct io_uring_zcrx_ifq_reg reg = {};
+	struct ring r1, r2, r3, r4;
+	struct zcrx a, b, c;
+	int sock, box, queued = 0, ret, i;
+
+	drop_cap(CAP_IPC_LOCK);
+	if (ring_init(&r1, IORING_SETUP_CQE32) || ring_init(&r2, IORING_SETUP_CQE32) ||
+	    ring_init(&r3, IORING_SETUP_CQE32) || ring_init(&r4, IORING_SETUP_CQE32))
+		return 2;
+	if (setrlimit(RLIMIT_MEMLOCK, &lim))
+		return 3;
+
+	/* Instance a on port A gets frames that the socket does not read. */
+	zcrx_prepare(&a, &r1, ZCRX_REG_MAIO, pr->ifindex, CHARGE_PAGES);
+	ret = zcrx_do_register(&a);
+	if (ret == -EOPNOTSUPP || ret == -ENODEV)
+		return 50;
+	if (ret)
+		return 4;
+	sock = connect_peer(pr, 0, listener, port);
+	send_stream(pr->peer.socks[0], 0, CHARGE_BYTES, 9);
+	for (i = 0; i < 500 && queued != CHARGE_BYTES; i++) {
+		usleep(10 * 1000);
+		if (ioctl(sock, SIOCINQ, &queued))
+			return 5;
+	}
+	if (queued != CHARGE_BYTES)
+		return 6;
+
+	/* The last user of a goes. Its charge must go too, so that b fits. */
+	zcrx_close(&a);
+	ring_exit(&r1);
+	ret = charge_register(&r2, &b, ZCRX_REG_MAIO, pr->ifindex);
+	if (ret)
+		return ret == -ENOMEM ? 10 : 11;
+	/* The pages of a that the socket holds kept the frames. */
+	recv_stream(sock, 0, CHARGE_BYTES, 9);
+	close(sock);
+
+	/* An exported file and an importing ring keep b and its charge. */
+	ctrl.zcrx_id = b.id;
+	if (zcrx_ctrl(&r2, &ctrl))
+		return 12;
+	box = ctrl.zc_export.zcrx_fd;
+	reg.if_idx = box;
+	reg.flags = ZCRX_REG_IMPORT;
+	if (zcrx_register_raw(&r3, &reg))
+		return 13;
+	zcrx_close(&b);
+	ring_exit(&r2);
+	usleep(500 * 1000);
+	zcrx_prepare(&c, &r4, ZCRX_REG_MAIO | ZCRX_REG_NODEV, 0, CHARGE_PAGES);
+	if (zcrx_do_register(&c) != -ENOMEM)
+		return 14;
+
+	/* The last user of b goes, and c fits. */
+	close(box);
+	ring_exit(&r3);
+	ret = charge_register(&r4, &c, ZCRX_REG_MAIO | ZCRX_REG_NODEV, 0);
+	if (ret)
+		return ret == -ENOMEM ? 15 : 16;
+	zcrx_close(&c);
+	ring_exit(&r4);
+	return 0;
+}
+
+static void test_charge_last_user(void)
+{
+	int listener, rcvbuf = 1 << 20, status;
+	struct pair pr;
+	uint16_t port;
+	pid_t pid;
+
+	if (!pair_create(&pr, 210, 211)) {
+		ksft_test_result_skip("netdevsim ports or network namespaces are not available\n");
+		return;
+	}
+	listener = listen_local(&port);
+	/* The accepted socket inherits the buffer, so that TCP keeps the frames as they are. */
+	require(!setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)),
+		"receive buffer of the listener");
+	pid = fork();
+	require(pid >= 0, "fork");
+	if (!pid)
+		_exit(charge_child(&pr, listener, port));
+	require(waitpid(pid, &status, 0) == pid, "wait for the child");
+	close(listener);
+	pair_destroy(&pr);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 50) {
+		ksft_test_result_skip("the port has no queue API\n");
+		return;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+		/* 10: the charge of a closed instance still filled the limit. */
+		ksft_test_result_fail("charge and last user: child status 0x%x\n", status);
+		return;
+	}
+	ksft_test_result_pass("the charge goes with the last user, held pages stay\n");
+}
+
 /* 9. A device without the queue API cannot take the provider. */
 static void test_loopback(struct ring *r)
 {
@@ -1986,6 +2119,7 @@ int main(void)
 	test_netdevsim_foreign();
 	test_netdevsim_exhaust();
 	test_netdevsim_head();
+	test_charge_last_user();
 	/* The last test closes the first ring. */
 	test_export_import(&r);
 

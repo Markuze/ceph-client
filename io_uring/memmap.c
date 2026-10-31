@@ -103,6 +103,15 @@ enum {
 	IO_REGION_F_SINGLE_REF			= 4,
 };
 
+/* The number of pages that io_create_region() charged to the user for @mr. */
+unsigned long io_region_nr_accounted(struct io_mapped_region *mr)
+{
+	/* a compound region was accounted for the whole allocation */
+	if (mr->flags & IO_REGION_F_SINGLE_REF)
+		return 1UL << get_order(io_region_size(mr));
+	return mr->nr_pages;
+}
+
 void io_free_region(struct user_struct *user, struct io_mapped_region *mr)
 {
 	if (mr->pages) {
@@ -120,15 +129,8 @@ void io_free_region(struct user_struct *user, struct io_mapped_region *mr)
 	}
 	if ((mr->flags & IO_REGION_F_VMAP) && mr->ptr)
 		vunmap(mr->ptr);
-	if (mr->nr_pages && user) {
-		unsigned long nr_accounted = mr->nr_pages;
-
-		/* a compound region was accounted for the whole allocation */
-		if (mr->flags & IO_REGION_F_SINGLE_REF)
-			nr_accounted = 1UL << get_order(io_region_size(mr));
-
-		__io_unaccount_mem(user, nr_accounted);
-	}
+	if (mr->nr_pages && user)
+		__io_unaccount_mem(user, io_region_nr_accounted(mr));
 
 	memset(mr, 0, sizeof(*mr));
 }

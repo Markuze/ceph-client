@@ -39,6 +39,7 @@ enum {
 	IO_ZCRX_KSLOT_FREE,	/* in the freelist */
 	IO_ZCRX_KSLOT_OWNED,	/* handed out: a page pool owns it, or it is a copy page */
 	IO_ZCRX_KSLOT_LIMBO,	/* in the limbo list: an outsider holds a reference */
+	IO_ZCRX_KSLOT_GONE,	/* released after the close, the area holds no reference */
 };
 
 /* A run of pages with consecutive page frame numbers in consecutive slots. */
@@ -62,6 +63,11 @@ struct io_zcrx_kmem {
 	u32			*limbo;
 	u32			limbo_head;
 	u32			limbo_count;
+	/*
+	 * The instance has no user left, see io_zcrx_kmem_close(). A slot that
+	 * comes back releases its page. ->alloc_lock
+	 */
+	bool			closed;
 };
 
 struct io_zcrx_area {
@@ -124,6 +130,12 @@ struct io_zcrx_ifq {
 	u32				nr_rxq;
 	/* MAIO: the area had no free page at the last allocation. ->alloc_lock */
 	bool				maio_exhausted;
+	/*
+	 * MAIO: the users of the area. The rings and files of user_refs count
+	 * as one, and each store that binds the instance counts as one. The
+	 * last one closes the area, see zcrx_maio_close().
+	 */
+	refcount_t			maio_users;
 
 	struct zcrx_rq			rq ____cacheline_aligned_in_smp;
 	spinlock_t			alloc_lock ____cacheline_aligned_in_smp;
@@ -228,14 +240,16 @@ unsigned int io_zcrx_ring_refill(struct page_pool *pp, struct io_zcrx_ifq *ifq,
 				 netmem_ref *netmems, unsigned int to_alloc);
 void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned int type);
 void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq);
+void io_zcrx_maio_drop_user(struct io_zcrx_ifq *ifq);
 extern const struct memory_provider_ops io_uring_pp_maio_ops;
 
 /* zcrx_maio.c */
 int io_zcrx_kmem_import(struct io_zcrx_ifq *ifq, struct io_zcrx_mem *mem,
 			const struct io_uring_zcrx_area_reg *area_reg);
-void io_zcrx_kmem_release(struct io_zcrx_mem *mem);
+void io_zcrx_kmem_release(struct io_zcrx_area *area);
 int io_zcrx_kmem_init_area(struct io_zcrx_area *area);
 void io_zcrx_kmem_free_area(struct io_zcrx_area *area);
+void io_zcrx_kmem_close(struct io_zcrx_area *area);
 int io_zcrx_kmem_map(struct io_zcrx_ifq *ifq, struct device *dev);
 void io_zcrx_kmem_unmap(struct io_zcrx_ifq *ifq, struct io_zcrx_area *area);
 void io_zcrx_kmem_return_slot(struct io_zcrx_area *area, u32 idx);

@@ -153,14 +153,23 @@ err_unaccount:
 }
 
 /*
- * Drop the reference of the area to each page. A page that someone else still
- * references, for example a socket buffer or a pinned user buffer, lives on
- * until the last holder drops it. The caller undoes the accounting.
+ * Drop the reference of the area to each page that it still holds. A page
+ * that someone else still references, for example a socket buffer or a pinned
+ * user buffer, lives on until the last holder drops it. The caller undoes the
+ * accounting.
  */
-void io_zcrx_kmem_release(struct io_zcrx_mem *mem)
+void io_zcrx_kmem_release(struct io_zcrx_area *area)
 {
-	io_zcrx_kmem_free_pages(mem->pages, mem->size >> PAGE_SHIFT);
-	kvfree(mem->pages);
+	struct io_zcrx_kmem *kmem = area->kmem;
+	unsigned long i, nr = area->mem.size >> PAGE_SHIFT;
+
+	for (i = 0; i < nr; i++) {
+		/* A closed area released these, see io_zcrx_kmem_close(). */
+		if (kmem && kmem->state && kmem->state[i] == IO_ZCRX_KSLOT_GONE)
+			continue;
+		put_page(area->mem.pages[i]);
+	}
+	kvfree(area->mem.pages);
 }
 
 /*
@@ -256,7 +265,7 @@ void io_zcrx_kmem_free_area(struct io_zcrx_area *area)
 
 	/*
 	 * Every pool is gone and every holder has returned its pages, so each
-	 * slot is in the freelist or in limbo.
+	 * slot is in the freelist, in limbo or gone.
 	 */
 	if (kmem->state)
 		for (i = 0; i < area->nia.num_niovs; i++)
@@ -326,24 +335,79 @@ static u32 io_zcrx_limbo_pop(struct io_zcrx_area *area)
 /*
  * Give a slot back to the area. It goes to the freelist if no outsider holds
  * its page, and to limbo otherwise. The slot must be owned: a pool owned it,
- * or it was a copy page.
+ * or it was a copy page. A closed area releases the page instead.
  */
 void io_zcrx_kmem_return_slot(struct io_zcrx_area *area, u32 idx)
 {
 	struct io_zcrx_kmem *kmem = area->kmem;
+	struct page *page = area->mem.pages[idx];
+	bool release = false;
 
-	guard(spinlock_bh)(&area->ifq->alloc_lock);
+	scoped_guard(spinlock_bh, &area->ifq->alloc_lock) {
+		if (WARN_ON_ONCE(kmem->state[idx] != IO_ZCRX_KSLOT_OWNED))
+			return;
+		release = kmem->closed;
+		if (release) {
+			kmem->state[idx] = IO_ZCRX_KSLOT_GONE;
+		} else if (io_zcrx_page_is_quiet(page)) {
+			kmem->state[idx] = IO_ZCRX_KSLOT_FREE;
+			area->freelist[area->free_count++] = idx;
+		} else {
+			kmem->state[idx] = IO_ZCRX_KSLOT_LIMBO;
+			io_zcrx_limbo_push(area, idx);
+			io_zcrx_maio_stat_add(area->ifq,
+					      offsetof(struct zcrx_stats, limbo_enter), 1);
+		}
+	}
+	/* An outsider that still holds the page frees it. */
+	if (release)
+		put_page(page);
+}
 
-	if (WARN_ON_ONCE(kmem->state[idx] != IO_ZCRX_KSLOT_OWNED))
+/**
+ * io_zcrx_kmem_close() - release the pages of an instance without users
+ * @area:	the area of a MAIO instance
+ *
+ * The area has no user left: no ring or file holds the instance, and no store
+ * binds it. The provider is off every queue, and the users gave their slots
+ * back. Page pools, socket buffers and objects can still hold pages. A pool
+ * keeps the instance until all its pages are back, and that can take long:
+ * virtio_net leaves the buffers that a pool posted in the ring until the
+ * device fills them. Release every page that the area holds now, and each
+ * page that comes back later, so that the instance keeps only the pages that
+ * are still out. A page in limbo lives on until its outsider drops it.
+ *
+ * A device can still reach the pages of an area that is mapped for DMA, so
+ * they stay until io_zcrx_ifq_free() unmaps the area. A device that uses the
+ * DMA API takes its buffers back when its queue stops, so its pools go soon.
+ *
+ * The caller holds ->pp_lock, which keeps the mapping as it is.
+ */
+void io_zcrx_kmem_close(struct io_zcrx_area *area)
+{
+	struct io_zcrx_kmem *kmem = area->kmem;
+	u32 i, nr = 0;
+
+	lockdep_assert_held(&area->ifq->pp_lock);
+
+	if (area->is_mapped)
 		return;
-	if (io_zcrx_page_is_quiet(area->mem.pages[idx])) {
-		kmem->state[idx] = IO_ZCRX_KSLOT_FREE;
-		area->freelist[area->free_count++] = idx;
-	} else {
-		kmem->state[idx] = IO_ZCRX_KSLOT_LIMBO;
-		io_zcrx_limbo_push(area, idx);
-		io_zcrx_maio_stat_add(area->ifq,
-				      offsetof(struct zcrx_stats, limbo_enter), 1);
+
+	scoped_guard(spinlock_bh, &area->ifq->alloc_lock) {
+		kmem->closed = true;
+		/* Gather the slots in limbo behind the free slots. */
+		nr = area->free_count;
+		while (kmem->limbo_count)
+			area->freelist[nr++] = io_zcrx_limbo_pop(area);
+		area->free_count = 0;
+		for (i = 0; i < nr; i++)
+			kmem->state[area->freelist[i]] = IO_ZCRX_KSLOT_GONE;
+	}
+
+	/* The area is closed and empty, so no one else reads these entries. */
+	for (i = 0; i < nr; i++) {
+		put_page(area->mem.pages[area->freelist[i]]);
+		cond_resched();
 	}
 }
 
@@ -668,8 +732,9 @@ int io_pp_maio_init(struct page_pool *pp)
  * @zcrx_id:	the zcrx id that registration or import returned for the ring
  *
  * The reference keeps the area and its pages alive. It does not keep the
- * provider installed: the application can unregister the instance. Drop the
- * reference with io_zcrx_maio_put().
+ * provider installed: the application can unregister the instance. The holder
+ * is a user of the area, so the area keeps all its pages until the holder is
+ * gone, see io_zcrx_kmem_close(). Drop the reference with io_zcrx_maio_put().
  *
  * Return: the instance with a reference, or NULL if the ring has no MAIO
  * instance with this id.
@@ -684,12 +749,18 @@ struct io_zcrx_ifq *io_zcrx_maio_get(struct io_ring_ctx *ctx, u32 zcrx_id)
 	ifq = xa_load(&ctx->zcrx_ctxs, zcrx_id);
 	if (!ifq || !ifq->maio || !refcount_inc_not_zero(&ifq->refs))
 		return NULL;
+	/* A closed area takes no new user. */
+	if (!refcount_inc_not_zero(&ifq->maio_users)) {
+		io_put_zcrx_ifq(ifq);
+		return NULL;
+	}
 	return ifq;
 }
 
 /** io_zcrx_maio_put() - drop the reference of io_zcrx_maio_get() */
 void io_zcrx_maio_put(struct io_zcrx_ifq *ifq)
 {
+	io_zcrx_maio_drop_user(ifq);
 	io_put_zcrx_ifq(ifq);
 }
 

@@ -303,12 +303,14 @@ out_err:
 	return ret;
 }
 
-static void io_release_area_mem(struct io_zcrx_mem *mem)
+static void io_release_area_mem(struct io_zcrx_area *area)
 {
+	struct io_zcrx_mem *mem = &area->mem;
+
 	if (mem->is_dmabuf) {
 		io_release_dmabuf(mem);
 	} else if (mem->is_kernel) {
-		io_zcrx_kmem_release(mem);
+		io_zcrx_kmem_release(area);
 	} else if (mem->pages) {
 		unpin_user_pages(mem->pages, mem->nr_folios);
 		sg_free_table(mem->sgt);
@@ -499,7 +501,7 @@ static void io_zcrx_free_area(struct io_zcrx_ifq *ifq,
 {
 	if (WARN_ON_ONCE(area->is_mapped))
 		return;
-	io_release_area_mem(&area->mem);
+	io_release_area_mem(area);
 
 	if (area->mem.account_pages)
 		io_unaccount_mem(ifq->user, ifq->mm_account,
@@ -668,6 +670,7 @@ static struct io_zcrx_ifq *io_zcrx_ifq_alloc(struct io_ring_ctx *ctx)
 	mutex_init(&ifq->pp_lock);
 	refcount_set(&ifq->refs, 1);
 	refcount_set(&ifq->user_refs, 1);
+	refcount_set(&ifq->maio_users, 1);
 	return ifq;
 }
 
@@ -850,6 +853,44 @@ static void io_zcrx_scrub(struct io_zcrx_ifq *ifq)
 		io_zcrx_scrub_area(ifq, ifq->areas[i]);
 }
 
+/*
+ * The area of a MAIO instance has no user left: no ring or file holds the
+ * instance, and no store binds it. Its page pools can keep the instance for
+ * long, see io_zcrx_kmem_close(), and it keeps only the pages that are still
+ * out. The locked memory charge of the area and of the refill region belongs
+ * to the users, so it goes back now and not when the last pool is gone. The
+ * refill region itself stays until then.
+ */
+static void zcrx_maio_close(struct io_zcrx_ifq *ifq)
+{
+	if (ifq->nr_areas) {
+		struct io_zcrx_area *area = ifq->areas[0];
+
+		scoped_guard(mutex, &ifq->pp_lock)
+			io_zcrx_kmem_close(area);
+		io_unaccount_mem(ifq->user, ifq->mm_account,
+				 area->mem.account_pages);
+		area->mem.account_pages = 0;
+	}
+	if (ifq->user)
+		__io_unaccount_mem(ifq->user,
+				   io_region_nr_accounted(&ifq->rq_region));
+	/* io_zcrx_ifq_free() then gives nothing back again. */
+	free_uid(ifq->user);
+	ifq->user = NULL;
+	if (ifq->mm_account) {
+		mmdrop(ifq->mm_account);
+		ifq->mm_account = NULL;
+	}
+}
+
+/* Drop a user of the area of a MAIO instance, see ->maio_users. */
+void io_zcrx_maio_drop_user(struct io_zcrx_ifq *ifq)
+{
+	if (refcount_dec_and_test(&ifq->maio_users))
+		zcrx_maio_close(ifq);
+}
+
 static void zcrx_unregister_user(struct io_zcrx_ifq *ifq, struct io_ring_ctx *ctx)
 {
 	scoped_guard(spinlock_bh, &ifq->ctx_lock) {
@@ -862,6 +903,9 @@ static void zcrx_unregister_user(struct io_zcrx_ifq *ifq, struct io_ring_ctx *ct
 	if (refcount_dec_and_test(&ifq->user_refs)) {
 		io_close_queue(ifq);
 		io_zcrx_scrub(ifq);
+		/* The rings and files were one user of the area. */
+		if (ifq->maio)
+			io_zcrx_maio_drop_user(ifq);
 	}
 }
 

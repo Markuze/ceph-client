@@ -26,7 +26,9 @@ struct zt_env {
 	struct page_pool	*pp[2];
 };
 
-static struct io_zcrx_ifq *zt_ifq(struct kunit *test, unsigned int pages)
+/* Create an instance whose area counts against the locked memory of @user. */
+static struct io_zcrx_ifq *zt_ifq_user(struct kunit *test, unsigned int pages,
+				       struct user_struct *user)
 {
 	struct io_uring_zcrx_area_reg area_reg = {
 		.len	= (u64)pages << PAGE_SHIFT,
@@ -37,6 +39,8 @@ static struct io_zcrx_ifq *zt_ifq(struct kunit *test, unsigned int pages)
 
 	ifq = io_zcrx_ifq_alloc(NULL);
 	KUNIT_ASSERT_NOT_NULL(test, ifq);
+	if (user)
+		ifq->user = get_uid(user);
 	ifq->maio = true;
 	ifq->kern_readable = true;
 	ifq->rq.nr_entries = ZT_RQ_ENTRIES;
@@ -50,6 +54,11 @@ static struct io_zcrx_ifq *zt_ifq(struct kunit *test, unsigned int pages)
 	KUNIT_ASSERT_NOT_NULL(test, ifq->notif_stats);
 	KUNIT_ASSERT_EQ(test, io_zcrx_create_area(ifq, &area_reg, &reg), 0);
 	return ifq;
+}
+
+static struct io_zcrx_ifq *zt_ifq(struct kunit *test, unsigned int pages)
+{
+	return zt_ifq_user(test, pages, NULL);
 }
 
 static struct net_device *zt_netdev(struct kunit *test, unsigned int queues)
@@ -1412,6 +1421,147 @@ static void zcrx_maio_destroy_after_uninstall(struct kunit *test)
 	free_netdev(env.dev);
 }
 
+/*
+ * The last user goes while a pool and an outsider still hold pages, as when
+ * virtio_net keeps buffers that the pool posted. The area releases its free
+ * pages and its page in limbo at once, and each page that comes back later.
+ * The final free releases no page twice.
+ */
+static void zcrx_maio_close_pages(struct kunit *test)
+{
+	const u32 nr = 2 * ZT_BATCH;
+	struct page *posted, *held;
+	struct zt_env env;
+	u64 off;
+	u32 idx;
+
+	zt_env_init(test, &env, nr, 1);
+	/* The pool takes a batch: one page goes out, the rest waits in its cache. */
+	posted = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, posted);
+	idx = zt_slot(test, env.ifq, posted);
+	held = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	get_page(held);
+	io_zcrx_maio_page_put(env.ifq, held);
+	KUNIT_ASSERT_EQ(test, env.area->kmem->limbo_count, 1U);
+	KUNIT_ASSERT_EQ(test, env.area->free_count, (u32)(nr - ZT_BATCH - 1));
+
+	zcrx_unregister_user(env.ifq, NULL);
+	KUNIT_EXPECT_TRUE(test, env.area->kmem->closed);
+	KUNIT_EXPECT_EQ(test, env.area->free_count, 0U);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->limbo_count, 0U);
+	KUNIT_EXPECT_EQ(test, zt_count(env.area, IO_ZCRX_KSLOT_GONE), (u32)(nr - ZT_BATCH));
+	KUNIT_EXPECT_EQ(test, zt_count(env.area, IO_ZCRX_KSLOT_OWNED), (u32)ZT_BATCH);
+	/* The outsider holds the last reference of the page that was in limbo. */
+	KUNIT_EXPECT_EQ(test, page_count(held), 1);
+	put_page(held);
+
+	/* A page that comes back is released. The extra reference shows it. */
+	get_page(posted);
+	zt_free(env.pp[0], posted);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->state[idx], IO_ZCRX_KSLOT_GONE);
+	KUNIT_EXPECT_EQ(test, page_count(posted), 1);
+	KUNIT_EXPECT_EQ(test, env.area->free_count, 0U);
+	put_page(posted);
+
+	/* The pool returns its cache when it goes. Nothing is left. */
+	page_pool_destroy(env.pp[0]);
+	env.pp[0] = NULL;
+	KUNIT_EXPECT_EQ(test, zt_count(env.area, IO_ZCRX_KSLOT_GONE), nr);
+	zt_env_exit(test, &env);
+}
+
+/*
+ * The area counts against the locked memory of the user. The charge goes back
+ * with the last user, also while a pool still holds a page of the area, and the
+ * final free does not give it back again.
+ */
+static void zcrx_maio_close_charge(struct kunit *test)
+{
+	struct user_struct *user = get_current_user();
+	struct io_zcrx_ifq *ifq;
+	struct net_device *dev;
+	struct page_pool *pp;
+	struct page *page;
+	long base;
+
+	base = atomic_long_read(&user->locked_vm);
+	ifq = zt_ifq_user(test, 16, user);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&user->locked_vm), base + 16);
+
+	dev = zt_netdev(test, 1);
+	zt_bind(dev, 0, ifq);
+	pp = zt_pool(test, dev, 0, PP_FLAG_PRIVATE_HEADERS);
+	page = zt_alloc(pp);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+
+	zcrx_unregister_user(ifq, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&user->locked_vm), base);
+	KUNIT_EXPECT_NULL(test, ifq->user);
+	KUNIT_EXPECT_EQ(test, ifq->areas[0]->mem.account_pages, 0UL);
+
+	/* The pool gets its page back and goes. The instance goes with it. */
+	zt_free(pp, page);
+	page_pool_destroy(pp);
+	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 1U);
+	io_put_zcrx_ifq(ifq);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&user->locked_vm), base);
+	free_netdev(dev);
+	free_uid(user);
+}
+
+/*
+ * A store that binds the instance is a user of the area too. When the rings
+ * and files are gone, the area stays whole and charged for the store, and it
+ * closes when the store lets go.
+ */
+static void zcrx_maio_close_store(struct kunit *test)
+{
+	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct user_struct *user = get_current_user();
+	struct io_zcrx_ifq *ifq, *store_ref;
+	struct page *p;
+	long base;
+	u64 off;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	base = atomic_long_read(&user->locked_vm);
+	ifq = zt_ifq_user(test, 16, user);
+	mutex_init(&ctx->uring_lock);
+	xa_init_flags(&ctx->zcrx_ctxs, XA_FLAGS_ALLOC);
+	KUNIT_ASSERT_EQ(test, xa_err(xa_store(&ctx->zcrx_ctxs, 0, ifq, GFP_KERNEL)), 0);
+	mutex_lock(&ctx->uring_lock);
+	store_ref = io_zcrx_maio_get(ctx, 0);
+	mutex_unlock(&ctx->uring_lock);
+	KUNIT_ASSERT_PTR_EQ(test, store_ref, ifq);
+
+	zcrx_unregister_user(ifq, NULL);
+	KUNIT_EXPECT_FALSE(test, ifq->areas[0]->kmem->closed);
+	KUNIT_EXPECT_EQ(test, ifq->areas[0]->free_count, 16U);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&user->locked_vm), base + 16);
+	/* The store still takes pages of the area. */
+	p = io_zcrx_maio_copy_page(ifq, &off);
+	KUNIT_EXPECT_NOT_NULL(test, p);
+	if (p)
+		io_zcrx_maio_page_put(ifq, p);
+
+	io_zcrx_maio_put(store_ref);
+	KUNIT_EXPECT_TRUE(test, ifq->areas[0]->kmem->closed);
+	KUNIT_EXPECT_EQ(test, zt_count(ifq->areas[0], IO_ZCRX_KSLOT_GONE), 16U);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&user->locked_vm), base);
+	/* A closed area takes no new user. */
+	mutex_lock(&ctx->uring_lock);
+	KUNIT_EXPECT_NULL(test, io_zcrx_maio_get(ctx, 0));
+	mutex_unlock(&ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 1U);
+
+	xa_destroy(&ctx->zcrx_ctxs);
+	io_put_zcrx_ifq(ifq);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&user->locked_vm), base);
+	free_uid(user);
+}
+
 struct zt_stress {
 	struct io_zcrx_ifq	*ifq;
 	struct page_pool	*pp;
@@ -1714,6 +1864,9 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_queues),
 	KUNIT_CASE(zcrx_maio_queues_down),
 	KUNIT_CASE(zcrx_maio_destroy_after_uninstall),
+	KUNIT_CASE(zcrx_maio_close_pages),
+	KUNIT_CASE(zcrx_maio_close_charge),
+	KUNIT_CASE(zcrx_maio_close_store),
 	KUNIT_CASE_SLOW(zcrx_maio_stress),
 #ifdef CONFIG_HAS_DMA
 	KUNIT_CASE(zcrx_maio_dma),

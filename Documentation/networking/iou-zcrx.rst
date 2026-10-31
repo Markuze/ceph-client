@@ -356,11 +356,18 @@ While the instance exists, these requests fail:
 * A new XDP program or an AF_XDP binding on the device fails.
 
 Unregistration, and the exit of the ring, remove the provider from every
-queue. Each queue restarts with an ordinary page pool. A socket buffer, an
-object, the process or, on ``virtio_net``, a posted receive buffer can still
-hold area pages. The area stays until the last holder drops its page. It
-stays mapped for DMA until the last page pool of the instance is gone. When the device goes away first, the core removes the
-provider. The instance and its area stay valid until the ring exits.
+queue once no ring that registered or imported the instance and no exported
+file is left. Each queue restarts with an ordinary page pool. A socket buffer,
+an object, the process or, on ``virtio_net``, a posted receive buffer can still
+hold area pages. ``virtio_net`` keeps a posted buffer until the device fills
+it, which can take long on a queue without traffic. Once no store binds the
+instance either, the area keeps only the pages that are held. It releases its
+other pages at once, and each held page when its holder drops it. The locked
+memory charge of the area and of the refill ring goes back to the user at the
+same time. An area that is mapped for DMA keeps all its pages, and the mapping,
+until the last page pool of the instance is gone. When the device goes away
+first, the core removes the provider. The instance and its area stay valid
+until the ring exits.
 
 ``ZCRX_CTRL_EXPORT`` and ``ZCRX_REG_IMPORT`` work as for any instance. A ring
 that imports a MAIO instance maps the same pages. Its mmap offset depends on
