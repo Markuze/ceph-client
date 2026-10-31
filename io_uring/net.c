@@ -1369,7 +1369,7 @@ void io_send_zc_cleanup(struct io_kiocb *req)
 
 #define IO_ZC_FLAGS_COMMON (IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_FIXED_BUF)
 #define IO_ZC_FLAGS_VALID  (IO_ZC_FLAGS_COMMON | IORING_SEND_ZC_REPORT_USAGE | \
-				IORING_SEND_VECTORIZED)
+				IORING_SEND_VECTORIZED | IORING_SEND_ZC_NO_RX_COPY)
 
 int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
@@ -1410,6 +1410,20 @@ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 			nd->zc_report = true;
 			nd->zc_used = false;
 			nd->zc_copied = false;
+		}
+		/*
+		 * Skip the receive-path copy: a consumer, a packet socket for
+		 * one, may hold the skbs of this request, and with them the
+		 * pages, for as long as it likes. A registered buffer allows
+		 * that: the notification holds its node until the cqe is
+		 * posted, which is after the last skb that carries the pages,
+		 * a tap's clone included, is gone. A buffer that is not
+		 * registered is not meant to be held for long: not offered.
+		 */
+		if (zc->flags & IORING_SEND_ZC_NO_RX_COPY) {
+			if (!(zc->flags & IORING_RECVSEND_FIXED_BUF))
+				return -EINVAL;
+			io_notif_to_data(notif)->uarg.flags |= SKBFL_DONT_ORPHAN_RX;
 		}
 	}
 

@@ -19,6 +19,7 @@
 
 #include "io_uring.h"
 #include "mpscq.h"
+#include "notif.h"
 #include "opaque_internal.h"
 
 static void opaque_test_txs_free(void *store)
@@ -7645,6 +7646,224 @@ static void opaque_ubuf_complete_atomic(struct kunit *test)
 	}
 }
 
+/*
+ * SEND_ZC's notification and IORING_SEND_ZC_NO_RX_COPY, the counterpart of the managed sends
+ * above that a registered-buffer send gets by asking for it. The notifications are built by
+ * hand, as io_alloc_notif() and io_send_zc_prep() leave them, with no ring behind them, and
+ * every test keeps the reference that the request holds: no completion drops the last one, so
+ * no task work is queued and no cqe is posted.
+ */
+#define SENDZC_TEST_FRAGS	2
+#define SENDZC_TEST_FRAG_LEN	100
+
+struct sendzc_test_ring {
+	struct io_ring_ctx	*ctx;
+	struct io_uring_task	*tctx;
+};
+
+/* What the notifications of one test share: only compared, never used. */
+static struct sendzc_test_ring *sendzc_test_ring(struct kunit *test)
+{
+	struct sendzc_test_ring *ring = kunit_kzalloc(test, sizeof(*ring), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ring);
+	ring->ctx = kunit_kzalloc(test, sizeof(*ring->ctx), GFP_KERNEL);
+	ring->tctx = kunit_kzalloc(test, sizeof(*ring->tctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ring->ctx);
+	KUNIT_ASSERT_NOT_NULL(test, ring->tctx);
+	return ring;
+}
+
+/* A notification as io_send_zc_prep() leaves it, the usage report on. */
+static struct io_notif_data *sendzc_test_notif(struct kunit *test,
+					       const struct sendzc_test_ring *ring,
+					       bool rx_waiver)
+{
+	struct io_kiocb *notif = kunit_kzalloc(test, sizeof(*notif), GFP_KERNEL);
+	struct io_notif_data *nd;
+
+	KUNIT_ASSERT_NOT_NULL(test, notif);
+	notif->ctx = ring->ctx;
+	notif->tctx = ring->tctx;
+	nd = io_notif_to_data(notif);
+	nd->head = nd;
+	nd->zc_report = true;
+	nd->uarg.flags = IO_NOTIF_UBUF_FLAGS | (rx_waiver ? SKBFL_DONT_ORPHAN_RX : 0);
+	nd->uarg.ops = &io_ubuf_ops;
+	refcount_set(&nd->uarg.refcnt, 1);
+	return nd;
+}
+
+static void sendzc_test_free_page(void *page)
+{
+	__free_page(page);
+}
+
+/*
+ * Fragments of a registered buffer, as io_sg_from_iter() adds them: managed, so that the skb
+ * takes no reference on the pages, which the test owns. Frag i is filled with the byte i + 1.
+ */
+static void sendzc_test_fill(struct kunit *test, struct sk_buff *skb, struct page **pages)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int i;
+
+	shinfo->flags |= SKBFL_MANAGED_FRAG_REFS;
+	for (i = 0; i < SENDZC_TEST_FRAGS; i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, pages[i]);
+		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sendzc_test_free_page,
+								pages[i]), 0);
+		memset(page_address(pages[i]), i + 1, PAGE_SIZE);
+		__skb_fill_page_desc_noacc(shinfo, i, pages[i], 0, SENDZC_TEST_FRAG_LEN);
+	}
+	shinfo->nr_frags = SENDZC_TEST_FRAGS;
+	skb->len = SENDZC_TEST_FRAGS * SENDZC_TEST_FRAG_LEN;
+	skb->data_len = skb->len;
+	skb->truesize += SENDZC_TEST_FRAGS * PAGE_SIZE;
+}
+
+/*
+ * A notification joins the skb of another only if both asked for the same of the receive path:
+ * an skb is held by it or copied for it as a whole.
+ */
+static void sendzc_link_waiver(struct kunit *test)
+{
+	const struct sendzc_test_ring *ring = sendzc_test_ring(test);
+	int prev, cur;
+
+	for (prev = 0; prev < 2; prev++) {
+		for (cur = 0; cur < 2; cur++) {
+			struct io_notif_data *a = sendzc_test_notif(test, ring, prev);
+			struct io_notif_data *b = sendzc_test_notif(test, ring, cur);
+			struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+			u8 waived;
+
+			KUNIT_ASSERT_NOT_NULL(test, skb);
+			/* The first ubuf is the skb's, and gives it its bit. */
+			KUNIT_ASSERT_EQ(test, io_link_skb(skb, &a->uarg), 0);
+			KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), &a->uarg);
+			waived = skb_shinfo(skb)->flags & SKBFL_DONT_ORPHAN_RX;
+			KUNIT_EXPECT_EQ(test, !!waived, prev);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->uarg.refcnt), 2U);
+			/* The same notification joins itself, and takes nothing. */
+			KUNIT_EXPECT_EQ(test, io_link_skb(skb, &a->uarg), 0);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->uarg.refcnt), 2U);
+
+			if (prev == cur) {
+				/* Chained behind the first, which the skb keeps for both. */
+				KUNIT_EXPECT_EQ(test, io_link_skb(skb, &b->uarg), 0);
+				KUNIT_EXPECT_PTR_EQ(test, b->head, a);
+				KUNIT_EXPECT_PTR_EQ(test, a->next, b);
+				KUNIT_EXPECT_EQ(test, refcount_read(&a->uarg.refcnt), 3U);
+			} else {
+				/* Refused and nothing changed: TCP starts a new skb. */
+				KUNIT_EXPECT_EQ(test, io_link_skb(skb, &b->uarg), -EEXIST);
+				KUNIT_EXPECT_PTR_EQ(test, b->head, b);
+				KUNIT_EXPECT_NULL(test, a->next);
+				KUNIT_EXPECT_NULL(test, b->next);
+				KUNIT_EXPECT_EQ(test, refcount_read(&a->uarg.refcnt), 2U);
+				KUNIT_EXPECT_EQ(test, refcount_read(&b->uarg.refcnt), 1U);
+			}
+			KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), &a->uarg);
+			KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->flags & SKBFL_DONT_ORPHAN_RX,
+					waived);
+
+			/* The skb's release is the one completion the test lets run. */
+			consume_skb(skb);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->uarg.refcnt),
+					prev == cur ? 2U : 1U);
+		}
+	}
+}
+
+struct sendzc_rx_case {
+	const char	*name;
+	bool		waiver;		/* IORING_SEND_ZC_NO_RX_COPY */
+};
+
+static const struct sendzc_rx_case sendzc_rx_cases[] = {
+	{ "copied", false },
+	{ "held", true },
+};
+
+static void sendzc_rx_case_to_desc(const struct sendzc_rx_case *c, char *desc)
+{
+	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
+}
+
+KUNIT_ARRAY_PARAM(sendzc_rx, sendzc_rx_cases, sendzc_rx_case_to_desc);
+
+/*
+ * What a packet socket does to the skb of a registered-buffer send: dev_queue_xmit_nit()
+ * clones it for the taps and skb_orphan_frags_rx() copies the clone, unless the request waived
+ * the copy. Then the tap holds the clone after the device is done with its skb.
+ */
+static void sendzc_rx_copy(struct kunit *test)
+{
+	const struct sendzc_rx_case *c = test->param_value;
+	struct io_notif_data *nd = sendzc_test_notif(test, sendzc_test_ring(test), c->waiver);
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL), *tap;
+	u8 want[SENDZC_TEST_FRAGS * SENDZC_TEST_FRAG_LEN], data[sizeof(want)];
+	struct page *pages[SENDZC_TEST_FRAGS];
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	for (i = 0; i < sizeof(want); i++)
+		want[i] = i / SENDZC_TEST_FRAG_LEN + 1;
+	/* TCP links the ubuf before it fills the skb, io_sg_from_iter() adds the frags. */
+	KUNIT_ASSERT_EQ(test, io_link_skb(skb, &nd->uarg), 0);
+	sendzc_test_fill(test, skb, pages);
+	KUNIT_ASSERT_EQ(test, refcount_read(&nd->uarg.refcnt), 2U);
+
+	tap = skb_clone(skb, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tap);
+	KUNIT_ASSERT_PTR_EQ(test, skb_zcopy(tap), &nd->uarg);
+	KUNIT_EXPECT_EQ(test, skb_orphan_frags_rx(tap, GFP_KERNEL), 0);
+
+	if (c->waiver) {
+		/* The tap holds the clone as it is: the buffer's pages, no reference of its own. */
+		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(tap), &nd->uarg);
+		KUNIT_ASSERT_EQ(test, skb_shinfo(tap)->nr_frags, SENDZC_TEST_FRAGS);
+		for (i = 0; i < SENDZC_TEST_FRAGS; i++) {
+			KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(&skb_shinfo(tap)->frags[i]),
+					    pages[i]);
+			KUNIT_EXPECT_EQ(test, page_count(pages[i]), 1);
+		}
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(nd->zc_copied));
+		/* The device is done with its skb. The clone shares the shinfo, which holds it. */
+		consume_skb(skb);
+		KUNIT_EXPECT_EQ(test, refcount_read(&nd->uarg.refcnt), 2U);
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(nd->zc_used));
+		/* The tap reads the buffer, which is unchanged. */
+		KUNIT_ASSERT_EQ(test, skb_copy_bits(tap, 0, data, sizeof(data)), 0);
+		KUNIT_EXPECT_MEMEQ(test, data, want, sizeof(want));
+		/* It lets go: the notification is due now, and says that nothing was copied. */
+		consume_skb(tap);
+		KUNIT_EXPECT_EQ(test, refcount_read(&nd->uarg.refcnt), 1U);
+		KUNIT_EXPECT_TRUE(test, READ_ONCE(nd->zc_used));
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(nd->zc_copied));
+	} else {
+		/* The tap holds a copy: pages of its own, the bytes, and the notification told. */
+		KUNIT_EXPECT_NULL(test, skb_zcopy(tap));
+		KUNIT_EXPECT_EQ(test, skb_shinfo(tap)->flags & SKBFL_ALL_ZEROCOPY, 0);
+		KUNIT_ASSERT_EQ(test, skb_shinfo(tap)->nr_frags, 1);
+		for (i = 0; i < SENDZC_TEST_FRAGS; i++)
+			KUNIT_EXPECT_PTR_NE(test, skb_frag_page(&skb_shinfo(tap)->frags[0]),
+					    pages[i]);
+		KUNIT_ASSERT_EQ(test, skb_copy_bits(tap, 0, data, sizeof(data)), 0);
+		KUNIT_EXPECT_MEMEQ(test, data, want, sizeof(want));
+		KUNIT_EXPECT_TRUE(test, READ_ONCE(nd->zc_copied));
+		/* The device's skb still holds the notification, and the tap no longer does. */
+		KUNIT_EXPECT_EQ(test, refcount_read(&nd->uarg.refcnt), 2U);
+		consume_skb(tap);
+		KUNIT_EXPECT_EQ(test, refcount_read(&nd->uarg.refcnt), 2U);
+		consume_skb(skb);
+		KUNIT_EXPECT_EQ(test, refcount_read(&nd->uarg.refcnt), 1U);
+		KUNIT_EXPECT_TRUE(test, READ_ONCE(nd->zc_copied));
+	}
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_reservation_unwind),
 	KUNIT_CASE(opaque_create_publish_revalidate),
@@ -7749,6 +7968,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_managed_fill_fallback),
 	KUNIT_CASE(opaque_managed_link),
 	KUNIT_CASE(opaque_ubuf_complete_atomic),
+	KUNIT_CASE(sendzc_link_waiver),
+	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}
 };
 

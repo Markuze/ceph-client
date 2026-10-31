@@ -254,7 +254,10 @@ alone, and a packet socket, a tun device or a local socket can hold the
 skb, and the memory, for as long as it likes, as it can hold an skb
 whose pages were added with MSG_SPLICE_PAGES. MSG_ZEROCOPY does not set
 the flag: its completion is the notification that the application waits
-for.
+for. An io_uring SEND_ZC request with a registered buffer can set it on
+its own account, with IORING_SEND_ZC_NO_RX_COPY: it then accepts that its
+notification waits for the consumer, however long that is, and leaves the
+buffer unchanged until the notification arrives.
 
 For VSOCK:
 Data path sent to local sockets is the same as for non-local sockets.

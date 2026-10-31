@@ -26,6 +26,10 @@ struct io_notif_data {
 struct io_kiocb *io_alloc_notif(struct io_ring_ctx *ctx);
 void io_tx_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
 			 bool success);
+#if IS_ENABLED(CONFIG_KUNIT)
+extern const struct ubuf_info_ops io_ubuf_ops;
+int io_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
+#endif
 
 static inline struct io_notif_data *io_notif_to_data(struct io_kiocb *notif)
 {

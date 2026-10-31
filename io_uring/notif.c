@@ -5,12 +5,13 @@
 #include <linux/slab.h>
 #include <linux/net.h>
 #include <linux/io_uring.h>
+#include <kunit/visibility.h>
 
 #include "io_uring.h"
 #include "notif.h"
 #include "rsrc.h"
 
-static const struct ubuf_info_ops io_ubuf_ops;
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_ubuf_ops;
 
 static void io_notif_tw_complete(struct io_tw_req tw_req, io_tw_token_t tw)
 {
@@ -67,7 +68,7 @@ void io_tx_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
 	__io_req_task_work_add(notif, tw_flags);
 }
 
-static int io_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
+VISIBLE_IF_KUNIT int io_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 {
 	struct io_notif_data *nd, *prev_nd;
 	struct io_kiocb *prev_notif, *notif;
@@ -91,6 +92,15 @@ static int io_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 	if (unlikely(prev_uarg->ops != &io_ubuf_ops))
 		return -EEXIST;
 
+	/*
+	 * The receive path holds an skb or copies it, as a whole: the skb takes
+	 * its flags from the first ubuf, and a request that did not ask to be
+	 * held must not find its pages in an skb that is, nor the other way
+	 * round. Start a new skb.
+	 */
+	if (unlikely((prev_uarg->flags ^ uarg->flags) & SKBFL_DONT_ORPHAN_RX))
+		return -EEXIST;
+
 	prev_nd = container_of(prev_uarg, struct io_notif_data, uarg);
 	prev_notif = cmd_to_io_kiocb(prev_nd);
 
@@ -106,7 +116,7 @@ static int io_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 	return 0;
 }
 
-static const struct ubuf_info_ops io_ubuf_ops = {
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_ubuf_ops = {
 	.complete = io_tx_ubuf_complete,
 	.link_skb = io_link_skb,
 };

@@ -437,6 +437,27 @@ enum io_uring_op {
  *
  * IORING_SEND_VECTORIZED	If set, SEND[_ZC] will take a pointer to a io_vec
  *				to allow vectorized send operations.
+ *
+ * IORING_SEND_ZC_NO_RX_COPY	SEND[MSG]_ZC with IORING_RECVSEND_FIXED_BUF only,
+ *				any other send answers -EINVAL. The kernel copies
+ *				the data of a zerocopy skb that is looped to a
+ *				consumer on this host, such as a packet socket
+ *				(tcpdump), a tun device or a socket of the local
+ *				stack, so that the notification does not wait for
+ *				that consumer. If set, the skbs of this request
+ *				are not copied, and the consumer may hold them,
+ *				and with them the registered buffer, for as long
+ *				as it likes: IORING_SEND_ZC_REPORT_USAGE then does
+ *				not report a copy on its account. The application
+ *				accepts that the IORING_CQE_F_NOTIF cqe can be
+ *				delayed without bound by a consumer that does not
+ *				let go, and that the task waits for it when it
+ *				exits. And it must not modify the range that it
+ *				sent until that cqe arrives: a consumer reads the
+ *				buffer and not a copy of it. The kernel does not
+ *				depend on that promise: the notification holds the
+ *				registered buffer, so the pages stay pinned until
+ *				the cqe is posted.
  */
 #define IORING_RECVSEND_POLL_FIRST	(1U << 0)
 #define IORING_RECV_MULTISHOT		(1U << 1)
@@ -444,6 +465,7 @@ enum io_uring_op {
 #define IORING_SEND_ZC_REPORT_USAGE	(1U << 3)
 #define IORING_RECVSEND_BUNDLE		(1U << 4)
 #define IORING_SEND_VECTORIZED		(1U << 5)
+#define IORING_SEND_ZC_NO_RX_COPY	(1U << 6)
 
 /*
  * cqe.res for IORING_CQE_F_NOTIF if

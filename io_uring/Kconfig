@@ -39,4 +39,6 @@ config IO_URING_OPAQUE_OBJ_KUNIT_TEST
 	  Check capture page identity and independent fallback copies,
 	  backing-memory reservations, stable-handle compaction and lifetime
 	  across replacement. The suite also checks cancellation rollback
-	  and generation exhaustion. Results appear in the KUnit boot log.
+	  and generation exhaustion. It also checks what the
+	  IORING_SEND_ZC_NO_RX_COPY flag of SEND_ZC does to a notification and
+	  to the skbs it is linked to. Results appear in the KUnit boot log.
