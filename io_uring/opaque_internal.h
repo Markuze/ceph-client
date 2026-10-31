@@ -118,7 +118,12 @@ struct io_opaque_vec {
 	u32 nr;
 	/* Segments of the combined cursor, from io_opaque_vec_build(). */
 	u32 nr_segs;
-	/* Entries of pin[] that hold a reference. */
+	/*
+	 * Entries of pin[] that admission has set. The version of each is kept
+	 * alive by the send, by a reference of the entry's own or, unless the
+	 * vector is LAST, by that of the entry before it when both name the
+	 * same handle.
+	 */
 	u32 pinned;
 	u32 cap_nr;
 	u32 cap_segs;

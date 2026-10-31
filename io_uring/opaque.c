@@ -2510,6 +2510,22 @@ VISIBLE_IF_KUNIT int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr)
 	return 0;
 }
 
+/*
+ * Whether entry @i of an admitted vector holds a reference of its own. A LAST
+ * vector takes one per entry. Any other takes one per run of entries that name
+ * the same handle: within one hold of tables the same handle is the same
+ * version, so the rest of the run shares the first entry's pin. This looks at
+ * the entries, which never change, and not at the pins, which may be freed by
+ * the time the run's owner has been released.
+ */
+static bool io_opaque_vec_owns(const struct io_opaque_req *op, u32 i)
+{
+	const struct io_opaque_vec *vec = op->vec;
+
+	return (op->send_flags & IORING_OPAQUE_SEND_LAST) || !i ||
+	       vec->ent[i].handle != vec->ent[i - 1].handle;
+}
+
 /* Drop every version reference the send holds; one that took none drops none. */
 VISIBLE_IF_KUNIT void io_opaque_vec_release(struct io_opaque_req *op)
 {
@@ -2517,7 +2533,8 @@ VISIBLE_IF_KUNIT void io_opaque_vec_release(struct io_opaque_req *op)
 	u32 i;
 
 	for (i = 0; i < vec->pinned; i++)
-		io_opaque_data_put(op->store, vec->pin[i]);
+		if (io_opaque_vec_owns(op, i))
+			io_opaque_data_put(op->store, vec->pin[i]);
 	vec->pinned = 0;
 	vec->nr_segs = 0;
 }
@@ -2640,10 +2657,15 @@ static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *
  * there instead of from the first: ranges in ascending order walk each object
  * once. A block with too few segments is not grown here, as that allocates; the
  * number needed is returned, and io_opaque_vec_finish() grows the block and
- * asks again. Pass two takes the references: a LAST vector detaches each
- * handle at its first entry and shares that reference with the entries that
- * repeat it. Nothing can fail from there on. The cursor over the combined
- * segments is io_opaque_vec_build()'s, once tables is dropped.
+ * asks again. Pass two takes the references and looks nothing up: pass one
+ * recorded every version in pin[], and tables has been held since. A LAST
+ * vector detaches each handle at its first entry, and an entry that repeats
+ * the handle takes one more reference on the version it found. Any other
+ * vector takes one reference for each run of entries that name the same
+ * handle (see io_opaque_vec_owns()), so eight ranges of one object cost one
+ * reference, and a handle that returns after another one pins again. Nothing
+ * can fail from there on. The cursor over the combined segments is
+ * io_opaque_vec_build()'s, once tables is dropped.
  */
 static int io_opaque_vec_acquire(struct io_opaque_req *op)
 {
@@ -2687,12 +2709,18 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 	if (segs > vec->cap_segs)
 		return segs;
 	for (i = 0; i < vec->nr; i++) {
-		struct io_opaque_slot *slot = io_opaque_lookup(store, vec->ent[i].handle);
+		struct io_opaque_slot *slot;
 
-		if (last && !slot->data)
+		if (!last) {
+			if (io_opaque_vec_owns(op, i))
+				refcount_inc(&vec->pin[i]->refs);
+			continue;
+		}
+		slot = io_opaque_lookup(store, vec->ent[i].handle);
+		if (!slot->data)
 			refcount_inc(&vec->pin[i]->refs);
 		else
-			vec->pin[i] = io_opaque_send_pin(store, slot, last);
+			vec->pin[i] = io_opaque_send_pin(store, slot, true);
 	}
 	vec->pinned = vec->nr;
 	if (last)
