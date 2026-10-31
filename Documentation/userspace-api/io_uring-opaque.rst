@@ -350,15 +350,16 @@ the handle available for caching, further reads and sends to other destinations.
 SEND preparation validates SQE fields without resolving the handle. A send
 claims what it names, the pin of an ordinary one and, for SEND_LAST, the removal
 of the handle with the transfer of the table reference into the request, when
-it becomes the head of its destination's queue, after destination validation,
+it is admitted to its destination's queue, after destination validation,
 framing snapshot and TX queue allocation. One that finds the queue free is the
 head at once, and claims with the destination socket owned if that is plain TCP.
-One admitted behind an earlier send claims before it waits for its turn. A claim
-uses the version current when it is made, including any compaction published
-since preparation, and subsequent retries retain what it took. Two sends that
-contend for one SEND_LAST handle are decided by which of them claims first, not
-by their place in the queue, and that is not ordered between rings or between
-inline and io-wq issue; the loser returns ESTALE without the consumed flag.
+One admitted behind an earlier send claims before it waits for its turn, and
+holds what it took while it waits. A claim uses the version current when it is
+made, including any compaction published since preparation, and subsequent
+retries retain what it took. Two sends that contend for one SEND_LAST handle are
+decided by which of them claims first, not by their place in the queue, and that
+is not ordered between rings or between inline and io-wq issue; the loser
+returns ESTALE without the consumed flag.
 
 The prefix and suffix are copied into private request storage before admission.
 Descriptor and framing faults, invalid lengths, allocation failure or framing
@@ -448,17 +449,21 @@ and FREE can already be submitted together in one ``io_uring_enter``.
 
 Object sends are FIFO per shared store and destination socket. Only the queue
 head polls for write space; later requests reuse their own request state as
-queue entries. On a plain TCP socket a send that finds its queue free takes its
-references and gives them back, all but the last on an object, while it owns the
-destination socket, and puts the last as soon as it has released the socket. One
-that returns EAGAIN keeps them, and its place at the head, for the next issue,
-and cancellation or failure then releases them with the request. The socket's
-security hook is asked once per issue, for what is left of the frame, and a
-refusal or EAGAIN from it ends the issue as one from the first part of the frame
-would. A socket whose TCP sendmsg has been replaced, by kTLS or a socket map for
-example, takes the ordinary send path instead: references first, then the hook
-and TCP for each part, and the references stay with the request until it is
-cleaned up. This ordering does not cover plain writes or other stores.
+queue entries. On a plain TCP socket the head, whether it found its queue free
+or was promoted from behind an earlier send, gives its references back, all but
+the last on an object, while it owns the destination socket, and puts the last
+as soon as it has released the socket. One that returns EAGAIN keeps them, and
+its place at the head, for the next issue, and cancellation or failure then
+releases them with the request. The socket's security hook is asked before the
+socket is taken, once per issue while the send stays on this path, for what is
+left of the frame. Its verdict applies once the references are taken and the
+send has started, and a refusal or EAGAIN from it ends the issue as one from the
+first part of the frame would. A socket whose TCP sendmsg has been replaced, by
+kTLS or a socket map for example, takes the ordinary send path instead:
+references first, then the hook and TCP for each part, and the references stay
+with the request until it is cleaned up. So do the remaining parts of a frame
+whose socket is found replaced part-way through, each asking the hook as the
+ordinary send does. This ordering does not cover plain writes or other stores.
 
 Backing and memory management
 =============================
