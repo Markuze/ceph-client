@@ -320,10 +320,11 @@ and the complete prefix/body/suffix length must be positive and fit INT_MAX.
 Zero addr3 selects a body-only send. With handle, offset and body length zero,
 a nonempty frame sends a generated-only reply through the same queue; LAST is
 invalid for that form. ``MSG_MORE`` and ``MSG_DONTWAIT`` are accepted
-in ``msg_flags``. ``ioprio`` is zero for reusable sends or contains
-``IORING_OPAQUE_SEND_LAST`` for a consuming send. Other operation-specific
-fields are zero. SEND_LAST rejects ``IOSQE_CQE_SKIP_SUCCESS`` so ownership
-transfer is always reported.
+in ``msg_flags``. ``ioprio`` is zero for a reusable send of one range, and may
+contain ``IORING_OPAQUE_SEND_LAST`` for a consuming send and
+``IORING_OPAQUE_SEND_VECTOR`` for a send of several ranges, described below.
+Other operation-specific fields are zero. SEND_LAST rejects
+``IOSQE_CQE_SKIP_SUCCESS`` so ownership transfer is always reported.
 
 With ``IORING_OPAQUE_SEND_VECTOR`` in ``ioprio``, ``addr`` instead points to an
 array of ``len`` ``struct io_uring_opaque_send_entry``, from one to

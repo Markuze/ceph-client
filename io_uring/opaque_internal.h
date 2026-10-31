@@ -97,14 +97,26 @@ struct io_opaque_tx {
 };
 
 /*
+ * Where one range of a vectored send starts in the version it pins. Admission
+ * finds it under tables; the cursor is built from it once tables is dropped.
+ */
+struct io_opaque_vec_start {
+	/* The first segment of the range. */
+	u32 seg;
+	/* Bytes of that segment before the range. */
+	u32 skip;
+};
+
+/*
  * What a vectored send needs besides the request: its entries, copied at prep,
- * the version each pins and the segments of the combined cursor. One block
- * holds the header and the three arrays, so that growing it is one allocation.
+ * the version each pins, where each starts in it and the segments of the
+ * combined cursor. One block holds the header and the four arrays, so that
+ * growing it is one allocation.
  */
 struct io_opaque_vec {
 	/* Entries, from the SQE. */
 	u32 nr;
-	/* Segments of the combined cursor, from admission. */
+	/* Segments of the combined cursor, from io_opaque_vec_build(). */
 	u32 nr_segs;
 	/* Entries of pin[] that hold a reference. */
 	u32 pinned;
@@ -114,6 +126,7 @@ struct io_opaque_vec {
 	u32 max_len;
 	struct io_uring_opaque_send_entry *ent;
 	struct io_opaque_data **pin;
+	struct io_opaque_vec_start *start;
 	struct bio_vec *bv;
 };
 
@@ -353,7 +366,10 @@ int io_opaque_vec_check(const struct io_uring_opaque_send_entry *ent, u32 nr,
 int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
 int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr);
 void io_opaque_vec_release(struct io_opaque_req *op);
+void io_opaque_vec_build(struct io_opaque_req *op);
+int io_opaque_vec_finish(struct io_opaque_req *op, int ret);
 extern unsigned int io_opaque_send_vec_segs;
+extern atomic_long_t io_opaque_vec_stepped;
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
