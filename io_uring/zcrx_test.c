@@ -638,6 +638,280 @@ static void zcrx_maio_get_put(struct kunit *test)
 	io_put_zcrx_ifq(ifq);
 }
 
+/*
+ * The offset of a CQE is the area token in the top bits, the slot index shifted
+ * by the slot size, and the byte offset. It is the same for the slot of a page
+ * and for the slot of a net_iov.
+ */
+static void zcrx_maio_slot_off(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = kunit_kzalloc(test, sizeof(*ifq), GFP_KERNEL);
+	struct io_zcrx_area *area = kunit_kzalloc(test, sizeof(*area), GFP_KERNEL);
+	struct net_iov *niovs = kunit_kcalloc(test, 8, sizeof(*niovs), GFP_KERNEL);
+	const u64 token = (u64)3 << IORING_ZCRX_AREA_SHIFT;
+	struct io_zcrx_slot slot;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ifq);
+	KUNIT_ASSERT_NOT_NULL(test, area);
+	KUNIT_ASSERT_NOT_NULL(test, niovs);
+	area->ifq = ifq;
+	area->area_id = 3;
+	area->nia.niovs = niovs;
+	area->nia.num_niovs = 8;
+	for (i = 0; i < 8; i++)
+		net_iov_init(&niovs[i], &area->nia, NET_IOV_IOURING);
+	KUNIT_EXPECT_EQ(test, zcrx_area_id_to_token(3), token);
+
+	/* A slot of a kernel area is a page. */
+	ifq->niov_shift = PAGE_SHIFT;
+	slot = (struct io_zcrx_slot){ .area = area, .idx = 5 };
+	KUNIT_EXPECT_EQ(test, io_zcrx_slot_off(ifq, slot, 0), token + 5 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, io_zcrx_slot_off(ifq, slot, 100), token + 5 * PAGE_SIZE + 100);
+	KUNIT_EXPECT_EQ(test, io_zcrx_slot_off(ifq, slot, PAGE_SIZE - 1),
+			token + 6 * PAGE_SIZE - 1);
+
+	/* An area of more than 4 GiB: the index shifts in 64 bits. */
+	slot.idx = (1U << (32 - PAGE_SHIFT)) + 7;
+	KUNIT_EXPECT_EQ(test, io_zcrx_slot_off(ifq, slot, 9),
+			token + (1ULL << 32) + 7 * PAGE_SIZE + 9);
+
+	/* A net_iov slot has the size of the niov of the instance. */
+	ifq->niov_shift = 14;
+	slot = io_zcrx_niov_slot(&niovs[6]);
+	KUNIT_EXPECT_PTR_EQ(test, slot.area, area);
+	KUNIT_EXPECT_EQ(test, slot.idx, 6U);
+	KUNIT_EXPECT_EQ(test, io_zcrx_slot_off(ifq, slot, 300), token + 6 * 16384ULL + 300);
+	slot.idx = (1U << 18) + 1;
+	KUNIT_EXPECT_EQ(test, io_zcrx_slot_off(ifq, slot, 0), token + (1ULL << 32) + 16384);
+}
+
+/*
+ * A copy page that the process returns through the refill ring goes back to the
+ * area. The pool that reads the ring does not own it, so the page takes the way
+ * of every page without a pool: it passes the test for outsiders.
+ */
+static void zcrx_maio_copy_refill(struct kunit *test)
+{
+	struct page *copy, *p, *q, *cached[ZT_BATCH];
+	struct io_zcrx_slot slot;
+	struct zt_env env;
+	unsigned int n;
+	u64 off;
+	u32 idx;
+
+	/* No outsider: the page is free, and the pool takes it from the freelist. */
+	zt_env_init(test, &env, 16, 1);
+	copy = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	idx = zt_slot(test, env.ifq, copy);
+	slot = (struct io_zcrx_slot){ .area = env.area, .idx = idx };
+	/* What the copy path does after it posts the CQE. */
+	io_zcrx_get_uref(slot);
+	zt_rqe(&env, off);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, env.ifq->rq.ring->head, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&env.area->user_refs[idx]), 0);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_enter, 0ULL);
+	/* The area has 16 pages. The pool took all, also the returned page. */
+	KUNIT_EXPECT_EQ(test, env.area->free_count, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, copy->pp, env.pp[0]);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->state[idx], IO_ZCRX_KSLOT_OWNED);
+	n = zt_drain_cache(test, env.pp[0], cached, ARRAY_SIZE(cached));
+	zt_free(env.pp[0], p);
+	while (n--)
+		zt_free(env.pp[0], cached[n]);
+	zt_env_exit(test, &env);
+
+	/* An outsider holds the page: it waits in limbo until the outsider leaves. */
+	zt_env_init(test, &env, 16, 1);
+	copy = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	idx = zt_slot(test, env.ifq, copy);
+	slot = (struct io_zcrx_slot){ .area = env.area, .idx = idx };
+	get_page(copy);
+	io_zcrx_get_uref(slot);
+	zt_rqe(&env, off);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, atomic_read(&env.area->user_refs[idx]), 0);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->state[idx], IO_ZCRX_KSLOT_LIMBO);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_enter, 1ULL);
+	KUNIT_EXPECT_NULL(test, copy->pp);
+	put_page(copy);
+	/* The next call of the provider reclaims the page. */
+	n = zt_drain_cache(test, env.pp[0], cached, ARRAY_SIZE(cached));
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_PTR_EQ(test, q, copy);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_leave, 1ULL);
+	zt_free(env.pp[0], q);
+	zt_free(env.pp[0], p);
+	while (n--)
+		zt_free(env.pp[0], cached[n]);
+	zt_env_exit(test, &env);
+}
+
+/*
+ * The receive path passes a reference only to a page that a pool of the
+ * instance owns as a slot of the area, in an skb marked for recycling, with
+ * the bytes inside the page.
+ */
+static void zcrx_maio_page_slot(struct kunit *test)
+{
+	struct page *fb[ZT_BATCH], *copies[4], *copy, *p, *po, *plain, *f;
+	struct zt_env env, other, small;
+	struct io_zcrx_slot slot = {};
+	unsigned int i, n;
+	u64 off;
+
+	zt_env_init(test, &env, 32, 1);
+	zt_env_init(test, &other, 32, 1);
+	zt_env_init(test, &small, ARRAY_SIZE(copies), 1);
+
+	/* The pool takes the free pages of the area, so take a copy page first. */
+	copy = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+
+	/* A page of a pool of the instance, with bytes inside the page. */
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(env.ifq, p, 0, 100, true, &slot));
+	KUNIT_EXPECT_PTR_EQ(test, slot.area, env.area);
+	KUNIT_EXPECT_EQ(test, slot.idx, zt_slot(test, env.ifq, p));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(env.ifq, p, 0, PAGE_SIZE, true, &slot));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(env.ifq, p, PAGE_SIZE - 100, 100, true,
+						       &slot));
+	/* The bytes span two pages, or the skb has no recycle mark: copy. */
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, p, PAGE_SIZE - 99, 100, true,
+							&slot));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, p, 0, PAGE_SIZE + 1, true,
+							&slot));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, p, 0, 100, false, &slot));
+
+	/* A page of a pool of another instance. */
+	po = zt_alloc(other.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, po);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, po, 0, 100, true, &slot));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(other.ifq, po, 0, 100, true, &slot));
+
+	/* A page of the area that no pool owns, and an ordinary page. */
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, copy, 0, 100, true, &slot));
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, plain, 0, 100, true, &slot));
+	__free_page(plain);
+
+	/* A fallback page of a pool of the instance is no slot. */
+	for (i = 0; i < ARRAY_SIZE(copies); i++) {
+		copies[i] = io_zcrx_maio_copy_page(small.ifq, &off);
+		KUNIT_ASSERT_NOT_NULL(test, copies[i]);
+		KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(small.ifq, copies[i], 0, 100, true,
+								&slot));
+	}
+	f = zt_alloc(small.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_EXPECT_TRUE(test, page_pool_page_is_pp(f));
+	KUNIT_EXPECT_PTR_EQ(test, f->pp, small.pp[0]);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(small.ifq, f, 0, 100, true, &slot));
+	n = zt_drain_cache(test, small.pp[0], fb, ARRAY_SIZE(fb));
+	zt_free(small.pp[0], f);
+	while (n--)
+		zt_free(small.pp[0], fb[n]);
+	for (i = 0; i < ARRAY_SIZE(copies); i++)
+		io_zcrx_maio_page_put(small.ifq, copies[i]);
+
+	zt_free(other.pp[0], po);
+	zt_free(env.pp[0], p);
+	io_zcrx_maio_page_put(env.ifq, copy);
+	zt_env_exit(test, &small);
+	zt_env_exit(test, &other);
+	zt_env_exit(test, &env);
+}
+
+/*
+ * A net_iov belongs to another provider. A MAIO instance cannot copy it, and
+ * it owns none, so the fragment fails the request. The function never reaches
+ * the request for this case.
+ */
+static void zcrx_maio_net_iov_frag(struct kunit *test)
+{
+	struct net_iov_area nia = {};
+	struct net_iov niov = {};
+	skb_frag_t frag = {};
+	struct zt_env env;
+
+	zt_env_init(test, &env, 16, 1);
+	net_iov_init(&niov, &nia, NET_IOV_IOURING);
+	frag.netmem = net_iov_to_netmem(&niov);
+	frag.len = 100;
+
+	KUNIT_EXPECT_EQ(test, io_zcrx_recv_frag(NULL, env.ifq, &frag, 0, 100, true), -EFAULT);
+	/* A net_iov of a pool of the MAIO provider does not make it ours. */
+	niov.desc.pp = env.pp[0];
+	KUNIT_EXPECT_EQ(test, io_zcrx_recv_frag(NULL, env.ifq, &frag, 0, 100, true), -EFAULT);
+	KUNIT_EXPECT_EQ(test, io_zcrx_recv_frag(NULL, env.ifq, &frag, 0, 100, false), -EFAULT);
+	zt_env_exit(test, &env);
+}
+
+/*
+ * A pool and a copy share one exhaustion episode. The first allocation that
+ * finds the area empty counts it, whoever it is. A retry does not count again.
+ * An allocation that gets a page ends the episode.
+ */
+static void zcrx_maio_copy_episode(struct kunit *test)
+{
+	struct page *pg[16], *fb[ZT_BATCH], *p;
+	struct zt_env env;
+	unsigned int i, n;
+	u64 off;
+
+	zt_env_init(test, &env, ARRAY_SIZE(pg), 1);
+	for (i = 0; i < ARRAY_SIZE(pg); i++) {
+		pg[i] = io_zcrx_maio_copy_page(env.ifq, &off);
+		KUNIT_ASSERT_NOT_NULL(test, pg[i]);
+	}
+	KUNIT_EXPECT_FALSE(test, env.ifq->maio_exhausted);
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 0ULL);
+
+	/* A copy finds the area empty: one episode. A retry is the same one. */
+	KUNIT_EXPECT_NULL(test, io_zcrx_maio_copy_page(env.ifq, &off));
+	KUNIT_EXPECT_TRUE(test, env.ifq->maio_exhausted);
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
+	KUNIT_EXPECT_NULL(test, io_zcrx_maio_copy_page(env.ifq, &off));
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
+
+	/* The pool finds the area empty in the same episode, and gets ordinary pages. */
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
+	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages, (u64)ZT_BATCH);
+	n = zt_drain_cache(test, env.pp[0], fb, ARRAY_SIZE(fb));
+
+	/* A page returns, and the pool takes it. That ends the episode. */
+	io_zcrx_maio_page_put(env.ifq, pg[0]);
+	KUNIT_EXPECT_TRUE(test, env.ifq->maio_exhausted);
+	zt_free(env.pp[0], p);
+	n += zt_drain_cache(test, env.pp[0], fb + n, ARRAY_SIZE(fb) - n);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_PTR_EQ(test, p, pg[0]);
+	KUNIT_EXPECT_FALSE(test, env.ifq->maio_exhausted);
+
+	/* The next empty result starts a new episode, a copy that gets a page ends it. */
+	KUNIT_EXPECT_NULL(test, io_zcrx_maio_copy_page(env.ifq, &off));
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 2ULL);
+	io_zcrx_maio_page_put(env.ifq, pg[1]);
+	KUNIT_EXPECT_PTR_EQ(test, io_zcrx_maio_copy_page(env.ifq, &off), pg[1]);
+	KUNIT_EXPECT_FALSE(test, env.ifq->maio_exhausted);
+
+	zt_free(env.pp[0], p);
+	while (n--)
+		zt_free(env.pp[0], fb[n]);
+	for (i = 1; i < ARRAY_SIZE(pg); i++)
+		io_zcrx_maio_page_put(env.ifq, pg[i]);
+	zt_env_exit(test, &env);
+}
+
 /* A fake queue API makes the conversion of the queues of a device testable. */
 struct zt_qmem {
 	struct page_pool	*pp;
@@ -1191,6 +1465,11 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_mapped),
 	KUNIT_CASE(zcrx_maio_teardown),
 	KUNIT_CASE(zcrx_maio_get_put),
+	KUNIT_CASE(zcrx_maio_slot_off),
+	KUNIT_CASE(zcrx_maio_copy_refill),
+	KUNIT_CASE(zcrx_maio_page_slot),
+	KUNIT_CASE(zcrx_maio_net_iov_frag),
+	KUNIT_CASE(zcrx_maio_copy_episode),
 	KUNIT_CASE(zcrx_maio_queues),
 	KUNIT_CASE(zcrx_maio_queues_down),
 	KUNIT_CASE(zcrx_maio_destroy_after_uninstall),
