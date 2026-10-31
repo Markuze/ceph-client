@@ -120,6 +120,10 @@ IO_OPAQUE_STAT_PARAM(stat_compact_auto, IO_OPAQUE_STAT_COMPACT_AUTO);
 IO_OPAQUE_STAT_PARAM(stat_compact_bytes, IO_OPAQUE_STAT_COMPACT_BYTES);
 IO_OPAQUE_STAT_PARAM(stat_framing_copied, IO_OPAQUE_STAT_FRAMING_COPIED);
 IO_OPAQUE_STAT_PARAM(stat_body_copied, IO_OPAQUE_STAT_BODY_COPIED);
+IO_OPAQUE_STAT_PARAM(stat_send_managed_skbs, IO_OPAQUE_STAT_SEND_MANAGED_SKBS);
+IO_OPAQUE_STAT_PARAM(stat_send_folio_refs, IO_OPAQUE_STAT_SEND_FOLIO_REFS);
+IO_OPAQUE_STAT_PARAM(stat_send_frag_fallback, IO_OPAQUE_STAT_SEND_FRAG_FALLBACK);
+IO_OPAQUE_STAT_PARAM(stat_send_ubuf_copied, IO_OPAQUE_STAT_SEND_UBUF_COPIED);
 
 static void io_opaque_auto_compact(struct io_opaque_store *store);
 

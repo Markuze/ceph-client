@@ -774,6 +774,19 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
 ``stat_framing_copied``, ``stat_body_copied``
     Prefix and suffix bytes copied from user memory into request storage, and
     body bytes TCP copied under ``send_copy_max``.
+``stat_send_managed_skbs``, ``stat_send_folio_refs``
+    Skbs given a ubuf for managed fragments, and the folio references those
+    ubufs took: one for each distinct folio that the fragments of the skbs
+    sharing a ubuf use, taken once however many fragments use it.
+``stat_send_frag_fallback``
+    Fills of an skb that already had fragments of its own, such as the one a
+    prefix starts, which took a page reference for each fragment instead.
+``stat_send_ubuf_copied``
+    Ubufs let go of because somebody copied the data of an skb
+    (``skb_copy_ubufs()``) instead of holding it. A consumer on the receive
+    path that holds a clone, such as a packet socket or a socket of this host,
+    does not copy it, and neither does the transmit path, so it stays at zero;
+    a count means that something copied the data of a managed send.
 
 Validation and reproduction
 ===========================

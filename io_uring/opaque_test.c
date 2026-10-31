@@ -2597,10 +2597,17 @@ static void opaque_params_sysfs(struct kunit *test)
 	const struct kernel_param *managed = opaque_test_param("io_uring_opaque.send_managed");
 	const struct kernel_param *body_copied =
 		opaque_test_param("io_uring_opaque.stat_body_copied");
+	static const char * const send_stats[] = {
+		"io_uring_opaque.stat_send_managed_skbs",
+		"io_uring_opaque.stat_send_folio_refs",
+		"io_uring_opaque.stat_send_frag_fallback",
+		"io_uring_opaque.stat_send_ubuf_copied",
+	};
 	const struct kernel_param *framing_copied =
 		opaque_test_param("io_uring_opaque.stat_framing_copied");
 	struct kobject *kobj = kset_find_obj(module_kset, "io_uring_opaque");
 	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	unsigned int i;
 	u64 value;
 
 	KUNIT_EXPECT_NOT_NULL(test, kobj);
@@ -2643,6 +2650,19 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_GT(test, body_copied->ops->get(buf, body_copied), 0);
 	KUNIT_EXPECT_EQ(test, kstrtou64(strim(buf), 10, &value), 0);
 	KUNIT_EXPECT_EQ(test, value, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED));
+	/* The counters of managed sends are there to be read, and to be read only. */
+	for (i = 0; i < ARRAY_SIZE(send_stats); i++) {
+		const struct kernel_param *stat = opaque_test_param(send_stats[i]);
+
+		KUNIT_ASSERT_NOT_NULL(test, stat);
+		KUNIT_EXPECT_EQ(test, stat->perm, (u16)0444);
+		KUNIT_EXPECT_EQ(test, stat->ops->set("1", stat), -EPERM);
+		io_opaque_count(IO_OPAQUE_STAT_SEND_MANAGED_SKBS + i, 3);
+		KUNIT_EXPECT_GT(test, stat->ops->get(buf, stat), 0);
+		KUNIT_EXPECT_EQ(test, kstrtou64(strim(buf), 10, &value), 0);
+		KUNIT_EXPECT_EQ(test, value,
+				io_opaque_stat_read(IO_OPAQUE_STAT_SEND_MANAGED_SKBS + i));
+	}
 }
 
 /* A ring context that preps OBJ_SEND requests for @store, which it knows as store 1. */
