@@ -1694,6 +1694,7 @@ struct opaque_test_params {
 	unsigned int inline_compact_max;
 	unsigned int send_copy_max;
 	bool copy_per_page;
+	bool send_managed;
 };
 
 static void opaque_test_params_restore(void *arg)
@@ -1705,6 +1706,7 @@ static void opaque_test_params_restore(void *arg)
 	io_opaque_inline_compact_max = saved->inline_compact_max;
 	io_opaque_send_copy_max = saved->send_copy_max;
 	io_opaque_copy_per_page = saved->copy_per_page;
+	io_opaque_send_managed = saved->send_managed;
 }
 
 /* Tests that change the tunables restore them even when an assertion fails. */
@@ -1718,6 +1720,7 @@ static void opaque_test_params_save(struct kunit *test)
 	saved->inline_compact_max = io_opaque_inline_compact_max;
 	saved->send_copy_max = io_opaque_send_copy_max;
 	saved->copy_per_page = io_opaque_copy_per_page;
+	saved->send_managed = io_opaque_send_managed;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_params_restore,
 							saved), 0);
 }
@@ -1739,6 +1742,54 @@ static u32 opaque_test_pages(struct io_opaque_data *data, struct page **pages, u
 		if (nr < max)
 			pages[nr++] = extent->backing->page;
 	return nr;
+}
+
+/* A reference of the test's on each page of an object, to look at them after it is gone. */
+struct opaque_page_refs {
+	struct page *page[40];
+	u32 nr;
+};
+
+static void opaque_page_refs_put(void *arg)
+{
+	struct opaque_page_refs *r = arg;
+
+	while (r->nr)
+		put_page(r->page[--r->nr]);
+}
+
+static struct opaque_page_refs *opaque_page_refs_take(struct kunit *test,
+						      struct io_opaque_data *data)
+{
+	struct opaque_page_refs *r = kunit_kzalloc(test, sizeof(*r), GFP_KERNEL);
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	r->nr = opaque_test_pages(data, r->page, ARRAY_SIZE(r->page));
+	for (i = 0; i < r->nr; i++)
+		get_page(r->page[i]);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_page_refs_put, r), 0);
+	return r;
+}
+
+/*
+ * TCP, the peer's queue and the ubufs have let go of the pages: the test's
+ * reference is left, and the backing's if @held, the object being still there.
+ */
+static bool opaque_pages_settle(const struct opaque_page_refs *r, bool held)
+{
+	int tries;
+	u32 i;
+
+	for (tries = 0; tries < 100; tries++) {
+		for (i = 0; i < r->nr; i++)
+			if (page_count(r->page[i]) != 1 + held)
+				break;
+		if (i == r->nr)
+			return true;
+		msleep(20);
+	}
+	return false;
 }
 
 /* Units of a freed compacted version are rewritten by the next compaction. */
@@ -2543,6 +2594,7 @@ static void opaque_params_sysfs(struct kunit *test)
 	const struct kernel_param *order = opaque_test_param("io_uring_opaque.unit_order");
 	const struct kernel_param *hits = opaque_test_param("io_uring_opaque.stat_cache_hits");
 	const struct kernel_param *copy_max = opaque_test_param("io_uring_opaque.send_copy_max");
+	const struct kernel_param *managed = opaque_test_param("io_uring_opaque.send_managed");
 	const struct kernel_param *body_copied =
 		opaque_test_param("io_uring_opaque.stat_body_copied");
 	const struct kernel_param *framing_copied =
@@ -2561,10 +2613,12 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, opaque_test_param("io_uring_opaque.compact_copy_per_page"));
 	KUNIT_EXPECT_NOT_NULL(test, opaque_test_param("io_uring_opaque.stat_compact_bytes"));
 	KUNIT_ASSERT_NOT_NULL(test, copy_max);
+	KUNIT_ASSERT_NOT_NULL(test, managed);
 	KUNIT_ASSERT_NOT_NULL(test, body_copied);
 	KUNIT_ASSERT_NOT_NULL(test, framing_copied);
 	KUNIT_EXPECT_EQ(test, order->perm, (u16)0644);
 	KUNIT_EXPECT_EQ(test, copy_max->perm, (u16)0644);
+	KUNIT_EXPECT_EQ(test, managed->perm, (u16)0644);
 	KUNIT_EXPECT_EQ(test, hits->perm, (u16)0444);
 	KUNIT_EXPECT_EQ(test, body_copied->perm, (u16)0444);
 	KUNIT_EXPECT_EQ(test, framing_copied->perm, (u16)0444);
@@ -2576,6 +2630,10 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_GT(test, hits->ops->get(buf, hits), 0);
 	KUNIT_EXPECT_EQ(test, kstrtou64(strim(buf), 10, &value), 0);
 	KUNIT_EXPECT_EQ(test, value, io_opaque_stat_read(IO_OPAQUE_STAT_CACHE_HITS));
+	/* Managed fragments are on by default, and off for the next send once it is said. */
+	KUNIT_EXPECT_TRUE(test, io_opaque_send_managed);
+	KUNIT_EXPECT_EQ(test, managed->ops->set("N", managed), 0);
+	KUNIT_EXPECT_FALSE(test, io_opaque_send_managed);
 	/* The copy threshold takes effect at the next send; its counters are read-only. */
 	KUNIT_EXPECT_EQ(test, copy_max->ops->set("2048", copy_max), 0);
 	KUNIT_EXPECT_EQ(test, io_opaque_send_copy_max, 2048U);
@@ -3421,6 +3479,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 	u8 *want = kunit_kmalloc(test, total, GFP_KERNEL);
 	u8 *got = kunit_kmalloc(test, total, GFP_KERNEL);
 	unsigned int tries, i, done = 0;
+	struct opaque_page_refs *pages;
 	struct io_opaque_req *op;
 	u64 progress;
 	int ret;
@@ -3432,6 +3491,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 	KUNIT_ASSERT_NOT_NULL(test, got);
 	opaque_test_publish(store, 0, 9, data);
 	opaque_test_copy(data, source);
+	pages = opaque_page_refs_take(test, data);
 	for (i = 0; i < prefix + suffix; i++)
 		frame[i] = 0xc0 + i;
 	memcpy(want, frame, prefix);
@@ -3547,6 +3607,11 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 	opaque_wire_read(test, w, got, done, total);
 	KUNIT_EXPECT_MEMEQ(test, got, want, total);
+	/*
+	 * Nothing that TCP or a ubuf held is still held, or was put twice: the pages
+	 * of the version are the test's and, while the table has it, the table's.
+	 */
+	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, !last && action == OPAQUE_EAGAIN_KEEP));
 
 	/* What the table still holds, the version or its compacted copy, is the table's alone. */
 	if (!last && action != OPAQUE_EAGAIN_FREE) {
@@ -6765,6 +6830,801 @@ static void opaque_extents_free_wakes_all(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/*
+ * Managed fragments. A body that goes out of the owned path is filled in as
+ * managed fragments, and each skb that gets some has a ubuf of its own that
+ * holds one reference on every distinct folio it uses. The tests look at the
+ * fill on a skb, at the counters and the pages on the wire fixture, and at what
+ * a consumer on the receive path does with the skb.
+ */
+
+/* The counters of managed sends, as a test sees them move. */
+struct opaque_managed {
+	u64 skbs, refs, fallback, copied, body;
+};
+
+static void opaque_managed_read(struct opaque_managed *m)
+{
+	m->skbs = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_MANAGED_SKBS);
+	m->refs = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_FOLIO_REFS);
+	m->fallback = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_FRAG_FALLBACK);
+	m->copied = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_UBUF_COPIED);
+	m->body = io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED);
+}
+
+/* Wait for the peer to have acknowledged everything that @sk sent. */
+static void opaque_wire_acked(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	int i;
+
+	for (i = 0; i < 100 && READ_ONCE(tp->snd_una) != READ_ONCE(tp->write_seq); i++)
+		msleep(20);
+}
+
+static u8 opaque_test_ubuf_no_waiver(void)
+{
+	return SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN;
+}
+
+static bool opaque_test_not_direct(const struct sock *sk)
+{
+	return false;
+}
+
+/* One body-only send of @len bytes of the object from @off, as request 0 of the fixture. */
+static void opaque_managed_send(struct kunit *test, struct opaque_wire *w,
+				struct io_opaque_store *store, u64 off, u32 len, u32 msg_flags)
+{
+	struct io_opaque_req *op = opaque_wire_req(test, w, store, 0, 0, off, len);
+
+	op->msg_flags = msg_flags;
+	memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
+	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, true), IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)len);
+	/* The ordinary path keeps its references until the request is cleaned up. */
+	io_opaque_data_put(store, op->data);
+	op->data = NULL;
+}
+
+/*
+ * The sends of the wire fixture go out of the owned path as managed fragments.
+ * Each skb has a ubuf, which takes a reference on a folio once however many
+ * fragments use it, and the peer, whose receive path would have copied a
+ * zerocopy skb, is not made to copy: the ubuf says it need not be. The
+ * sparse object has an extent of 2000 bytes in each page, so a range takes
+ * one reference per extent it spans.
+ */
+static void opaque_send_managed_loopback(struct kunit *test)
+{
+	static const struct {
+		struct opaque_send_case c;
+		u64 folios;	/* extents the ranges span */
+	} cases[] = {
+		{ { .unlocked = true }, 21 },	/* 4196 + 40000: extents 2 to 22 */
+		{ { }, 21 },
+		{ { .last = true }, 21 },
+		{ { .vector = true, .unlocked = true }, 4 },	/* extents 2, 3, 35 and 0 */
+		{ { .vector = true, .last = true }, 4 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct opaque_managed before, after;
+
+		opaque_managed_read(&before);
+		opaque_wire_send(test, w, store, &cases[i].c);
+		opaque_managed_read(&after);
+		KUNIT_EXPECT_GE(test, after.skbs - before.skbs, 1ULL);
+		/* A folio once for each extent, and again where an skb ends in one. */
+		KUNIT_EXPECT_GE(test, after.refs - before.refs, cases[i].folios);
+		KUNIT_EXPECT_LE(test, after.refs - before.refs,
+				cases[i].folios + (after.skbs - before.skbs) - 1);
+		KUNIT_EXPECT_EQ(test, after.fallback, before.fallback);
+		/* Nobody copied the data on its way in, at the peer, or in TCP. */
+		KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+		KUNIT_EXPECT_EQ(test, after.body, before.body);
+		if (!i) {
+			/* A fresh connection: skbs of as many fragments as may be, a ubuf each. */
+			unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+
+			KUNIT_EXPECT_GE(test, after.skbs - before.skbs,
+					(u64)DIV_ROUND_UP(21, limit));
+		}
+	}
+}
+
+/*
+ * A unit that a send's ubuf holds is not taken from the cache, and not
+ * rewritten, for as long as the peer's queue holds the skbs: the object is gone
+ * with the LAST send and the sender has everything acknowledged, but the
+ * ubuf is released only with the last skb of the data. A unit is taken again
+ * only when the peer has read.
+ */
+static void opaque_send_managed_holds_unit(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct io_opaque_req compact = {
+		.store = store, .data = data, .handle = io_opaque_handle(0, 9),
+	};
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 40000, GFP_KERNEL);
+	struct page *units[3], *taken[2];
+	u64 hits;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	io_opaque_send_copy_max = 0;
+	opaque_test_cache(test, store, 4);
+	opaque_test_copy(data, source);
+	/* Publish the compacted copy: two whole units and a tail, and the send spans the units. */
+	opaque_test_publish(store, 0, 9, data);
+	refcount_inc(&data->refs); /* compaction worker */
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+	KUNIT_ASSERT_EQ(test, opaque_test_pages(compact.replacement, units, 3), 3U);
+	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
+	io_opaque_data_put(store, compact.data);
+	io_opaque_compact_end(&compact);
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_wire_req(test, w, store, 0, IORING_OPAQUE_SEND_LAST, 0, 40000);
+	hits = io_opaque_stat_read(IO_OPAQUE_STAT_CACHE_COOLING_HITS);
+
+	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, true), IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 40000);
+	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+	/* The units left with the object, and the ubuf's references keep them cooling. */
+	KUNIT_EXPECT_EQ(test, store->cache.nr_cooling, 2U);
+	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 0U);
+	opaque_wire_acked(w->tx->sk);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(tcp_sk(w->tx->sk)->snd_una),
+			READ_ONCE(tcp_sk(w->tx->sk)->write_seq));
+	/* The peer's queue holds the skbs, and with them the ubuf and the units. */
+	KUNIT_EXPECT_GT(test, page_count(units[0]), 1);
+	KUNIT_EXPECT_GT(test, page_count(units[1]), 1);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_unit_take(store), NULL);
+	KUNIT_EXPECT_EQ(test, store->cache.nr_cooling, 2U);
+
+	/* The peer reads, the last skb of the data is freed, and the ubuf lets go. */
+	opaque_wire_read(test, w, got, 0, 40000);
+	KUNIT_EXPECT_MEMEQ(test, got, source, 40000);
+	KUNIT_EXPECT_TRUE(test, opaque_wire_unit_free(units[0]));
+	KUNIT_EXPECT_TRUE(test, opaque_wire_unit_free(units[1]));
+	taken[0] = io_opaque_unit_take(store);
+	taken[1] = io_opaque_unit_take(store);
+	KUNIT_EXPECT_TRUE(test,
+			  (taken[0] == units[0] && taken[1] == units[1]) ||
+			  (taken[0] == units[1] && taken[1] == units[0]));
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_CACHE_COOLING_HITS) - hits, 2ULL);
+	if (taken[0])
+		io_opaque_unit_put(store, taken[0]);
+	if (taken[1])
+		io_opaque_unit_put(store, taken[1]);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * Without the waiver the receive path copies the skb on loopback, as it would a
+ * MSG_ZEROCOPY skb: every skb that went in comes back through
+ * skb_copy_ubufs(), the counter of copies sees it, and the bytes are still
+ * right. With it, the same send copies nothing, so the counter is shown to
+ * count and not to be stuck.
+ */
+static void opaque_send_managed_copied_without_waiver(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct opaque_managed before, after;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+
+	kunit_activate_static_stub(test, io_opaque_ubuf_flags, opaque_test_ubuf_no_waiver);
+	opaque_managed_read(&before);
+	opaque_wire_send(test, w, store, &(struct opaque_send_case) { .unlocked = true });
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_GE(test, after.skbs - before.skbs, 1ULL);
+	KUNIT_EXPECT_GE(test, after.copied - before.copied, after.skbs - before.skbs);
+
+	kunit_deactivate_static_stub(test, io_opaque_ubuf_flags);
+	opaque_managed_read(&before);
+	opaque_wire_send(test, w, store, &(struct opaque_send_case) { .unlocked = true });
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_GE(test, after.skbs - before.skbs, 1ULL);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+}
+
+/*
+ * A framed send copies its prefix into the skb first, and that skb cannot be
+ * managed: the body takes a page reference for each fragment, and the fill is
+ * counted. The skbs after it are managed, and the suffix, which TCP copies
+ * into the last of them, makes that one hold references of its own.
+ */
+static void opaque_send_managed_prefix_fallback(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	struct opaque_managed before, after;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+
+	opaque_managed_read(&before);
+	opaque_wire_send(test, w, store, &(struct opaque_send_case) {
+			 .prefix = 24, .suffix = 8, .unlocked = true });
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_GE(test, after.fallback - before.fallback, 1ULL);
+	/* The prefix and 16 extents fill the first skb; the other 5 are managed, 5 references. */
+	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)(21 - (limit - 1)));
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 2ULL);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+}
+
+/*
+ * A managed send, a send that TCP copies, a send that is spliced by the
+ * ordinary path, and a managed one again, corked so that they are one
+ * stream and share the skb that is at the tail of the queue: each appends to
+ * what the one before left, the skb is downgraded by the first copy, and the
+ * bytes of all four are the peer's, in order. The ubuf was made once, and what
+ * the last send found was not managed.
+ */
+static void opaque_send_managed_mixed(struct kunit *test)
+{
+	static const struct { u64 off; u32 len; } r[4] = {
+		{ 0, 6000 }, { 10000, 3000 }, { 20000, 6000 }, { 30000, 6000 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 21000, GFP_KERNEL);
+	struct opaque_page_refs *pages;
+	struct opaque_managed before, after;
+	u32 done = 0, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	pages = opaque_page_refs_take(test, data);
+
+	opaque_managed_read(&before);
+	io_opaque_send_copy_max = 0;
+	opaque_managed_send(test, w, store, r[0].off, r[0].len, MSG_MORE);
+	io_opaque_send_copy_max = SZ_1M;
+	opaque_managed_send(test, w, store, r[1].off, r[1].len, MSG_MORE);
+	io_opaque_send_copy_max = 0;
+	kunit_activate_static_stub(test, io_opaque_send_direct, opaque_test_not_direct);
+	opaque_managed_send(test, w, store, r[2].off, r[2].len, MSG_MORE);
+	kunit_deactivate_static_stub(test, io_opaque_send_direct);
+	opaque_managed_send(test, w, store, r[3].off, r[3].len, 0);
+	opaque_managed_read(&after);
+
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
+	KUNIT_EXPECT_EQ(test, after.fallback - before.fallback, 1ULL);
+	KUNIT_EXPECT_EQ(test, after.body - before.body, (u64)r[1].len);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+	for (i = 0; i < ARRAY_SIZE(r); i++) {
+		opaque_wire_read(test, w, got, 0, r[i].len);
+		KUNIT_EXPECT_MEMEQ(test, got, source + r[i].off, r[i].len);
+		done += r[i].len;
+	}
+	KUNIT_EXPECT_EQ(test, done, 21000U);
+	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, true));
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, false));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+}
+
+/*
+ * Frames larger than the room the socket has: the head queues what fits and
+ * waits with its cursor, and no ubuf reference outlives the send. The pages of
+ * the object are back to the object's reference alone once the peer has read
+ * (opaque_wire_eagain() looks at them).
+ */
+static void opaque_send_managed_eagain(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct opaque_managed before, after;
+	unsigned int action, vector;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	opaque_wire_init(test, w);
+	opaque_managed_read(&before);
+	opaque_wire_eagain(test, w, store, false, false, OPAQUE_EAGAIN_KEEP);
+	opaque_wire_eagain(test, w, store, true, true, OPAQUE_EAGAIN_KEEP);
+	for (action = OPAQUE_EAGAIN_FREE; action <= OPAQUE_EAGAIN_COMPACT; action++)
+		for (vector = 0; vector < 2; vector++)
+			opaque_wire_eagain(test, w, store, vector, false, action);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_GT(test, after.skbs, before.skbs);
+	KUNIT_EXPECT_GT(test, after.refs, before.refs);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+}
+
+/*
+ * A vector of eight ranges in eight folios takes eight references and puts
+ * eight, and eight ranges of one folio take one, however many fragments they
+ * make: the references are the ubuf's, one for a folio.
+ */
+static void opaque_send_managed_vec_distinct(struct kunit *test)
+{
+	const u64 handle = io_opaque_handle(0, 9);
+	struct io_uring_opaque_send_entry ent[8];
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 8000, GFP_KERNEL);
+	struct opaque_page_refs *pages;
+	struct opaque_managed before, after;
+	unsigned int pass, i;
+	struct io_opaque_req *op;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	io_opaque_send_copy_max = 0;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	pages = opaque_page_refs_take(test, data);
+
+	for (pass = 0; pass < 2; pass++) {
+		/* Eight extents, a range from each; then eight times the range of one. */
+		for (i = 0; i < ARRAY_SIZE(ent); i++)
+			ent[i] = (struct io_uring_opaque_send_entry) {
+				.handle = handle, .off = pass ? 100 : i * 2000 + 100, .len = 1000,
+			};
+		op = opaque_wire_vec(test, w, store, 0, ent, ARRAY_SIZE(ent), 0);
+		memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
+		opaque_managed_read(&before);
+		KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, true), IOU_COMPLETE);
+		opaque_managed_read(&after);
+		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 8000);
+		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		/* One ubuf for the skb, and a reference for each folio in it. */
+		KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
+		KUNIT_EXPECT_EQ(test, after.refs - before.refs, pass ? 1ULL : 8ULL);
+		KUNIT_EXPECT_EQ(test, after.fallback, before.fallback);
+		opaque_wire_read(test, w, got, 0, 8000);
+		for (i = 0; i < ARRAY_SIZE(ent); i++)
+			KUNIT_EXPECT_MEMEQ(test, got + i * 1000, source + ent[i].off, 1000);
+		opaque_wire_acked(w->tx->sk);
+		/* All put: only the test's reference and the object's are left. */
+		KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, true));
+	}
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * Anything that is not the owned path splices, and a ubuf is not made: the
+ * ordinary path, with the sock_sendmsg() a ULP would take, and the evaluation
+ * parameter that turns managed fragments off. Both send the same bytes.
+ */
+static void opaque_send_managed_ordinary_path(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 12000, GFP_KERNEL);
+	struct opaque_page_refs *pages;
+	struct opaque_managed before, after;
+	unsigned int mode;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	io_opaque_send_copy_max = 0;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	pages = opaque_page_refs_take(test, data);
+
+	for (mode = 0; mode < 3; mode++) {
+		/* 0: not the owned path; 1: the owned path with the parameter off; 2: on. */
+		io_opaque_send_managed = mode == 2;
+		if (mode == 0)
+			kunit_activate_static_stub(test, io_opaque_send_direct,
+						   opaque_test_not_direct);
+		opaque_managed_read(&before);
+		opaque_managed_send(test, w, store, 4196, 12000, 0);
+		opaque_managed_read(&after);
+		if (mode == 0)
+			kunit_deactivate_static_stub(test, io_opaque_send_direct);
+		opaque_wire_read(test, w, got, 0, 12000);
+		KUNIT_EXPECT_MEMEQ(test, got, source + 4196, 12000);
+		if (mode == 2) {
+			KUNIT_EXPECT_GE(test, after.skbs - before.skbs, 1ULL);
+			KUNIT_EXPECT_GE(test, after.refs - before.refs, 1ULL);
+		} else {
+			KUNIT_EXPECT_EQ(test, after.skbs, before.skbs);
+			KUNIT_EXPECT_EQ(test, after.refs, before.refs);
+		}
+		KUNIT_EXPECT_EQ(test, after.fallback, before.fallback);
+		KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+		KUNIT_EXPECT_EQ(test, after.body, before.body);
+		opaque_wire_acked(w->tx->sk);
+		KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, true));
+	}
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+}
+
+/* An skb with managed fragments of the units of a compacted object, and the ubuf it was given. */
+static struct io_opaque_ubuf *opaque_managed_skb(struct kunit *test, struct opaque_splice *f)
+{
+	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(f->skb, NULL), 0);
+	KUNIT_ASSERT_NOT_NULL(test, skb_zcopy(f->skb));
+	return container_of(skb_zcopy(f->skb), struct io_opaque_ubuf, uarg);
+}
+
+/*
+ * A folio is one fragment and one reference of the ubuf, however many calls
+ * fill from it, and the fragments are managed: the skb takes no reference
+ * and weighs what it holds.
+ */
+static void opaque_managed_fill_runs(struct kunit *test)
+{
+	size_t len = OPAQUE_TEST_UNIT + 2 * PAGE_SIZE, first = 5 * PAGE_SIZE;
+	struct opaque_managed before, after;
+	struct io_opaque_ubuf *u;
+	struct opaque_splice f;
+	unsigned int truesize;
+	skb_frag_t *frag;
+
+	opaque_splice_setup(test, &f);
+	truesize = f.skb->truesize;
+	iov_iter_truncate(&f.iter, len);
+	opaque_managed_read(&before);
+	u = opaque_managed_skb(test, &f);
+	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(f.skb)->ops, &io_opaque_ubuf_ops);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->flags & SKBFL_ALL_ZEROCOPY,
+			SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX);
+	KUNIT_EXPECT_EQ(test, u->nr, 0);
+	/* The first call stops inside the first unit. */
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &f.iter, first), 0);
+	KUNIT_EXPECT_TRUE(test, skb_zcopy_managed(f.skb));
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 1);
+	KUNIT_EXPECT_EQ(test, u->nr, 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), len - first);
+	/* The rest of the unit extends the fragment, with no reference; the next starts another. */
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &f.iter, len - first), 0);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 2);
+	KUNIT_EXPECT_EQ(test, u->nr, 2);
+	frag = &skb_shinfo(f.skb)->frags[0];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[0]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)OPAQUE_TEST_UNIT);
+	frag = &skb_shinfo(f.skb)->frags[1];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[1]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 0U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), (unsigned int)(2 * PAGE_SIZE));
+	KUNIT_EXPECT_PTR_EQ(test, u->folio[0], page_folio(f.units[0]));
+	KUNIT_EXPECT_PTR_EQ(test, u->folio[1], page_folio(f.units[1]));
+	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)len);
+	KUNIT_EXPECT_EQ(test, f.skb->data_len, (unsigned int)len);
+	KUNIT_EXPECT_EQ(test, f.skb->truesize, truesize + (unsigned int)len);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&f.iter), 0UL);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
+	KUNIT_EXPECT_EQ(test, after.refs - before.refs, 2ULL);
+	/* The skb let go of the data: the ubuf completes, and gives the folios back. */
+	kfree_skb(f.skb);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+	opaque_splice_done(&f);
+}
+
+/*
+ * Ranges of one folio that touch make one fragment, and ranges that do not
+ * make two, with the one reference; a range that starts inside a unit starts
+ * the fragment at that offset, as a splice would.
+ */
+static void opaque_managed_fill_adjacent(struct kunit *test)
+{
+	size_t skip = PAGE_SIZE + 100;
+	struct bio_vec bv[5];
+	struct io_opaque_ubuf *u;
+	struct opaque_splice f;
+	struct iov_iter iter;
+	skb_frag_t *frag;
+
+	opaque_splice_setup(test, &f);
+	u = opaque_managed_skb(test, &f);
+	/* Three ranges in a row in unit 0, one after a gap, and one in unit 1. */
+	bvec_set_page(&bv[0], f.units[0], 1000, skip);
+	bvec_set_page(&bv[1], f.units[0], 1000, skip + 1000);
+	bvec_set_page(&bv[2], f.units[0], 500, skip + 2000);
+	bvec_set_page(&bv[3], f.units[0], 700, skip + 3000);
+	bvec_set_page(&bv[4], f.units[1], 300, 10);
+	iov_iter_bvec(&iter, ITER_SOURCE, bv, ARRAY_SIZE(bv), 3500);
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 3500), 0);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 0UL);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 3);
+	frag = &skb_shinfo(f.skb)->frags[0];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[0]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), (unsigned int)skip);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), 2500U);
+	frag = &skb_shinfo(f.skb)->frags[1];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[0]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), (unsigned int)(skip + 3000));
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), 700U);
+	frag = &skb_shinfo(f.skb)->frags[2];
+	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[1]);
+	KUNIT_EXPECT_EQ(test, skb_frag_off(frag), 10U);
+	KUNIT_EXPECT_EQ(test, skb_frag_size(frag), 300U);
+	/* Two folios, two references, for three fragments. */
+	KUNIT_EXPECT_EQ(test, u->nr, 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+	kfree_skb(f.skb);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	opaque_splice_done(&f);
+}
+
+/*
+ * The fragment limit ends a fill with the bytes it added and the next with
+ * none, and a ubuf that cannot hold another folio ends it like a full skb, for
+ * an skb that shares a ubuf with a full one: the fill takes no reference it has
+ * nowhere to keep. The skb that follows has a ubuf of its own and goes on.
+ */
+static void opaque_managed_fill_limits(struct kunit *test)
+{
+	const unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	struct sk_buff *shared = alloc_skb(0, GFP_KERNEL), *next = alloc_skb(0, GFP_KERNEL);
+	size_t room = 2000 * limit;
+	struct opaque_managed before, after;
+	struct io_opaque_ubuf *u, *v;
+	struct opaque_splice f;
+	struct iov_iter iter;
+
+	KUNIT_ASSERT_NOT_NULL(test, shared);
+	KUNIT_ASSERT_NOT_NULL(test, next);
+	opaque_splice_setup(test, &f);
+	/* One extent, one page, 2000 bytes each: a fragment each. */
+	iov_iter_bvec(&iter, ITER_SOURCE, f.data->bvec, f.data->nr, 80000);
+	opaque_managed_read(&before);
+	u = opaque_managed_skb(test, &f);
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 80000), -EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, (int)limit);
+	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)room);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 80000 - room);
+	KUNIT_EXPECT_EQ(test, u->nr, limit);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)limit);
+	/* A full skb takes nothing more, and takes no reference for it. */
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 80000), -EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)room);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 80000 - room);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)limit);
+
+	/* An skb that shares the full ubuf, as a split makes it, has no room for a folio. */
+	skb_zcopy_set(shared, &u->uarg, NULL);
+	if (limit == ARRAY_SIZE(u->folio)) {
+		KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(shared, &iter, 2000), -EMSGSIZE);
+		KUNIT_EXPECT_EQ(test, shared->len, 0U);
+		KUNIT_EXPECT_EQ(test, u->nr, limit);
+		opaque_managed_read(&after);
+		KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)limit);
+	}
+
+	/* The skb after the full one has a ubuf of its own, and the rest of the bytes. */
+	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(next, NULL), 0);
+	v = container_of(skb_zcopy(next), struct io_opaque_ubuf, uarg);
+	KUNIT_EXPECT_PTR_NE(test, v, u);
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(next, &iter, 6000), 0);
+	KUNIT_EXPECT_EQ(test, next->len, 6000U);
+	KUNIT_EXPECT_EQ(test, v->nr, 3);
+	kfree_skb(f.skb);
+	kfree_skb(shared);
+	kfree_skb(next);
+	/* Every reference was given back by the last skb of its ubuf. */
+	opaque_splice_done(&f);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f.store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f.store->extents), 0);
+}
+
+/*
+ * An skb that has fragments of its own cannot be managed: a framed send's
+ * prefix is one. The body is then filled as a splice fills it, with a page
+ * reference for each fragment and none in the ubuf, and the fill is counted.
+ */
+static void opaque_managed_fill_fallback(struct kunit *test)
+{
+	struct page *prefix = alloc_page(GFP_KERNEL);
+	struct opaque_managed before, after;
+	struct io_opaque_ubuf *u;
+	struct opaque_splice f;
+	struct iov_iter iter;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, prefix);
+	opaque_splice_setup(test, &f);
+	skb_add_rx_frag(f.skb, 0, prefix, 0, 24, 24);
+	u = opaque_managed_skb(test, &f);
+	iov_iter_bvec(&iter, ITER_SOURCE, f.data->bvec, f.data->nr, 80000);
+	opaque_managed_read(&before);
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 6000), 0);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.fallback - before.fallback, 1ULL);
+	KUNIT_EXPECT_EQ(test, after.refs, before.refs);
+	KUNIT_EXPECT_FALSE(test, skb_zcopy_managed(f.skb));
+	KUNIT_EXPECT_EQ(test, u->nr, 0);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 4);
+	KUNIT_EXPECT_EQ(test, f.skb->len, 6024U);
+	/* A reference of the skb's own on each page. */
+	for (i = 1; i < 4; i++)
+		KUNIT_EXPECT_EQ(test, page_count(skb_frag_page(&skb_shinfo(f.skb)->frags[i])), 2);
+	/* The skb is full when its fragments are, and then TCP starts another. */
+	while (skb_shinfo(f.skb)->nr_frags < READ_ONCE(net_hotdata.sysctl_max_skb_frags))
+		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 2000), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 2000), -EMSGSIZE);
+	kfree_skb(f.skb);
+	opaque_splice_done(&f);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f.store->bytes), 0LL);
+}
+
+/* The foreign ubuf an skb of another provider carries. */
+static void opaque_test_foreign_complete(struct sk_buff *skb, struct ubuf_info *uarg,
+					 bool success)
+{
+}
+
+static const struct ubuf_info_ops opaque_test_foreign_ops = {
+	.complete = opaque_test_foreign_complete,
+};
+
+/*
+ * A skb with a ubuf of ours is joined for no more than the look, another
+ * provider's is a boundary, and a skb that has none gets one.
+ */
+static void opaque_managed_link(struct kunit *test)
+{
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+	struct ubuf_info foreign = {
+		.ops = &opaque_test_foreign_ops, .flags = SKBFL_ZEROCOPY_ENABLE,
+	};
+	struct opaque_managed before, after;
+	struct ubuf_info *uarg;
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	opaque_managed_read(&before);
+	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, NULL), 0);
+	uarg = skb_zcopy(skb);
+	KUNIT_ASSERT_NOT_NULL(test, uarg);
+	KUNIT_EXPECT_EQ(test, refcount_read(&uarg->refcnt), 1U);
+	/* Joined: the same ubuf, and no new object. */
+	KUNIT_EXPECT_EQ(test, io_opaque_link_skb(skb, NULL), 0);
+	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), uarg);
+	KUNIT_EXPECT_EQ(test, refcount_read(&uarg->refcnt), 1U);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
+	kfree_skb(skb);
+
+	skb = alloc_skb(0, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	refcount_set(&foreign.refcnt, 1);
+	skb_zcopy_init(skb, &foreign);
+	KUNIT_EXPECT_EQ(test, io_opaque_link_skb(skb, NULL), -EEXIST);
+	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), &foreign);
+	kfree_skb(skb);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
+}
+
+struct opaque_atomic {
+	struct tasklet_struct tasklet;
+	struct completion done;
+	struct sk_buff *skb;
+	bool copy, softirq;
+	int ret;
+};
+
+static void opaque_atomic_fn(struct tasklet_struct *t)
+{
+	struct opaque_atomic *a = from_tasklet(a, t, tasklet);
+
+	a->softirq = in_serving_softirq();
+	if (a->copy)
+		a->ret = skb_copy_ubufs(a->skb, GFP_ATOMIC);
+	kfree_skb(a->skb);
+	complete(&a->done);
+}
+
+/*
+ * The ubuf completes where the last skb is freed, and that is often a softirq:
+ * the ACK that frees a sent skb, or a consumer that copies the skb on the
+ * receive path and so completes it with the data copied. Neither may sleep or
+ * take a lock that is not for interrupts; the debug configuration checks that.
+ */
+static void opaque_ubuf_complete_atomic(struct kunit *test)
+{
+	struct opaque_atomic *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+	unsigned int copy;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	for (copy = 0; copy < 2; copy++) {
+		struct opaque_managed before, after;
+		struct opaque_splice f;
+
+		opaque_splice_setup(test, &f);
+		opaque_managed_skb(test, &f);
+		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &f.iter, 80000), 0);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 2);
+		a->skb = f.skb;
+		a->copy = copy;
+		a->softirq = false;
+		a->ret = -1;
+		init_completion(&a->done);
+		tasklet_setup(&a->tasklet, opaque_atomic_fn);
+		opaque_managed_read(&before);
+		tasklet_schedule(&a->tasklet);
+		KUNIT_ASSERT_TRUE(test, wait_for_completion_timeout(&a->done, 5 * HZ));
+		tasklet_kill(&a->tasklet);
+		opaque_managed_read(&after);
+		KUNIT_EXPECT_TRUE(test, a->softirq);
+		KUNIT_EXPECT_EQ(test, a->ret, copy ? 0 : -1);
+		/* Copied: told so, once. Freed: not. The folios are back either way. */
+		KUNIT_EXPECT_EQ(test, after.copied - before.copied, (u64)copy);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 1);
+		opaque_splice_done(&f);
+	}
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_reservation_unwind),
 	KUNIT_CASE(opaque_create_publish_revalidate),
@@ -6855,6 +7715,20 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_extents_free_wakes_once),
 	KUNIT_CASE(opaque_extents_free_wakes_all),
 	KUNIT_CASE(opaque_params_sysfs),
+	KUNIT_CASE(opaque_send_managed_loopback),
+	KUNIT_CASE(opaque_send_managed_holds_unit),
+	KUNIT_CASE(opaque_send_managed_copied_without_waiver),
+	KUNIT_CASE(opaque_send_managed_prefix_fallback),
+	KUNIT_CASE(opaque_send_managed_mixed),
+	KUNIT_CASE(opaque_send_managed_eagain),
+	KUNIT_CASE(opaque_send_managed_vec_distinct),
+	KUNIT_CASE(opaque_send_managed_ordinary_path),
+	KUNIT_CASE(opaque_managed_fill_runs),
+	KUNIT_CASE(opaque_managed_fill_adjacent),
+	KUNIT_CASE(opaque_managed_fill_limits),
+	KUNIT_CASE(opaque_managed_fill_fallback),
+	KUNIT_CASE(opaque_managed_link),
+	KUNIT_CASE(opaque_ubuf_complete_atomic),
 	{}
 };
 

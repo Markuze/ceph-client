@@ -7,6 +7,7 @@
 #include <linux/net.h>
 #include <linux/percpu.h>
 #include <linux/sizes.h>
+#include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <kunit/visibility.h>
 #include <uapi/linux/io_uring/opaque.h>
@@ -228,6 +229,10 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_COMPACT_BYTES,
 	IO_OPAQUE_STAT_FRAMING_COPIED,
 	IO_OPAQUE_STAT_BODY_COPIED,
+	IO_OPAQUE_STAT_SEND_MANAGED_SKBS,
+	IO_OPAQUE_STAT_SEND_FOLIO_REFS,
+	IO_OPAQUE_STAT_SEND_FRAG_FALLBACK,
+	IO_OPAQUE_STAT_SEND_UBUF_COPIED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -244,12 +249,25 @@ static inline void io_opaque_count(enum io_opaque_stat_item item, u64 delta)
 
 u64 io_opaque_stat_read(enum io_opaque_stat_item item);
 
+/*
+ * The ubuf_info of the skbs that carry a send's managed fragments (see
+ * io_opaque_link_skb()): one per skb, shared by the skbs that are derived from it.
+ */
+struct io_opaque_ubuf {
+	struct ubuf_info uarg;
+	/* Entries of folio[]. */
+	u8 nr;
+	/* The distinct folios of the fragments of the skbs that share the ubuf. */
+	struct folio *folio[MAX_SKB_FRAGS];
+};
+
 /* Evaluation tunables; module parameters, not ABI. */
 extern unsigned long io_opaque_cache_bytes;
 extern unsigned int io_opaque_unit_order;
 extern unsigned int io_opaque_inline_compact_max;
 extern bool io_opaque_copy_per_page;
 extern unsigned int io_opaque_send_copy_max;
+extern bool io_opaque_send_managed;
 
 struct io_opaque_store {
 	refcount_t refs;
@@ -423,6 +441,10 @@ struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
+extern const struct ubuf_info_ops io_opaque_ubuf_ops;
+u8 io_opaque_ubuf_flags(void);
+int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
+int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);
 int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
 			   unsigned int issue_flags);
 extern atomic_long_t io_opaque_send_locked_calls;

@@ -13,6 +13,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/hotdata.h>
 #include <net/rps.h>
 #include <net/tcp.h>
 #include <trace/events/sock.h>
@@ -3351,6 +3352,272 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 }
 
 /*
+ * Managed fragments. Spliced, a body costs TCP a page reference for every
+ * fragment, taken and dropped by whichever CPU gets to it, and a charge of
+ * socket memory for every byte. SEND_ZC does without both: its skbs have
+ * managed fragments (SKBFL_MANAGED_FRAG_REFS), which take no page reference
+ * and, in a pure zerocopy skb, no socket memory, and the ubuf_info of the skb
+ * keeps alive what they point to. That ubuf_info holds a notification, which
+ * holds the registered buffer. This one holds the pages, and nothing else.
+ *
+ * It is made for each skb that gets fragments (io_opaque_link_skb()), owns one
+ * reference on every distinct folio that the fragments of the skbs sharing it
+ * use, and drops them when the last of those is freed, from whatever context
+ * that is: the ACK that frees a sent skb, the sender's own backlog, the
+ * completion of a device, a tap that held a clone (io_opaque_ubuf_complete()).
+ * It has no pointer to the request, the store or the version. A send gives
+ * back its references on its version as it did, and a LAST send hands the
+ * extents back to the store as it did: what holds the pages then is the
+ * ubuf, as it was TCP's references before, and the unit cache keeps a unit
+ * cooling until it completes. What the store has charged, the handles and the
+ * lifetime of the request do not depend on it.
+ *
+ * Nor can a consumer be left with a page that is recycled or rewritten: a
+ * clone shares the shinfo, the shinfo holds the ubuf, and the ubuf holds the
+ * folios. An skb that gets a shinfo of its own, by a split, a segmentation or
+ * the copy of a clone, takes references on the pages for itself first and one
+ * on the ubuf. The completion is not a notification that anyone waits for, so
+ * the ubuf asks not to be copied on the receive path (SKBFL_DONT_ORPHAN_RX):
+ * a packet socket, or a socket of this host, may hold the skb for as long as
+ * it likes, as it may hold a spliced page.
+ */
+
+/*
+ * The flags of the ubuf. Not SKBFL_SHARED_FRAG: the pages cannot change. And
+ * not SKBFL_MANAGED_FRAG_REFS, which belongs to the shinfo and is set by the
+ * fill: were it the ubuf's, an skb derived from this one with
+ * skb_zerocopy_clone() would take no references of its own.
+ */
+#define IO_OPAQUE_UBUF_FLAGS \
+	(SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX)
+
+static struct kmem_cache *io_opaque_ubuf_cache __ro_after_init;
+
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops;
+
+VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_ubuf_flags);
+	return IO_OPAQUE_UBUF_FLAGS;
+}
+
+/* The pages go back, whichever context frees the last skb that shares the ubuf. */
+static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
+{
+	struct io_opaque_ubuf *u = container_of(uarg, struct io_opaque_ubuf, uarg);
+	unsigned int i;
+
+	/* Told by skb_copy_ubufs() that the data was copied: a consumer did not wait. */
+	if (!success)
+		io_opaque_count(IO_OPAQUE_STAT_SEND_UBUF_COPIED, 1);
+	if (!refcount_dec_and_test(&uarg->refcnt))
+		return;
+	for (i = 0; i < u->nr; i++)
+		folio_put(u->folio[i]);
+	kmem_cache_free(io_opaque_ubuf_cache, u);
+}
+
+/*
+ * Give @skb a ubuf of its own, called by TCP before it fills a skb and with
+ * the socket owned, where it may sleep. The new ubuf has the one reference
+ * that the skb's shinfo owns; the skbs that share the shinfo and the ones
+ * derived from it take theirs. A skb that has one of ours joins it, for the
+ * price of the comparison: a send appends to the tail of the write queue, and
+ * it does not matter whose send began that skb. Another provider's skb is a
+ * boundary, as io_uring's own link_skb() makes it for the provider it does not
+ * mix with: TCP pushes it and starts a new one.
+ *
+ * TCP does not set skb->sk on a skb of its write queue, so the allocation has
+ * no socket to take its mask from. GFP_KERNEL is what a user's socket
+ * allocates its skbs with.
+ */
+VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
+{
+	struct ubuf_info *cur = skb_zcopy(skb);
+	struct io_opaque_ubuf *u;
+
+	if (cur)
+		return cur->ops == &io_opaque_ubuf_ops ? 0 : -EEXIST;
+	u = kmem_cache_alloc(io_opaque_ubuf_cache, GFP_KERNEL);
+	if (!u)
+		return -ENOMEM;
+	u->uarg.ops = &io_opaque_ubuf_ops;
+	u->uarg.flags = io_opaque_ubuf_flags();
+	refcount_set(&u->uarg.refcnt, 1);
+	u->nr = 0;
+	skb_zcopy_init(skb, &u->uarg);
+	io_opaque_count(IO_OPAQUE_STAT_SEND_MANAGED_SKBS, 1);
+	return 0;
+}
+
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops = {
+	.complete	= io_opaque_ubuf_complete,
+	.link_skb	= io_opaque_link_skb,
+};
+
+/*
+ * What msg_ubuf points at, for skb_zerocopy_iter_stream() to find link_skb
+ * through. TCP never links it to an skb, because link_skb has given each skb
+ * its own, and it must not: it is shared by every send. The one path that
+ * would is fast open, whose SYN takes the msg_ubuf of its first send; a socket
+ * that could take that path is not sent managed, and a send never has
+ * MSG_FASTOPEN.
+ */
+static void io_opaque_cursor_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
+{
+	WARN_ON_ONCE(1);
+}
+
+static const struct ubuf_info_ops io_opaque_cursor_ops = {
+	.complete	= io_opaque_cursor_complete,
+	.link_skb	= io_opaque_link_skb,
+};
+
+static struct ubuf_info io_opaque_ubuf_cursor = {
+	.ops	= &io_opaque_cursor_ops,
+};
+
+static bool io_opaque_ubuf_holds(const struct io_opaque_ubuf *u, const struct folio *folio)
+{
+	unsigned int i = u->nr;
+
+	/* Ranges come in the order they are stored, so the last entry is nearly always the one. */
+	while (i--)
+		if (u->folio[i] == folio)
+			return true;
+	return false;
+}
+
+/*
+ * Add the bytes of @from to @skb as managed fragments, at most @length of
+ * them: what a splice would add, with a folio's reference taken once for the
+ * ubuf and not once for each fragment, and no page reference in the skb. A
+ * fragment starts where the previous one ends if it continues in the same
+ * folio (skb_can_coalesce() refuses zerocopy skbs). The fragment limit is
+ * the splice's, and so is what a fragment weighs, its bytes, for a skb that
+ * owns no page. A reference is taken together with the fragment that needs
+ * it, before the fragment is published, so that every fragment of the skb
+ * has its folio in the ubuf. The list can hold as many folios as an skb has
+ * fragments, which it does if the skb is the only one to use the ubuf, as it
+ * is while the skb is managed; one that is full ends the fill like a full skb.
+ *
+ * A skb that has fragments of its own cannot be managed: the fill takes a
+ * reference for each, as a splice does (a framed send's prefix is copied into
+ * the skb first). Returns 0 with the bytes added, or -EMSGSIZE if the skb
+ * cannot take any more, in which case TCP starts another when nothing was added.
+ */
+VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from,
+					    size_t length)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	struct ubuf_info *uarg = skb_zcopy(skb);
+	unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	unsigned int nr = shinfo->nr_frags, refs = 0;
+	const struct bio_vec *bv = from->bvec;
+	unsigned long segs = from->nr_segs;
+	size_t skip = from->iov_offset;
+	size_t left = min(from->count, length), added = 0;
+	struct io_opaque_ubuf *u;
+	int ret = 0;
+
+	if (WARN_ON_ONCE(!uarg || uarg->ops != &io_opaque_ubuf_ops || !iov_iter_is_bvec(from)))
+		return -EFAULT;
+	if (nr && !skb_zcopy_managed(skb)) {
+		ssize_t spliced;
+
+		io_opaque_count(IO_OPAQUE_STAT_SEND_FRAG_FALLBACK, 1);
+		spliced = skb_splice_from_iter(skb, from, left);
+		if (spliced == -EMSGSIZE)
+			return -EMSGSIZE;
+		/* TCP takes -EFAULT as the end of the send, and no other error is worth more. */
+		return spliced < 0 ? -EFAULT : 0;
+	}
+	if (!nr)
+		shinfo->flags |= SKBFL_MANAGED_FRAG_REFS;
+	u = container_of(uarg, struct io_opaque_ubuf, uarg);
+
+	while (left) {
+		size_t boff, part, foff;
+		struct folio *folio;
+		struct page *page;
+		skb_frag_t *last = nr ? &shinfo->frags[nr - 1] : NULL;
+
+		/* The cursor holds as many bytes as its count says, or the count is wrong. */
+		if (unlikely(!segs)) {
+			ret = -EFAULT;
+			break;
+		}
+		part = min(bv->bv_len - skip, left);
+		if (!part) {
+			bv++;
+			segs--;
+			skip = 0;
+			continue;
+		}
+		boff = bv->bv_offset + skip;
+		page = bv->bv_page + (boff >> PAGE_SHIFT);
+		folio = page_folio(page);
+		foff = folio_page_idx(folio, page) * PAGE_SIZE + offset_in_page(boff);
+		part = min(part, folio_size(folio) - foff);
+
+		if (last && skb_frag_page(last) == folio_page(folio, 0) &&
+		    skb_frag_off(last) + skb_frag_size(last) == foff) {
+			skb_frag_size_add(last, part);
+		} else {
+			if (nr >= limit) {
+				ret = -EMSGSIZE;
+				break;
+			}
+			if (!io_opaque_ubuf_holds(u, folio)) {
+				if (u->nr == ARRAY_SIZE(u->folio)) {
+					ret = -EMSGSIZE;
+					break;
+				}
+				folio_get(folio);
+				u->folio[u->nr++] = folio;
+				refs++;
+			}
+			__skb_fill_page_desc_noacc(shinfo, nr++, folio_page(folio, 0), foff, part);
+		}
+		added += part;
+		left -= part;
+		skip += part;
+		if (skip == bv->bv_len) {
+			bv++;
+			segs--;
+			skip = 0;
+		}
+	}
+	shinfo->nr_frags = nr;
+	skb_len_add(skb, added);
+	iov_iter_advance(from, added);
+	if (refs)
+		io_opaque_count(IO_OPAQUE_STAT_SEND_FOLIO_REFS, refs);
+	return ret;
+}
+
+/*
+ * Whether a body that is spliced goes out as managed fragments: when the
+ * send calls tcp_sendmsg_locked() itself, not on a socket that TCP fast open
+ * could take (see io_opaque_ubuf_cursor), and unless the evaluation
+ * parameter turned it off. Anywhere else the body is spliced as before.
+ */
+static bool io_opaque_sends_managed(const struct sock *sk)
+{
+	return READ_ONCE(io_opaque_send_managed) && io_opaque_ubuf_cache &&
+	       !inet_test_bit(DEFER_CONNECT, sk);
+}
+
+static int __init io_opaque_ubuf_init(void)
+{
+	BUILD_BUG_ON(MAX_SKB_FRAGS > U8_MAX);
+	/* A cache that failed leaves every send spliced. */
+	io_opaque_ubuf_cache = KMEM_CACHE(io_opaque_ubuf, 0);
+	return 0;
+}
+device_initcall(io_opaque_ubuf_init);
+
+/*
  * A body of up to send_copy_max bytes is copied by TCP: below that a page
  * reference and a fragment cost more than the copy. The object stays immutable
  * and TCP keeps no reference to it, so nothing else about the send changes.
@@ -3545,8 +3812,13 @@ again:
 	} else if (body) {
 		msg.msg_iter = op->iter;
 		splice = io_opaque_send_splices(op);
-		if (splice)
+		if (splice && owned && io_opaque_sends_managed(sk)) {
+			msg.msg_flags |= MSG_ZEROCOPY;
+			msg.msg_ubuf = &io_opaque_ubuf_cursor;
+			msg.sg_from_iter = io_opaque_sg_from_iter;
+		} else if (splice) {
 			msg.msg_flags |= MSG_SPLICE_PAGES;
+		}
 		if (op->suffix_length)
 			msg.msg_flags |= MSG_MORE;
 	} else {

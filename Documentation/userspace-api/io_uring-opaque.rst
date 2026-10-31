@@ -384,11 +384,26 @@ and fails with ESTALE if another operation removes the handle first.
 
 One SQE, queue item, continuation cursor and CQE cover prefix, opaque body and
 suffix, also when the body is a vector of ranges. The body uses the retained
-bvec array with ``MSG_SPLICE_PAGES``; private
-framing uses ordinary copied TCP sends. The ``send_copy_max`` evaluation
-parameter can make TCP copy a small body the same way instead: the object stays
-immutable and TCP keeps no reference to it, so nothing else about the send
-changes. A vector is spliced or copied as a whole, by its largest range.
+bvec array; private framing uses ordinary copied TCP sends. On a plain TCP
+socket that the send owns, the body is added to TCP's skbs as managed
+fragments, as ``SEND_ZC`` adds a registered buffer: the skb takes no page
+reference for a fragment and charges the socket no memory for its bytes, and a
+completion of the skb holds one reference on each distinct folio that the skb
+uses until the last skb that shares it is freed, wherever that is. Like the
+page references that TCP held before, it ends with the data and not with the
+send: it does not hold the request, the store or the version, and a LAST send
+still frees the object when it is done. Because the completion is not a
+notification that anyone waits for, the receive path does not copy the skb on
+its way to a packet socket or to a socket of this host, which may hold it as
+long as it likes, as it may hold a spliced page. On any other socket, such as
+one with a ULP, and when ``send_managed`` is off, the body is added with
+``MSG_SPLICE_PAGES``, a page reference for each fragment. The skb that a prefix
+starts has fragments of its own and takes a page reference for each fragment of
+the body that goes into it, and a suffix makes the last skb of the body take
+references too. The ``send_copy_max`` evaluation parameter can make TCP copy a
+small body instead of either: the object stays immutable and TCP keeps no
+reference to it, so nothing else about the send changes. A vector is added or
+copied as a whole, by its largest range.
 Internal send attempts advance across
 these segments, setting MSG_MORE while segments remain. Partial progress resumes
 at the saved whole-frame cursor. Without MSG_DONTWAIT,
@@ -417,9 +432,9 @@ including all prefix, body and suffix bytes, not peer delivery or acknowledgment
 An error/short result counts the prefix of the complete response, including
 cases where no body byte was queued. The consumed flag is independent of that
 total. No user-buffer reuse notification is
-needed: the payload cannot be overwritten by userspace, and TCP owns ordinary
-page references. FREE after queued sends can invalidate the handle while TCP
-still retains those pages. SEND_LAST does this without a separate FREE SQE or
+needed: the payload cannot be overwritten by userspace, and TCP, or the
+completion of its skbs, owns the page references. FREE after queued sends can
+invalidate the handle while TCP still retains those pages. SEND_LAST does this without a separate FREE SQE or
 CQE and transfers a reference rather than adding and dropping a send pin.
 An ordinary SEND awaiting first issue has not acquired its backing reference;
 users must order handle release accordingly.
@@ -697,13 +712,14 @@ Evaluation parameters
 =====================
 
 The destination unit cache, the unit size, inline manual compaction, the
-compaction copy loop and the send copy threshold are selected by parameters under
+compaction copy loop, the send copy threshold and managed fragments are
+selected by parameters under
 ``/sys/module/io_uring_opaque/parameters/``, writable by root at run time or
 set on the kernel command line as ``io_uring_opaque.<name>=<value>``. They
 exist for measurement, are not ABI and may change or disappear. The defaults
 keep the behaviour without the cache, without inline compaction and with every
-body spliced; the per-run copy is byte-identical to the page-split copy it
-replaces.
+body added to TCP's skbs without a copy; the per-run copy is byte-identical to
+the page-split copy it replaces.
 
 ``cache_bytes`` (default 0)
     Per-store unit cache size in bytes, sampled when a store is registered;
@@ -720,8 +736,13 @@ replaces.
     source and destination page. Read at each compaction.
 ``send_copy_max`` (default 0)
     Largest send body in bytes (``len``, without prefix or suffix) that TCP
-    copies instead of splicing page references; 0 splices every body. Read at
-    each send.
+    copies instead of adding it to its skbs without a copy; 0 copies none.
+    Read at each send.
+``send_managed`` (default Y)
+    Y adds a body that is not copied to TCP's skbs as managed fragments on a
+    plain TCP socket that the send owns. N takes a page reference for each
+    fragment, as ``MSG_SPLICE_PAGES`` does, which is what every other socket
+    does. Read at each send.
 
 The same directory holds read-only counters summed over all stores. They are
 cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
@@ -847,6 +868,12 @@ Copy cases compare the per-run and page-split loops byte for byte with and
 without units; inline cases cover synchronous publication, the dispatcher
 threshold and an inline reservation failure. A pressure case shows that a full
 cache leaves capture admission and watermarks unchanged.
+Managed fragment cases fill skbs without TCP, for folios shared by fragments
+and ranges that touch, the fragment limit, a ubuf that is full, and an skb with
+fragments of its own, and they send over loopback for the counters, the pages
+that a ubuf or a peer that has not read holds, a unit that the cache cannot take
+until the peer reads, the copy that the receive path makes without the waiver,
+framed and mixed sends, and the completion in a softirq.
 ``CONFIG_KUNIT`` is required. Compaction and tests compile as separate source
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.
