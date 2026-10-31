@@ -1038,27 +1038,37 @@ static int sysfs_write(const char *path, const char *text)
 	return ret;
 }
 
-static bool nsim_create(unsigned int id, unsigned int queues, char name[IFNAMSIZ])
+/*
+ * Create a netdevsim device with one port. Return the index of its interface,
+ * or 0. udev can rename the interface at any time after this, also while it is
+ * up, so the tests address it by index and never by name.
+ */
+static unsigned int nsim_create(unsigned int id, unsigned int queues)
 {
-	char path[128], text[64];
+	char path[128], text[64], name[IFNAMSIZ];
+	unsigned int ifindex = 0;
 	struct dirent *de;
 	DIR *dir;
-	int ret;
+	int i;
 
 	snprintf(text, sizeof(text), "%u 1 %u", id, queues);
-	ret = sysfs_write("/sys/bus/netdevsim/new_device", text);
-	if (ret)
-		return false;
+	if (sysfs_write("/sys/bus/netdevsim/new_device", text))
+		return 0;
 	snprintf(path, sizeof(path), "/sys/bus/netdevsim/devices/netdevsim%u/net", id);
-	dir = opendir(path);
-	if (!dir)
-		return false;
-	name[0] = 0;
-	while ((de = readdir(dir)))
-		if (de->d_name[0] != '.')
-			snprintf(name, IFNAMSIZ, "%.*s", IFNAMSIZ - 1, de->d_name);
-	closedir(dir);
-	return name[0];
+	/* A rename between the listing and the lookup hides the name: list again. */
+	for (i = 0; i < 10 && !ifindex; i++) {
+		dir = opendir(path);
+		if (!dir)
+			return 0;
+		name[0] = 0;
+		while ((de = readdir(dir)))
+			if (de->d_name[0] != '.')
+				snprintf(name, IFNAMSIZ, "%.*s", IFNAMSIZ - 1, de->d_name);
+		closedir(dir);
+		if (name[0])
+			ifindex = if_nametoindex(name);
+	}
+	return ifindex;
 }
 
 static void nsim_destroy(unsigned int id)
@@ -1069,39 +1079,54 @@ static void nsim_destroy(unsigned int id)
 	sysfs_write("/sys/bus/netdevsim/del_device", text);
 }
 
-static int link_up(const char *name)
+/*
+ * Run an interface ioctl on the interface with index @ifindex. Look up its
+ * name first, and again if udev renamed it between the lookup and the call.
+ * Return 0 or a negative errno, -ENODEV if the interface does not exist.
+ */
+static int if_ioctl(unsigned int ifindex, unsigned long req, struct ifreq *ifr)
 {
-	struct ifreq ifr = {};
-	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret = -ENODEV, i;
 
 	require(s >= 0, "control socket");
-	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
-	ret = ioctl(s, SIOCGIFFLAGS, &ifr);
-	if (!ret) {
-		ifr.ifr_flags |= IFF_UP;
-		ret = ioctl(s, SIOCSIFFLAGS, &ifr);
+	for (i = 0; i < 10 && ret == -ENODEV; i++) {
+		if (!if_indextoname(ifindex, ifr->ifr_name)) {
+			errno = ENODEV;
+			break;
+		}
+		ret = ioctl(s, req, ifr) ? -errno : 0;
 	}
 	close(s);
-	return ret ? -errno : 0;
+	return ret;
 }
 
-static int set_channels(const char *name, unsigned int combined)
+static int link_up(unsigned int ifindex)
+{
+	struct ifreq ifr = {};
+	int ret;
+
+	ret = if_ioctl(ifindex, SIOCGIFFLAGS, &ifr);
+	if (!ret) {
+		ifr.ifr_flags |= IFF_UP;
+		ret = if_ioctl(ifindex, SIOCSIFFLAGS, &ifr);
+	}
+	return ret;
+}
+
+static int set_channels(unsigned int ifindex, unsigned int combined)
 {
 	struct ethtool_channels ch = { .cmd = ETHTOOL_GCHANNELS };
 	struct ifreq ifr = {};
-	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+	int ret;
 
-	require(s >= 0, "control socket");
-	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
 	ifr.ifr_data = (void *)&ch;
-	ret = ioctl(s, SIOCETHTOOL, &ifr);
+	ret = if_ioctl(ifindex, SIOCETHTOOL, &ifr);
 	if (!ret) {
 		ch.cmd = ETHTOOL_SCHANNELS;
 		ch.combined_count = combined;
-		ret = ioctl(s, SIOCETHTOOL, &ifr);
+		ret = if_ioctl(ifindex, SIOCETHTOOL, &ifr);
 	}
-	close(s);
-	return ret ? -errno : 0;
+	return ret;
 }
 
 /* Poll until the provider is gone after a ring exits. */
@@ -1123,18 +1148,16 @@ static void test_device(void)
 {
 	struct ring r, r2;
 	struct zcrx z, z2;
-	char name[IFNAMSIZ];
 	unsigned int ifindex;
 	int ret;
 
-	if (!nsim_create(100, 4, name)) {
+	ifindex = nsim_create(100, 4);
+	if (!ifindex) {
 		ksft_test_result_skip("netdevsim is not available\n");
 		return;
 	}
-	require(!link_up(name), "bring the netdevsim device up");
-	ifindex = if_nametoindex(name);
-	require(ifindex, "netdevsim ifindex");
-	require(!set_channels(name, 3), "set 3 channels");
+	require(!link_up(ifindex), "bring the netdevsim device up");
+	require(!set_channels(ifindex, 3), "set 3 channels");
 
 	require(!ring_init(&r, IORING_SETUP_CQE32), "ring for the device test");
 	zcrx_prepare(&z, &r, ZCRX_REG_MAIO, ifindex, AREA_PAGES);
@@ -1148,9 +1171,9 @@ static void test_device(void)
 	require(!ret, "install the provider on a device");
 
 	/* All three queues have the provider. */
-	require(set_channels(name, 2) == -EINVAL, "fewer channels are refused");
-	require(set_channels(name, 1) == -EINVAL, "one channel is refused");
-	require(set_channels(name, 4) == -EINVAL, "more channels are refused");
+	require(set_channels(ifindex, 2) == -EINVAL, "fewer channels are refused");
+	require(set_channels(ifindex, 1) == -EINVAL, "one channel is refused");
+	require(set_channels(ifindex, 4) == -EINVAL, "more channels are refused");
 
 	/* A second instance cannot take the queues. */
 	require(!ring_init(&r2, IORING_SETUP_CQE32), "second ring");
@@ -1175,7 +1198,7 @@ static void test_device(void)
 
 	/* After the removal, the channel count can change again. */
 	for (ret = 0; ret < 100; ret++) {
-		if (!set_channels(name, 2))
+		if (!set_channels(ifindex, 2))
 			break;
 		usleep(100 * 1000);
 	}
@@ -1192,13 +1215,12 @@ static void test_device_removal(void)
 	struct ring r;
 	struct zcrx z;
 
-	if (!nsim_create(101, 2, name)) {
+	ifindex = nsim_create(101, 2);
+	if (!ifindex) {
 		ksft_test_result_skip("netdevsim is not available\n");
 		return;
 	}
-	require(!link_up(name), "bring the second netdevsim device up");
-	ifindex = if_nametoindex(name);
-	require(ifindex, "second netdevsim ifindex");
+	require(!link_up(ifindex), "bring the second netdevsim device up");
 	require(!ring_init(&r, IORING_SETUP_CQE32), "ring for the removal test");
 	zcrx_prepare(&z, &r, ZCRX_REG_MAIO, ifindex, AREA_PAGES);
 	if (zcrx_do_register(&z)) {
@@ -1213,7 +1235,7 @@ static void test_device_removal(void)
 
 	/* The core removes the provider from the queues as it unregisters the device. */
 	nsim_destroy(101);
-	require(!if_nametoindex(name), "the device is gone");
+	require(!if_indextoname(ifindex, name), "the device is gone");
 
 	/* The instance and its area outlive the device. */
 	require(check_pattern(z.map, z.area.len, 9), "the area survives the device");
@@ -1242,44 +1264,35 @@ struct peer {
 
 struct pair {
 	unsigned int id;		/* netdevsim device id of port A */
-	char name[IFNAMSIZ];
 	unsigned int ifindex;
 	struct peer peer;
 };
 
-static int set_addr(const char *name, const char *addr)
+static int set_addr(unsigned int ifindex, const char *addr)
 {
 	struct sockaddr_in *sin;
 	struct ifreq ifr = {};
-	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+	int ret;
 
-	require(s >= 0, "control socket");
-	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
 	sin = (struct sockaddr_in *)&ifr.ifr_addr;
 	sin->sin_family = AF_INET;
 	inet_pton(AF_INET, addr, &sin->sin_addr);
-	ret = ioctl(s, SIOCSIFADDR, &ifr);
+	ret = if_ioctl(ifindex, SIOCSIFADDR, &ifr);
 	if (!ret) {
 		inet_pton(AF_INET, "255.255.255.0", &sin->sin_addr);
-		ret = ioctl(s, SIOCSIFNETMASK, &ifr);
+		ret = if_ioctl(ifindex, SIOCSIFNETMASK, &ifr);
 	}
-	close(s);
-	return ret ? -errno : 0;
+	return ret;
 }
 
 /* Without TSO the stack sends one frame per segment. */
-static int tso_set(const char *name, bool on)
+static int tso_set(unsigned int ifindex, bool on)
 {
 	struct ethtool_value eval = { .cmd = ETHTOOL_STSO, .data = on };
 	struct ifreq ifr = {};
-	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
 
-	require(s >= 0, "control socket");
-	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
 	ifr.ifr_data = (void *)&eval;
-	ret = ioctl(s, SIOCETHTOOL, &ifr);
-	close(s);
-	return ret ? -errno : 0;
+	return if_ioctl(ifindex, SIOCETHTOOL, &ifr);
 }
 
 /* The name of the last device in this namespace that is not the loopback device. */
@@ -1313,10 +1326,12 @@ static void *peer_thread(void *arg)
 	snprintf(text, sizeof(text), "%u 1 1", p->id);
 	if (sysfs_write("/sys/bus/netdevsim/new_device", text))
 		return NULL;
-	if (!first_nonlo(name) || set_addr(name, PEER_ADDR) || tso_set(name, false) ||
-	    link_up(name))
+	if (!first_nonlo(name))
 		return NULL;
 	p->ifindex = if_nametoindex(name);
+	if (!p->ifindex || set_addr(p->ifindex, PEER_ADDR) ||
+	    tso_set(p->ifindex, false) || link_up(p->ifindex))
+		return NULL;
 	p->netns = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
 	for (i = 0; i < PEER_SOCKETS; i++)
 		p->socks[i] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1337,10 +1352,10 @@ static bool pair_create(struct pair *pr, unsigned int id_a, unsigned int id_b)
 	pr->id = id_a;
 	pr->peer.id = id_b;
 	pr->peer.netns = -1;
-	if (!nsim_create(id_a, 1, pr->name))
+	pr->ifindex = nsim_create(id_a, 1);
+	if (!pr->ifindex)
 		return false;
-	pr->ifindex = if_nametoindex(pr->name);
-	if (!pr->ifindex || set_addr(pr->name, LOCAL_ADDR) || link_up(pr->name))
+	if (set_addr(pr->ifindex, LOCAL_ADDR) || link_up(pr->ifindex))
 		goto err_a;
 	if (pthread_create(&th, NULL, peer_thread, &pr->peer))
 		goto err_a;
@@ -1375,7 +1390,7 @@ static void *tso_thread(void *arg)
 
 	a->err = -1;
 	if (!setns(a->netns, CLONE_NEWNET) && first_nonlo(name))
-		a->err = tso_set(name, a->on);
+		a->err = tso_set(if_nametoindex(name), a->on);
 	return NULL;
 }
 
@@ -1638,7 +1653,6 @@ static int dev_instance(struct ring *r, struct zcrx *z, unsigned int ifindex,
 static void test_netdevsim_foreign(void)
 {
 	unsigned char seen[DEV_AREA_PAGES] = {};
-	char name_c[IFNAMSIZ];
 	struct zcrx za, zc;
 	struct rx rx = {};
 	struct pair pr;
@@ -1653,14 +1667,13 @@ static void test_netdevsim_foreign(void)
 		ksft_test_result_skip("netdevsim ports or network namespaces are not available\n");
 		return;
 	}
-	if (!nsim_create(204, 1, name_c)) {
+	ifindex_c = nsim_create(204, 1);
+	if (!ifindex_c) {
 		pair_destroy(&pr);
 		ksft_test_result_skip("netdevsim is not available\n");
 		return;
 	}
-	require(!link_up(name_c), "bring port C up");
-	ifindex_c = if_nametoindex(name_c);
-	require(ifindex_c, "port C ifindex");
+	require(!link_up(ifindex_c), "bring port C up");
 	require(!ring_init(&r, IORING_SETUP_CQE32), "ring for the foreign page test");
 	ret = dev_instance(&r, &za, pr.ifindex, DEV_AREA_PAGES);
 	if (ret == -EOPNOTSUPP || ret == -ENODEV) {
