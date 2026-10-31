@@ -2242,9 +2242,19 @@ static void test_send_last(struct io_uring_opaque_config *cfg)
 	{
 		struct io_uring_opaque_stat stat;
 
-		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
-			!stat.objects && !stat.backing_bytes && !stat.extents && !stat.streams,
-			"SEND_LAST store references drain");
+		/*
+		 * The IOSQE_ASYNC LAST ran in io-wq. Its CQE can arrive before the
+		 * worker drops its request reference; the request, and the backing
+		 * it claimed, is then freed by task work that a later enter runs.
+		 */
+		for (i = 0; i < 300; i++) {
+			require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat),
+					 &stat).res, "SEND_LAST store stat");
+			if (!stat.objects && !stat.backing_bytes && !stat.extents && !stat.streams)
+				break;
+			usleep(10000);
+		}
+		require(i < 300, "SEND_LAST store references drain");
 	}
 	ring_exit(&r);
 	close(source[0]);
