@@ -81,7 +81,13 @@ enum zcrx_event_desc_flags {
 };
 
 struct zcrx_stats {
-	__u64	copy_count;	/* cumulative copy-fallback CQEs */
+	/*
+	 * The kernel copies a fragment of a socket buffer into buffers of the
+	 * area and posts one CQE for each buffer it fills. copy_count counts
+	 * the copied fragments and copy_bytes counts the copied bytes. Neither
+	 * counts CQEs.
+	 */
+	__u64	copy_count;	/* cumulative fragments copied */
 	__u64	copy_bytes;	/* cumulative bytes copied */
 };
 
