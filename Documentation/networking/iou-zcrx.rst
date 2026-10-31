@@ -440,8 +440,9 @@ refill ring and submit a new request to get them.
 Four counters in ``struct zcrx_stats`` follow ``copy_count`` and
 ``copy_bytes``. They count for a MAIO instance:
 
-* ``limbo_enter``: pages that a pool released while an outsider held a
-  reference. See `Page states`_.
+* ``limbo_enter``: pages that a pool released, or that the process returned
+  through the refill ring, while an outsider held a reference. See
+  `Page states`_.
 * ``limbo_leave``: parked pages that became free again.
 * ``fallback_pages``: ordinary pages that the provider gave to a pool.
 * ``exhaust_count``: episodes.
@@ -458,8 +459,10 @@ of the area. A slot *in a pool* belongs to the page pool of a queue. It is in
 the cache or the ring of the pool, in a descriptor of the device, or in a
 socket buffer. A *held* slot is a slot in a pool that has extra references:
 the user references of ``RECV_ZC`` CQEs, or the extents of opaque objects. A
-page *in limbo* was released by its pool while an outsider still held a
-reference. An *outsider* is any holder of a page reference other than the
+page *in limbo* was released by its pool, or returned through the refill
+ring, while an outsider still held a reference. A slot that the process
+returns while another socket or a send still holds its page therefore waits
+in limbo. An *outsider* is any holder of a page reference other than the
 area, the pool and the PTEs of the mapping. A transmit queue after a send, a
 splice and a pinned user buffer are outsiders. A page waits in limbo until
 the outsider drops its reference. Then it becomes free. The provider never

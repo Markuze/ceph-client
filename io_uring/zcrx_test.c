@@ -479,6 +479,84 @@ static void zcrx_maio_refill_ring(struct kunit *test)
 	zt_env_exit(test, &env);
 }
 
+/*
+ * A slot that the user returns through the refill ring goes back to its pool
+ * only if no outsider holds its page. A pipe after a splice of another socket
+ * that shares the page is such an outsider, and so is a transmit queue after a
+ * send of the slot. The PTE of the mapping of the area is not.
+ */
+static void zcrx_maio_refill_outsider(struct kunit *test)
+{
+	struct page **drain = kunit_kcalloc(test, 2 * ZT_BATCH, sizeof(*drain), GFP_KERNEL);
+	struct page *p, *q;
+	struct zt_env env;
+	unsigned int n;
+	u64 off;
+	u32 idx;
+
+	KUNIT_ASSERT_NOT_NULL(test, drain);
+
+	/* A page that only the area and its mapping hold returns at once. */
+	zt_env_init(test, &env, 2 * ZT_BATCH, 1);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	get_page(p);
+	atomic_inc(&p->_mapcount);
+	zt_hold(test, &env, p);
+	KUNIT_ASSERT_TRUE(test, io_zcrx_maio_page_off(env.ifq, p, &off));
+	zt_rqe(&env, off);
+	n = zt_drain_cache(test, env.pp[0], drain, 2 * ZT_BATCH);
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_EXPECT_PTR_EQ(test, q, p);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_enter, 0ULL);
+	atomic_dec(&p->_mapcount);
+	put_page(p);
+	zt_free(env.pp[0], q);
+	while (n--)
+		zt_free(env.pp[0], drain[n]);
+	zt_env_exit(test, &env);
+
+	/* With an outsider, the refill takes the entry and parks the slot. */
+	zt_env_init(test, &env, 2 * ZT_BATCH, 1);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	idx = zt_slot(test, env.ifq, p);
+	get_page(p);
+	atomic_inc(&p->_mapcount);
+	zt_hold(test, &env, p);
+	get_page(p);
+	KUNIT_ASSERT_TRUE(test, io_zcrx_maio_page_off(env.ifq, p, &off));
+	zt_rqe(&env, off);
+	n = zt_drain_cache(test, env.pp[0], drain, 2 * ZT_BATCH);
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	drain[n++] = q;
+	KUNIT_EXPECT_PTR_NE(test, q, p);
+	KUNIT_EXPECT_EQ(test, env.ifq->rq.ring->head, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&env.area->user_refs[idx]), 0);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->state[idx], IO_ZCRX_KSLOT_LIMBO);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_enter, 1ULL);
+	KUNIT_EXPECT_NULL(test, p->pp);
+
+	/* The outsider leaves. The reclaim finds the page when the freelist runs low. */
+	n += zt_drain_cache(test, env.pp[0], drain + n, 2 * ZT_BATCH - n);
+	put_page(p);
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_EXPECT_PTR_EQ(test, q, p);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_leave, 1ULL);
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 0ULL);
+
+	/* Undo the imitation of the mapping and return every page. */
+	atomic_dec(&p->_mapcount);
+	put_page(p);
+	zt_free(env.pp[0], q);
+	while (n--)
+		zt_free(env.pp[0], drain[n]);
+	zt_env_exit(test, &env);
+}
+
 /* Copy pages come from the freelist, have no pool and obey the same test. */
 static void zcrx_maio_copy_page(struct kunit *test)
 {
@@ -1517,6 +1595,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_lookup),
 	KUNIT_CASE(zcrx_maio_states),
 	KUNIT_CASE(zcrx_maio_refill_ring),
+	KUNIT_CASE(zcrx_maio_refill_outsider),
 	KUNIT_CASE(zcrx_maio_copy_page),
 	KUNIT_CASE(zcrx_maio_owned),
 	KUNIT_CASE(zcrx_maio_mapped),

@@ -1456,6 +1456,12 @@ static bool zcrx_put_refill_slot(struct io_zcrx_slot slot, struct page_pool *pp,
 		io_zcrx_return_slot(slot);
 		return false;
 	}
+	/* The page of a kernel area must not reach the device under an outsider. */
+	if (slot.area->mem.is_kernel &&
+	    unlikely(!io_zcrx_page_is_quiet(netmem_to_page(netmem)))) {
+		io_zcrx_kmem_park_slot(pp, slot.area, slot.idx);
+		return false;
+	}
 	return true;
 }
 
