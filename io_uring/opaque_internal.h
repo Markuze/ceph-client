@@ -29,6 +29,8 @@
 #define IO_OPAQUE_UNIT_COOL_MAX	HZ
 /* Unused per-socket TX queues kept per store; the oldest is freed beyond this. */
 #define IO_OPAQUE_TX_IDLE_MAX	64
+/* Backing segments all ranges of one vectored send may span; more is EMSGSIZE. */
+#define IO_OPAQUE_SEND_VEC_SEGS	4096
 
 struct io_opaque_backing {
 	refcount_t refs;
@@ -92,6 +94,27 @@ struct io_opaque_tx {
 	/* Requests between lookup and enqueue; the queue stays while any. */
 	unsigned int admitting;
 	bool failed;
+};
+
+/*
+ * What a vectored send needs besides the request: its entries, copied at prep,
+ * the version each pins and the segments of the combined cursor. One block
+ * holds the header and the three arrays, so that growing it is one allocation.
+ */
+struct io_opaque_vec {
+	/* Entries, from the SQE. */
+	u32 nr;
+	/* Segments of the combined cursor, from admission. */
+	u32 nr_segs;
+	/* Entries of pin[] that hold a reference. */
+	u32 pinned;
+	u32 cap_nr;
+	u32 cap_segs;
+	/* The largest entry; the copy threshold applies to it. */
+	u32 max_len;
+	struct io_uring_opaque_send_entry *ent;
+	struct io_opaque_data **pin;
+	struct bio_vec *bv;
 };
 
 struct io_opaque_stream {
@@ -325,6 +348,12 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 void io_opaque_send_resolve(struct io_opaque_req *op);
 int io_opaque_send_acquire(struct io_opaque_req *op);
+int io_opaque_vec_check(const struct io_uring_opaque_send_entry *ent, u32 nr,
+			u32 *total, u32 *max_len);
+int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
+int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr);
+void io_opaque_vec_release(struct io_opaque_req *op);
+extern unsigned int io_opaque_send_vec_segs;
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);

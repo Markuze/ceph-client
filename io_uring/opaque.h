@@ -14,6 +14,7 @@ struct io_uring_opaque_config;
 struct io_opaque_stream;
 struct io_opaque_data;
 struct io_opaque_tx;
+struct io_opaque_vec;
 
 enum io_opaque_phase {
 	IO_OPAQUE_IDLE,
@@ -76,6 +77,13 @@ struct io_opaque_req {
 			u64 transient;
 		};
 	};
+	/*
+	 * Block of a vectored send, kept when the request returns to the ring's
+	 * cache so that the next one has none to allocate. It is not part of the
+	 * union and is the last member: allocation clears everything before it.
+	 * Only a request with IORING_OPAQUE_SEND_VECTOR uses it, whatever it holds.
+	 */
+	struct io_opaque_vec *vec;
 };
 
 bool io_opaque_cache_init(struct io_ring_ctx *ctx);

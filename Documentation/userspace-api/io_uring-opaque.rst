@@ -325,6 +325,25 @@ in ``msg_flags``. ``ioprio`` is zero for reusable sends or contains
 fields are zero. SEND_LAST rejects ``IOSQE_CQE_SKIP_SUCCESS`` so ownership
 transfer is always reported.
 
+With ``IORING_OPAQUE_SEND_VECTOR`` in ``ioprio``, ``addr`` instead points to an
+array of ``len`` ``struct io_uring_opaque_send_entry``, from one to
+``IORING_OPAQUE_SEND_VEC_MAX`` (1024), and ``off`` is zero. An entry holds a
+handle, an offset, a length of at least one byte and a reserved word that is
+zero. It names an object range exactly as ``addr``, ``off`` and ``len`` do for
+a single send, and the same handle, even the same range, may appear more than
+once. The body is the concatenation of the ranges in order, and the optional
+``addr3`` frame wraps the whole vector; prefix, body and suffix together must
+still fit INT_MAX. The array is copied when the SQE is prepared and need not
+stay valid afterwards; the frame keeps its validity rule. A vector is one send,
+with one queue entry, one cursor and one CQE, whose result counts the bytes
+queued and which has ``IORING_CQE_F_OPAQUE_CONSUMED`` exactly when the request
+took ownership of every handle. SEND_LAST applies to every entry: first issue checks
+all of them before it pins or removes any, so a vector that fails admission
+consumes nothing, and then takes each distinct handle once however often it
+appears. All ranges together may span at most 4096 backing segments, one per
+extent of the object's bvec array; more fails with EMSGSIZE at first issue,
+before anything is pinned.
+
 Ordinary SEND first issue pins the current immutable backing version, leaving
 the handle available for caching, further reads and sends to other destinations.
 SEND preparation validates SQE fields without resolving the handle. At first
@@ -356,11 +375,13 @@ continue using their version. A SEND_LAST awaiting its first issue has no pin
 and fails with ESTALE if another operation removes the handle first.
 
 One SQE, queue item, continuation cursor and CQE cover prefix, opaque body and
-suffix. The body uses the retained bvec array with ``MSG_SPLICE_PAGES``; private
+suffix, also when the body is a vector of ranges. The body uses the retained
+bvec array with ``MSG_SPLICE_PAGES``; private
 framing uses ordinary copied TCP sends. The ``send_copy_max`` evaluation
 parameter can make TCP copy a small body the same way instead: the object stays
 immutable and TCP keeps no reference to it, so nothing else about the send
-changes. Internal send attempts advance across
+changes. A vector is spliced or copied as a whole, by its largest range.
+Internal send attempts advance across
 these segments, setting MSG_MORE while segments remain. Partial progress resumes
 at the saved whole-frame cursor. Without MSG_DONTWAIT,
 the request continues until the complete frame is queued or an error/cancellation ends
