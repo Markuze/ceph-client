@@ -2685,6 +2685,90 @@ static void opaque_send_loopback(struct kunit *test)
 }
 
 /*
+ * Attaching a collector takes the socket and then tables, the order in which a
+ * send admits with the socket owned. This runs it on the wire fixture's socket,
+ * whose lockdep class a send shares: an attach that succeeds, one that is
+ * refused after both locks are taken, and the close that undoes the first.
+ * None may leave either lock held, and under lockdep none may find them in
+ * the other order.
+ */
+static void opaque_attach_lock_order(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_req *op[2];
+	struct io_opaque_stream *stream;
+	struct io_rings *rings;
+	struct sock *sk;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	/* One stream slot, and a CQ ring of four 32-byte entries to take its token. */
+	store->config.max_streams = 1;
+	store->streams = kunit_kcalloc(test, 1, sizeof(*store->streams), GFP_KERNEL);
+	store->stream_used = kunit_kzalloc(test, sizeof(unsigned long), GFP_KERNEL);
+	rings = kunit_kzalloc(test, struct_size(rings, cqes, 8), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, store->streams);
+	KUNIT_ASSERT_NOT_NULL(test, store->stream_used);
+	KUNIT_ASSERT_NOT_NULL(test, rings);
+	opaque_wire_init(test, w);
+	w->ctx->rings = rings;
+	RCU_INIT_POINTER(w->ctx->rings_rcu, rings);
+	w->ctx->cq_entries = 4;
+	w->ctx->flags |= IORING_SETUP_CQE32;
+	spin_lock_init(&w->ctx->completion_lock);
+	sk = w->tx->sk;
+	for (i = 0; i < ARRAY_SIZE(op); i++) {
+		op[i] = kunit_kzalloc(test, sizeof(*op[i]), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, op[i]);
+		op[i]->store = store;
+		op[i]->req = &w->req[i];
+		op[i]->op = U16_MAX - 1;
+		INIT_LIST_HEAD(&op[i]->wait);
+		INIT_LIST_HEAD(&op[i]->cancel);
+		w->req[i].cqe.user_data = 0xa0 + i;
+	}
+
+	mutex_lock(&w->ctx->uring_lock);
+	KUNIT_ASSERT_EQ(test, io_opaque_attach(op[0]), 0);
+	mutex_unlock(&w->ctx->uring_lock);
+	lockdep_assert_none_held_once();
+	stream = op[0]->stream;
+	KUNIT_ASSERT_NOT_NULL(test, stream);
+	KUNIT_EXPECT_PTR_EQ(test, sk->sk_rx_owner, &stream->owner);
+	KUNIT_EXPECT_PTR_EQ(test, store->streams[0].stream, stream);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 1U);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	/* The token went to the request in a 32-byte CQE, with MORE. */
+	KUNIT_EXPECT_EQ(test, rings->cqes[0].user_data, 0xa0ULL);
+	KUNIT_EXPECT_TRUE(test, rings->cqes[0].flags & IORING_CQE_F_MORE);
+	KUNIT_EXPECT_EQ(test, rings->cqes[1].user_data, stream->token);
+
+	/* A second collector is refused with both locks taken, and gives both back. */
+	mutex_lock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, io_opaque_attach(op[1]), -EBUSY);
+	mutex_unlock(&w->ctx->uring_lock);
+	lockdep_assert_none_held_once();
+	KUNIT_EXPECT_PTR_EQ(test, op[1]->stream, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, sk->sk_rx_owner, &stream->owner);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 1U);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+
+	/* Closing the stream lets go of the socket; then the slot's and the collector's refs. */
+	io_opaque_stream_close(stream);
+	lockdep_assert_none_held_once();
+	KUNIT_EXPECT_TRUE(test, stream->closed);
+	KUNIT_EXPECT_PTR_EQ(test, sk->sk_rx_owner, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&stream->refs), 2);
+	store->streams[0].stream = NULL;
+	store->nr_streams--;
+	io_opaque_stream_put(stream);
+	io_opaque_stream_put(stream);
+}
+
+/*
  * Vectored OBJ_SEND: one SQE names several object ranges, and the body is
  * their concatenation. The request owns a block with the entries, a reference
  * per entry and the combined segments; a test frees it with the request.
@@ -4423,6 +4507,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_resolve),
 	KUNIT_CASE(opaque_send_copy_policy),
 	KUNIT_CASE(opaque_send_loopback),
+	KUNIT_CASE(opaque_attach_lock_order),
 	KUNIT_CASE(opaque_send_vec_check),
 	KUNIT_CASE(opaque_send_vec_acquire),
 	KUNIT_CASE(opaque_send_vec_pin_once),

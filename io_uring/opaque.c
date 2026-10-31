@@ -506,7 +506,7 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 	return 0;
 }
 
-static void io_opaque_stream_put(struct io_opaque_stream *stream)
+VISIBLE_IF_KUNIT void io_opaque_stream_put(struct io_opaque_stream *stream)
 {
 	if (stream && refcount_dec_and_test(&stream->refs)) {
 		io_opaque_extents_free(stream->store, &stream->extents);
@@ -1396,7 +1396,12 @@ int io_opaque_recv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	return 0;
 }
 
-static int io_opaque_attach(struct io_opaque_req *op)
+/*
+ * Make @op the collector of its socket. The socket is taken before tables,
+ * which is the order a send admits in, with the socket owned. Nothing may wait
+ * for a socket lock while it holds tables.
+ */
+VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_stream *stream;
@@ -1420,8 +1425,8 @@ static int io_opaque_attach(struct io_opaque_req *op)
 	stream->owner.actor = io_opaque_actor;
 	stream->owner.data = stream;
 	stream->collector = op;
-	mutex_lock(&store->tables);
 	lock_sock(sock->sk);
+	mutex_lock(&store->tables);
 	if (sock->sk->sk_rx_owner || sock->sk->sk_prot != sock->sk->sk_prot_creator ||
 	    tcp_sk(sock->sk)->repair || tcp_sk(sock->sk)->urg_data) {
 		ret = -EBUSY;
@@ -1470,8 +1475,8 @@ static int io_opaque_attach(struct io_opaque_req *op)
 		break;
 	}
 unlock:
-	release_sock(sock->sk);
 	mutex_unlock(&store->tables);
+	release_sock(sock->sk);
 	if (!ret)
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 	if (ret)

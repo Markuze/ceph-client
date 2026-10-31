@@ -232,7 +232,11 @@ struct io_opaque_store {
 	refcount_t refs;
 	refcount_t users;
 	struct io_uring_opaque_config config;
-	/* Handles and candidates; never held during copies or I/O. */
+	/*
+	 * Handles and candidates; never held during copies or I/O. Attach takes
+	 * it with its socket owned, so nothing may take a socket lock while
+	 * holding it.
+	 */
 	struct mutex tables;
 	struct io_opaque_slot *objects;
 	struct io_opaque_stream_slot *streams;
@@ -358,6 +362,8 @@ int io_opaque_range_start(struct io_opaque_req *op);
 void io_opaque_retry_work(struct work_struct *work);
 void io_opaque_budget_wait(struct io_opaque_req *op, int error);
 void io_opaque_stream_close(struct io_opaque_stream *stream);
+void io_opaque_stream_put(struct io_opaque_stream *stream);
+int io_opaque_attach(struct io_opaque_req *op);
 int io_opaque_capture(struct io_opaque_stream *stream,
 		      const struct sk_buff *skb, u32 offset, u32 len,
 		      bool shared);
