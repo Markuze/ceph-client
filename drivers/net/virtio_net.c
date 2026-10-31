@@ -358,11 +358,18 @@ struct receive_queue {
 
 	/* True if the pool was created with PP_FLAG_PRIVATE_HEADERS, for a
 	 * queue that has a provider of readable pages. Another party can then
-	 * read and write the pool pages, so page_to_skb() copies the headers
-	 * into a private head. Changes only while NAPI is off. XDP and AF_XDP
-	 * cannot attach to a device with a provider: the core refuses it.
+	 * read and write the pool pages. Changes only while NAPI is off. XDP
+	 * and AF_XDP cannot attach to a device with a provider: the core
+	 * refuses it.
 	 */
 	bool private_headers;
+
+	/* True once a pool with PP_FLAG_PRIVATE_HEADERS served the queue. The
+	 * ring can then hold pages of such a pool, also after the queue got
+	 * another pool, and page_to_skb() looks at the pool of each page to
+	 * keep the headers out of provider pages. Set while NAPI is off.
+	 */
+	bool provider_pages;
 
 	/* RX: fragments + linear part + virtio header */
 	struct scatterlist sg[MAX_SKB_FRAGS + 2];
@@ -880,6 +887,19 @@ static unsigned int virtnet_priv_head_len(const struct virtnet_info *vi,
 	return hlen;
 }
 
+/* True if no header may stay in @page: the page belongs to a pool that binds a
+ * memory provider, and another party can write the pages of the provider.
+ * The ring can hold pages of an earlier pool of the queue, so look at the pool
+ * of the page, not at the pool of the queue.
+ */
+static bool virtnet_page_private(const struct receive_queue *rq,
+				 struct page *page)
+{
+	if (likely(!rq->provider_pages))
+		return false;
+	return __netmem_get_pp(page_to_netmem(page))->mp_ops;
+}
+
 /* Called from bottom half context */
 static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 				   struct receive_queue *rq,
@@ -911,15 +931,15 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 
 	shinfo_size = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 
-	/* The pool binds a memory provider, so another party can write the
-	 * page. Do not build the skb over the page: the stack would parse
-	 * headers in it. Copy the headers into a private head and attach the
-	 * rest of the buffer as a fragment of the page. Allocate the same
-	 * head as for the other queues, so that a later pull from the
-	 * fragment finds room. Only mergeable buffers get here: no other mode
-	 * has such a queue.
+	/* The pool of the page binds a memory provider, so another party can
+	 * write the page. Do not build the skb over the page: the stack would
+	 * parse headers in it. Copy the headers into a private head and attach
+	 * the rest of the buffer as a fragment of the page. Allocate the same
+	 * head as for the other queues, so that a later pull from the fragment
+	 * finds room. Only mergeable buffers get here: no other mode has such
+	 * a queue.
 	 */
-	if (unlikely(rq->private_headers)) {
+	if (unlikely(virtnet_page_private(rq, page))) {
 		skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
 		if (unlikely(!skb))
 			return NULL;
@@ -3278,6 +3298,7 @@ static int virtnet_setup_page_pool(struct virtnet_info *vi,
 
 	rq->page_pool = pool;
 	rq->private_headers = private_headers;
+	rq->provider_pages |= private_headers;
 	rq->use_page_pool_dma = !!virtqueue_dma_dev(rq->vq);
 
 	return 0;
@@ -6087,6 +6108,7 @@ static int virtnet_queue_start(struct net_device *dev,
 	/* NAPI is off, so no poll sees the queue half installed. */
 	rq->page_pool = mem->page_pool;
 	rq->private_headers = mem->private_headers;
+	rq->provider_pages |= mem->private_headers;
 	mem->page_pool = NULL;
 	mem->private_headers = false;
 	page_pool_enable_direct_recycling(rq->page_pool, &rq->napi);
