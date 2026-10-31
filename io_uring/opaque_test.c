@@ -7406,6 +7406,88 @@ static void opaque_maio_compact(struct kunit *test)
 	io_opaque_data_put(plain, sparse);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
+
+/*
+ * CREATE in a bound store copies into ordinary pages and not into the area:
+ * the process has the bytes already, so there is nothing to make visible to
+ * it. The object is not mapped and not published as MAPPED, every extent is
+ * outside the area, a COMPACT is the no-op of any created object, and the area
+ * neither gives a page when the object is made nor takes one when it is freed.
+ */
+static void opaque_maio_create(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+	struct io_opaque_store *store = opaque_maio_store(test, ifq);
+	struct io_zcrx_area *area = ifq->areas[0];
+	struct io_kiocb *req = kunit_kzalloc(test, sizeof(*req), GFP_KERNEL);
+	struct io_opaque_req op = {
+		.store = store, .req = req, .op = IORING_OPAQUE_CREATE,
+		.length = 2 * PAGE_SIZE + 100,
+	};
+	struct io_opaque_extent *extent;
+	struct io_opaque_data *data;
+	u64 flags = 0, total = 0;
+	unsigned long addr;
+	u8 *pattern, *after;
+
+	KUNIT_ASSERT_NOT_NULL(test, req);
+	addr = kunit_vm_mmap(test, NULL, 0, 4 * PAGE_SIZE, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE, 0);
+	if (!addr || addr >= TASK_SIZE)
+		kunit_skip(test, "no userspace mapping for CREATE input");
+	pattern = kunit_kmalloc(test, op.length, GFP_KERNEL);
+	after = kunit_kzalloc(test, op.length, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, pattern);
+	KUNIT_ASSERT_NOT_NULL(test, after);
+	get_random_bytes(pattern, op.length);
+	KUNIT_ASSERT_EQ(test, copy_to_user((void __user *)addr, pattern, op.length), 0UL);
+	op.addr = (void __user *)addr;
+
+	op.data = io_opaque_data_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, op.data);
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, ALIGN(op.length, PAGE_SIZE), true));
+	op.create_reserved = ALIGN(op.length, PAGE_SIZE);
+	KUNIT_ASSERT_EQ(test, io_opaque_create_build(&op), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_publish(&op, &flags), (int)op.length);
+	KUNIT_EXPECT_EQ(test, flags, 0ULL);
+
+	/* No page of the area is in use, and the object is not mapped. */
+	KUNIT_EXPECT_EQ(test, area->free_count, 16U);
+	KUNIT_EXPECT_EQ(test, opaque_slots_in(ifq, IO_ZCRX_KSLOT_OWNED), 0U);
+	data = store->objects[op.slot].data;
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_EXPECT_FALSE(test, data->mapped);
+	KUNIT_EXPECT_TRUE(test, data->dense);
+	KUNIT_EXPECT_EQ(test, data->length, (u64)op.length);
+	KUNIT_EXPECT_GE(test, data->nr, 1U);
+	list_for_each_entry(extent, &data->extents, list) {
+		struct io_uring_opaque_extent pair = io_opaque_extent_pair(store, extent);
+
+		KUNIT_EXPECT_FALSE(test, extent->backing->area);
+		KUNIT_EXPECT_FALSE(test, extent->backing->pool);
+		KUNIT_EXPECT_EQ(test, pair.area_off, IORING_OPAQUE_EXTENT_UNMAPPED);
+		KUNIT_EXPECT_EQ(test, pair.len, (u64)extent->length);
+		total += pair.len;
+	}
+	KUNIT_EXPECT_EQ(test, total, data->length);
+	opaque_test_copy(data, after);
+	KUNIT_EXPECT_MEMEQ(test, after, pattern, op.length);
+
+	/* It is dense, so COMPACT does nothing, and does not refuse as for a mapped object. */
+	KUNIT_EXPECT_EQ(test, io_opaque_compact_start(&op), 0);
+
+	/* The release gives the area nothing. */
+	mutex_lock(&store->tables);
+	data = io_opaque_detach(store, &store->objects[op.slot]);
+	mutex_unlock(&store->tables);
+	io_opaque_data_put(store, data);
+	io_opaque_create_release(&op);
+	KUNIT_EXPECT_EQ(test, area->free_count, 16U);
+	KUNIT_EXPECT_EQ(test, opaque_slots_in(ifq, IO_ZCRX_KSLOT_FREE), 16U);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
 #endif
 
 static struct kunit_case opaque_cases[] = {
@@ -7508,6 +7590,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_maio_extents),
 	KUNIT_CASE(opaque_maio_exhausted),
 	KUNIT_CASE(opaque_maio_compact),
+	KUNIT_CASE(opaque_maio_create),
 #endif
 	{}
 };

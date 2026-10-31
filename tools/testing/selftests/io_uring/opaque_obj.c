@@ -5456,6 +5456,86 @@ static void test_maio_store_first(struct io_uring_opaque_config cfg)
 	ksft_test_result_pass("the store exits first: the instance stays, every page is free\n");
 }
 
+/*
+ * CREATE in a store that binds an instance copies into pages outside the area.
+ * The process has the bytes already, so nothing needs to be made visible: the
+ * completion and OBJECT_STAT do not say MAPPED, every extent is outside the
+ * area, and the area stays whole. An object of every page of the area still
+ * arrives while the created one lives.
+ */
+static void test_maio_create(struct io_uring_opaque_config cfg)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	const size_t length = 3 * page + 123, pages = 8;
+	struct io_uring_opaque_extent vec[32];
+	struct io_uring_opaque_object_stat os;
+	struct io_uring_opaque_stat stat;
+	uint64_t stream, created, whole, total = 0;
+	unsigned char *data, *got;
+	unsigned int i, nr;
+	struct event event;
+	uint32_t bound;
+	int source[2];
+	struct maio z;
+	struct ring r;
+
+	if (!maio_ok) {
+		maio_skip(1);
+		return;
+	}
+	data = malloc(2 * pages * page);
+	require(data, "MAIO test buffers");
+	got = data + pages * page;
+	maio_pattern(data, length, 3);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "MAIO ring");
+	require(!maio_register(&r, &z, pages), "MAIO instance");
+	maio_map(&r, &z);
+	require(!maio_store(&r, cfg, z.id, &bound), "store that binds the instance");
+
+	event = command(&r, bound, IORING_OPAQUE_CREATE, 0, 0, length, data);
+	created = event.extra[0];
+	require(event.res == (int)length && created && !event.flags && !event.extra[1],
+		"CREATE in a bound store: complete, without MAPPED");
+	require(!cmd_res(&r, bound, IORING_OPAQUE_OBJECT_STAT, created, 0, sizeof(os), &os) &&
+		!(os.flags & IORING_OPAQUE_OBJECT_F_MAPPED) && os.length == length,
+		"OBJECT_STAT of a created object: not MAPPED");
+	nr = os.extents;
+	require(nr && nr <= ARRAY_SIZE(vec), "extents of the created object");
+	event = command(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, created, 0, sizeof(vec), vec);
+	require(event.res == (int)(nr * sizeof(vec[0])), "EXTENTS writes one pair per extent");
+	for (i = 0; i < nr; i++) {
+		require(vec[i].area_off == IORING_OPAQUE_EXTENT_UNMAPPED && vec[i].len,
+			"every extent of a created object is outside the area");
+		total += vec[i].len;
+	}
+	require(total == length, "extent lengths add up to the object");
+	require(cmd_res(&r, bound, IORING_OPAQUE_READ_OBJECT, created, 0, length, got) ==
+		(int)length && !memcmp(got, data, length), "READ_OBJECT returns the created bytes");
+
+	/* The area is whole: an object of every page of it arrives, and is in the area. */
+	tcp_pair(source);
+	stream = attach(&r, bound, source[1], next_tag++);
+	maio_pattern(data, pages * page, 6);
+	event = receive_complete(&r, bound, stream, source[0], 0, data, pages * page);
+	whole = event.extra[0];
+	require(whole && (event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED),
+		"an object of every page of the area, MAPPED");
+	maio_gather(&r, bound, &z, whole, pages * page, got, vec, ARRAY_SIZE(vec));
+	require(!memcmp(got, data, pages * page), "the whole area in the mapping");
+
+	maio_end(&r, bound, IORING_OPAQUE_FREE, whole);
+	maio_end(&r, bound, IORING_OPAQUE_FREE, created);
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	require(!cmd_res(&r, bound, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		!stat.backing_bytes && !stat.extents && !stat.objects, "store drains");
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(source[0]);
+	close(source[1]);
+	free(data);
+	ksft_test_result_pass("bound store: CREATE stays outside the area, UNMAPPED, area whole\n");
+}
+
 static void test_timeout(int signal_number)
 {
 	static const char message[] = "OPAQUE timeout; adjust OPAQUE_TEST_TIMEOUT\n";
@@ -5974,7 +6054,7 @@ int main(void)
 		maio_ok = !maio_err;
 		ring_exit(&probe);
 	}
-	ksft_set_plan(120);
+	ksft_set_plan(121);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	test_create(cfg);
 	test_create_quota(cfg);
@@ -6252,6 +6332,7 @@ int main(void)
 	test_allocation_failure(&cfg);
 	test_maio_registration(cfg);
 	test_maio_objects(cfg);
+	test_maio_create(cfg);
 	test_maio_exhaustion(cfg);
 	test_maio_recycle(cfg);
 	test_maio_instance_first(cfg);
