@@ -38,6 +38,8 @@
  * began. A smaller one is walked, which is as short.
  */
 #define IO_OPAQUE_SEEK_STRIDE	16
+/* Slots of the table of handles that a policy change walks while it holds tables. */
+#define IO_OPAQUE_POLICY_CHUNK	256
 
 /* What io_opaque_tx_join() returns besides an error. */
 /* Queued behind another frame and parked, with its references taken. */
@@ -309,6 +311,8 @@ struct io_opaque_store {
 	struct delayed_work retry_work;
 	struct list_head candidates;
 	struct io_uring_opaque_policy policy;
+	/* Counts policy changes; a walk of the table that is overtaken by another stops. */
+	u32 policy_seq;
 	u64 tokens;
 	unsigned long token_time;
 	unsigned long auto_at;
@@ -404,6 +408,10 @@ int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr);
 void io_opaque_vec_release(struct io_opaque_req *op);
 void io_opaque_vec_build(struct io_opaque_req *op);
 int io_opaque_vec_finish(struct io_opaque_req *op, int ret);
+int io_opaque_apply_policy(struct io_opaque_store *store,
+			   const struct io_uring_opaque_policy *policy);
+extern unsigned int io_opaque_policy_chunk;
+extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_stepped;
 extern atomic_long_t io_opaque_vec_counted;

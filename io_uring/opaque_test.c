@@ -5502,6 +5502,205 @@ static void opaque_compact_inline(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/*
+ * A policy change marks the candidates for automatic compaction, in chunks of
+ * the table of handles with tables dropped between them. What it leaves is what
+ * one walk would, whatever else happens in between: an object that joins the
+ * candidates meanwhile is not added twice, a newer policy that was installed
+ * between two chunks is not overwritten by the rest of the older walk, and a
+ * store that has stopped ends it.
+ */
+#define OPAQUE_POLICY_SLOTS	12
+
+static struct {
+	unsigned int calls, candidates[4], at;
+	bool tables_free;
+	/* What to do between chunks. */
+	enum { POLICY_NOTHING, POLICY_OVERTAKE, POLICY_STOP, POLICY_JOIN } what;
+	struct io_uring_opaque_policy *newer;
+	bool inside;
+} opaque_policy_hook;
+
+static unsigned int opaque_policy_count(struct io_opaque_store *store)
+{
+	struct io_opaque_slot *slot;
+	unsigned int n = 0;
+
+	list_for_each_entry(slot, &store->candidates, candidate)
+		n++;
+	return n;
+}
+
+static void opaque_policy_between(struct io_opaque_store *store)
+{
+	struct io_opaque_slot *slot;
+
+	if (opaque_policy_hook.inside)
+		return;
+	opaque_policy_hook.inside = true;
+	opaque_policy_hook.tables_free &= !mutex_is_locked(&store->tables);
+	if (opaque_policy_hook.at < ARRAY_SIZE(opaque_policy_hook.candidates))
+		opaque_policy_hook.candidates[opaque_policy_hook.at] = opaque_policy_count(store);
+	opaque_policy_hook.at++;
+	opaque_policy_hook.calls++;
+	switch (opaque_policy_hook.what) {
+	case POLICY_OVERTAKE:
+		/* The first chunk is behind us: a newer policy walks all of it. */
+		if (opaque_policy_hook.calls == 1)
+			io_opaque_apply_policy(store, opaque_policy_hook.newer);
+		break;
+	case POLICY_STOP:
+		mutex_lock(&store->tables);
+		store->dead = 1;
+		mutex_unlock(&store->tables);
+		break;
+	case POLICY_JOIN:
+		/* The publish path adds an object that the walk has not reached yet. */
+		slot = &store->objects[OPAQUE_POLICY_SLOTS - 1];
+		mutex_lock(&store->tables);
+		if (list_empty(&slot->candidate))
+			list_add_tail(&slot->candidate, &store->candidates);
+		mutex_unlock(&store->tables);
+		break;
+	default:
+		break;
+	}
+	opaque_policy_hook.inside = false;
+}
+
+static void opaque_policy_restore(void *arg)
+{
+	io_opaque_policy_chunk = IO_OPAQUE_POLICY_CHUNK;
+	io_opaque_policy_between = NULL;
+}
+
+/* The slots that a policy marks, in order, as a bit mask. */
+static u32 opaque_policy_mask(struct io_opaque_store *store)
+{
+	struct io_opaque_slot *slot;
+	u32 mask = 0;
+
+	list_for_each_entry(slot, &store->candidates, candidate)
+		mask |= 1U << (slot - store->objects);
+	return mask;
+}
+
+static void opaque_policy_chunks(struct kunit *test)
+{
+	/* Slots 0, 2, 3, 5, 8, 9 and 11 hold a version that compaction could improve. */
+	const u32 eligible = BIT(0) | BIT(2) | BIT(3) | BIT(5) | BIT(8) | BIT(9) | BIT(11);
+	struct io_uring_opaque_policy on = {
+		.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT, .bytes_per_second = SZ_1M,
+		.burst_bytes = SZ_64K, .max_temporary_bytes = SZ_64K,
+	};
+	struct io_uring_opaque_policy off = { };
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data[OPAQUE_POLICY_SLOTS] = {};
+	u32 i, seq;
+
+	store->config.max_objects = OPAQUE_POLICY_SLOTS;
+	store->config.hard_limit = SZ_1M;
+	store->objects = kunit_kcalloc(test, OPAQUE_POLICY_SLOTS, sizeof(*store->objects),
+				       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, store->objects);
+	INIT_LIST_HEAD(&store->copies);
+	INIT_DELAYED_WORK(&store->compact_work, opaque_test_noop_work);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_cancel_work,
+							&store->compact_work), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_policy_restore, NULL), 0);
+	for (i = 0; i < OPAQUE_POLICY_SLOTS; i++)
+		INIT_LIST_HEAD(&store->objects[i].candidate);
+	for (i = 0; i < OPAQUE_POLICY_SLOTS; i++) {
+		if (i == 6 || i == 7)
+			continue;	/* nothing published */
+		data[i] = io_opaque_data_alloc();
+		KUNIT_ASSERT_NOT_NULL(test, data[i]);
+		data[i]->dense = i == 1 || i == 10;
+		data[i]->forward_only = i == 4;
+		store->objects[i].data = data[i];
+	}
+	memset(&opaque_policy_hook, 0, sizeof(opaque_policy_hook));
+	opaque_policy_hook.newer = &off;
+	opaque_policy_hook.tables_free = true;
+
+	/* In one go: every candidate, and the policy and its counter. */
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), eligible);
+	KUNIT_EXPECT_EQ(test, store->policy.flags, (u32)IORING_OPAQUE_POLICY_F_AUTO_COMPACT);
+	KUNIT_EXPECT_EQ(test, store->tokens, (u64)SZ_64K);
+	KUNIT_EXPECT_EQ(test, store->policy_seq, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.calls, 0U);
+	/* Again: nothing is added twice. */
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_count(store), (unsigned int)hweight32(eligible));
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), 0U);
+	KUNIT_EXPECT_EQ(test, store->policy.flags, 0U);
+
+	/* In chunks of three: the same, with tables free between, and the walk seen half done. */
+	io_opaque_policy_chunk = 3;
+	io_opaque_policy_between = opaque_policy_between;
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), eligible);
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.calls, 3U);
+	KUNIT_EXPECT_TRUE(test, opaque_policy_hook.tables_free);
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.candidates[0], 2U);	/* slots 0 and 2 */
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.candidates[1], 4U);	/* and 3 and 5 */
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.candidates[2], 5U);	/* and 8 */
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), 0U);
+
+	/* An object that joins the candidates between chunks is on the list once. */
+	memset(&opaque_policy_hook, 0, sizeof(opaque_policy_hook));
+	opaque_policy_hook.tables_free = true;
+	opaque_policy_hook.what = POLICY_JOIN;
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), eligible);
+	KUNIT_EXPECT_EQ(test, opaque_policy_count(store), (unsigned int)hweight32(eligible));
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), 0);
+
+	/*
+	 * A newer policy that comes in after the first chunk, and is off: it clears
+	 * every candidate and the older walk, on, gives up without adding the rest.
+	 */
+	memset(&opaque_policy_hook, 0, sizeof(opaque_policy_hook));
+	opaque_policy_hook.tables_free = true;
+	opaque_policy_hook.what = POLICY_OVERTAKE;
+	opaque_policy_hook.newer = &off;
+	seq = store->policy_seq;
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
+	KUNIT_EXPECT_EQ(test, store->policy_seq, seq + 2);
+	KUNIT_EXPECT_EQ(test, store->policy.flags, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), 0U);
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.calls, 1U);
+	/* And the other way round: the newer one is on, and has every candidate once. */
+	memset(&opaque_policy_hook, 0, sizeof(opaque_policy_hook));
+	opaque_policy_hook.tables_free = true;
+	opaque_policy_hook.what = POLICY_OVERTAKE;
+	opaque_policy_hook.newer = &on;
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), 0);
+	KUNIT_EXPECT_EQ(test, store->policy.flags, (u32)IORING_OPAQUE_POLICY_F_AUTO_COMPACT);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), eligible);
+	KUNIT_EXPECT_EQ(test, opaque_policy_count(store), (unsigned int)hweight32(eligible));
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), 0);
+
+	/* A store that stops between chunks ends the change, with what was walked left. */
+	memset(&opaque_policy_hook, 0, sizeof(opaque_policy_hook));
+	opaque_policy_hook.tables_free = true;
+	opaque_policy_hook.what = POLICY_STOP;
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.calls, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), (u32)(BIT(0) | BIT(2)));
+	/* And one that has stopped takes no change at all. */
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, store->policy.flags, (u32)IORING_OPAQUE_POLICY_F_AUTO_COMPACT);
+
+	for (i = 0; i < OPAQUE_POLICY_SLOTS; i++) {
+		list_del_init(&store->objects[i].candidate);
+		kfree(data[i]);
+	}
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_reservation_unwind),
 	KUNIT_CASE(opaque_create_publish_revalidate),
@@ -5582,6 +5781,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_grow_retry),
 	KUNIT_CASE(opaque_send_vec_build_pinned),
 	KUNIT_CASE(opaque_send_vec_prep),
+	KUNIT_CASE(opaque_policy_chunks),
 	KUNIT_CASE(opaque_params_sysfs),
 	{}
 };

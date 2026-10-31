@@ -598,11 +598,89 @@ int io_opaque_compact_start(struct io_opaque_req *op)
 	return io_opaque_compact_inline(op);
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/* Variables under KUnit, so that a test walks in small chunks and acts between them. */
+unsigned int io_opaque_policy_chunk = IO_OPAQUE_POLICY_CHUNK;
+void (*io_opaque_policy_between)(struct io_opaque_store *store);
+#define IO_OPAQUE_POLICY_CHUNK_SLOTS	io_opaque_policy_chunk
+#define IO_OPAQUE_POLICY_BETWEEN(store)				\
+	do {							\
+		if (io_opaque_policy_between)			\
+			io_opaque_policy_between(store);	\
+	} while (0)
+#else
+#define IO_OPAQUE_POLICY_CHUNK_SLOTS	IO_OPAQUE_POLICY_CHUNK
+#define IO_OPAQUE_POLICY_BETWEEN(store)	((void)(store))
+#endif
+
+/*
+ * Install @policy and mark the objects it concerns as candidates, or not. Where
+ * the table of handles is long this is the longest thing done under tables, so
+ * the walk drops it every IO_OPAQUE_POLICY_CHUNK_SLOTS slots and those waiting
+ * for it wait for a chunk. What happens between chunks cannot hurt it. The
+ * policy is in force from the first one, so an object published meanwhile joins
+ * the candidates by itself, or does not, and one freed leaves them; the walk
+ * adds a slot only if it is not on the list. A second change that starts
+ * meanwhile walks the whole table itself, so the first gives up when it comes
+ * back and finds it was overtaken, as it does if the store has stopped.
+ */
+VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
+					    const struct io_uring_opaque_policy *policy)
+{
+	bool automatic = policy->flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
+	u32 i, seq;
+
+	mutex_lock(&store->tables);
+	if (store->dead) {
+		mutex_unlock(&store->tables);
+		return -ESHUTDOWN;
+	}
+	store->policy = *policy;
+	store->tokens = policy->burst_bytes;
+	store->token_time = jiffies;
+	store->auto_at = jiffies;
+	seq = ++store->policy_seq;
+	for (i = 0; i < store->config.max_objects; i++) {
+		struct io_opaque_slot *slot = &store->objects[i];
+
+		if (automatic && slot->data && !slot->data->dense && !slot->data->forward_only &&
+		    list_empty(&slot->candidate)) {
+			list_add_tail(&slot->candidate, &store->candidates);
+			slot->retry = jiffies;
+		} else if (!automatic) {
+			list_del_init(&slot->candidate);
+		}
+		if ((i + 1) % IO_OPAQUE_POLICY_CHUNK_SLOTS || i + 1 == store->config.max_objects)
+			continue;
+		mutex_unlock(&store->tables);
+		IO_OPAQUE_POLICY_BETWEEN(store);
+		cond_resched();
+		mutex_lock(&store->tables);
+		if (store->dead) {
+			mutex_unlock(&store->tables);
+			return -ESHUTDOWN;
+		}
+		if (store->policy_seq != seq) {
+			mutex_unlock(&store->tables);
+			return 0;
+		}
+	}
+	if (automatic) {
+		mod_delayed_work(system_dfl_wq, &store->compact_work, 0);
+	} else {
+		guard(spinlock)(&store->wait_lock);
+		/* Policy changes cannot cancel an accepted manual request. */
+		if (list_empty(&store->copies))
+			cancel_delayed_work(&store->compact_work);
+	}
+	mutex_unlock(&store->tables);
+	return 0;
+}
+
 int io_opaque_set_policy(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_uring_opaque_policy policy;
-	u32 i;
 	int ret;
 
 	if (op->length < offsetof(struct io_uring_opaque_policy, __resv) ||
@@ -620,37 +698,7 @@ int io_opaque_set_policy(struct io_opaque_req *op)
 	    (!policy.bytes_per_second || !policy.burst_bytes ||
 	     policy.max_temporary_bytes < PAGE_SIZE))
 		return -EINVAL;
-	mutex_lock(&store->tables);
-	if (store->dead) {
-		mutex_unlock(&store->tables);
-		return -ESHUTDOWN;
-	}
-	store->policy = policy;
-	store->tokens = policy.burst_bytes;
-	store->token_time = jiffies;
-	store->auto_at = jiffies;
-	for (i = 0; i < store->config.max_objects; i++) {
-		struct io_opaque_slot *slot = &store->objects[i];
-
-		if ((policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) &&
-		    slot->data && !slot->data->dense && !slot->data->forward_only &&
-		    list_empty(&slot->candidate)) {
-			list_add_tail(&slot->candidate, &store->candidates);
-			slot->retry = jiffies;
-		} else if (!(policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
-			list_del_init(&slot->candidate);
-		}
-	}
-	if (policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) {
-		mod_delayed_work(system_dfl_wq, &store->compact_work, 0);
-	} else {
-		guard(spinlock)(&store->wait_lock);
-		/* Policy changes cannot cancel an accepted manual request. */
-		if (list_empty(&store->copies))
-			cancel_delayed_work(&store->compact_work);
-	}
-	mutex_unlock(&store->tables);
-	return 0;
+	return io_opaque_apply_policy(store, &policy);
 }
 
 /* The same dispatcher handles bounded scans and the store-wide token bucket. */
