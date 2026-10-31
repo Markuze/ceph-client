@@ -645,6 +645,8 @@ struct zt_qmem {
 
 static struct {
 	int		fail_at;
+	int		fail_err;	/* error of the allocation at fail_at, -ENOMEM if 0 */
+	int		close_err;	/* error of the restart that removes the provider */
 	unsigned int	n;
 	int		idx[32];
 	bool		mp[32];
@@ -670,7 +672,9 @@ static int zt_queue_mem_alloc(struct net_device *dev,
 		zt_log.n++;
 	}
 	if (mp && idx == zt_log.fail_at)
-		return -ENOMEM;
+		return zt_log.fail_err ?: -ENOMEM;
+	if (!mp && zt_log.close_err)
+		return zt_log.close_err;
 	pp = page_pool_create(&params);
 	if (IS_ERR(pp))
 		return PTR_ERR(pp);
@@ -804,6 +808,98 @@ static void zcrx_maio_queues(struct kunit *test)
 	free_netdev(dev);
 	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 1U);
 	io_put_zcrx_ifq(ifq);
+}
+
+/*
+ * A driver can fail the allocation of queue memory with -ENETDOWN, as
+ * virtio_net does for an interface that is down. The install then fails with
+ * that error and leaves the device as it was. The removal accepts the same
+ * error from the restart of a queue.
+ */
+static void zcrx_maio_queues_down(struct kunit *test)
+{
+	struct pp_memory_provider_params p = {
+		.mp_ops	= &io_uring_pp_maio_ops,
+		.flags	= PP_MP_F_READABLE,
+	};
+	struct io_zcrx_ifq *ifq = zt_ifq(test, 16);
+	struct net_device *dev = zt_netdev(test, 4);
+
+	p.mp_priv = ifq;
+	dev->netdev_ops = &zt_ndo;
+	dev->queue_mgmt_ops = &zt_qops;
+	netdev_lock(dev);
+
+	/* The first queue fails, so there is nothing to undo. */
+	memset(&zt_log, 0, sizeof(zt_log));
+	zt_log.fail_at = 0;
+	zt_log.fail_err = -ENETDOWN;
+	KUNIT_EXPECT_EQ(test, zcrx_open_maio_queues(dev, ifq), -ENETDOWN);
+	KUNIT_EXPECT_EQ(test, ifq->nr_rxq, 0U);
+	KUNIT_EXPECT_EQ(test, zt_log.n, 1U);
+	KUNIT_EXPECT_TRUE(test, zt_all_clear(dev));
+
+	/* The device goes down after queue 1. The undo meets the error too. */
+	memset(&zt_log, 0, sizeof(zt_log));
+	zt_log.fail_at = 2;
+	zt_log.fail_err = -ENETDOWN;
+	zt_log.close_err = -ENETDOWN;
+	KUNIT_EXPECT_EQ(test, zcrx_open_maio_queues(dev, ifq), -ENETDOWN);
+	KUNIT_EXPECT_EQ(test, ifq->nr_rxq, 0U);
+	KUNIT_EXPECT_EQ(test, zt_log.n, 5U);
+	KUNIT_EXPECT_TRUE(test, zt_all_clear(dev));
+
+	/* The removal on a device that went down clears every queue. */
+	memset(&zt_log, 0, sizeof(zt_log));
+	zt_log.fail_at = -1;
+	KUNIT_ASSERT_EQ(test, zcrx_open_maio_queues(dev, ifq), 0);
+	zt_log.close_err = -ENETDOWN;
+	zcrx_close_maio_queues(dev, ifq, &p);
+	KUNIT_EXPECT_EQ(test, ifq->nr_rxq, 0U);
+	KUNIT_EXPECT_TRUE(test, zt_all_clear(dev));
+
+	netdev_unlock(dev);
+	free_netdev(dev);
+	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 1U);
+	io_put_zcrx_ifq(ifq);
+}
+
+/*
+ * The core calls uninstall when the device unregisters. A pool of the
+ * instance can live on, for example when the driver could not stop a queue
+ * and destroys its pool later. The ring can unregister the instance in the
+ * meantime. The destroy of the pool then drops the last reference. It needs
+ * no device, and the area stays whole until then.
+ */
+static void zcrx_maio_destroy_after_uninstall(struct kunit *test)
+{
+	struct netdev_rx_queue *rxq;
+	struct zt_env env;
+	struct page *page;
+
+	zt_env_init(test, &env, 16, 1);
+	rxq = __netif_get_rx_queue(env.dev, 0);
+	page = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	/* The ring holds one reference and the pool holds one. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&env.ifq->refs), 2U);
+
+	/* The device unregisters. The instance drops its hold on the device. */
+	netdev_hold(env.dev, &env.ifq->netdev_tracker, GFP_KERNEL);
+	env.ifq->netdev = env.dev;
+	rxq->mp_params.mp_ops->uninstall(rxq->mp_params.mp_priv, rxq);
+	KUNIT_EXPECT_NULL(test, env.ifq->netdev);
+	KUNIT_EXPECT_TRUE(test, zt_all_clear(env.dev));
+
+	/* The ring unregisters the instance and finds no device. */
+	zcrx_unregister(env.ifq, NULL);
+	KUNIT_EXPECT_EQ(test, env.ifq->nr_rxq, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&env.ifq->refs), 1U);
+
+	/* The pool gets its page back and dies. This frees the instance. */
+	zt_free(env.pp[0], page);
+	page_pool_destroy(env.pp[0]);
+	free_netdev(env.dev);
 }
 
 struct zt_stress {
@@ -1096,6 +1192,8 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_teardown),
 	KUNIT_CASE(zcrx_maio_get_put),
 	KUNIT_CASE(zcrx_maio_queues),
+	KUNIT_CASE(zcrx_maio_queues_down),
+	KUNIT_CASE(zcrx_maio_destroy_after_uninstall),
 	KUNIT_CASE_SLOW(zcrx_maio_stress),
 #ifdef CONFIG_HAS_DMA
 	KUNIT_CASE(zcrx_maio_dma),
