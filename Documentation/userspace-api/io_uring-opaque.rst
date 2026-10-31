@@ -347,12 +347,18 @@ before anything is pinned.
 
 Ordinary SEND first issue pins the current immutable backing version, leaving
 the handle available for caching, further reads and sends to other destinations.
-SEND preparation validates SQE fields without resolving the handle. At first
-issue, after destination validation, framing snapshot and TX queue allocation, SEND_LAST
-atomically removes the handle and transfers the table reference into the
-request. It uses the version current at that point, including any compaction
-published since preparation. Admission behind an earlier send also takes
-ownership before waiting for its turn; subsequent retries retain that reference.
+SEND preparation validates SQE fields without resolving the handle. A send
+claims what it names, the pin of an ordinary one and, for SEND_LAST, the removal
+of the handle with the transfer of the table reference into the request, when
+it becomes the head of its destination's queue, after destination validation,
+framing snapshot and TX queue allocation. One that finds the queue free is the
+head at once, and claims with the destination socket owned if that is plain TCP.
+One admitted behind an earlier send claims before it waits for its turn. A claim
+uses the version current when it is made, including any compaction published
+since preparation, and subsequent retries retain what it took. Two sends that
+contend for one SEND_LAST handle are decided by which of them claims first, not
+by their place in the queue, and that is not ordered between rings or between
+inline and io-wq issue; the loser returns ESTALE without the consumed flag.
 
 The prefix and suffix are copied into private request storage before admission.
 Descriptor and framing faults, invalid lengths, allocation failure or framing
@@ -417,8 +423,11 @@ CQE and transfers a reference rather than adding and dropping a send pin.
 An ordinary SEND awaiting first issue has not acquired its backing reference;
 users must order handle release accordingly.
 
-Ordering is per shared store and destination, in admission order. It does
-not serialize another store or ordinary writes to the same socket. Linked
+Ordering is per shared store and destination, in the order in which sends join
+its queue: sends issued inline from one ring join in submission order, while
+sends from different rings, or issued by io-wq, are not ordered by when they
+were submitted. It does not serialize another store or ordinary writes to the
+same socket. Linked
 chains add their normal ordering; independently submitted chains do not form
 a single socket-wide chain. A protocol connection must route all its replies,
 including generated-only replies, through one shared store's send queue and
@@ -439,11 +448,17 @@ and FREE can already be submitted together in one ``io_uring_enter``.
 
 Object sends are FIFO per shared store and destination socket. Only the queue
 head polls for write space; later requests reuse their own request state as
-queue entries. A send that finds its queue free takes its references and gives
-them back while it owns the destination socket, and one for a socket whose TCP
-sendmsg has been replaced, by kTLS or a socket map for example, takes the
-ordinary send path instead. This ordering does not cover plain writes or other
-stores.
+queue entries. On a plain TCP socket a send that finds its queue free takes its
+references and gives them back, all but the last on an object, while it owns the
+destination socket, and puts the last as soon as it has released the socket. One
+that returns EAGAIN keeps them, and its place at the head, for the next issue,
+and cancellation or failure then releases them with the request. The socket's
+security hook is asked once per issue, for what is left of the frame, and a
+refusal or EAGAIN from it ends the issue as one from the first part of the frame
+would. A socket whose TCP sendmsg has been replaced, by kTLS or a socket map for
+example, takes the ordinary send path instead: references first, then the hook
+and TCP for each part, and the references stay with the request until it is
+cleaned up. This ordering does not cover plain writes or other stores.
 
 Backing and memory management
 =============================
