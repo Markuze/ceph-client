@@ -41,7 +41,7 @@
 
 #include "../kselftest.h"
 
-#define PLAN			15
+#define PLAN			17
 #define AREA_PAGES		64
 #define RQ_ENTRIES		64
 #define RQ_REGION_SIZE		8192
@@ -708,6 +708,25 @@ static void send_stream(int fd, uint64_t pos, size_t len, unsigned int seed)
 		require(n > 0, "send the stream");
 		done += n;
 	}
+	free(buf);
+}
+
+/* Read a stream with recv(), as any socket of the host does. */
+static void recv_stream(int fd, uint64_t pos, size_t len, unsigned int seed)
+{
+	unsigned char *buf = malloc(len);
+	size_t done = 0;
+
+	require(buf, "buffer for the stream");
+	alarm(120);
+	while (done < len) {
+		ssize_t n = recv(fd, buf + done, len - done, 0);
+
+		require(n > 0, "receive the stream with recv");
+		done += n;
+	}
+	alarm(0);
+	require(check_stream(buf, pos, len, seed), "recv gets the bytes that the peer sent");
 	free(buf);
 }
 
@@ -1592,6 +1611,189 @@ static void test_netdevsim_rx(void)
 	ksft_test_result_pass("netdevsim: a MAIO instance receives frames, two rings share it\n");
 }
 
+/* Install an instance on a port and map its area. Return the error of the registration. */
+static int dev_instance(struct ring *r, struct zcrx *z, unsigned int ifindex,
+			unsigned int pages)
+{
+	int ret;
+
+	zcrx_prepare(z, r, ZCRX_REG_MAIO, ifindex, pages);
+	z->nr_rqes = DEV_RQ_ENTRIES;
+	z->reg.rq_entries = DEV_RQ_ENTRIES;
+	zcrx_want_events(z, (1U << ZCRX_EVENT_COPY) | (1U << ZCRX_EVENT_ALLOC_FAIL));
+	ret = zcrx_do_register(z);
+	if (ret)
+		return ret;
+	z->map = map_area(r, z->area.mmap_offset, z->area.len, PROT_READ | PROT_WRITE, MAP_SHARED);
+	require(z->map != MAP_FAILED, "map the area of an instance");
+	return 0;
+}
+
+/*
+ * 11. The application binds a socket of port A to the instance of port C. The
+ * frames are in pages of a pool of the instance of port A. The instance of
+ * port C does not own these pages, so it does not pass a reference. It copies
+ * the bytes into its own area, and the request does not fail.
+ */
+static void test_netdevsim_foreign(void)
+{
+	unsigned char seen[DEV_AREA_PAGES] = {};
+	char name_c[IFNAMSIZ];
+	struct zcrx za, zc;
+	struct rx rx = {};
+	struct pair pr;
+	struct ring r;
+	size_t len;
+	int sock, listener, mss, ret;
+	socklen_t optlen = sizeof(mss);
+	unsigned int ifindex_c;
+	uint16_t port;
+
+	if (!pair_create(&pr, 202, 203)) {
+		ksft_test_result_skip("netdevsim ports or network namespaces are not available\n");
+		return;
+	}
+	if (!nsim_create(204, 1, name_c)) {
+		pair_destroy(&pr);
+		ksft_test_result_skip("netdevsim is not available\n");
+		return;
+	}
+	require(!link_up(name_c), "bring port C up");
+	ifindex_c = if_nametoindex(name_c);
+	require(ifindex_c, "port C ifindex");
+	require(!ring_init(&r, IORING_SETUP_CQE32), "ring for the foreign page test");
+	ret = dev_instance(&r, &za, pr.ifindex, DEV_AREA_PAGES);
+	if (ret == -EOPNOTSUPP || ret == -ENODEV) {
+		ksft_test_result_skip("the port has no queue API: %d\n", ret);
+		ring_exit(&r);
+		nsim_destroy(204);
+		pair_destroy(&pr);
+		return;
+	}
+	require(!ret, "install the instance on port A");
+	require(!dev_instance(&r, &zc, ifindex_c, DEV_AREA_PAGES),
+		"install the instance on port C");
+
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	require(!getsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, &mss, &optlen), "read the MSS");
+	len = (size_t)DEV_FRAMES * mss;
+
+	/* The request names the instance of port C. */
+	rx_start(&r, &rx, &zc, sock);
+	send_stream(pr.peer.socks[0], 0, len, 7);
+	rx_wait(&r, &rx, len);
+	require(rx.bytes == len, "all the bytes arrive");
+	rx_check_dev(&zc, &rx, 0, 0, 7, false, seen);
+	ksft_print_msg("wrong instance: %u copies of %lu bytes, no error\n", rx.nr_data,
+		       (unsigned long)rx.bytes);
+	require(stat_read(&zcrx_stats(&zc)->copy_bytes) == len, "the instance of port C copied");
+	require(!stat_read(&zcrx_stats(&za)->copy_bytes), "the instance of port A copied nothing");
+
+	/* The copy pages go back to the area of port C. */
+	rq_return(&zc, &rx, 0);
+	rq_flush(&r, &zc);
+
+	close(sock);
+	close(listener);
+	zcrx_close(&za);
+	zcrx_close(&zc);
+	ring_exit(&r);
+	nsim_destroy(204);
+	pair_destroy(&pr);
+	ksft_test_result_pass("netdevsim: another instance copies pages it does not own\n");
+}
+
+/*
+ * 12. The area of an instance with a device runs out. The pool then gets
+ * ordinary pages, so the host keeps receiving. A socket of the host reads its
+ * bytes with recv(). The request of the instance gets references while the
+ * area has slots, and then it ends with -ENOMEM: the ordinary pages need a
+ * copy into the area. The pool and the copy find the area empty in one
+ * episode, so it counts once and sends one event. When the process returns the
+ * slots, the next request copies the bytes that were left.
+ */
+static void test_netdevsim_exhaust(void)
+{
+	const unsigned int pages = 80;
+	unsigned char seen[DEV_AREA_PAGES] = {};
+	struct zcrx_stats *st;
+	struct rx rx = {};
+	uint64_t sent = 0, recvd;
+	struct zcrx z;
+	struct pair pr;
+	struct ring r;
+	size_t round_len;
+	int sock1, sock2, listener, mss, ret;
+	socklen_t optlen = sizeof(mss);
+	unsigned int round;
+	uint16_t port;
+
+	if (!pair_create(&pr, 205, 206)) {
+		ksft_test_result_skip("netdevsim ports or network namespaces are not available\n");
+		return;
+	}
+	require(!ring_init(&r, IORING_SETUP_CQE32), "ring for the exhaustion test");
+	ret = dev_instance(&r, &z, pr.ifindex, pages);
+	if (ret == -EOPNOTSUPP || ret == -ENODEV) {
+		ksft_test_result_skip("the port has no queue API: %d\n", ret);
+		ring_exit(&r);
+		pair_destroy(&pr);
+		return;
+	}
+	require(!ret, "install a small instance on port A");
+	st = zcrx_stats(&z);
+
+	listener = listen_local(&port);
+	sock1 = connect_peer(&pr, 0, listener, port);
+	sock2 = connect_peer(&pr, 1, listener, port);
+	require(!getsockopt(sock1, IPPROTO_TCP, TCP_MAXSEG, &mss, &optlen), "read the MSS");
+	round_len = (size_t)DEV_FRAMES * mss;
+
+	/* The process holds every slot. The 81st frame finds the area empty. */
+	rx_start(&r, &rx, &z, sock1);
+	for (round = 0; round < 4 && !rx.done; round++) {
+		send_stream(pr.peer.socks[0], sent, round_len, 8);
+		sent += round_len;
+		rx_wait(&r, &rx, sent);
+	}
+	require(rx.done && rx.final_res == -ENOMEM, "the request ends with -ENOMEM");
+	require(rx.nr_data <= pages && rx.bytes < sent, "the request got slots and no more");
+	rx_check_dev(&z, &rx, 0, 0, 8, true, seen);
+	recvd = rx.bytes;
+	ksft_print_msg("%u completions for %lu of %lu bytes, then -ENOMEM; %lu fallback pages\n",
+		       rx.nr_data, (unsigned long)recvd, (unsigned long)sent,
+		       (unsigned long)stat_read(&st->fallback_pages));
+	require(stat_read(&st->fallback_pages), "the pool gave ordinary pages");
+	require(!stat_read(&st->copy_count), "the request copied nothing");
+	require(stat_read(&st->exhaust_count) == 1, "the pool and the copy share one episode");
+	require(rx.nr_event[ZCRX_EVENT_ALLOC_FAIL] == 1, "one allocation failure event");
+
+	/* Another socket of the host keeps receiving. */
+	send_stream(pr.peer.socks[1], 0, round_len, 9);
+	recv_stream(sock2, 0, round_len, 9);
+
+	/* The slots come back, and the bytes that were left arrive as copies. */
+	rq_return(&z, &rx, 0);
+	rq_flush(&r, &z);
+	rx_start(&r, &rx, &z, sock1);
+	rx_wait(&r, &rx, sent - recvd);
+	require(rx.bytes == sent - recvd, "the next request gets the bytes that were left");
+	rx_check_dev(&z, &rx, 0, recvd, 8, true, seen);
+	require(stat_read(&st->copy_bytes) == sent - recvd, "the ordinary pages were copied");
+	require(stat_read(&st->exhaust_count) == 1, "no new episode");
+	rq_return(&z, &rx, 0);
+	rq_flush(&r, &z);
+
+	close(sock1);
+	close(sock2);
+	close(listener);
+	zcrx_close(&z);
+	ring_exit(&r);
+	pair_destroy(&pr);
+	ksft_test_result_pass("netdevsim: a full area, ordinary pages, host keeps receiving\n");
+}
+
 /* 9. A device without the queue API cannot take the provider. */
 static void test_loopback(struct ring *r)
 {
@@ -1718,6 +1920,8 @@ int main(void)
 	test_device();
 	test_device_removal();
 	test_netdevsim_rx();
+	test_netdevsim_foreign();
+	test_netdevsim_exhaust();
 	/* The last test closes the first ring. */
 	test_export_import(&r);
 
