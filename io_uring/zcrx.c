@@ -448,11 +448,6 @@ static void io_zcrx_get_uref(struct io_zcrx_slot slot)
 	atomic_inc(io_zcrx_slot_uref(slot));
 }
 
-static void io_zcrx_get_niov_uref(struct net_iov *niov)
-{
-	io_zcrx_get_uref(io_zcrx_niov_slot(niov));
-}
-
 static void io_fill_zcrx_offsets(struct io_uring_zcrx_offsets *offsets)
 {
 	offsets->head = offsetof(struct zcrx_rq_hdr, head);
@@ -2020,32 +2015,118 @@ static int io_zcrx_copy_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	return ret;
 }
 
-static int io_zcrx_recv_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
-			     const skb_frag_t *frag, int off, int len)
+/*
+ * Tell whether the bytes [@page_off, @page_off + @len) of @page can pass by
+ * reference: a page pool of this MAIO instance owns the page as a slot of the
+ * area, and the bytes lie in this one page. Return the slot if so. A fallback
+ * page of such a pool is an ordinary page and no slot. A page that no pool
+ * owns, for example a page of the area that the process sent with SEND_ZC, is
+ * no slot either.
+ *
+ * @recycle tells that the skb is marked for recycling. Such an skb holds one
+ * pool reference to each page of a pool that it carries. The reference keeps
+ * the page with its pool: the pool fields of the page do not change, and the
+ * pool does not go away. An skb without the mark can hold a pool page by a
+ * plain reference only, for example after a splice. The pool may release such
+ * a page at any time, so the function does not trust it.
+ */
+static bool io_zcrx_maio_page_slot(struct io_zcrx_ifq *ifq, struct page *page,
+				   unsigned int page_off, size_t len,
+				   bool recycle, struct io_zcrx_slot *slot)
 {
-	struct net_iov *niov;
+	struct io_zcrx_area *area = ifq->areas[0];
 	struct page_pool *pp;
 
-	if (unlikely(!skb_frag_is_net_iov(frag)))
-		return io_zcrx_copy_frag(req, ifq, frag, off, len);
+	if (page_off + len > PAGE_SIZE)
+		return false;
+	if (!recycle || !page_pool_page_is_pp(page))
+		return false;
+	pp = pp_page_to_nmdesc(page)->pp;
+	if (pp->mp_ops != &io_uring_pp_maio_ops || io_pp_to_ifq(pp) != ifq)
+		return false;
+	if (!io_zcrx_kmem_lookup(area, page, &slot->idx))
+		return false;
+	slot->area = area;
+	return true;
+}
 
-	niov = netmem_to_net_iov(frag->netmem);
-	pp = niov->desc.pp;
-
-	if (!pp || pp->mp_ops != &io_uring_pp_zc_ops || io_pp_to_ifq(pp) != ifq)
-		return -EFAULT;
-
-	if (!io_zcrx_queue_cqe(req, io_zcrx_niov_slot(niov), ifq,
-			       off + skb_frag_off(frag), len))
+/*
+ * Pass a reference to @len bytes at @off in the buffer of a slot. The bytes
+ * stay in the buffer. The process reads them there, and it returns the slot
+ * through the refill ring.
+ */
+static int io_zcrx_ref_slot(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
+			    struct io_zcrx_slot slot, int off, int len)
+{
+	if (!io_zcrx_queue_cqe(req, slot, ifq, off, len))
 		return -ENOSPC;
 
 	/*
 	 * Prevent it from being recycled while user is accessing it.
 	 * It has to be done before grabbing a user reference.
 	 */
-	page_pool_ref_netmem(net_iov_to_netmem(niov));
-	io_zcrx_get_niov_uref(niov);
+	page_pool_ref_netmem(io_zcrx_slot_netmem(slot));
+	io_zcrx_get_uref(slot);
 	return len;
+}
+
+static int io_zcrx_recv_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
+			     const skb_frag_t *frag, int off, int len,
+			     bool recycle)
+{
+	struct io_zcrx_slot slot;
+	struct net_iov *niov;
+	struct page_pool *pp;
+
+	if (unlikely(!skb_frag_is_net_iov(frag))) {
+		/*
+		 * A readable page. A MAIO instance passes a reference to a
+		 * page of its own pools. It copies every other page.
+		 */
+		if (ifq->maio &&
+		    io_zcrx_maio_page_slot(ifq, skb_frag_page(frag),
+					   off + skb_frag_off(frag), len,
+					   recycle, &slot))
+			return io_zcrx_ref_slot(req, ifq, slot,
+						off + skb_frag_off(frag), len);
+		return io_zcrx_copy_frag(req, ifq, frag, off, len);
+	}
+
+	/*
+	 * A net_iov belongs to a provider. It is memory that the CPU may not
+	 * read, so no instance can copy it. An instance accepts the net_iov of
+	 * its own pools only, and a MAIO instance has none.
+	 */
+	niov = netmem_to_net_iov(frag->netmem);
+	pp = niov->desc.pp;
+
+	if (!pp || pp->mp_ops != &io_uring_pp_zc_ops || io_pp_to_ifq(pp) != ifq)
+		return -EFAULT;
+
+	return io_zcrx_ref_slot(req, ifq, io_zcrx_niov_slot(niov),
+				off + skb_frag_off(frag), len);
+}
+
+/*
+ * Receive the bytes of the linear part of an skb. A MAIO instance passes a
+ * reference when the bytes lie in one page that one of its pools owns. A
+ * driver that keeps the headers in a private head puts no payload there, so
+ * this case is rare. The instance copies in every other case, also when the
+ * bytes span two pages.
+ */
+static ssize_t io_zcrx_recv_head(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
+				 struct sk_buff *skb, unsigned int offset,
+				 size_t len)
+{
+	struct page *page = virt_to_page(skb->data);
+	unsigned int page_off = offset_in_page(skb->data) + offset;
+	struct io_zcrx_slot slot;
+
+	if (ifq->maio &&
+	    io_zcrx_maio_page_slot(ifq, page, page_off, len, skb->pp_recycle,
+				   &slot))
+		return io_zcrx_ref_slot(req, ifq, slot, page_off, len);
+	return io_zcrx_copy_chunk(req, ifq, page, page_off, len);
 }
 
 static int
@@ -2077,9 +2158,7 @@ io_zcrx_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 		size_t to_copy;
 
 		to_copy = min_t(size_t, skb_headlen(skb) - offset, len);
-		copied = io_zcrx_copy_chunk(req, ifq, virt_to_page(skb->data),
-					    offset_in_page(skb->data) + offset,
-					    to_copy);
+		copied = io_zcrx_recv_head(req, ifq, skb, offset, to_copy);
 		if (copied < 0) {
 			ret = copied;
 			goto out;
@@ -2106,7 +2185,8 @@ io_zcrx_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 			unsigned copy = min(frag_end - offset, len);
 			unsigned frag_off = offset - start;
 
-			ret = io_zcrx_recv_frag(req, ifq, frag, frag_off, copy);
+			ret = io_zcrx_recv_frag(req, ifq, frag, frag_off, copy,
+						skb->pp_recycle);
 			if (ret < 0)
 				goto out;
 

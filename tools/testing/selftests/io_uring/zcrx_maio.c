@@ -722,8 +722,12 @@ struct rx {
 	int final_res;
 };
 
-/* Start a request. The event counts of @rx survive, the rest starts again. */
-static void rx_start(struct ring *r, struct rx *rx, struct zcrx *z, int fd)
+/*
+ * Start a request for @len bytes, or for any number of bytes if @len is zero.
+ * The event counts of @rx survive, the rest starts again.
+ */
+static void rx_start_len(struct ring *r, struct rx *rx, struct zcrx *z, int fd,
+			 unsigned int len)
 {
 	struct io_uring_sqe sqe = {};
 
@@ -732,11 +736,17 @@ static void rx_start(struct ring *r, struct rx *rx, struct zcrx *z, int fd)
 	rx->done = false;
 	sqe.opcode = IORING_OP_RECV_ZC;
 	sqe.fd = fd;
+	sqe.len = len;
 	sqe.ioprio = IORING_RECV_MULTISHOT;
 	sqe.zcrx_ifq_idx = z->id;
 	sqe.user_data = next_tag++;
 	rx->recv_tag = sqe.user_data;
 	stage(r, sqe);
+}
+
+static void rx_start(struct ring *r, struct rx *rx, struct zcrx *z, int fd)
+{
+	rx_start_len(r, rx, z, fd, 0);
 }
 
 static void rx_drain(struct ring *r, struct rx *rx)
@@ -1432,15 +1442,18 @@ static unsigned int rx_check_dev(struct zcrx *z, struct rx *rx, unsigned int fir
 	return reused;
 }
 
-/* 10. Receive from a netdevsim port that has an instance. */
+/*
+ * 10. Receive from a netdevsim port that has an instance. The pool pages carry
+ * the payload, so the instance passes references: it copies nothing.
+ */
 static void test_netdevsim_rx(void)
 {
-	const bool byref = false;
+	const bool byref = true;
 	unsigned char seen[DEV_AREA_PAGES] = {};
 	struct zcrx_ctrl ctrl = { .op = ZCRX_CTRL_EXPORT };
 	struct io_uring_zcrx_ifq_reg reg = {};
 	unsigned int round, reused = 0, n1;
-	uint64_t pos = 0, pos2 = 0;
+	uint64_t pos = 0, pos2 = 0, off1;
 	struct rx rx = {}, rx2 = {};
 	struct zcrx z, z2;
 	struct zcrx_stats *st;
@@ -1494,8 +1507,18 @@ static void test_netdevsim_rx(void)
 	require(!stat_read(&st->exhaust_count) && !stat_read(&st->fallback_pages),
 		"the area did not run out");
 	require(!rx.nr_event[ZCRX_EVENT_ALLOC_FAIL], "no allocation failure event");
-	require(stat_read(&st->copy_bytes) == (byref ? 0 : rx.bytes),
-		"copy_bytes matches the way the instance receives");
+	/*
+	 * The frames pass by reference, so no fragment is copied. The counters
+	 * and the event see the copy of a fragment only. A copy from the linear
+	 * part of an skb is not counted. The check of the reuse below and the
+	 * check of the offset in the page, for the second ring, tell a copy
+	 * from a reference too.
+	 */
+	require(!stat_read(&st->copy_count) && !stat_read(&st->copy_bytes),
+		"no fragment is copied");
+	require(!rx.nr_event[ZCRX_EVENT_COPY], "no copy event");
+	/* The pool took the returned slots and handed them to later frames. */
+	require(reused, "a slot that the process returned serves a later frame");
 	n1 = rx.nr_data;
 
 	/* A second ring imports the instance and receives on another socket. */
@@ -1510,14 +1533,33 @@ static void test_netdevsim_rx(void)
 	z2.ring = &r2;
 	z2.id = reg.zcrx_id;
 
+	/*
+	 * A request for 1000 bytes ends in the middle of the first frame. The
+	 * next request starts there, so its first completion names the same
+	 * page, 1000 bytes further.
+	 */
 	sock2 = connect_peer(&pr, 1, listener, port);
+	rx_start_len(&r2, &rx2, &z2, sock2, 1000);
+	send_stream(pr.peer.socks[1], pos2, mss, 6);
+	rx_wait(&r2, &rx2, 1000);
+	require(rx2.done && rx2.final_res == 0 && rx2.bytes == 1000 && rx2.nr_data == 1,
+		"a request with a length ends after that many bytes");
+	rx_check_dev(&z, &rx2, 0, pos2, 6, byref, seen);
+	off1 = rx2.data[0].extra[0];
+	rq_return(&z, &rx2, 0);
+	pos2 += 1000;
+
 	rx_start(&r2, &rx2, &z2, sock2);
-	send_stream(pr.peer.socks[1], pos2, round_len, 6);
-	rx_wait(&r2, &rx2, round_len);
-	require(rx2.bytes == round_len, "the second ring gets the bytes of its socket");
+	send_stream(pr.peer.socks[1], pos2 + mss - 1000, round_len, 6);
+	rx_wait(&r2, &rx2, mss - 1000 + round_len);
+	require(rx2.bytes == mss - 1000 + round_len,
+		"the second ring gets the bytes of its socket");
+	require(rx2.data[0].extra[0] == off1 + 1000,
+		"the offset adds the bytes that the first request took");
 	rx_check_dev(&z, &rx2, 0, pos2, 6, byref, seen);
 	rq_return(&z, &rx2, 0);
 	require(rx.nr_data == n1, "the first ring got nothing of the second socket");
+	require(!stat_read(&st->copy_bytes), "the second ring copies nothing");
 	ksft_print_msg("second ring: %u completions for %lu bytes\n", rx2.nr_data,
 		       (unsigned long)rx2.bytes);
 
