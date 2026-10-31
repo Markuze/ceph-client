@@ -3390,9 +3390,14 @@ static u32 io_opaque_send_msg_flags(const struct io_opaque_req *op, unsigned int
  * and a refusal ends that call before any byte goes: a send that has taken its
  * references and started, so that LAST is consumed and a frame behind it fails
  * with it, or is told to try again if the hook says EAGAIN. Here it is asked
- * once, for what is left of the frame, in the same place and ending the
- * issue in the same way. The ordinary path asks for every part, which a
+ * once, for what is left of the frame. The caller keeps the verdict and
+ * applies it where the first sock_sendmsg() would have met it, so that the
+ * issue ends in the same way. The ordinary path asks for every part, which a
  * policy that depends on the socket and not on the part cannot tell apart.
+ *
+ * It is asked with the socket not owned, because a hook may take the socket
+ * lock itself: AppArmor's finds the address with getname(), which does, and
+ * would wait for the owner of the socket for ever.
  */
 VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
 					     unsigned int issue_flags)
@@ -3400,6 +3405,7 @@ VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct i
 	struct msghdr msg = { .msg_flags = io_opaque_send_msg_flags(op, issue_flags) };
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_security, sock, op, issue_flags);
+	lockdep_assert_not_held(&sock->sk->sk_lock);
 	return security_socket_sendmsg(sock, &msg, op->total_length - op->progress);
 }
 
@@ -3409,11 +3415,12 @@ VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct i
  * suffix, from where it stopped, and the frame leaves the queue once all of it
  * is queued to TCP.
  *
- * On a plain TCP socket (io_opaque_send_direct()) the head does all of that
- * under one lock_sock(): it takes the references it has not taken yet, asks the
- * security hook, calls tcp_sendmsg_locked() for each part of the frame, hands
- * the queue on, lets go of the references that are not the last and only then
- * releases the socket, and after it puts the last ones. While the socket is
+ * On a plain TCP socket (io_opaque_send_direct()) the head asks the security
+ * hook, and then does all of the rest under one lock_sock(): it takes the
+ * references it has not taken yet, applies what the hook said, calls
+ * tcp_sendmsg_locked() for each part of the frame, hands the queue on, lets go
+ * of the references that are not the last and only then releases the socket,
+ * and after it puts the last ones. While the socket is
  * unowned, ACKs and the transmit that autocorking left queued run under its
  * spinlock, for as long as they take, and the sender's next lock_sock() waits
  * for them; the less the sender does in that window, the less often it does.
@@ -3434,7 +3441,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct kvec vec;
 	u32 body_end;
 	bool body = false, splice = false, fresh, left, owned = false;
-	int ret;
+	int ret, sec = 0;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
@@ -3463,8 +3470,13 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	fresh = ret == IO_OPAQUE_TX_SETTLE;
 
 	if (io_opaque_send_direct(sk)) {
-		/* The hint says plain TCP; the socket decides once it is owned. */
+		/*
+		 * The hint says plain TCP; the socket decides once it is owned.
+		 * The security hook is asked now, with it not owned, and what it
+		 * says is applied below, after the references are taken.
+		 */
 		io_ring_submit_unlock(req->ctx, issue_flags);
+		sec = io_opaque_send_security(sock, op, issue_flags);
 		sock_rps_record_flow(sk);
 		lock_sock(sk);
 		owned = io_opaque_send_direct(sk);
@@ -3482,10 +3494,10 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 		}
 	}
 	op->tx_started = true;
-	if (owned) {
-		ret = io_opaque_send_security(sock, op, issue_flags);
-		if (ret)
-			goto sent;
+	if (owned && sec) {
+		/* As the first sock_sendmsg() would have ended with it. */
+		ret = sec;
+		goto sent;
 	}
 
 again:
