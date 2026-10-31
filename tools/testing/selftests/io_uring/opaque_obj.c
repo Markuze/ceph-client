@@ -1984,7 +1984,7 @@ static void test_send_last(struct io_uring_opaque_config *cfg)
 			{ udp, 0, 8, IORING_OPAQUE_SEND_LAST, 0, -EOPNOTSUPP },
 			{ target[0], 0, 9, IORING_OPAQUE_SEND_LAST, 0, -ERANGE },
 			{ target[0], 0, 0, IORING_OPAQUE_SEND_LAST, 0, -EINVAL },
-			{ target[0], 0, 8, 2, 0, -EINVAL },
+			{ target[0], 0, 8, 4, 0, -EINVAL },
 			{ target[0], 0, 8, IORING_OPAQUE_SEND_LAST,
 				IOSQE_CQE_SKIP_SUCCESS, -EINVAL },
 			{ target[0], UINT64_MAX, 8, IORING_OPAQUE_SEND_LAST, 0, -EINVAL },
