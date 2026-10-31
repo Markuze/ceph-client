@@ -286,7 +286,7 @@ static void zcrx_maio_states(struct kunit *test)
 {
 	struct page **held = kunit_kcalloc(test, ZT_STATES_PAGES, sizeof(*held), GFP_KERNEL);
 	struct page **fb = kunit_kcalloc(test, 4 * ZT_BATCH, sizeof(*fb), GFP_KERNEL);
-	unsigned int nfb = 0, nheld = 0, i;
+	unsigned int nfb = 0, nheld = 0, i, batch;
 	struct page *p, *stranger;
 	struct zt_env env;
 	u64 off;
@@ -347,22 +347,31 @@ static void zcrx_maio_states(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(env.ifq, p, &off));
 	KUNIT_EXPECT_PTR_EQ(test, p->pp, env.pp[0]);
 	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
-	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages, (u64)ZT_BATCH);
+	/*
+	 * The bulk allocation of the pool may return fewer pages than a
+	 * batch, one in UML. The provider counts the page that it returns
+	 * and the pages that the pool cached with it.
+	 */
+	batch = 1 + env.pp[0]->alloc.count;
+	KUNIT_EXPECT_LE(test, batch, (unsigned int)ZT_BATCH);
+	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages, (u64)batch);
 	KUNIT_EXPECT_TRUE(test, env.ifq->maio_exhausted);
 	fb[nfb++] = p;
 
 	/* The pool serves the rest of the batch without the provider. */
 	nfb += zt_drain_cache(test, env.pp[0], fb + nfb, 4 * ZT_BATCH - nfb);
-	KUNIT_EXPECT_EQ(test, nfb, (unsigned int)ZT_BATCH);
+	KUNIT_EXPECT_EQ(test, nfb, batch);
 	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
 
 	/* The next batch is the same episode. */
 	p = zt_alloc(env.pp[0]);
 	KUNIT_ASSERT_NOT_NULL(test, p);
+	batch += 1 + env.pp[0]->alloc.count;
 	fb[nfb++] = p;
 	nfb += zt_drain_cache(test, env.pp[0], fb + nfb, 4 * ZT_BATCH - nfb);
+	KUNIT_EXPECT_EQ(test, nfb, batch);
 	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
-	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages, 2ULL * ZT_BATCH);
+	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages, (u64)batch);
 
 	/*
 	 * A fallback page leaves through release_netmem, which returns true.
@@ -941,7 +950,9 @@ static void zcrx_maio_copy_episode(struct kunit *test)
 	p = zt_alloc(env.pp[0]);
 	KUNIT_ASSERT_NOT_NULL(test, p);
 	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 1ULL);
-	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages, (u64)ZT_BATCH);
+	/* The bulk allocation may return fewer pages than a batch. */
+	KUNIT_EXPECT_EQ(test, env.stats->fallback_pages,
+			(u64)(1 + env.pp[0]->alloc.count));
 	n = zt_drain_cache(test, env.pp[0], fb, ARRAY_SIZE(fb));
 
 	/* A page returns, and the pool takes it. That ends the episode. */
