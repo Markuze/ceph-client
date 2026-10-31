@@ -2262,8 +2262,19 @@ void io_opaque_cleanup(struct io_kiocb *req)
 		return;
 	store = op->store;
 	list_del_init(&op->cancel);
-	scoped_guard(spinlock, &store->wait_lock)
-		list_del_init(&op->wait);
+	/*
+	 * Taking wait_lock is how cleanup waits out a waker that is still in
+	 * its hold: budget_waits and copies are walked under it, using the
+	 * request's file and stream after its entry has been unlinked. A send
+	 * is on neither list. What reaches one from outside comes through its
+	 * TX queue, which io_opaque_tx_put() below waits for, or from
+	 * cancellation, which holds the ring lock as cleanup does. It has no
+	 * waker to wait out, and takes the lock only if its entry is linked.
+	 */
+	if (req->opcode != IORING_OP_OPAQUE_OBJ_SEND || !list_empty(&op->wait)) {
+		scoped_guard(spinlock, &store->wait_lock)
+			list_del_init(&op->wait);
+	}
 	/* Waiters have stopped accessing this request before cleanup. */
 	if (op->stream) {
 		mutex_lock(&op->stream->lock);
