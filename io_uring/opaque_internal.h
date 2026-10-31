@@ -415,6 +415,7 @@ extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_stepped;
 extern atomic_long_t io_opaque_vec_counted;
+extern atomic_long_t io_opaque_budget_wakes;
 int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk);
 int io_opaque_tx_settle_head(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);

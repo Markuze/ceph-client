@@ -86,6 +86,14 @@ static bool io_opaque_collect_blocked(struct io_opaque_req *op)
 	       !io_opaque_discard_ready(op->stream);
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/* Times the waiters for budget have been looked at, for a test to read. */
+atomic_long_t io_opaque_budget_wakes = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_BUDGET_WAKE()	atomic_long_inc(&io_opaque_budget_wakes)
+#else
+#define IO_OPAQUE_BUDGET_WAKE()	((void)0)
+#endif
+
 static void io_opaque_wake_budget(struct io_opaque_store *store)
 {
 	struct io_opaque_req *op, *next;
@@ -94,6 +102,7 @@ static void io_opaque_wake_budget(struct io_opaque_store *store)
 	unsigned int woken = 0;
 	bool stopped;
 
+	IO_OPAQUE_BUDGET_WAKE();
 	guard(spinlock)(&store->wait_lock);
 	stopped = READ_ONCE(store->dead);
 	list_for_each_entry_safe(op, next, &store->budget_waits, wait) {
@@ -338,17 +347,23 @@ no_space:
 	return ERR_PTR(-ENOBUFS);
 }
 
-VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
-					    struct io_opaque_extent *extent)
+/*
+ * Let go of @extent, and of its backing if it was the last to use it. Returns
+ * the charge of the backing that went, for the caller to give back to the
+ * store: giving it back lets those waiting for budget in, which one free does
+ * once and a list of them once, not once per extent.
+ */
+static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opaque_extent *extent)
 {
 	struct io_opaque_backing *backing = extent->backing;
+	u64 charge = 0;
 
 	list_del(&extent->list);
 	if (!extent->embedded)
 		kfree(extent);
 	atomic_dec(&store->extents);
 	if (refcount_dec_and_test(&backing->refs)) {
-		u64 charge = backing->charge;
+		charge = backing->charge;
 
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
@@ -358,19 +373,42 @@ VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
 		else
 			put_page(backing->page);
 		kfree(container_of(backing, struct io_opaque_chunk, backing));
-		io_opaque_uncharge(store, charge);
-	} else {
-		io_opaque_wake_budget(store);
 	}
+	return charge;
 }
 
+VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
+					    struct io_opaque_extent *extent)
+{
+	u64 charge = io_opaque_extent_release(store, extent);
+
+	if (charge)
+		io_opaque_uncharge(store, charge);
+	else
+		io_opaque_wake_budget(store);
+}
+
+/*
+ * Free the extents of @list. What they held is returned to the store in one
+ * step, and the waiters for budget are looked at once: each look takes
+ * wait_lock and walks the list of them, which for the 700 extents of a 1 MB
+ * object that is not a single mapping was 700 times.
+ */
 VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
 					     struct list_head *list)
 {
 	struct io_opaque_extent *extent, *next;
+	bool any = false;
+	u64 charge = 0;
 
-	list_for_each_entry_safe(extent, next, list, list)
-		io_opaque_extent_free(store, extent);
+	list_for_each_entry_safe(extent, next, list, list) {
+		charge += io_opaque_extent_release(store, extent);
+		any = true;
+	}
+	if (charge)
+		io_opaque_uncharge(store, charge);
+	else if (any)
+		io_opaque_wake_budget(store);
 }
 
 struct io_opaque_data *io_opaque_data_alloc(void)
@@ -387,6 +425,7 @@ struct io_opaque_data *io_opaque_data_alloc(void)
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data)
 {
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_data_put, store, data);
 	if (data && refcount_dec_and_test(&data->refs)) {
 		io_opaque_extents_free(store, &data->extents);
 		kvfree(data->bvec);
@@ -2712,6 +2751,47 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
 }
 
 /*
+ * The part of io_opaque_send_unpin() that a socket lock can wait for: drop
+ * every reference of the send that is not the last on its version, which is a
+ * decrement and cannot free anything, and say whether any is left. What is
+ * left is for io_opaque_send_unpin() once the socket is released, since the
+ * last reference frees the version, every extent of it, and that is not for
+ * the lock to wait out. Nobody can take a reference on a version whose count
+ * is one, which is not in the table, so the last one is still the last then.
+ * A vector's entries that were put are cleared, so that the rest cannot put
+ * them again.
+ */
+static bool io_opaque_send_unpin_cheap(struct io_opaque_req *op)
+{
+	bool left = false;
+
+	if (op->send_flags & IORING_OPAQUE_SEND_VECTOR) {
+		struct io_opaque_vec *vec = op->vec;
+		u32 i;
+
+		for (i = 0; i < vec->pinned; i++) {
+			if (!vec->pin[i] || !io_opaque_vec_owns(op, i))
+				continue;
+			if (refcount_dec_not_one(&vec->pin[i]->refs))
+				vec->pin[i] = NULL;
+			else
+				left = true;
+		}
+		if (!left) {
+			vec->pinned = 0;
+			vec->nr_segs = 0;
+		}
+	}
+	if (op->data) {
+		if (refcount_dec_not_one(&op->data->refs))
+			op->data = NULL;
+		else
+			left = true;
+	}
+	return left;
+}
+
+/*
  * Point the send's cursor at the range it selects: @len bytes in @nr segments
  * from @bv, of which the range starts @skip bytes in and lasts for op->length.
  */
@@ -3458,9 +3538,12 @@ finish:
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
 	if (owned) {
-		/* The references go with the socket still owned, not under the ring lock. */
-		io_opaque_send_unpin(op);
+		/* The references go with the socket, the last of a version after it. */
+		bool left = io_opaque_send_unpin_cheap(op);
+
 		release_sock(sk);
+		if (left)
+			io_opaque_send_unpin(op);
 		io_ring_submit_lock(req->ctx, issue_flags);
 	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
