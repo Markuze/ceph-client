@@ -40,3 +40,13 @@ config IO_URING_OPAQUE_OBJ_KUNIT_TEST
 	  backing-memory reservations, stable-handle compaction and lifetime
 	  across replacement. The suite also checks cancellation rollback
 	  and generation exhaustion. Results appear in the KUnit boot log.
+
+config IO_URING_ZCRX_KUNIT_TEST
+	bool "KUnit tests for the MAIO mode of io_uring zero-copy receive" if !KUNIT_ALL_TESTS
+	depends on KUNIT && IO_URING_ZCRX
+	default KUNIT_ALL_TESTS
+	help
+	  Check the page states of the provider of readable pages, the lookup
+	  of a page in the area, the refill ring, the fallback pages, the
+	  teardown and the conversion of the receive queues of a device. The
+	  tests need no network hardware. Results appear in the KUnit boot log.

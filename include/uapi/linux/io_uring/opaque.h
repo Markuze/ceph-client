@@ -28,14 +28,41 @@ struct io_uring_opaque_config {
 	__u32 max_streams;
 	__u32 max_extents;
 	__u32 max_requests;
-	__u32 flags;
+	__u32 flags;			/* IORING_OPAQUE_CFG_* */
 	__u64 __resv[2];
 	__u64 high_watermark;
 	__u64 low_watermark;
 	__u64 reply_reserve;
-	__u32 __resv2;
+	/*
+	 * The zcrx id of the MAIO instance to bind, in the registering ring.
+	 * Valid only with IORING_OPAQUE_CFG_MAIO. Must be 0 without it.
+	 */
+	__u32 zcrx_id;
 	__u32 __resv1;
 };
+
+/*
+ * Bind the store to a MAIO zcrx instance (ZCRX_REG_MAIO) of the registering
+ * ring. @zcrx_id names the instance. The store keeps every byte that it
+ * captures from a stream in the area of the instance. The process that maps
+ * the area can read and write the bytes of such an object in place. A send
+ * transmits the bytes that are present when TCP builds the segment. A byte
+ * that is not in the area is copied into it. When the area has no free page,
+ * the copy waits and retries, as it does when a page allocation fails.
+ * IORING_OPAQUE_CREATE is the exception. It copies the bytes of the process
+ * into pages outside the area, and the object is not
+ * IORING_OPAQUE_OBJECT_F_MAPPED.
+ *
+ * The store holds a reference to the instance until the store is gone. The
+ * instance can go first, for example when its ring exits. The objects keep
+ * their pages, and the store keeps taking free pages of the area. Another ring
+ * can import the store. The store stays bound to the instance of the ring that
+ * created it.
+ *
+ * Registration fails with -ENXIO if the ring has no MAIO instance with this
+ * id, and with -EOPNOTSUPP if the kernel has no zero-copy receive.
+ */
+#define IORING_OPAQUE_CFG_MAIO		(1U << 0)
 
 /* IORING_OP_OPAQUE_OBJ: sqe->ioprio selects the operation. */
 enum io_uring_opaque_op {
@@ -57,7 +84,40 @@ enum io_uring_opaque_op {
 	IORING_OPAQUE_CREATE,
 	/* Nonconsuming contiguous byte count, without copying payload. */
 	IORING_OPAQUE_AVAILABLE,
+	/*
+	 * List where the bytes of an object are in the area of the MAIO
+	 * instance that the store binds. addr is the handle and off is 0. The
+	 * buffer at addr3 has len bytes. The kernel writes one
+	 * struct io_uring_opaque_extent for each extent of the object, in object
+	 * order, and the result is the number of bytes written. If the buffer is
+	 * too small, the result is -EOVERFLOW, nothing is written, and the first
+	 * extra word of the completion holds the size that is needed. A buffer
+	 * with len 0 and addr3 0 asks for that size. A store that binds no
+	 * instance returns -EOPNOTSUPP. An extent that is not in the area, such
+	 * as one of an object that IORING_OPAQUE_CREATE made, has area_off
+	 * IORING_OPAQUE_EXTENT_UNMAPPED.
+	 */
+	IORING_OPAQUE_OBJECT_EXTENTS,
 };
+
+/*
+ * One extent of an object in the area of a MAIO instance. The sum of the @len
+ * of all extents is the length of the object.
+ */
+struct io_uring_opaque_extent {
+	/*
+	 * The zcrx offset of the first byte of the extent: the area id in the
+	 * bits from IORING_ZCRX_AREA_SHIFT up, and the byte offset in the area
+	 * below. It is the format of the offset in the completion of RECV_ZC.
+	 * IORING_OPAQUE_EXTENT_UNMAPPED if the extent is not in the area.
+	 */
+	__u64 area_off;
+	/* The number of bytes of the extent. They do not cross a page. */
+	__u64 len;
+};
+
+/* @area_off of an extent that is not in the area, as all those of a created object. */
+#define IORING_OPAQUE_EXTENT_UNMAPPED	(~0ULL)
 
 /* IORING_OP_OPAQUE_OBJ_SEND: sqe->ioprio contains these flags. */
 #define IORING_OPAQUE_SEND_LAST	(1U << 0)
@@ -91,6 +151,15 @@ struct io_uring_opaque_frame {
 #define IORING_OPAQUE_OBJECT_F_COMPACTED	(1U << 0)
 #define IORING_OPAQUE_OBJECT_F_COMPACTING	(1U << 1)
 #define IORING_OPAQUE_OBJECT_F_FORWARD_ONLY (1U << 2)
+/*
+ * Every extent of the object is in the area of the MAIO instance that the
+ * store binds, so the process can see all its bytes through the mapping of the
+ * area. Set for every object that a bound store captured, and never for an
+ * object that IORING_OPAQUE_CREATE made. The flag is in the flags of
+ * IORING_OPAQUE_OBJECT_STAT and in the second extra word of the completion of
+ * IORING_OPAQUE_RECV_OBJECT, next to IORING_OPAQUE_OBJECT_F_FORWARD_ONLY.
+ */
+#define IORING_OPAQUE_OBJECT_F_MAPPED		(1U << 3)
 #define IORING_OPAQUE_STREAM_F_EOF		(1U << 0)
 #define IORING_OPAQUE_POLICY_F_AUTO_COMPACT	(1U << 0)
 

@@ -31,8 +31,15 @@
  */
 #define PP_FLAG_ALLOW_UNREADABLE_NETMEM BIT(3)
 
+#define PP_FLAG_PRIVATE_HEADERS	BIT(4) /* Pool pages never hold a header the
+					* stack parses: the driver copies
+					* headers into a private skb head.
+					* Lets a readable memory provider bind.
+					*/
+
 #define PP_FLAG_ALL		(PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV | \
-				 PP_FLAG_SYSTEM_POOL | PP_FLAG_ALLOW_UNREADABLE_NETMEM)
+				 PP_FLAG_SYSTEM_POOL | PP_FLAG_ALLOW_UNREADABLE_NETMEM | \
+				 PP_FLAG_PRIVATE_HEADERS)
 
 /* Index limit to stay within PP_DMA_INDEX_BITS for DMA indices */
 #define PP_DMA_INDEX_LIMIT XA_LIMIT(1, BIT(PP_DMA_INDEX_BITS) - 1)
@@ -82,7 +89,9 @@ struct pp_alloc_cache {
  * @netdev:	netdev this pool will serve (leave as NULL if none or multiple)
  * @queue_idx:	queue idx this page_pool is being created for.
  * @flags:	PP_FLAG_DMA_MAP, PP_FLAG_DMA_SYNC_DEV, PP_FLAG_SYSTEM_POOL,
- *		PP_FLAG_ALLOW_UNREADABLE_NETMEM.
+ *		PP_FLAG_ALLOW_UNREADABLE_NETMEM, PP_FLAG_PRIVATE_HEADERS.
+ *		A driver that sets PP_FLAG_ALLOW_UNREADABLE_NETMEM or
+ *		PP_FLAG_PRIVATE_HEADERS must also set @netdev and @queue_idx.
  */
 struct page_pool_params {
 	struct_group_tagged(page_pool_params_fast, fast,
@@ -167,10 +176,21 @@ struct page_pool_stats {
 
 struct memory_provider_ops;
 
+/* Flags for struct pp_memory_provider_params. */
+#define PP_MP_F_READABLE	BIT(0) /* The provider returns struct page memory
+					* that the CPU can read. The queue needs
+					* no header split. The pool needs no DMA
+					* mapping. A pool binds the provider if the
+					* driver set PP_FLAG_PRIVATE_HEADERS or
+					* PP_FLAG_ALLOW_UNREADABLE_NETMEM.
+					*/
+#define PP_MP_F_ALL		PP_MP_F_READABLE
+
 struct pp_memory_provider_params {
 	void *mp_priv;
 	const struct memory_provider_ops *mp_ops;
 	u32 rx_page_size;
+	u32 flags;	/* PP_MP_F_* */
 };
 
 struct page_pool {
@@ -183,6 +203,7 @@ struct page_pool {
 	bool dma_map:1;			/* Perform DMA mapping */
 	bool dma_sync:1;		/* Perform DMA sync for device */
 	bool dma_sync_for_cpu:1;	/* Perform DMA sync for cpu */
+	bool mp_readable:1;		/* mp_ops hands out readable pages */
 #ifdef CONFIG_PAGE_POOL_STATS
 	bool system:1;			/* This is a global percpu pool */
 #endif

@@ -216,7 +216,7 @@ static void pressure_seed(struct kunit *test, bool extent_limit)
 		addr = kmap_local_page(page);
 		memset(addr, i, PAGE_SIZE);
 		kunmap_local(addr);
-		extent = io_opaque_extent_new(&f->store, page, 0, 32, i * 32, false);
+		extent = io_opaque_extent_new(&f->store, page, 0, 32, i * 32, 0);
 		if (IS_ERR(extent))
 			put_page(page);
 		KUNIT_ASSERT_FALSE(test, IS_ERR(extent));

@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/ethtool.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/opaque.h>
+#include <linux/sockios.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <poll.h>
@@ -2727,7 +2731,7 @@ static void test_registration_abi(struct io_uring_opaque_config cfg)
 	reg.__resv0 = 1;
 	require(register_request(&r, &reg) == -EINVAL, "registration reserved field");
 	reg = create;
-	cfg.flags = 1;
+	cfg.flags = 1U << 31;
 	require(register_request(&r, &reg) == -EINVAL, "configuration flags");
 	cfg.flags = 0;
 	cfg.__resv[0] = 1;
@@ -4121,7 +4125,7 @@ static void test_watermark_config(struct io_uring_opaque_config cfg)
 			bad.reply_reserve = 0;
 			break;
 		case 5:
-			bad.__resv2 = 1;
+			bad.zcrx_id = 1;
 			break;
 		case 6:
 			bad.__resv1 = 1;
@@ -4700,6 +4704,758 @@ static void test_create_allocation_faults(struct io_uring_opaque_config cfg)
 	}
 }
 
+/*
+ * Stores that bind the area of a MAIO zcrx instance. The instance uses
+ * ZCRX_REG_NODEV, so every byte of a loopback stream is copied into area pages,
+ * and no device is needed. The registration code follows zcrx_maio.c.
+ */
+#define MAIO_RQ_ENTRIES		64
+#define MAIO_RQ_REGION_SIZE	8192
+
+struct maio {
+	struct io_uring_zcrx_ifq_reg reg;
+	struct io_uring_zcrx_area_reg area;
+	struct io_uring_region_desc rd;
+	uint32_t id;
+	unsigned char *map;
+};
+
+/* False when the kernel has no MAIO mode, or the task may not use it. */
+static bool maio_ok;
+/* Why the probe failed. -EOPNOTSUPP: no zero-copy receive. -EPERM: no CAP_NET_ADMIN. */
+static int maio_err;
+
+/* Register an instance on the device @ifindex, or without a device if it is 0. */
+static int maio_register_on(struct ring *r, struct maio *z, unsigned int ifindex,
+			    unsigned int pages)
+{
+	int ret;
+
+	memset(z, 0, sizeof(*z));
+	z->rd.size = MAIO_RQ_REGION_SIZE;
+	z->area.len = (uint64_t)pages * sysconf(_SC_PAGESIZE);
+	z->area.flags = IORING_ZCRX_AREA_KERNEL;
+	z->reg.if_idx = ifindex;
+	z->reg.rq_entries = MAIO_RQ_ENTRIES;
+	z->reg.flags = ZCRX_REG_MAIO | (ifindex ? 0 : ZCRX_REG_NODEV);
+	z->reg.area_ptr = (uintptr_t)&z->area;
+	z->reg.region_ptr = (uintptr_t)&z->rd;
+	ret = syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_ZCRX_IFQ, &z->reg, 1);
+	if (ret < 0)
+		return -errno;
+	z->id = z->reg.zcrx_id;
+	return 0;
+}
+
+static int maio_register(struct ring *r, struct maio *z, unsigned int pages)
+{
+	return maio_register_on(r, z, 0, pages);
+}
+
+static void maio_map(struct ring *r, struct maio *z)
+{
+	z->map = mmap(NULL, z->area.len, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd,
+		      z->area.mmap_offset);
+	require(z->map != MAP_FAILED, "map the area read-write");
+}
+
+static void maio_unmap(struct maio *z)
+{
+	if (z->map)
+		munmap(z->map, z->area.len);
+	z->map = NULL;
+}
+
+static int maio_export(struct ring *r, struct maio *z)
+{
+	struct zcrx_ctrl ctrl = { .zcrx_id = z->id, .op = ZCRX_CTRL_EXPORT };
+	int ret = syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_ZCRX_CTRL, &ctrl, 0);
+
+	return ret < 0 ? -errno : (int)ctrl.zc_export.zcrx_fd;
+}
+
+static int maio_import(struct ring *r, int fd, uint32_t *id)
+{
+	struct io_uring_zcrx_ifq_reg reg = { .if_idx = fd, .flags = ZCRX_REG_IMPORT };
+	int ret = syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_ZCRX_IFQ, &reg, 1);
+
+	*id = reg.zcrx_id;
+	return ret < 0 ? -errno : 0;
+}
+
+/* Register a store that binds the instance. */
+static int maio_store(struct ring *r, struct io_uring_opaque_config cfg, uint32_t zcrx_id,
+		      uint32_t *context)
+{
+	cfg.flags = IORING_OPAQUE_CFG_MAIO;
+	cfg.zcrx_id = zcrx_id;
+	return register_store(r, &cfg, context);
+}
+
+/* Run a control and return its result. */
+static int cmd_res(struct ring *r, uint32_t context, unsigned int op, uint64_t handle,
+		   uint64_t offset, unsigned int length, void *ptr)
+{
+	return command(r, context, op, handle, offset, length, ptr).res;
+}
+
+/* FREE an object, or close a stream: the controls that take no buffer. */
+static void maio_end(struct ring *r, uint32_t context, unsigned int op, uint64_t id)
+{
+	require(!cmd_res(r, context, op, id, 0, 0, NULL), "release an object or a stream");
+}
+
+static void maio_skip(unsigned int n)
+{
+	while (n--)
+		ksft_test_result_skip("MAIO mode is unavailable\n");
+}
+
+static void maio_pattern(unsigned char *p, size_t len, unsigned int seed)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		p[i] = (unsigned char)(i * 131 + (i >> 8) * 7 + seed);
+}
+
+/* Like wait_tag_ms(), but a missing completion is an answer and not a failure. */
+static bool maio_poll(struct ring *r, uint64_t tag, unsigned int ms, struct event *event)
+{
+	struct timespec start, now;
+	struct event e;
+	unsigned int i;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		struct __kernel_timespec ts = { .tv_nsec = 10000000 };
+		struct io_uring_getevents_arg arg = { .ts = (uintptr_t)&ts };
+		unsigned int pending = *r->sq_tail - *r->sq_head;
+		int ret;
+
+		for (i = 0; i < r->nr_saved; i++) {
+			if (r->saved[i].tag == tag) {
+				*event = r->saved[i];
+				r->saved[i] = r->saved[--r->nr_saved];
+				return true;
+			}
+		}
+		ret = syscall(__NR_io_uring_enter, r->fd, pending, 1,
+			      IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg, sizeof(arg));
+		require(ret >= 0 || errno == ETIME || errno == EINTR, "bounded CQ wait");
+		while (peek(r, &e)) {
+			if (e.tag == tag) {
+				*event = e;
+				return true;
+			}
+			require(r->nr_saved < 64, "bounded wait completion stash");
+			r->saved[r->nr_saved++] = e;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((now.tv_sec - start.tv_sec) * 1000 +
+		    (now.tv_nsec - start.tv_nsec) / 1000000 >= ms)
+			return false;
+	}
+}
+
+/*
+ * Check the extents of an object against the area and gather its bytes from
+ * the mapping. The extents cover the object, each one lies inside one page of
+ * the area, and area id 0 is the only area. Return the number of extents.
+ */
+static unsigned int maio_gather(struct ring *r, uint32_t context, struct maio *z,
+				uint64_t handle, uint64_t length, unsigned char *out,
+				struct io_uring_opaque_extent *vec, unsigned int max)
+{
+	const uint64_t page = sysconf(_SC_PAGESIZE);
+	struct io_uring_opaque_object_stat os;
+	struct event event;
+	uint64_t done = 0;
+	unsigned int i, nr;
+
+	require(!command(r, context, IORING_OPAQUE_OBJECT_STAT, handle, 0,
+			 sizeof(os), &os).res, "object stat");
+	nr = os.extents;
+	require(nr && nr <= max && os.length == length, "object extents");
+	event = command(r, context, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0,
+			nr * sizeof(*vec), vec);
+	require(event.res == (int)(nr * sizeof(*vec)), "extents write one pair per extent");
+	for (i = 0; i < nr; i++) {
+		require(!(vec[i].area_off >> IORING_ZCRX_AREA_SHIFT), "extent in area 0");
+		require(vec[i].len && vec[i].area_off + vec[i].len <= z->area.len,
+			"extent inside the area");
+		require((vec[i].area_off % page) + vec[i].len <= page, "extent inside a page");
+		memcpy(out + done, z->map + vec[i].area_off, vec[i].len);
+		done += vec[i].len;
+	}
+	require(done == length, "extent lengths add up to the object");
+	return nr;
+}
+
+/* An object of a store that binds an area is visible and writable in place. */
+static void test_maio_objects(struct io_uring_opaque_config cfg)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	const size_t length = 3 * page + 123, length2 = 2 * page + 17;
+	struct io_uring_opaque_policy policy = {
+		.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT,
+		.bytes_per_second = 64U << 20,
+		.burst_bytes = 8U << 20,
+		.max_temporary_bytes = 8U << 20,
+	};
+	const unsigned int compaction_flags = IORING_OPAQUE_OBJECT_F_COMPACTED |
+					      IORING_OPAQUE_OBJECT_F_COMPACTING;
+	struct io_uring_opaque_extent vec[32], before[32], copy[2];
+	struct io_uring_opaque_object_stat os;
+	struct io_uring_opaque_stat stat;
+	unsigned char *data, *expect, *actual, *got;
+	uint64_t stream, plain_stream, handle, handle2, plain_handle, needed;
+	uint64_t cursor = 0;
+	uint32_t bound, plain;
+	unsigned int nr, nr2, i;
+	int source[2], source2[2], target[2];
+	struct event event;
+	struct maio z;
+	struct ring r;
+
+	if (!maio_ok) {
+		maio_skip(5);
+		return;
+	}
+	data = malloc(4 * length);
+	require(data, "MAIO test buffers");
+	expect = data + length;
+	actual = expect + length;
+	got = actual + length;
+	maio_pattern(data, length, 1);
+	memcpy(expect, data, length);
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "MAIO ring");
+	require(!maio_register(&r, &z, 64), "MAIO instance");
+	maio_map(&r, &z);
+	require(!maio_store(&r, cfg, z.id, &bound), "store that binds the instance");
+	require(!register_store(&r, &cfg, &plain), "store without an instance");
+	tcp_pair(source);
+	tcp_pair(source2);
+	tcp_pair(target);
+	stream = attach(&r, bound, source[1], next_tag++);
+	plain_stream = attach(&r, plain, source2[1], next_tag++);
+
+	/* 1. The completion and the statistics say MAPPED. The extents cover the object. */
+	event = receive_complete(&r, bound, stream, source[0], cursor, data, length);
+	cursor += length;
+	handle = event.extra[0];
+	require(handle && (event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED), "RECV_OBJECT: MAPPED");
+	require(!(event.extra[1] & IORING_OPAQUE_OBJECT_F_FORWARD_ONLY), "no forwarding-only flag");
+	require(!cmd_res(&r, bound, IORING_OPAQUE_OBJECT_STAT, handle, 0, sizeof(os), &os) &&
+		(os.flags & IORING_OPAQUE_OBJECT_F_MAPPED) && !(os.flags & compaction_flags),
+		"OBJECT_STAT says MAPPED");
+	nr = maio_gather(&r, bound, &z, handle, length, actual, vec, ARRAY_SIZE(vec));
+	require(nr >= 2, "an object of three pages has several extents");
+	require(!memcmp(actual, data, length), "the mapping holds the received bytes");
+	require(cmd_res(&r, bound, IORING_OPAQUE_READ_OBJECT, handle, 0, length, got) ==
+		(int)length && !memcmp(got, data, length), "READ_OBJECT equals the mapping");
+	require(!cmd_res(&r, bound, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		stat.copied_bytes >= length, "copied_bytes counts the copies into the area");
+	memcpy(before, vec, nr * sizeof(*vec));
+	ksft_test_result_pass("bound store: extents, MAPPED, mapping equals READ_OBJECT\n");
+
+	/* 2. A write through the mapping shows in READ_OBJECT and in a send. */
+	z.map[vec[0].area_off + 5] ^= 0xff;
+	expect[5] ^= 0xff;
+	z.map[vec[nr - 1].area_off + vec[nr - 1].len - 1] ^= 0x5a;
+	expect[length - 1] ^= 0x5a;
+	require(cmd_res(&r, bound, IORING_OPAQUE_READ_OBJECT, handle, 0, length, got) ==
+		(int)length && !memcmp(got, expect, length), "READ_OBJECT sees the write");
+	require(wait_tag(&r, send_stage(&r, bound, target[0], handle, 0, length)).res ==
+		(int)length, "send the object");
+	read_all(target[1], got, length);
+	require(!memcmp(got, expect, length), "the peer sees the written bytes");
+	/* A range of the object, from the middle of a page. */
+	require(wait_tag(&r, send_stage(&r, bound, target[0], handle, page - 3, 10)).res == 10,
+		"send a range across a page boundary");
+	read_all(target[1], got, 10);
+	require(!memcmp(got, expect + page - 3, 10), "the peer sees the range");
+	ksft_test_result_pass("bound store: a write in the mapping shows in READ_OBJECT, SEND\n");
+
+	/* 3. The size and the errors of EXTENTS. */
+	memset(copy, 0xaa, sizeof(copy));
+	event = command(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, sizeof(copy[0]), copy);
+	needed = nr * sizeof(vec[0]);
+	require(event.res == -EOVERFLOW && event.extra[0] == needed, "small buffer: needed size");
+	require(copy[0].area_off == 0xaaaaaaaaaaaaaaaaULL, "a small buffer is not written");
+	event = command(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, 0, NULL);
+	require(event.res == -EOVERFLOW && event.extra[0] == needed, "size query");
+	event = command(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, needed - 1, vec);
+	require(event.res == -EOVERFLOW && event.extra[0] == needed, "one byte short");
+	memset(vec, 0xaa, sizeof(vec));
+	event = command(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, sizeof(vec), vec);
+	require(event.res == (int)needed && !memcmp(vec, before, needed), "same vector again");
+	require(((unsigned char *)vec)[needed] == 0xaa, "nothing is written past the vector");
+	require(cmd_res(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, 16, NULL) == -EINVAL,
+		"a buffer size without a buffer");
+	require(cmd_res(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 1, needed, vec) == -EINVAL,
+		"EXTENTS takes no offset");
+	require(cmd_res(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle + (1ULL << 20), 0, needed,
+			vec) == -ESTALE, "EXTENTS of a stale handle");
+	require(cmd_res(&r, bound, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, needed,
+			(void *)(uintptr_t)1) == -EFAULT, "EXTENTS to a bad address");
+	ksft_test_result_pass("bound store: EXTENTS size, vector bounds and bad arguments\n");
+
+	/* 4. A store without an instance keeps the old behaviour. */
+	event = receive_complete(&r, plain, plain_stream, source2[0], 0, data, length);
+	plain_handle = event.extra[0];
+	require(plain_handle && !(event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED), "plain object");
+	require(!cmd_res(&r, plain, IORING_OPAQUE_OBJECT_STAT, plain_handle, 0, sizeof(os), &os) &&
+		!(os.flags & IORING_OPAQUE_OBJECT_F_MAPPED), "plain OBJECT_STAT");
+	require(cmd_res(&r, plain, IORING_OPAQUE_OBJECT_EXTENTS, plain_handle, 0, sizeof(vec),
+			vec) == -EOPNOTSUPP, "EXTENTS of an object of a store without an instance");
+	require(cmd_res(&r, plain, IORING_OPAQUE_OBJECT_EXTENTS, plain_handle, 0, 0, NULL) ==
+		-EOPNOTSUPP, "size query of a store without an instance");
+	ksft_test_result_pass("store without an instance: no MAPPED, EXTENTS: -EOPNOTSUPP\n");
+
+	/*
+	 * 5. Compaction would move the bytes out of the area. A manual COMPACT is
+	 * refused. The automatic compaction skips the objects, one that exists
+	 * when the policy changes, and one that arrives later. The same policy
+	 * compacts the object of the store without an instance, so the dispatcher runs.
+	 */
+	require(cmd_res(&r, bound, IORING_OPAQUE_COMPACT, handle, 0, 0, NULL) == -EOPNOTSUPP,
+		"manual COMPACT of an object in the area");
+	require(!cmd_res(&r, bound, IORING_OPAQUE_SET_POLICY, 0, 0, sizeof(policy), &policy),
+		"policy of the bound store");
+	maio_pattern(data, length2, 9);
+	event = receive_complete(&r, bound, stream, source[0], cursor, data, length2);
+	cursor += length2;
+	handle2 = event.extra[0];
+	require(handle2 && (event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED), "second MAPPED");
+	require(!cmd_res(&r, plain, IORING_OPAQUE_SET_POLICY, 0, 0, sizeof(policy), &policy),
+		"policy of the plain store");
+	for (i = 0; i < 500; i++) {
+		require(!cmd_res(&r, plain, IORING_OPAQUE_OBJECT_STAT, plain_handle, 0,
+				 sizeof(os), &os), "control object stat");
+		if (os.flags & IORING_OPAQUE_OBJECT_F_COMPACTED)
+			break;
+		usleep(10000);
+	}
+	require(i < 500, "the policy compacts the object of the plain store");
+	usleep(300000);
+	for (i = 0; i < 2; i++) {
+		uint64_t h = i ? handle2 : handle;
+
+		require(!cmd_res(&r, bound, IORING_OPAQUE_OBJECT_STAT, h, 0, sizeof(os), &os) &&
+			(os.flags & IORING_OPAQUE_OBJECT_F_MAPPED) &&
+			!(os.flags & compaction_flags), "objects in the area are not compacted");
+	}
+	require(cmd_res(&r, bound, IORING_OPAQUE_COMPACT, handle2, 0, 0, NULL) == -EOPNOTSUPP,
+		"manual COMPACT with a policy");
+	nr2 = maio_gather(&r, bound, &z, handle, length, actual, vec, ARRAY_SIZE(vec));
+	require(nr2 == nr && !memcmp(vec, before, nr * sizeof(*vec)) &&
+		!memcmp(actual, expect, length), "the extents did not move");
+	maio_gather(&r, bound, &z, handle2, length2, actual, vec, ARRAY_SIZE(vec));
+	require(!memcmp(actual, data, length2), "the second object in the mapping");
+
+	/* Release everything and check that nothing stays in the stores. */
+	maio_end(&r, bound, IORING_OPAQUE_FREE, handle);
+	maio_end(&r, bound, IORING_OPAQUE_FREE, handle2);
+	maio_end(&r, plain, IORING_OPAQUE_FREE, plain_handle);
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_end(&r, plain, IORING_OPAQUE_STREAM_CLOSE, plain_stream);
+	for (i = 0; i < 2; i++) {
+		uint32_t id = i ? plain : bound;
+
+		require(!cmd_res(&r, id, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+			!stat.backing_bytes && !stat.extents && !stat.objects && !stat.streams,
+			"stores drain");
+	}
+	maio_unmap(&z);
+	ring_exit(&r);
+	for (i = 0; i < 2; i++) {
+		close(source[i]);
+		close(source2[i]);
+		close(target[i]);
+	}
+	free(data);
+	ksft_test_result_pass("objects in the area: COMPACT is refused, no automatic compaction\n");
+}
+
+/* The flag needs an instance in the ring, the id must exist, and the id needs the flag. */
+static void test_maio_registration(struct io_uring_opaque_config cfg)
+{
+	struct io_uring_opaque_register reg;
+	struct io_uring_opaque_stat stat;
+	struct maio z, second;
+	struct ring r;
+	uint32_t context;
+
+	require(!ring_init(&r, IORING_SETUP_CQE32), "MAIO registration ring");
+	cfg.flags = IORING_OPAQUE_CFG_MAIO;
+	if (!maio_ok) {
+		/*
+		 * A kernel without zero-copy receive cannot bind. A task without
+		 * CAP_NET_ADMIN has no instance to bind.
+		 */
+		if (maio_err != -EOPNOTSUPP && maio_err != -EPERM) {
+			ring_exit(&r);
+			maio_skip(1);
+			return;
+		}
+		require(register_store(&r, &cfg, &context) ==
+			(maio_err == -EPERM ? -ENXIO : -EOPNOTSUPP),
+			"the flag without an instance");
+		ring_exit(&r);
+		ksft_test_result_pass("the flag fails without MAIO mode\n");
+		return;
+	}
+	require(register_store(&r, &cfg, &context) == -ENXIO, "the flag, no instance in the ring");
+	/* Ids 0 and 1. An id of 0 is the same as no id, so test with id 1. */
+	require(!maio_register(&r, &z, 4) && !maio_register(&r, &second, 4), "MAIO instances");
+	require(z.id == 0 && second.id == 1, "instance ids");
+	cfg.zcrx_id = 99;
+	require(register_store(&r, &cfg, &context) == -ENXIO, "an id without an instance");
+	cfg.zcrx_id = second.id;
+	cfg.flags = 0;
+	require(register_store(&r, &cfg, &context) == -EINVAL, "an id without the flag");
+	cfg.flags = IORING_OPAQUE_CFG_MAIO | (1U << 1);
+	require(register_store(&r, &cfg, &context) == -EINVAL, "an unknown flag");
+	cfg.flags = IORING_OPAQUE_CFG_MAIO;
+	cfg.__resv1 = 1;
+	require(register_store(&r, &cfg, &context) == -EINVAL, "the remaining reserved word");
+	cfg.__resv1 = 0;
+
+	/* The shortest configuration that has the flag word binds instance 0. */
+	reg = (struct io_uring_opaque_register) {
+		.size = sizeof(reg), .fd = -1, .config = (uintptr_t)&cfg,
+		.config_size = offsetof(struct io_uring_opaque_config, __resv),
+	};
+	cfg.zcrx_id = 0;
+	require(!register_request(&r, &reg), "the shortest configuration binds id 0");
+	context = reg.store_id;
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		stat.hard_limit == cfg.hard_limit, "the bound store works");
+	ring_exit(&r);
+	ksft_test_result_pass("the flag needs an instance in the ring, an id needs the flag\n");
+}
+
+/* Keep a stream of objects of the given size going until the area runs dry. */
+static void test_maio_exhaustion(struct io_uring_opaque_config cfg)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	struct io_uring_opaque_stat stat;
+	struct io_uring_opaque_extent vec[8];
+	uint64_t stream, a, b, c, handle_a, handle_b, handle_c;
+	unsigned char *data, *got;
+	struct transfer tx;
+	uint32_t context;
+	struct event event;
+	pthread_t producer;
+	int pair[2];
+	struct maio z;
+	struct ring r;
+	size_t total;
+
+	if (!maio_ok) {
+		maio_skip(1);
+		return;
+	}
+	/* Nine pages. Two objects of four pages leave one page for a third object of two. */
+	total = 10 * page;
+	data = malloc(2 * total);
+	require(data, "exhaustion buffers");
+	got = data + total;
+	maio_pattern(data, total, 3);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "exhaustion ring");
+	require(!maio_register(&r, &z, 9), "small instance");
+	maio_map(&r, &z);
+	require(!maio_store(&r, cfg, z.id, &context), "store of the small instance");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], next_tag++);
+
+	a = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, 0, 4 * page, NULL);
+	b = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, 4 * page, 4 * page, NULL);
+	c = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, 8 * page, 2 * page, NULL);
+	submit_only(&r);
+	tx = (struct transfer) { .fd = pair[0], .data = data, .length = total };
+	require(!pthread_create(&producer, NULL, writer, &tx), "exhaustion producer");
+	event = wait_tag_ms(&r, a, 30000);
+	require(event.res == (int)(4 * page) && event.extra[0], "first object");
+	handle_a = event.extra[0];
+	event = wait_tag_ms(&r, b, 30000);
+	require(event.res == (int)(4 * page) && event.extra[0], "second object");
+	handle_b = event.extra[0];
+
+	/*
+	 * The third object copied one page, and then the area ran dry. The
+	 * request waits and retries every 50 ms. It does not fail, and it keeps
+	 * the bytes that it has.
+	 */
+	require(!maio_poll(&r, c, 500, &event), "the third object waits for a free page");
+	require(!cmd_res(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		stat.copied_bytes >= 9 * page && stat.backing_bytes == 9 * page,
+		"the third object holds its first page");
+
+	/* A page comes back, and the request finishes. */
+	maio_end(&r, context, IORING_OPAQUE_FREE, handle_a);
+	require(maio_poll(&r, c, 10000, &event), "the third object finishes after the release");
+	require(event.res == (int)(2 * page) && event.extra[0], "third object");
+	handle_c = event.extra[0];
+	pthread_join(producer, NULL);
+	require(cmd_res(&r, context, IORING_OPAQUE_READ_OBJECT, handle_c, 0, 2 * page, got) ==
+		(int)(2 * page) && !memcmp(got, data + 8 * page, 2 * page),
+		"the third object is intact");
+	maio_gather(&r, context, &z, handle_c, 2 * page, got, vec, ARRAY_SIZE(vec));
+	require(!memcmp(got, data + 8 * page, 2 * page), "the third object in the mapping");
+	require(cmd_res(&r, context, IORING_OPAQUE_READ_OBJECT, handle_b, 0, 4 * page, got) ==
+		(int)(4 * page) && !memcmp(got, data + 4 * page, 4 * page),
+		"the second object is intact");
+
+	maio_end(&r, context, IORING_OPAQUE_FREE, handle_b);
+	maio_end(&r, context, IORING_OPAQUE_FREE, handle_c);
+	maio_end(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream);
+	require(!cmd_res(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		!stat.backing_bytes && !stat.extents && !stat.objects, "store drains");
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	free(data);
+	ksft_test_result_pass("an empty area: capture waits, a release lets it finish\n");
+}
+
+/*
+ * Cycle objects through a small area. A page that a release does not return,
+ * and a page that stays in limbo after a send, would end the loop with a wait
+ * that never finishes. A last object takes the whole area.
+ */
+static void test_maio_recycle(struct io_uring_opaque_config cfg)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	const size_t length = 2 * page + 904, area_pages = 16;
+	struct io_uring_opaque_stat stat;
+	unsigned char *data, *got, *whole;
+	uint64_t stream, cursor = 0;
+	uint32_t context;
+	struct event event;
+	int source[2], target[2];
+	struct maio z;
+	struct ring r;
+	unsigned int i;
+
+	if (!maio_ok) {
+		maio_skip(1);
+		return;
+	}
+	data = malloc(2 * length + area_pages * page);
+	require(data, "recycle buffers");
+	got = data + length;
+	whole = got + length;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "recycle ring");
+	require(!maio_register(&r, &z, area_pages), "recycle instance");
+	maio_map(&r, &z);
+	require(!maio_store(&r, cfg, z.id, &context), "recycle store");
+	tcp_pair(source);
+	tcp_pair(target);
+	stream = attach(&r, context, source[1], next_tag++);
+
+	for (i = 0; i < 300; i++) {
+		uint64_t handle, tag;
+
+		maio_pattern(data, length, i);
+		tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, cursor,
+				length, NULL);
+		submit_only(&r);
+		write_all(source[0], data, length);
+		require(maio_poll(&r, tag, 20000, &event) && event.res == (int)length,
+			"an object of the cycle");
+		cursor += length;
+		handle = event.extra[0];
+		require(cmd_res(&r, context, IORING_OPAQUE_READ_OBJECT, handle, 0, length, got) ==
+			(int)length && !memcmp(got, data, length), "object bytes in the cycle");
+		if (i & 1) {
+			/* The send holds the pages in TCP after the object is gone. */
+			tag = send_stage_flags(&r, context, target[0], handle, 0, length,
+					       IORING_OPAQUE_SEND_LAST, 0, 0);
+			event = wait_tag(&r, tag);
+			require(event.res == (int)length &&
+				(event.flags & IORING_CQE_F_OPAQUE_CONSUMED), "consuming send");
+			read_all(target[1], got, length);
+			require(!memcmp(got, data, length), "peer bytes in the cycle");
+		} else {
+			maio_end(&r, context, IORING_OPAQUE_FREE, handle);
+		}
+	}
+
+	/* The whole area fits in one object, so no page was lost. */
+	maio_pattern(whole, area_pages * page, 77);
+	event = receive_complete(&r, context, stream, source[0], cursor, whole, area_pages * page);
+	require(event.extra[0], "object of the whole area");
+	maio_end(&r, context, IORING_OPAQUE_FREE, event.extra[0]);
+	maio_end(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream);
+	require(!cmd_res(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		!stat.backing_bytes && !stat.extents && !stat.objects, "store drains");
+	maio_unmap(&z);
+	ring_exit(&r);
+	for (i = 0; i < 2; i++) {
+		close(source[i]);
+		close(target[i]);
+	}
+	free(data);
+	ksft_test_result_pass("300 objects cycle through a 16 page area, FREE and SEND_LAST\n");
+}
+
+/*
+ * The instance goes first. The ring that registered it exits while another ring
+ * holds the store through an import. The objects keep their pages. The store
+ * goes on taking pages of the area and releases them. The ring that holds the
+ * store exits last.
+ */
+static void test_maio_instance_first(struct io_uring_opaque_config cfg)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	const size_t length = 3 * page + 11;
+	struct io_uring_opaque_extent vec[16];
+	struct io_uring_opaque_stat stat;
+	uint32_t context, imported;
+	uint64_t stream, handle, handle2, stream2;
+	unsigned char *data, *got;
+	struct ring r, other;
+	struct event event;
+	int pair[2], pair2[2], fd;
+	unsigned int i;
+	struct maio z;
+
+	if (!maio_ok) {
+		maio_skip(1);
+		return;
+	}
+	data = malloc(2 * length);
+	require(data, "lifetime buffers");
+	got = data + length;
+	maio_pattern(data, length, 21);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "first ring");
+	require(!maio_register(&r, &z, 32), "first instance");
+	maio_map(&r, &z);
+	require(!maio_store(&r, cfg, z.id, &context), "first store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], next_tag++);
+	event = receive_complete(&r, context, stream, pair[0], 0, data, length);
+	handle = event.extra[0];
+	require(handle, "object before the exit");
+	maio_end(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream);
+
+	/* The second ring imports the store, and the first ring goes away. */
+	fd = export_store(&r, context);
+	require(fd >= 0, "export the store");
+	require(!ring_init(&other, IORING_SETUP_CQE32), "second ring");
+	require(!import_store(&other, fd, &imported), "import the store");
+	close(fd);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	/* Give the exit of the first ring time to unregister the instance. */
+	usleep(500000);
+
+	require(cmd_res(&other, imported, IORING_OPAQUE_READ_OBJECT, handle, 0, length, got) ==
+		(int)length && !memcmp(got, data, length), "the object survives the instance");
+	event = command(&other, imported, IORING_OPAQUE_OBJECT_EXTENTS, handle, 0, sizeof(vec),
+			vec);
+	require(event.res > 0 && !(event.res % sizeof(vec[0])), "extents after the exit");
+	for (i = 0; i < event.res / sizeof(vec[0]); i++)
+		require(vec[i].area_off != IORING_OPAQUE_EXTENT_UNMAPPED, "extent in the area");
+	/* The store still takes pages of the area. */
+	tcp_pair(pair2);
+	stream2 = attach(&other, imported, pair2[1], next_tag++);
+	maio_pattern(data, length, 22);
+	event = receive_complete(&other, imported, stream2, pair2[0], 0, data, length);
+	handle2 = event.extra[0];
+	require(handle2 && (event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED), "object after exit");
+	require(cmd_res(&other, imported, IORING_OPAQUE_READ_OBJECT, handle2, 0, length, got) ==
+		(int)length && !memcmp(got, data, length), "the new object in the area");
+	maio_end(&other, imported, IORING_OPAQUE_FREE, handle);
+	maio_end(&other, imported, IORING_OPAQUE_FREE, handle2);
+	maio_end(&other, imported, IORING_OPAQUE_STREAM_CLOSE, stream2);
+	require(!cmd_res(&other, imported, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		!stat.backing_bytes && !stat.extents && !stat.objects, "store drains");
+	ring_exit(&other);
+	close(pair2[0]);
+	close(pair2[1]);
+	free(data);
+	ksft_test_result_pass("the instance exits first: READ_OBJECT, new objects and FREE work\n");
+}
+
+/*
+ * The store goes first. A ring imports the instance and binds a store to it,
+ * keeps an object, and exits. The instance stays in the first ring, and the
+ * area has all its pages back: a new store takes the whole area.
+ */
+static void test_maio_store_first(struct io_uring_opaque_config cfg)
+{
+	const size_t page = sysconf(_SC_PAGESIZE);
+	const size_t pages = 16, length = 3 * page + 11;
+	struct io_uring_opaque_extent vec[32];
+	struct io_uring_opaque_stat stat;
+	uint32_t context, other_context, id;
+	uint64_t stream, handle;
+	unsigned char *data, *got;
+	struct ring r, other;
+	struct event event;
+	int pair[2], fd;
+	struct maio z;
+
+	if (!maio_ok) {
+		maio_skip(1);
+		return;
+	}
+	data = malloc(2 * pages * page);
+	require(data, "lifetime buffers");
+	got = data + pages * page;
+	maio_pattern(data, length, 31);
+	require(!ring_init(&r, IORING_SETUP_CQE32), "owner ring");
+	require(!maio_register(&r, &z, pages), "owner instance");
+	maio_map(&r, &z);
+	fd = maio_export(&r, &z);
+	require(fd >= 0, "export the instance");
+	require(!ring_init(&other, IORING_SETUP_CQE32), "importing ring");
+	require(!maio_import(&other, fd, &id), "import the instance");
+	close(fd);
+	require(!maio_store(&other, cfg, id, &other_context), "store of the importing ring");
+	tcp_pair(pair);
+	stream = attach(&other, other_context, pair[1], next_tag++);
+	event = receive_complete(&other, other_context, stream, pair[0], 0, data, length);
+	handle = event.extra[0];
+	require(handle, "object of the importing ring");
+	/* The owner sees the bytes in its mapping. */
+	maio_gather(&other, other_context, &z, handle, length, got, vec, ARRAY_SIZE(vec));
+	require(!memcmp(got, data, length), "the owner sees the bytes of the other store");
+	maio_end(&other, other_context, IORING_OPAQUE_STREAM_CLOSE, stream);
+	/* The importing ring exits with the object still in the store. */
+	ring_exit(&other);
+	close(pair[0]);
+	close(pair[1]);
+	usleep(500000);
+
+	/* The instance is intact, and every page is free again. */
+	require(!maio_store(&r, cfg, z.id, &context), "store of the owner");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], next_tag++);
+	maio_pattern(data, pages * page, 32);
+	event = receive_complete(&r, context, stream, pair[0], 0, data, pages * page);
+	require(event.extra[0], "object of the whole area");
+	maio_gather(&r, context, &z, event.extra[0], pages * page, got, vec, ARRAY_SIZE(vec));
+	require(!memcmp(got, data, pages * page), "the whole area in the mapping");
+	maio_end(&r, context, IORING_OPAQUE_FREE, event.extra[0]);
+	maio_end(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream);
+	require(!cmd_res(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
+		!stat.backing_bytes && !stat.extents && !stat.objects, "store drains");
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	free(data);
+	ksft_test_result_pass("the store exits first: the instance stays, every page is free\n");
+}
+
 static void test_timeout(int signal_number)
 {
 	static const char message[] = "OPAQUE timeout; adjust OPAQUE_TEST_TIMEOUT\n";
@@ -4726,6 +5482,452 @@ static void set_test_timeout(void)
 	}
 	signal(SIGALRM, test_timeout);
 	alarm(seconds);
+}
+
+/*
+ * Stores that bind an instance on a netdevsim port. Port A has the instance.
+ * Its peer B, and the TCP sockets that send through B, are in a namespace of
+ * their own, so that the frames cross the devices. The pool of port A puts the
+ * payload of each frame into a page of the area, as a driver with private
+ * headers does. The fixture follows zcrx_maio.c. Without netdevsim, network
+ * namespaces or root, the tests skip.
+ */
+#define LOCAL_ADDR		"10.77.0.1"
+#define PEER_ADDR		"10.77.0.2"
+#define PEER_SOCKETS		2
+
+struct peer {
+	unsigned int id;		/* netdevsim device id of the peer */
+	unsigned int ifindex;		/* in the namespace of the peer */
+	int netns;			/* a file descriptor of that namespace */
+	int socks[PEER_SOCKETS];	/* TCP sockets in that namespace */
+	int err;
+};
+
+struct pair {
+	unsigned int id;		/* netdevsim device id of port A */
+	char name[IFNAMSIZ];
+	unsigned int ifindex;
+	struct peer peer;
+};
+
+static int sysfs_write(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY), ret;
+
+	if (fd < 0)
+		return -errno;
+	ret = write(fd, text, strlen(text));
+	ret = ret < 0 ? -errno : 0;
+	close(fd);
+	return ret;
+}
+
+static bool nsim_create(unsigned int id, unsigned int queues, char name[IFNAMSIZ])
+{
+	char path[128], text[64];
+	struct dirent *de;
+	DIR *dir;
+	int ret;
+
+	snprintf(text, sizeof(text), "%u 1 %u", id, queues);
+	ret = sysfs_write("/sys/bus/netdevsim/new_device", text);
+	if (ret)
+		return false;
+	snprintf(path, sizeof(path), "/sys/bus/netdevsim/devices/netdevsim%u/net", id);
+	dir = opendir(path);
+	if (!dir)
+		return false;
+	name[0] = 0;
+	while ((de = readdir(dir)))
+		if (de->d_name[0] != '.')
+			snprintf(name, IFNAMSIZ, "%.*s", IFNAMSIZ - 1, de->d_name);
+	closedir(dir);
+	return name[0];
+}
+
+static void nsim_destroy(unsigned int id)
+{
+	char text[32];
+
+	snprintf(text, sizeof(text), "%u", id);
+	sysfs_write("/sys/bus/netdevsim/del_device", text);
+}
+
+static int link_up(const char *name)
+{
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	ret = ioctl(s, SIOCGIFFLAGS, &ifr);
+	if (!ret) {
+		ifr.ifr_flags |= IFF_UP;
+		ret = ioctl(s, SIOCSIFFLAGS, &ifr);
+	}
+	close(s);
+	return ret ? -errno : 0;
+}
+
+static int set_addr(const char *name, const char *addr)
+{
+	struct sockaddr_in *sin;
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	sin->sin_family = AF_INET;
+	inet_pton(AF_INET, addr, &sin->sin_addr);
+	ret = ioctl(s, SIOCSIFADDR, &ifr);
+	if (!ret) {
+		inet_pton(AF_INET, "255.255.255.0", &sin->sin_addr);
+		ret = ioctl(s, SIOCSIFNETMASK, &ifr);
+	}
+	close(s);
+	return ret ? -errno : 0;
+}
+
+/* Without TSO the stack sends one frame per segment. */
+static int tso_set(const char *name, bool on)
+{
+	struct ethtool_value eval = { .cmd = ETHTOOL_STSO, .data = on };
+	struct ifreq ifr = {};
+	int s = socket(AF_INET, SOCK_DGRAM, 0), ret;
+
+	require(s >= 0, "control socket");
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+	ifr.ifr_data = (void *)&eval;
+	ret = ioctl(s, SIOCETHTOOL, &ifr);
+	close(s);
+	return ret ? -errno : 0;
+}
+
+/* The name of the last device in this namespace that is not the loopback device. */
+static bool first_nonlo(char name[IFNAMSIZ])
+{
+	struct if_nameindex *list, *e;
+
+	name[0] = 0;
+	list = if_nameindex();
+	for (e = list; e && e->if_index; e++)
+		if (strcmp(e->if_name, "lo"))
+			snprintf(name, IFNAMSIZ, "%s", e->if_name);
+	if_freenameindex(list);
+	return name[0];
+}
+
+/*
+ * The network namespace belongs to a thread. unshare() gives this thread a
+ * namespace of its own, and netdevsim creates a device in the namespace of the
+ * task that asks for it. The sockets keep the namespace after the thread ends.
+ */
+static void *peer_thread(void *arg)
+{
+	struct peer *p = arg;
+	char name[IFNAMSIZ], text[32];
+	int i;
+
+	p->err = -1;
+	if (unshare(CLONE_NEWNET))
+		return NULL;
+	snprintf(text, sizeof(text), "%u 1 1", p->id);
+	if (sysfs_write("/sys/bus/netdevsim/new_device", text))
+		return NULL;
+	if (!first_nonlo(name) || set_addr(name, PEER_ADDR) || tso_set(name, false) ||
+	    link_up(name))
+		return NULL;
+	p->ifindex = if_nametoindex(name);
+	p->netns = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+	for (i = 0; i < PEER_SOCKETS; i++)
+		p->socks[i] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (!p->ifindex || p->netns < 0)
+		return NULL;
+	p->err = 0;
+	return NULL;
+}
+
+/* Return false if the fixture is not available. */
+static bool pair_create(struct pair *pr, unsigned int id_a, unsigned int id_b)
+{
+	char text[64];
+	pthread_t th;
+	int ns_a, ret;
+
+	memset(pr, 0, sizeof(*pr));
+	pr->id = id_a;
+	pr->peer.id = id_b;
+	pr->peer.netns = -1;
+	if (!nsim_create(id_a, 1, pr->name))
+		return false;
+	pr->ifindex = if_nametoindex(pr->name);
+	if (!pr->ifindex || set_addr(pr->name, LOCAL_ADDR) || link_up(pr->name))
+		goto err_a;
+	if (pthread_create(&th, NULL, peer_thread, &pr->peer))
+		goto err_a;
+	pthread_join(th, NULL);
+	if (pr->peer.err)
+		goto err_b;
+
+	ns_a = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+	snprintf(text, sizeof(text), "%d:%u %d:%u", ns_a, pr->ifindex,
+		 pr->peer.netns, pr->peer.ifindex);
+	ret = sysfs_write("/sys/bus/netdevsim/link_device", text);
+	close(ns_a);
+	if (!ret)
+		return true;
+err_b:
+	nsim_destroy(id_b);
+err_a:
+	nsim_destroy(id_a);
+	return false;
+}
+
+static void pair_destroy(struct pair *pr)
+{
+	int i;
+
+	for (i = 0; i < PEER_SOCKETS; i++)
+		close(pr->peer.socks[i]);
+	close(pr->peer.netns);
+	nsim_destroy(pr->id);
+	nsim_destroy(pr->peer.id);
+}
+
+static int listen_local(uint16_t *port)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET };
+	socklen_t len = sizeof(addr);
+	int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+	require(s >= 0, "listen socket");
+	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
+	require(!bind(s, (void *)&addr, len), "bind the listen socket to port A");
+	require(!getsockname(s, (void *)&addr, &len), "getsockname");
+	require(!listen(s, 4), "listen");
+	*port = ntohs(addr.sin_port);
+	return s;
+}
+
+/* Connect a socket of the peer to port A and return the accepted socket. */
+static int connect_peer(struct pair *pr, int idx, int listener, uint16_t port)
+{
+	struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+	int fd;
+
+	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
+	alarm(120);
+	require(!connect(pr->peer.socks[idx], (void *)&addr, sizeof(addr)),
+		"connect the peer to port A");
+	fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+	require(fd >= 0, "accept the connection of the peer");
+	alarm(0);
+	return fd;
+}
+
+/*
+ * Register an instance on port A and a store that binds it. Return false, with
+ * the fixture gone, if the port cannot take an instance.
+ */
+static bool maio_port(struct pair *pr, struct ring *r, struct maio *z, unsigned int pages,
+		      struct io_uring_opaque_config cfg, uint32_t *bound)
+{
+	int ret;
+
+	if (!maio_ok) {
+		ksft_test_result_skip("MAIO mode is unavailable\n");
+		return false;
+	}
+	if (!pair_create(pr, 300, 301)) {
+		ksft_test_result_skip("netdevsim ports in two namespaces are unavailable\n");
+		return false;
+	}
+	require(!ring_init(r, IORING_SETUP_CQE32), "ring for the port");
+	ret = maio_register_on(r, z, pr->ifindex, pages);
+	if (ret == -EOPNOTSUPP || ret == -ENODEV) {
+		ksft_test_result_skip("the port takes no MAIO instance: %d\n", ret);
+		ring_exit(r);
+		pair_destroy(pr);
+		return false;
+	}
+	require(!ret, "MAIO instance on the port");
+	maio_map(r, z);
+	require(!maio_store(r, cfg, z->id, bound), "store bound to the instance of the port");
+	return true;
+}
+
+/* Wait until the store holds no payload. A consuming send frees its backing a little late. */
+static void maio_drained(struct ring *r, uint32_t context)
+{
+	struct io_uring_opaque_stat stat;
+	unsigned int i;
+
+	for (i = 0; i < 500; i++) {
+		require(!cmd_res(r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat),
+			"store stat");
+		if (!stat.backing_bytes && !stat.extents && !stat.objects)
+			return;
+		usleep(10000);
+	}
+	require(false, "the store drains");
+}
+
+/*
+ * The pool pages of the port carry the payload, so the store holds them by
+ * pool reference and copies no byte. Each segment of the stream is one extent.
+ * 300 objects of 16 KiB cycle through an area of 128 pages. The objects with an
+ * even number are freed, and the others go back to the peer with a consuming
+ * send. The peer reads the bytes that it wrote.
+ */
+static void test_maio_device(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 16384;
+	struct io_uring_opaque_extent vec[64];
+	struct io_uring_opaque_stat stat;
+	unsigned char *data, *got;
+	uint64_t stream, handle, cursor = 0;
+	socklen_t optlen = sizeof(int);
+	unsigned int nr, round;
+	struct event event;
+	uint16_t port;
+	uint32_t bound;
+	struct maio z;
+	struct ring r;
+	struct pair pr;
+	int sock, listener, mss;
+
+	if (!maio_port(&pr, &r, &z, 128, cfg, &bound))
+		return;
+	data = malloc(2 * length);
+	require(data, "buffers");
+	got = data + length;
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	require(!getsockopt(pr.peer.socks[0], IPPROTO_TCP, TCP_MAXSEG, &mss, &optlen) && mss > 0,
+		"segment size of the peer");
+	stream = attach(&r, bound, sock, next_tag++);
+
+	for (round = 0; round < 300; round++) {
+		uint64_t tag;
+
+		maio_pattern(data, length, round);
+		tag = cmd_stage(&r, bound, IORING_OPAQUE_RECV_OBJECT, stream, cursor, length, NULL);
+		submit_only(&r);
+		write_all(pr.peer.socks[0], data, length);
+		require(maio_poll(&r, tag, 20000, &event) && event.res == (int)length,
+			"object from the port");
+		cursor += length;
+		handle = event.extra[0];
+		require(event.extra[1] & IORING_OPAQUE_OBJECT_F_MAPPED, "the object is mapped");
+		nr = maio_gather(&r, bound, &z, handle, length, got, vec, ARRAY_SIZE(vec));
+		require(nr == (length + mss - 1) / mss, "one extent for each segment");
+		require(!memcmp(got, data, length), "bytes through the mapping");
+		if (round & 1) {
+			tag = send_stage_flags(&r, bound, sock, handle, 0, length,
+					       IORING_OPAQUE_SEND_LAST, 0, 0);
+			require(wait_tag(&r, tag).res == (int)length, "consuming send to the peer");
+			read_all(pr.peer.socks[0], got, length);
+			require(!memcmp(got, data, length), "the peer reads the bytes back");
+		} else {
+			maio_end(&r, bound, IORING_OPAQUE_FREE, handle);
+		}
+	}
+	require(!cmd_res(&r, bound, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat), "store stat");
+	require(!stat.copied_bytes, "no byte is copied");
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_drained(&r, bound);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(sock);
+	close(listener);
+	pair_destroy(&pr);
+	free(data);
+	ksft_test_result_pass("store on a port: 300 objects, pool references, no copy\n");
+}
+
+/*
+ * The area of 64 pages is too small for the stream. A segment takes a whole
+ * page of the pool, so the objects use up the area. An object that needs
+ * another page waits and keeps what it has. It finishes after the process
+ * frees an object.
+ */
+static void test_maio_device_small(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 32768;
+	const unsigned int objects = 4;
+	struct io_uring_opaque_extent vec[64];
+	unsigned char *data, *got;
+	uint64_t stream, handle[4], tag[4], cursor = 0;
+	unsigned int i, j, waiting = 0;
+	bool done[4] = {};
+	struct event event;
+	uint16_t port;
+	uint32_t bound;
+	struct maio z;
+	struct ring r;
+	struct pair pr;
+	int sock, listener;
+
+	if (!maio_port(&pr, &r, &z, 64, cfg, &bound))
+		return;
+	data = malloc((objects + 1) * length);
+	require(data, "buffers");
+	got = data + objects * length;
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	stream = attach(&r, bound, sock, next_tag++);
+
+	for (i = 0; i < objects; i++) {
+		maio_pattern(data + i * length, length, 5 + i);
+		tag[i] = cmd_stage(&r, bound, IORING_OPAQUE_RECV_OBJECT, stream, cursor,
+				   length, NULL);
+		cursor += length;
+	}
+	submit_only(&r);
+	write_all(pr.peer.socks[0], data, objects * length);
+
+	/* The first objects find pages. Later ones may wait for the process. */
+	for (i = 0; i < objects; i++) {
+		done[i] = maio_poll(&r, tag[i], i < 2 ? 20000 : 1500, &event);
+		if (done[i]) {
+			require(event.res == (int)length, "object result");
+			handle[i] = event.extra[0];
+		} else {
+			waiting++;
+		}
+	}
+	require(waiting, "an object waits for a page of the area");
+
+	/* Free the finished objects in turn. The waiting ones finish. */
+	for (i = 0; i < objects; i++) {
+		if (!done[i]) {
+			require(maio_poll(&r, tag[i], 30000, &event), "a waiting object finishes");
+			require(event.res == (int)length, "late object result");
+			handle[i] = event.extra[0];
+			done[i] = true;
+		}
+		maio_gather(&r, bound, &z, handle[i], length, got, vec, ARRAY_SIZE(vec));
+		require(!memcmp(got, data + i * length, length), "object bytes");
+		maio_end(&r, bound, IORING_OPAQUE_FREE, handle[i]);
+		for (j = i + 1; j < objects; j++) {
+			if (done[j] || !maio_poll(&r, tag[j], 1000, &event))
+				continue;
+			require(event.res == (int)length, "next object result");
+			handle[j] = event.extra[0];
+			done[j] = true;
+		}
+	}
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_drained(&r, bound);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(sock);
+	close(listener);
+	pair_destroy(&pr);
+	free(data);
+	ksft_test_result_pass("store on a port: a full area makes an object wait for a free\n");
 }
 
 int main(void)
@@ -4763,7 +5965,16 @@ int main(void)
 	if (ret == -EINVAL || ret == -EOPNOTSUPP)
 		ksft_exit_skip("OPAQUE_OBJ unavailable\n");
 	require(!ret, "opaque registration");
-	ksft_set_plan(108);
+	{
+		struct ring probe;
+		struct maio z;
+
+		require(!ring_init(&probe, IORING_SETUP_CQE32), "MAIO probe ring");
+		maio_err = maio_register(&probe, &z, 1);
+		maio_ok = !maio_err;
+		ring_exit(&probe);
+	}
+	ksft_set_plan(120);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	test_create(cfg);
 	test_create_quota(cfg);
@@ -5039,5 +6250,13 @@ int main(void)
 	test_poll_first(&cfg);
 	test_full_cq(&cfg);
 	test_allocation_failure(&cfg);
+	test_maio_registration(cfg);
+	test_maio_objects(cfg);
+	test_maio_exhaustion(cfg);
+	test_maio_recycle(cfg);
+	test_maio_instance_first(cfg);
+	test_maio_store_first(cfg);
+	test_maio_device(cfg);
+	test_maio_device_small(cfg);
 	ksft_finished();
 }
