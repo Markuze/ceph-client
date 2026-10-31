@@ -423,6 +423,8 @@ struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
+int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
+			   unsigned int issue_flags);
 extern atomic_long_t io_opaque_send_locked_calls;
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);

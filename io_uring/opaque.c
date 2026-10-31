@@ -3354,8 +3354,14 @@ atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
  * that sk_prot_creator does not follow. A socket with no local port has not
  * connected. TCP's proto has inet_send_prepare() leave it unbound, so this
  * does not change what a send does, and only keeps such a socket on the
- * ordinary path. A ULP is installed under the socket lock, so the answer holds
- * only while the caller owns the socket; before that it is a hint.
+ * ordinary path.
+ *
+ * kTLS and espintcp install their proto under the socket lock, and a socket
+ * map under the bottom-half lock alone, so the answer is a hint until the
+ * socket is owned and is no more than true then. A swap that comes while
+ * tcp_sendmsg_locked() is in progress is what it is for a stock tcp_sendmsg()
+ * in flight: that call goes on with the proto it began with, and the next one
+ * takes the new, here the next part of the frame, which asks again.
  */
 VISIBLE_IF_KUNIT bool io_opaque_send_direct(const struct sock *sk)
 {
@@ -3376,15 +3382,35 @@ static u32 io_opaque_send_msg_flags(const struct io_opaque_req *op, unsigned int
 }
 
 /*
+ * The security hook, for an issue that sends on the socket directly. The
+ * first sock_sendmsg() of an issue asks it for the part of the frame it sends,
+ * and a refusal ends that call before any byte goes: a send that has taken its
+ * references and started, so that LAST is consumed and a frame behind it fails
+ * with it, or is told to try again if the hook says EAGAIN. Here it is asked
+ * once, for what is left of the frame, in the same place and ending the
+ * issue in the same way. The ordinary path asks for every part, which a
+ * policy that depends on the socket and not on the part cannot tell apart.
+ */
+VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
+					     unsigned int issue_flags)
+{
+	struct msghdr msg = { .msg_flags = io_opaque_send_msg_flags(op, issue_flags) };
+
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_security, sock, op, issue_flags);
+	return security_socket_sendmsg(sock, &msg, op->total_length - op->progress);
+}
+
+/*
  * One issue of an object send. A request that is not the head of its
  * destination's queue parks. The head sends its frame, prefix, body and
  * suffix, from where it stopped, and the frame leaves the queue once all of it
  * is queued to TCP.
  *
  * On a plain TCP socket (io_opaque_send_direct()) the head does all of that
- * under one lock_sock(): it takes the references it has not taken yet, calls
- * tcp_sendmsg_locked() for each part of the frame, hands the queue on, lets go
- * of its references and only then releases the socket. While the socket is
+ * under one lock_sock(): it takes the references it has not taken yet, asks the
+ * security hook, calls tcp_sendmsg_locked() for each part of the frame, hands
+ * the queue on, lets go of the references that are not the last and only then
+ * releases the socket, and after it puts the last ones. While the socket is
  * unowned, ACKs and the transmit that autocorking left queued run under its
  * spinlock, for as long as they take, and the sender's next lock_sock() waits
  * for them; the less the sender does in that window, the less often it does.
@@ -3403,7 +3429,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct msghdr msg;
 	struct kvec vec;
 	u32 body_end;
-	bool body, splice = false, fresh, owned = false;
+	bool body = false, splice = false, fresh, owned = false;
 	int ret;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
@@ -3433,19 +3459,8 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	fresh = ret == IO_OPAQUE_TX_SETTLE;
 
 	if (io_opaque_send_direct(sk)) {
-		/*
-		 * The hint says plain TCP. What sock_sendmsg() would ask the
-		 * security hook for each part of the frame it is asked once, for
-		 * what is left of it, before the socket is taken.
-		 */
+		/* The hint says plain TCP; the socket decides once it is owned. */
 		io_ring_submit_unlock(req->ctx, issue_flags);
-		memset(&msg, 0, sizeof(msg));
-		msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
-		ret = security_socket_sendmsg(sock, &msg, op->total_length - op->progress);
-		if (ret) {
-			io_ring_submit_lock(req->ctx, issue_flags);
-			goto finish;
-		}
 		sock_rps_record_flow(sk);
 		lock_sock(sk);
 		owned = io_opaque_send_direct(sk);
@@ -3463,6 +3478,11 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 		}
 	}
 	op->tx_started = true;
+	if (owned) {
+		ret = io_opaque_send_security(sock, op, issue_flags);
+		if (ret)
+			goto sent;
+	}
 
 again:
 	memset(&msg, 0, sizeof(msg));
@@ -3501,6 +3521,7 @@ again:
 		ret = sock_sendmsg(sock, &msg);
 		io_ring_submit_lock(req->ctx, issue_flags);
 	}
+sent:
 	if (ret > 0) {
 		if (body) {
 			op->iter = msg.msg_iter;
