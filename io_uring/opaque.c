@@ -3365,10 +3365,13 @@ atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
  */
 VISIBLE_IF_KUNIT bool io_opaque_send_direct(const struct sock *sk)
 {
-	const struct proto *prot = READ_ONCE(sk->sk_prot);
-	/* Written when the socket binds or connects; a stale zero only spoils a hint. */
-	u16 port = data_race(inet_sk(sk)->inet_num);
+	const struct proto *prot;
+	u16 port;
 
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_direct, sk);
+	prot = READ_ONCE(sk->sk_prot);
+	/* Written when the socket binds or connects; a stale zero only spoils a hint. */
+	port = data_race(inet_sk(sk)->inet_num);
 	return prot->sendmsg == tcp_sendmsg && prot == sk->sk_prot_creator && port;
 }
 

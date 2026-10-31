@@ -1265,13 +1265,101 @@ static void opaque_send_head_admit_fails(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/*
+ * A frame that arrives while the head has yet to take its references takes its
+ * own first, and the head, which is ahead of it in the queue, finds what that
+ * left. A head that then succeeds sends first and hands the queue on. A LAST
+ * frame behind it that took the handle leaves the head with ESTALE and no
+ * claim on LAST, nothing consumed and the queue not failed, and is promoted
+ * with the references it took: the winner of two that contend for a handle is
+ * the one that took it first, not the one first in the queue.
+ */
+static void opaque_send_head_races_follower(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct sock *sk = kunit_kzalloc(test, sizeof(*sk), GFP_KERNEL);
+	u64 handle = io_opaque_handle(0, 9);
+	unsigned int c;
+
+	KUNIT_ASSERT_NOT_NULL(test, sk);
+	opaque_test_wakeups(test);
+	for (c = 0; c < 3; c++) {
+		/* 0: the head goes on; 1: a LAST frame takes the handle; 2: both are LAST. */
+		struct io_opaque_data *data = opaque_test_object(test, store);
+		struct io_opaque_req head, follower;
+		struct io_opaque_tx *tx;
+
+		opaque_test_tx_op(&head, store);
+		opaque_test_tx_op(&follower, store);
+		head.handle = handle;
+		head.length = 100;
+		follower.handle = handle;
+		follower.length = 100;
+		follower.send_flags = c ? IORING_OPAQUE_SEND_LAST : 0;
+		head.send_flags = c == 2 ? IORING_OPAQUE_SEND_LAST : 0;
+
+		KUNIT_ASSERT_EQ(test, io_opaque_tx_join(&head, sk), IO_OPAQUE_TX_SETTLE);
+		tx = head.tx;
+		KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&follower, sk), IO_OPAQUE_TX_WAIT);
+		lockdep_assert_none_held_once();
+		KUNIT_EXPECT_EQ(test, follower.phase, IO_OPAQUE_SEND_WAIT);
+		KUNIT_EXPECT_PTR_EQ(test, follower.data, data);
+		KUNIT_EXPECT_EQ(test, follower.consumed, !!c);
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), c ? 1 : 2);
+		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, c ? NULL : data);
+
+		if (!c) {
+			/* The head takes its own, and goes first. */
+			KUNIT_EXPECT_EQ(test, io_opaque_tx_settle_head(&head), 0);
+			lockdep_assert_none_held_once();
+			KUNIT_EXPECT_PTR_EQ(test, head.data, data);
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 3);
+			opaque_test_tx_done(&head, true);
+			KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&head), &follower);
+			io_opaque_data_put(store, head.data);
+			head.data = NULL;
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+		} else {
+			/* The handle is gone. The head asks nothing more of the queue. */
+			KUNIT_EXPECT_EQ(test, io_opaque_tx_settle_head(&head), -ESTALE);
+			lockdep_assert_none_held_once();
+			KUNIT_EXPECT_FALSE(test, head.consumed);
+			KUNIT_EXPECT_PTR_EQ(test, head.data, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, head.tx, tx);
+			KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&head), &follower);
+		}
+		/* Either way the follower is promoted, whole, and the queue has not failed. */
+		KUNIT_EXPECT_PTR_EQ(test, head.tx, NULL);
+		KUNIT_EXPECT_EQ(test, follower.phase, IO_OPAQUE_QUEUED);
+		KUNIT_EXPECT_FALSE(test, follower.canceled);
+		KUNIT_EXPECT_FALSE(test, tx->failed);
+		KUNIT_EXPECT_EQ(test, opaque_woken.nr, 0U);
+		KUNIT_EXPECT_PTR_EQ(test, follower.data, data);
+		follower.phase = IO_OPAQUE_IDLE;
+		KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&follower, sk), IO_OPAQUE_TX_HEAD);
+		opaque_test_tx_done(&follower, true);
+		KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&follower), NULL);
+		io_opaque_data_put(store, follower.data);
+		if (!c) {
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+			mutex_lock(&store->tables);
+			io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+			mutex_unlock(&store->tables);
+		}
+		/* A LAST frame's put freed the object, which nobody else held. */
+		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	}
+}
+
 static int opaque_test_sendmsg(struct sock *sk, struct msghdr *msg, size_t size);
 
 /*
  * Only plain, bound TCP is sent on with tcp_sendmsg_locked(): not a socket
  * whose proto sends some other way, not one whose proto is not the one it was
- * made with, and not one sock_sendmsg() would have to bind first. Each of the
- * three is enough on its own.
+ * made with, and not one with no local port, which has not connected. Each of
+ * the three is enough on its own.
  */
 static void opaque_send_direct_predicate(struct kunit *test)
 {
@@ -1300,7 +1388,7 @@ static void opaque_send_direct_predicate(struct kunit *test)
 	sk->sk_prot = &tcp_prot;
 	sk->sk_prot_creator = other;
 	KUNIT_EXPECT_FALSE(test, io_opaque_send_direct(sk));
-	/* A socket that has no local port: sock_sendmsg() would bind it first. */
+	/* A socket with no local port has not connected, and stays on the ordinary path. */
 	sk->sk_prot_creator = &tcp_prot;
 	inet_sk(sk)->inet_num = 0;
 	KUNIT_EXPECT_FALSE(test, io_opaque_send_direct(sk));
@@ -6034,6 +6122,391 @@ static void opaque_send_security_refusal(struct kunit *test)
 				opaque_security_run(test, path, err ? -EAGAIN : -EACCES, last);
 }
 
+/* Issue request @i of the fixture, as io-wq does or inline under the ring lock. */
+static int opaque_wire_issue(struct opaque_wire *w, int i, bool unlocked)
+{
+	int ret;
+
+	if (unlocked)
+		return io_opaque_send(&w->req[i], IO_URING_F_UNLOCKED);
+	mutex_lock(&w->ctx->uring_lock);
+	ret = io_opaque_send(&w->req[i], IO_URING_F_NONBLOCK);
+	mutex_unlock(&w->ctx->uring_lock);
+	return ret;
+}
+
+/* A vectored send as request @i of the fixture, ready to be issued. */
+static struct io_opaque_req *opaque_wire_vec(struct kunit *test, struct opaque_wire *w,
+					     struct io_opaque_store *store, int i,
+					     const struct io_uring_opaque_send_entry *ent, u32 nr,
+					     u16 flags)
+{
+	struct io_opaque_req *op = opaque_vec_new(test, store, ent, nr, flags);
+
+	op->req = &w->req[i];
+	op->op = U16_MAX;
+	INIT_LIST_HEAD(&op->wait);
+	INIT_LIST_HEAD(&op->cancel);
+	INIT_LIST_HEAD(&op->send);
+	io_opaque_send_resolve(op);
+	w->req[i].async_data = op;
+	w->req[i].flags = 0;
+	return op;
+}
+
+/* What the window of an admission that has to grow its block saw, and the frame it lets in. */
+static struct {
+	struct sock *sk;
+	struct io_opaque_req *follower;
+	bool owned;
+	int joined;
+} opaque_admit_hook;
+
+static void opaque_admit_between(struct kunit *test, struct io_opaque_req *op)
+{
+	opaque_admit_hook.owned = sock_owned_by_user_nocheck(opaque_admit_hook.sk);
+	if (opaque_admit_hook.follower)
+		opaque_admit_hook.joined = io_opaque_tx_join(opaque_admit_hook.follower,
+							     opaque_admit_hook.sk);
+}
+
+/*
+ * A head that cannot take its references while it owns the socket: a stale
+ * handle, LAST or not, and a vector whose block cannot grow, which fails with
+ * the socket owned and a frame that joined meanwhile parked behind it. It
+ * leaves with the error, which is not a completion, nothing sent, nothing
+ * consumed and nothing held, and releases the socket and does not fail the
+ * queue; the frame behind it is promoted with its references and sends them.
+ */
+static void opaque_send_locked_admit_fails(struct kunit *test)
+{
+	struct io_uring_opaque_send_entry ent[2];
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 300, GFP_KERNEL);
+	unsigned int mode, last;
+	struct sock *sk;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_sndbuf(sk, SZ_1M);
+	for (mode = 0; mode < 2; mode++) {
+		bool unlocked = !mode;
+
+		for (last = 0; last < 2; last++) {
+			u16 flags = last ? IORING_OPAQUE_SEND_LAST : 0;
+			struct io_opaque_req *head, *follower;
+			long calls = atomic_long_read(&io_opaque_send_locked_calls);
+			int ret;
+
+			/* A handle that holds nothing: ESTALE, with nobody and nothing involved. */
+			head = opaque_wire_req(test, w, store, 0, flags, 100, 1000);
+			head->handle = io_opaque_handle(1, 3);
+			memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
+			ret = opaque_wire_issue(w, 0, unlocked);
+			lockdep_assert_none_held_once();
+			KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
+			KUNIT_EXPECT_FALSE(test, head->consumed);
+			KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, head->data, NULL);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+			KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
+			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
+					calls);
+
+			/* A vector whose block cannot grow, with a frame that joins as it fails. */
+			opaque_grow_entries(ent, io_opaque_handle(0, 9));
+			head = opaque_wire_vec(test, w, store, 0, ent, ARRAY_SIZE(ent), flags);
+			follower = opaque_wire_req(test, w, store, 1, 0, 200, 300);
+			memset(&opaque_admit_hook, 0, sizeof(opaque_admit_hook));
+			opaque_admit_hook.sk = sk;
+			opaque_admit_hook.follower = follower;
+			opaque_window_open(test, opaque_admit_between);
+			opaque_window.fail = -ENOMEM;
+			ret = opaque_wire_issue(w, 0, unlocked);
+			opaque_window_close(test);
+			lockdep_assert_none_held_once();
+			KUNIT_EXPECT_EQ(test, ret, -ENOMEM);
+			/* It was the owner of the socket that needed the block, and let it go. */
+			KUNIT_EXPECT_TRUE(test, opaque_admit_hook.owned);
+			KUNIT_EXPECT_EQ(test, opaque_window.calls, 1U);
+			KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
+			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+			KUNIT_EXPECT_FALSE(test, head->consumed);
+			KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
+			KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, data);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
+					calls);
+			/* The frame that came in was parked with its pin, and is promoted whole. */
+			KUNIT_EXPECT_EQ(test, opaque_admit_hook.joined, IO_OPAQUE_TX_WAIT);
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+			KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_QUEUED);
+			KUNIT_EXPECT_FALSE(test, follower->canceled);
+			KUNIT_ASSERT_NOT_NULL(test, follower->tx);
+			KUNIT_EXPECT_FALSE(test, follower->tx->failed);
+			KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&w->ctx->work_list, &w->ctx->work_head),
+					    &w->req[1].io_task_work.node);
+			/* It resumes as the head, and sends what it holds. */
+			follower->phase = IO_OPAQUE_IDLE;
+			ret = opaque_wire_issue(w, 1, unlocked);
+			KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+			KUNIT_EXPECT_EQ(test, w->req[1].cqe.res, 300);
+			KUNIT_EXPECT_PTR_EQ(test, follower->data, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, follower->tx, NULL);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
+					calls + 1);
+			opaque_wire_read(test, w, got, 0, 300);
+			KUNIT_EXPECT_MEMEQ(test, got, source + 200, 300);
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+		}
+	}
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * The proto of the socket is taken over while a frame is sent, as a ULP or a
+ * socket map would do it: before the socket is owned, between the first check
+ * and the second, or in the middle of the frame, after a part, when TCP may
+ * have given the socket up. The parts sent by then went with tcp_sendmsg_locked(),
+ * the rest go through the proto's own sendmsg, once the socket has been
+ * released, and the frame arrives whole. A send that did not own the socket
+ * when it took its references still took them where the ordinary path takes
+ * them, and the references it took stay with it until cleanup.
+ */
+static struct {
+	unsigned int calls, swap_at;
+} opaque_direct;
+
+static bool opaque_test_direct(const struct sock *sk)
+{
+	struct kunit *test = kunit_get_current_test();
+	bool ret;
+
+	if (++opaque_direct.calls == opaque_direct.swap_at)
+		((struct sock *)sk)->sk_prot = &opaque_test_proto;
+	kunit_deactivate_static_stub(test, io_opaque_send_direct);
+	ret = io_opaque_send_direct(sk);
+	kunit_activate_static_stub(test, io_opaque_send_direct, opaque_test_direct);
+	return ret;
+}
+
+static void opaque_direct_switch_run(struct kunit *test, unsigned int swap_at)
+{
+	const u32 prefix = 24, suffix = 8, body = 3200, total = prefix + body + suffix;
+	struct io_uring_opaque_send_entry ent[2];
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *frame = kunit_kmalloc(test, prefix + suffix, GFP_KERNEL);
+	u8 *want = kunit_kmalloc(test, total, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, total, GFP_KERNEL);
+	long calls = atomic_long_read(&io_opaque_send_locked_calls);
+	/* The parts that went with the socket owned: none, the prefix, it and the body, all. */
+	const unsigned int locked = swap_at == 2 ? 0 : swap_at == 3 ? 1 : swap_at == 4 ? 2 : 3;
+	struct io_opaque_req *op;
+	struct sock *sk;
+	unsigned int i;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_sndbuf(sk, SZ_1M);
+	for (i = 0; i < prefix + suffix; i++)
+		frame[i] = 0xc0 + i;
+	opaque_grow_entries(ent, io_opaque_handle(0, 9));
+	memcpy(want, frame, prefix);
+	memcpy(want + prefix, source + ent[0].off, ent[0].len);
+	memcpy(want + prefix + ent[0].len, source + ent[1].off, ent[1].len);
+	memcpy(want + prefix + body, frame + prefix, suffix);
+	/* A vector whose block must grow, which shows where the references are taken. */
+	op = opaque_wire_vec(test, w, store, 0, ent, ARRAY_SIZE(ent), 0);
+	op->framing = frame;
+	op->prefix_length = prefix;
+	op->suffix_length = suffix;
+	op->total_length = total;
+	op->resolved = true;
+	opaque_test_proto = tcp_prot;
+	opaque_test_proto.sendmsg = opaque_test_sendmsg;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_proto_restore, sk), 0);
+	memset(&opaque_admit_hook, 0, sizeof(opaque_admit_hook));
+	opaque_admit_hook.sk = sk;
+	memset(&opaque_refuse, 0, sizeof(opaque_refuse));
+	atomic_set(&opaque_test_proto_calls, 0);
+	opaque_direct.calls = 0;
+	opaque_direct.swap_at = swap_at;
+	if (swap_at)
+		kunit_activate_static_stub(test, io_opaque_send_direct, opaque_test_direct);
+	opaque_window_open(test, opaque_admit_between);
+
+	ret = opaque_wire_issue(w, 0, true);
+	opaque_window_close(test);
+	if (swap_at)
+		kunit_deactivate_static_stub(test, io_opaque_send_direct);
+	lockdep_assert_none_held_once();
+	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
+	KUNIT_EXPECT_EQ(test, opaque_window.calls, 1U);
+	/* The socket was owned when the block grew if the decision came out as direct. */
+	KUNIT_EXPECT_EQ(test, opaque_admit_hook.owned, swap_at != 2);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls) - calls, (long)locked);
+	KUNIT_EXPECT_EQ(test, atomic_read(&opaque_test_proto_calls), (int)(3 - locked));
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+	opaque_wire_read(test, w, got, 0, total);
+	KUNIT_EXPECT_MEMEQ(test, got, want, total);
+	/* Given back by a send that was direct to the end, else left to cleanup. */
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, swap_at && locked < 3 ? ARRAY_SIZE(ent) : 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), swap_at && locked < 3 ? 2 : 1);
+	if (swap_at && locked < 3)
+		io_opaque_vec_release(op);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+static void opaque_send_direct_switch(struct kunit *test)
+{
+	/* Never; at the check under the lock; after the first part; after the second. */
+	static const unsigned int swaps[] = { 0, 2, 3, 4 };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(swaps); i++)
+		opaque_direct_switch_run(test, swaps[i]);
+}
+
+/*
+ * A blocking send on the direct path sleeps in TCP when the buffers are full,
+ * which gives the socket up while it waits: with the ring lock not held, as
+ * io-wq issues it. A peer that starts to read a while later lets it go on,
+ * and it completes with the whole frame, from the one call that went to
+ * sleep.
+ */
+static struct {
+	struct delayed_work work;
+	struct opaque_wire *w;
+	u8 *got;
+	u32 total;
+	bool ring_free, unowned;
+	struct completion done;
+} opaque_reader;
+
+static void opaque_reader_fn(struct work_struct *work)
+{
+	u32 done = 0;
+
+	/* The sender went to sleep in TCP long ago: the ring lock is free, the socket unowned. */
+	opaque_reader.ring_free = !mutex_is_locked(&opaque_reader.w->ctx->uring_lock);
+	opaque_reader.unowned = !sock_owned_by_user_nocheck(opaque_reader.w->tx->sk);
+	while (done < opaque_reader.total) {
+		struct msghdr msg = {};
+		struct kvec vec = { .iov_base = opaque_reader.got + done,
+				    .iov_len = opaque_reader.total - done };
+		int ret = kernel_recvmsg(opaque_reader.w->rx, &msg, &vec, 1, vec.iov_len, 0);
+
+		if (ret <= 0)
+			break;
+		done += ret;
+	}
+	opaque_reader.total = done;
+	complete(&opaque_reader.done);
+}
+
+static void opaque_reader_cancel(void *arg)
+{
+	cancel_delayed_work_sync(&opaque_reader.work);
+}
+
+static void opaque_send_locked_blocking(struct kunit *test)
+{
+	struct io_uring_opaque_send_entry ent[6];
+	const u32 total = 6 * 80000;
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, total, GFP_KERNEL);
+	long calls = atomic_long_read(&io_opaque_send_locked_calls);
+	struct io_opaque_req *op;
+	ktime_t start;
+	unsigned int i;
+	s64 ms;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	opaque_wire_init(test, w);
+	/* Far more than the buffers on both sides will take before a read. */
+	opaque_wire_sndbuf(w->tx->sk, SZ_32K);
+	for (i = 0; i < ARRAY_SIZE(ent); i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = io_opaque_handle(0, 9), .off = 0, .len = 80000,
+		};
+	op = opaque_wire_vec(test, w, store, 0, ent, ARRAY_SIZE(ent), 0);
+	memset(&opaque_reader, 0, sizeof(opaque_reader));
+	opaque_reader.w = w;
+	opaque_reader.got = got;
+	opaque_reader.total = total;
+	init_completion(&opaque_reader.done);
+	INIT_DELAYED_WORK(&opaque_reader.work, opaque_reader_fn);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_reader_cancel, NULL), 0);
+	schedule_delayed_work(&opaque_reader.work, msecs_to_jiffies(150));
+
+	start = ktime_get();
+	ret = opaque_wire_issue(w, 0, true);
+	ms = ktime_ms_delta(ktime_get(), start);
+	lockdep_assert_none_held_once();
+	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
+	/* It could not have finished before the peer began to read. */
+	KUNIT_EXPECT_GE(test, ms, 100LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls) - calls, 1L);
+	KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
+	KUNIT_ASSERT_GT(test, wait_for_completion_timeout(&opaque_reader.done, 10 * HZ), 0UL);
+	KUNIT_EXPECT_TRUE(test, opaque_reader.ring_free);
+	KUNIT_EXPECT_TRUE(test, opaque_reader.unowned);
+	KUNIT_ASSERT_EQ(test, opaque_reader.total, total);
+	for (i = 0; i < ARRAY_SIZE(ent); i++)
+		KUNIT_EXPECT_MEMEQ(test, got + i * 80000, source, 80000);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_reservation_unwind),
 	KUNIT_CASE(opaque_create_publish_revalidate),
@@ -6072,6 +6545,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_tx_idle_cache),
 	KUNIT_CASE(opaque_tx_lock_order),
 	KUNIT_CASE(opaque_send_head_admit_fails),
+	KUNIT_CASE(opaque_send_head_races_follower),
 	KUNIT_CASE(opaque_send_direct_predicate),
 	KUNIT_CASE(opaque_cache_miss_then_hit),
 	KUNIT_CASE(opaque_cache_cooling_probe),
@@ -6101,6 +6575,9 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_locked_last_versions),
 	KUNIT_CASE(opaque_send_fallback),
 	KUNIT_CASE(opaque_send_security_refusal),
+	KUNIT_CASE(opaque_send_locked_admit_fails),
+	KUNIT_CASE(opaque_send_direct_switch),
+	KUNIT_CASE(opaque_send_locked_blocking),
 	KUNIT_CASE(opaque_attach_lock_order),
 	KUNIT_CASE(opaque_send_vec_check),
 	KUNIT_CASE(opaque_send_vec_acquire),
