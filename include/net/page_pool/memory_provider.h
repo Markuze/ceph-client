@@ -29,6 +29,7 @@ void net_mp_niov_clear_page_pool(struct net_iov *niov);
 
 netmem_ref net_mp_alloc_fallback(struct page_pool *pool, gfp_t gfp);
 bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr);
+void net_mp_page_init(struct page *page);
 void net_mp_page_set_page_pool(struct page_pool *pool, struct page *page);
 void net_mp_page_clear_page_pool(struct page *page);
 

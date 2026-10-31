@@ -358,11 +358,18 @@ struct receive_queue {
 
 	/* True if the pool was created with PP_FLAG_PRIVATE_HEADERS, for a
 	 * queue that has a provider of readable pages. Another party can then
-	 * read and write the pool pages, so page_to_skb() copies the headers
-	 * into a private head. Changes only while NAPI is off. XDP and AF_XDP
-	 * cannot attach to a device with a provider: the core refuses it.
+	 * read and write the pool pages. Changes only while NAPI is off. XDP
+	 * and AF_XDP cannot attach to a device with a provider: the core
+	 * refuses it.
 	 */
 	bool private_headers;
+
+	/* True once a pool with PP_FLAG_PRIVATE_HEADERS served the queue. The
+	 * ring can then hold pages of such a pool, also after the queue got
+	 * another pool, and page_to_skb() looks at the pool of each page to
+	 * keep the headers out of provider pages. Set while NAPI is off.
+	 */
+	bool provider_pages;
 
 	/* RX: fragments + linear part + virtio header */
 	struct scatterlist sg[MAX_SKB_FRAGS + 2];
@@ -709,13 +716,26 @@ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
 	return p;
 }
 
+/* Return a receive page to the pool that it came from. ndo_queue_start() can
+ * give a queue a new pool while buffers of the old pool are still posted, so
+ * the pool of the queue is not always the pool of the page. The old pool has
+ * no NAPI instance any more: recycle its pages only through its ring.
+ */
+static void virtnet_put_page(struct receive_queue *rq, struct page *page,
+			     bool allow_direct)
+{
+	struct page_pool *pp = __netmem_get_pp(page_to_netmem(page));
+
+	page_pool_put_page(pp, page, -1, allow_direct && pp == rq->page_pool);
+}
+
 static void virtnet_rq_free_buf(struct virtnet_info *vi,
 				struct receive_queue *rq, void *buf)
 {
 	if (!rq->page_pool)
 		give_pages(rq, buf);
 	else
-		page_pool_put_page(rq->page_pool, virt_to_head_page(buf), -1, false);
+		virtnet_put_page(rq, virt_to_head_page(buf), false);
 }
 
 static void virtqueue_napi_schedule(struct napi_struct *napi,
@@ -867,22 +887,36 @@ static unsigned int virtnet_priv_head_len(const struct virtnet_info *vi,
 	return hlen;
 }
 
-/* Called from bottom half context */
+/* True if no header may stay in @page: the page belongs to a pool that binds a
+ * memory provider, and another party can write the pages of the provider.
+ * The ring can hold pages of an earlier pool of the queue, so look at the pool
+ * of the page, not at the pool of the queue.
+ */
+static bool virtnet_page_private(const struct receive_queue *rq,
+				 struct page *page)
+{
+	if (likely(!rq->provider_pages))
+		return false;
+	return __netmem_get_pp(page_to_netmem(page))->mp_ops;
+}
+
+/* Called from bottom half context. @vhdr is the virtio-net header of the
+ * buffer: in the page, or a private copy of it, see virtnet_rx_hdr().
+ */
 static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 				   struct receive_queue *rq,
 				   struct page *page, unsigned int offset,
 				   unsigned int len, unsigned int truesize,
-				   unsigned int headroom)
+				   unsigned int headroom, const void *vhdr)
 {
 	struct sk_buff *skb;
 	struct virtio_net_common_hdr *hdr;
 	unsigned int copy, hdr_len, hdr_padded_len;
 	struct page *page_to_free = NULL;
 	int tailroom, shinfo_size;
-	char *p, *hdr_p, *buf;
+	char *p, *buf;
 
 	p = page_address(page) + offset;
-	hdr_p = p;
 
 	hdr_len = vi->hdr_len;
 	if (vi->mergeable_rx_bufs)
@@ -898,15 +932,15 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 
 	shinfo_size = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 
-	/* The pool binds a memory provider, so another party can write the
-	 * page. Do not build the skb over the page: the stack would parse
-	 * headers in it. Copy the headers into a private head and attach the
-	 * rest of the buffer as a fragment of the page. Allocate the same
-	 * head as for the other queues, so that a later pull from the
-	 * fragment finds room. Only mergeable buffers get here: no other mode
-	 * has such a queue.
+	/* The pool of the page binds a memory provider, so another party can
+	 * write the page. Do not build the skb over the page: the stack would
+	 * parse headers in it. Copy the headers into a private head and attach
+	 * the rest of the buffer as a fragment of the page. Allocate the same
+	 * head as for the other queues, so that a later pull from the fragment
+	 * finds room. Only mergeable buffers get here: no other mode has such
+	 * a queue.
 	 */
-	if (unlikely(rq->private_headers)) {
+	if (unlikely(virtnet_page_private(rq, page))) {
 		skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
 		if (unlikely(!skb))
 			return NULL;
@@ -979,9 +1013,9 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 
 ok:
 	hdr = skb_vnet_common_hdr(skb);
-	memcpy(hdr, hdr_p, hdr_len);
+	memcpy(hdr, vhdr, hdr_len);
 	if (page_to_free)
-		page_pool_put_page(rq->page_pool, page_to_free, -1, true);
+		virtnet_put_page(rq, page_to_free, true);
 
 	return skb;
 }
@@ -1736,7 +1770,7 @@ static void put_xdp_frags(struct receive_queue *rq, struct xdp_buff *xdp)
 		shinfo = xdp_get_shared_info_from_buff(xdp);
 		for (i = 0; i < shinfo->nr_frags; i++) {
 			xdp_page = skb_frag_page(&shinfo->frags[i]);
-			page_pool_put_page(rq->page_pool, xdp_page, -1, true);
+			virtnet_put_page(rq, xdp_page, true);
 		}
 	}
 }
@@ -1856,7 +1890,7 @@ static struct page *xdp_linearize_page(struct net_device *dev,
 						   off, buflen);
 
 		if (check_mergeable_len(dev, ctx, buflen)) {
-			page_pool_put_page(rq->page_pool, p, -1, true);
+			virtnet_put_page(rq, p, true);
 			goto err_buf;
 		}
 
@@ -1864,21 +1898,21 @@ static struct page *xdp_linearize_page(struct net_device *dev,
 		 * is sending packet larger than the MTU.
 		 */
 		if ((page_off + buflen + tailroom) > PAGE_SIZE) {
-			page_pool_put_page(rq->page_pool, p, -1, true);
+			virtnet_put_page(rq, p, true);
 			goto err_buf;
 		}
 
 		memcpy(page_address(page) + page_off,
 		       page_address(p) + off, buflen);
 		page_off += buflen;
-		page_pool_put_page(rq->page_pool, p, -1, true);
+		virtnet_put_page(rq, p, true);
 	}
 
 	/* Headroom does not contribute to packet length */
 	*len = page_off - XDP_PACKET_HEADROOM;
 	return page;
 err_buf:
-	page_pool_put_page(rq->page_pool, page, -1, true);
+	virtnet_put_page(rq, page, true);
 	return NULL;
 }
 
@@ -1950,7 +1984,7 @@ static struct sk_buff *receive_small_xdp(struct net_device *dev,
 			goto err_xdp;
 
 		buf = page_address(xdp_page);
-		page_pool_put_page(rq->page_pool, page, -1, true);
+		virtnet_put_page(rq, page, true);
 		page = xdp_page;
 	}
 
@@ -1990,7 +2024,7 @@ err_xdp:
 	u64_stats_inc(&stats->xdp_drops);
 err:
 	u64_stats_inc(&stats->drops);
-	page_pool_put_page(rq->page_pool, page, -1, true);
+	virtnet_put_page(rq, page, true);
 xdp_xmit:
 	return NULL;
 }
@@ -2046,7 +2080,7 @@ static struct sk_buff *receive_small(struct net_device *dev,
 
 err:
 	u64_stats_inc(&stats->drops);
-	page_pool_put_page(rq->page_pool, page, -1, true);
+	virtnet_put_page(rq, page, true);
 	return NULL;
 }
 
@@ -2073,7 +2107,8 @@ static struct sk_buff *receive_big(struct net_device *dev,
 		goto err;
 	}
 
-	skb = page_to_skb(vi, rq, page, 0, len, PAGE_SIZE, 0);
+	skb = page_to_skb(vi, rq, page, 0, len, PAGE_SIZE, 0,
+			  page_address(page));
 	u64_stats_add(&stats->bytes, len - vi->hdr_len);
 	if (unlikely(!skb))
 		goto err;
@@ -2104,7 +2139,7 @@ static void mergeable_buf_free(struct receive_queue *rq, int num_buf,
 		}
 		u64_stats_add(&stats->bytes, len);
 		page = virt_to_head_page(buf);
-		page_pool_put_page(rq->page_pool, page, -1, true);
+		virtnet_put_page(rq, page, true);
 	}
 }
 
@@ -2219,7 +2254,7 @@ static int virtnet_build_xdp_buff_mrg(struct net_device *dev,
 						   offset, len);
 
 		if (check_mergeable_len(dev, ctx, len)) {
-			page_pool_put_page(rq->page_pool, page, -1, true);
+			virtnet_put_page(rq, page, true);
 			goto err;
 		}
 
@@ -2313,7 +2348,7 @@ static void *mergeable_xdp_get_buf(struct virtnet_info *vi,
 
 	*frame_sz = PAGE_SIZE;
 
-	page_pool_put_page(rq->page_pool, *page, -1, true);
+	virtnet_put_page(rq, *page, true);
 
 	*page = xdp_page;
 
@@ -2374,7 +2409,7 @@ static struct sk_buff *receive_mergeable_xdp(struct net_device *dev,
 	put_xdp_frags(rq, &xdp);
 
 err_xdp:
-	page_pool_put_page(rq->page_pool, page, -1, true);
+	virtnet_put_page(rq, page, true);
 	mergeable_buf_free(rq, num_buf, dev, stats);
 
 	u64_stats_inc(&stats->xdp_drops);
@@ -2419,7 +2454,7 @@ static struct sk_buff *virtnet_skb_append_frag(struct receive_queue *rq,
 	offset = buf - page_address(page);
 	if (skb_can_coalesce(curr_skb, num_skb_frags, page, offset)) {
 		if (head_skb->pp_recycle)
-			page_pool_put_page(rq->page_pool, page, -1, true);
+			virtnet_put_page(rq, page, true);
 		else
 			put_page(page);
 		skb_coalesce_rx_frag(curr_skb, num_skb_frags - 1,
@@ -2436,12 +2471,13 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 					 struct virtnet_info *vi,
 					 struct receive_queue *rq,
 					 void *buf,
+					 struct virtio_net_common_hdr *vhdr,
 					 void *ctx,
 					 unsigned int len,
 					 unsigned int *xdp_xmit,
 					 struct virtnet_rq_stats *stats)
 {
-	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
+	struct virtio_net_hdr_mrg_rxbuf *hdr = &vhdr->mrg_hdr;
 	int num_buf = virtio16_to_cpu(vi->vdev, hdr->num_buffers);
 	struct page *page = virt_to_head_page(buf);
 	int offset = buf - page_address(page);
@@ -2462,6 +2498,14 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 		rcu_read_lock();
 		xdp_prog = rcu_dereference(rq->xdp_prog);
 		if (xdp_prog) {
+			/* XDP reads the headers in place. A page of a provider
+			 * pool can stay posted after the provider went away,
+			 * and no header may be parsed in it: drop the packet.
+			 */
+			if (unlikely((void *)vhdr != buf)) {
+				rcu_read_unlock();
+				goto err_skb;
+			}
 			head_skb = receive_mergeable_xdp(dev, vi, rq, xdp_prog, buf, ctx,
 							 len, xdp_xmit, stats);
 			rcu_read_unlock();
@@ -2470,7 +2514,8 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 		rcu_read_unlock();
 	}
 
-	head_skb = page_to_skb(vi, rq, page, offset, len, truesize, headroom);
+	head_skb = page_to_skb(vi, rq, page, offset, len, truesize, headroom,
+			       vhdr);
 	curr_skb = head_skb;
 
 	if (unlikely(!curr_skb))
@@ -2511,7 +2556,7 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 	return head_skb;
 
 err_skb:
-	page_pool_put_page(rq->page_pool, page, -1, true);
+	virtnet_put_page(rq, page, true);
 	mergeable_buf_free(rq, num_buf, dev, stats);
 
 err_buf:
@@ -2599,6 +2644,33 @@ frame_err:
 	dev_kfree_skb(skb);
 }
 
+/* Return the virtio-net header of a mergeable receive buffer, or NULL if the
+ * header is not valid. Another party can write a page of a provider pool, so
+ * the driver reads the header of such a page once, into @copy, and uses only
+ * the copy: for the flags, for num_buffers and for the header that the stack
+ * gets in skb->cb. Without the copy a write between two reads would change a
+ * field after the driver used it. num_buffers is then also bounded: a packet
+ * cannot have more buffers than the ring, and it has at least one.
+ */
+static struct virtio_net_common_hdr *
+virtnet_rx_hdr(const struct virtnet_info *vi, const struct receive_queue *rq,
+	       void *buf, struct virtio_net_common_hdr *copy)
+{
+	unsigned int num_buf;
+
+	if (!virtnet_page_private(rq, virt_to_head_page(buf)))
+		return buf;
+
+	memcpy(copy, buf, vi->hdr_len);
+	/* Make the compiler read the copy, not the page again. */
+	barrier();
+
+	num_buf = virtio16_to_cpu(vi->vdev, copy->mrg_hdr.num_buffers);
+	if (unlikely(!num_buf || num_buf > virtqueue_get_vring_size(rq->vq)))
+		return NULL;
+	return copy;
+}
+
 static void receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
 			void *buf, unsigned int len, void **ctx,
 			unsigned int *xdp_xmit,
@@ -2635,9 +2707,20 @@ static void receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
 	 */
 
 	if (vi->mergeable_rx_bufs) {
-		flags = ((struct virtio_net_common_hdr *)buf)->hdr.flags;
-		skb = receive_mergeable(dev, vi, rq, buf, ctx, len, xdp_xmit,
-					stats);
+		struct virtio_net_common_hdr copy, *hdr = buf;
+
+		if (unlikely(rq->provider_pages)) {
+			hdr = virtnet_rx_hdr(vi, rq, buf, &copy);
+			if (unlikely(!hdr)) {
+				pr_debug("%s: rx error: bad num_buffers\n", dev->name);
+				DEV_STATS_INC(dev, rx_length_errors);
+				virtnet_rq_free_buf(vi, rq, buf);
+				return;
+			}
+		}
+		flags = hdr->hdr.flags;
+		skb = receive_mergeable(dev, vi, rq, buf, hdr, ctx, len,
+					xdp_xmit, stats);
 	} else if (vi->big_packets) {
 		void *p = page_address((struct page *)buf);
 
@@ -2701,7 +2784,7 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
 	err = virtnet_rq_submit(rq, buf, vi->hdr_len + GOOD_PACKET_LEN, ctx, gfp);
 
 	if (err < 0)
-		page_pool_put_page(rq->page_pool, virt_to_head_page(buf), -1, false);
+		virtnet_put_page(rq, virt_to_head_page(buf), false);
 	return err;
 }
 
@@ -2803,7 +2886,7 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 	err = virtnet_rq_submit(rq, buf, len, ctx, gfp);
 
 	if (err < 0)
-		page_pool_put_page(rq->page_pool, virt_to_head_page(buf), -1, false);
+		virtnet_put_page(rq, virt_to_head_page(buf), false);
 	return err;
 }
 
@@ -3265,6 +3348,7 @@ static int virtnet_setup_page_pool(struct virtnet_info *vi,
 
 	rq->page_pool = pool;
 	rq->private_headers = private_headers;
+	rq->provider_pages |= private_headers;
 	rq->use_page_pool_dma = !!virtqueue_dma_dev(rq->vq);
 
 	return 0;
@@ -3295,48 +3379,14 @@ static void virtnet_destroy_page_pools(struct virtnet_info *vi)
 		virtnet_destroy_page_pool(&vi->rq[i]);
 }
 
-/* Return every posted buffer of @rq to its pool and destroy the pool.
+/* Give @rq the pool that fits the provider of the queue now. A pool stays as
+ * it is when it fits. Otherwise the provider came or went while the interface
+ * was down, or the device came back from a suspend while the interface was
+ * closed: destroy the pool and create one that fits.
  *
- * The caller holds dev->lock, and NAPI of the queue is off. On an error the
- * queue keeps its pool. The ring is already empty if only the last step of
- * the reset failed.
- */
-static int virtnet_release_page_pool(struct virtnet_info *vi,
-				     struct receive_queue *rq)
-{
-	int err;
-
-	err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
-	if (err) {
-		netdev_err(vi->dev, "reset rx fail: rx queue index: %d err: %d\n",
-			   (int)(rq - vi->rq), err);
-		return err;
-	}
-
-	page_pool_disable_direct_recycling(rq->page_pool);
-	virtnet_destroy_page_pool(rq);
-
-	return 0;
-}
-
-/* A pool that binds a memory provider lives only while the interface is up.
- * The core expects such a pool to die in ndo_stop, and the provider can go
- * away while the interface is down. The other pools live as long as the
- * device. virtnet_open() creates the pool again.
- */
-static void virtnet_release_provider_pools(struct virtnet_info *vi)
-{
-	int i;
-
-	for (i = 0; i < vi->max_queue_pairs; i++)
-		if (vi->rq[i].private_headers)
-			virtnet_release_page_pool(vi, &vi->rq[i]);
-}
-
-/* Give @rq the pool that fits the provider of the queue now. A pool stays
- * as it is when it fits. Otherwise the pool is a leftover: virtnet_close()
- * could not release it, or the device came back from a suspend while the
- * interface was closed.
+ * As in ndo_queue_stop(), the buffers of the old pool stay in the ring unless
+ * the device uses the DMA API, see "Receive queue management API". The caller
+ * holds dev->lock, and NAPI of the queue is off.
  */
 static int virtnet_sync_page_pool(struct virtnet_info *vi,
 				  struct receive_queue *rq)
@@ -3345,9 +3395,16 @@ static int virtnet_sync_page_pool(struct virtnet_info *vi,
 
 	if (rq->page_pool &&
 	    rq->private_headers != virtnet_rq_has_readable_provider(vi, rq)) {
-		err = virtnet_release_page_pool(vi, rq);
-		if (err)
-			return err;
+		if (rq->use_page_pool_dma) {
+			err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf,
+					      NULL);
+			if (err) {
+				netdev_err(vi->dev, "reset rx fail: rx queue index: %d err: %d\n",
+					   (int)(rq - vi->rq), err);
+				return err;
+			}
+		}
+		virtnet_destroy_page_pool(rq);
 	}
 
 	return virtnet_setup_page_pool(vi, rq);
@@ -3358,16 +3415,13 @@ static int virtnet_open(struct net_device *dev)
 	struct virtnet_info *vi = netdev_priv(dev);
 	int i, err;
 
-	/* virtnet_close() released the pool of each queue that binds a memory
-	 * provider. Create it again before the first fill, so that it binds
-	 * the provider that the queue has now. Replace a pool that does not
-	 * fit the provider. All other queues keep their pool, and this loop
-	 * does nothing for them.
+	/* Before the first fill, give each queue a pool that binds the
+	 * provider that the queue has now, or none. A pool that fits stays.
 	 */
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		err = virtnet_sync_page_pool(vi, &vi->rq[i]);
 		if (err)
-			goto err_pools;
+			return err;
 	}
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
@@ -3398,8 +3452,6 @@ err_enable_qp:
 		virtnet_disable_queue_pair(vi, i);
 		virtnet_cancel_dim(vi, &vi->rq[i].dim);
 	}
-err_pools:
-	virtnet_release_provider_pools(vi);
 
 	return err;
 }
@@ -4011,9 +4063,10 @@ static int virtnet_close(struct net_device *dev)
 
 	netif_carrier_off(dev);
 
-	/* NAPI is off and XDP no longer uses the pools. */
-	virtnet_release_provider_pools(vi);
-
+	/* Keep every pool, also one that binds a memory provider. Its buffers
+	 * stay in the ring. If the provider goes away while the interface is
+	 * down, virtnet_open() replaces the pool.
+	 */
 	return 0;
 }
 
@@ -5952,6 +6005,23 @@ static const struct netdev_stat_ops virtnet_stat_ops = {
  * holds dev->lock from the first call to the last. NAPI of the queue is
  * off from the stop to the start.
  *
+ * If the device does not use the DMA API, the replacement does not reset
+ * the virtqueue. The buffers that the old pool posted stay in the ring, and
+ * the device fills them as before. Each one returns to the old pool when the
+ * stack frees it: the driver and the skb recycling put a page into the pool
+ * of the page, not of the queue. The new pool fills the slots that the
+ * device frees. page_pool_destroy() of the old pool waits for its pages in
+ * the background. A reset depends on the device: a host that offers
+ * VIRTIO_F_RING_RESET and then does not restart the queue leaves the queue
+ * without receive until the device is reset, with no error that the driver
+ * can see.
+ *
+ * If the device uses the DMA API, the pool maps its pages, and
+ * page_pool_destroy() unmaps every page that the pool mapped, also a page
+ * that is still posted. The device would then write to an unmapped address.
+ * ndo_queue_stop() returns the posted buffers with a reset of the virtqueue
+ * first, which needs VIRTIO_F_RING_RESET.
+ *
  * ndo_queue_mem_alloc() creates the pool, because the core looks for the
  * new pool of a queue with a memory provider before it stops the queue.
  * It also registers the pool with XDP, because that step can fail.
@@ -5991,6 +6061,14 @@ static int virtnet_queue_mem_alloc(struct net_device *dev,
 	 */
 	if (rq->xsk_pool)
 		return -EBUSY;
+
+	/* The pools of a device that uses the DMA API unmap their pages when
+	 * they are destroyed. ndo_queue_stop() must then take every posted
+	 * buffer back with a reset of the virtqueue first.
+	 */
+	if (rq->use_page_pool_dma &&
+	    !virtio_has_feature(vi->vdev, VIRTIO_F_RING_RESET))
+		return -EOPNOTSUPP;
 
 	/* Create the pool without a NAPI instance. The queue still runs on
 	 * its old pool, and its NAPI is on. page_pool_destroy() warns if the
@@ -6036,22 +6114,23 @@ static int virtnet_queue_stop(struct net_device *dev, void *per_queue_mem,
 
 	virtnet_rx_pause(vi, rq);
 
-	/* Return every posted buffer to the old pool. Skbs in flight hold
-	 * their own pool references and return their pages later. The core
-	 * destroys the old pool after the start, and the destroy does not
-	 * wait for them.
+	/* Without the DMA API the posted buffers stay in the ring, see above.
+	 * With it, return them to the old pool before its destroy unmaps them.
+	 * Skbs in flight hold their own pool references either way.
 	 */
-	err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
-	if (err) {
-		netdev_err(dev, "reset rx fail: rx queue index: %d err: %d\n",
-			   idx, err);
-		virtnet_rx_resume(vi, rq, true);
-		return err;
+	if (rq->use_page_pool_dma) {
+		err = virtqueue_reset(rq->vq, virtnet_rq_unmap_free_buf, NULL);
+		if (err) {
+			netdev_err(dev, "reset rx fail: rx queue index: %d err: %d\n",
+				   idx, err);
+			virtnet_rx_resume(vi, rq, true);
+			return err;
+		}
 	}
 
-	/* NAPI is off and the ring is empty, so the old pool has no direct
-	 * recycling user left. Keep the pool registered with XDP, because
-	 * the core may start it again.
+	/* NAPI is off, so the old pool has no direct recycling user left: its
+	 * pages that come back from now on go to its ring. Keep the pool
+	 * registered with XDP, because the core may start it again.
 	 */
 	page_pool_disable_direct_recycling(rq->page_pool);
 	xdp_rxq_info_detach_mem_model(&rq->xdp_rxq);
@@ -6074,6 +6153,7 @@ static int virtnet_queue_start(struct net_device *dev,
 	/* NAPI is off, so no poll sees the queue half installed. */
 	rq->page_pool = mem->page_pool;
 	rq->private_headers = mem->private_headers;
+	rq->provider_pages |= mem->private_headers;
 	mem->page_pool = NULL;
 	mem->private_headers = false;
 	page_pool_enable_direct_recycling(rq->page_pool, &rq->napi);
@@ -7294,11 +7374,11 @@ static int virtnet_probe(struct virtio_device *vdev)
 	 * Offer it only for the mergeable buffer mode. The big packets mode
 	 * has no page pool. The small buffer mode builds every skb over the
 	 * page, so it cannot keep a header out of a page that another party
-	 * writes. The restart resets the virtqueue, which needs
+	 * writes. The replacement resets the virtqueue only if the device uses
+	 * the DMA API, and ndo_queue_mem_alloc() refuses such a device without
 	 * VIRTIO_F_RING_RESET.
 	 */
-	if (vi->mergeable_rx_bufs &&
-	    virtio_has_feature(vdev, VIRTIO_F_RING_RESET))
+	if (vi->mergeable_rx_bufs)
 		dev->queue_mgmt_ops = &virtnet_queue_mgmt_ops;
 
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_HASH_REPORT))

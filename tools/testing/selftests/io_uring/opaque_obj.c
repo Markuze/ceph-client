@@ -1237,6 +1237,23 @@ static void *send_cancel_follower(void *arg)
 			if (i % 8 == 4) {
 				while (!__atomic_load_n(&race->head_done, __ATOMIC_ACQUIRE))
 					sched_yield();
+				/*
+				 * The unacknowledged tail of the head fills the small
+				 * send buffer, so the promoted follower usually waits
+				 * for write space and the cancel below wins; on some
+				 * SMP guests no round sends it. Every other such round
+				 * waits until the drain has acknowledged the head, so
+				 * that the follower is sent at its first issue.
+				 */
+				while (i % 16 == 4) {
+					int unacked;
+
+					require(!ioctl(race->target[0], SIOCOUTQ, &unacked),
+						"race unacknowledged bytes");
+					if (!unacked)
+						break;
+					sched_yield();
+				}
 				enter(&r, 0);
 			}
 			end.opcode = IORING_OP_ASYNC_CANCEL;
@@ -1443,10 +1460,16 @@ static void test_send_cancel_race(struct io_uring_opaque_config *cfg)
 	}
 	pthread_join(follower, NULL);
 	pthread_join(drain, NULL);
-	require(complete && partial && canceled && sent && race.expired,
-		"all race paths exercised");
+	/*
+	 * Print the counts first: a failure must tell which path the timing of
+	 * this machine never hit. The check reads no syscall result, so clear
+	 * errno: an earlier call left a stale EAGAIN in it.
+	 */
 	ksft_print_msg("SEND races: full=%u partial=%u canceled=%u sent=%u expired=%u\n",
 		       complete, partial, canceled, sent, race.expired);
+	errno = 0;
+	require(complete && partial && canceled && sent && race.expired,
+		"all race paths exercised");
 	close(race.store_fd);
 	require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res &&
 		!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res &&
@@ -2219,9 +2242,19 @@ static void test_send_last(struct io_uring_opaque_config *cfg)
 	{
 		struct io_uring_opaque_stat stat;
 
-		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
-			!stat.objects && !stat.backing_bytes && !stat.extents && !stat.streams,
-			"SEND_LAST store references drain");
+		/*
+		 * The IOSQE_ASYNC LAST ran in io-wq. Its CQE can arrive before the
+		 * worker drops its request reference; the request, and the backing
+		 * it claimed, is then freed by task work that a later enter runs.
+		 */
+		for (i = 0; i < 300; i++) {
+			require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat),
+					 &stat).res, "SEND_LAST store stat");
+			if (!stat.objects && !stat.backing_bytes && !stat.extents && !stat.streams)
+				break;
+			usleep(10000);
+		}
+		require(i < 300, "SEND_LAST store references drain");
 	}
 	ring_exit(&r);
 	close(source[0]);

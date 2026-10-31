@@ -321,17 +321,19 @@ grow. A system without an MMU, and an architecture that needs page colouring
 Registration restarts the receive queues. The kernel takes the lock of the
 device and converts each queue in index order through the queue API of the
 driver. For each queue, the driver allocates new queue memory with a page
-pool that binds the provider. Then it stops the queue, returns the posted
-buffers to the old pool, and starts the queue from the area. A queue pauses
-during its restart. The link stays up. If one queue fails, the kernel restores
-that queue and removes the provider from the queues that it converted. The
-device is then as it was, and registration returns the error.
+pool that binds the provider. Then it stops the queue and starts it from the
+area. Most drivers return the posted buffers to the old pool at the stop.
+``virtio_net`` can leave them in the ring, see `Driver contract`_. A queue
+pauses during its restart. The link stays up. If one queue fails, the kernel
+restores that queue and removes the provider from the queues that it
+converted. The device is then as it was, and registration returns the error.
 
 Registration can fail for these reasons, among others:
 
 * ``EPERM``: the task has no ``CAP_NET_ADMIN``.
 * ``ENODEV``: the interface does not exist.
-* ``EOPNOTSUPP``: the driver has no queue API.
+* ``EOPNOTSUPP``: the driver has no queue API, or ``virtio_net`` uses the DMA
+  API and the device has no ``VIRTIO_F_RING_RESET``.
 * ``EEXIST``: a receive queue has a provider already, or an XDP program is
   attached to the device.
 * ``EBUSY``: AF_XDP uses a receive queue.
@@ -355,8 +357,9 @@ While the instance exists, these requests fail:
 
 Unregistration, and the exit of the ring, remove the provider from every
 queue. Each queue restarts with an ordinary page pool. A socket buffer, an
-object or the process can still hold area pages. The area stays until the last
-holder drops its page. When the device goes away first, the core removes the
+object, the process or, on ``virtio_net``, a posted receive buffer can still
+hold area pages. The area stays until the last holder drops its page. It
+stays mapped for DMA until the last page pool of the instance is gone. When the device goes away first, the core removes the
 provider. The instance and its area stay valid until the ring exits.
 
 ``ZCRX_CTRL_EXPORT`` and ``ZCRX_REG_IMPORT`` work as for any instance. A ring
@@ -493,17 +496,32 @@ Drivers differ in how they meet the contract:
   fbnic and bnge at this version. This series did not test them.
 * ``virtio_net`` meets the contract with the queue API and the copy of
   headers that this series adds. A receive queue that has a provider of
-  readable pages marks its pool with ``PP_FLAG_PRIVATE_HEADERS``.
-  ``page_to_skb()`` allocates a head of ``GOOD_COPY_LEN`` (128) bytes. It
+  readable pages marks its pool with ``PP_FLAG_PRIVATE_HEADERS``. For every
+  page of such a pool, also one that the queue posted before it got another
+  pool, ``page_to_skb()`` allocates a head of ``GOOD_COPY_LEN`` (128) bytes. It
   copies the headers that ``eth_get_headlen()`` finds in the first 128 bytes
   of the frame, and nothing else, so the payload stays in the page. If the
   dissector finds no header beyond the Ethernet header, it copies the frame,
   up to 128 bytes. Headers longer than 128 bytes stay partly in the page. The
   stack pulls the rest into the head with ``pskb_may_pull()``. This is a
-  copy. The stack never parses a header in place in the page.
-* The pool of a ``virtio_net`` queue with a provider lives while the
-  interface runs. ``virtnet_close()`` releases it, and ``virtnet_open()``
-  creates it again. While the interface is down, ``ndo_queue_mem_alloc()``
+  copy. The stack never parses a header in place in the page. The driver
+  reads the virtio-net header of such a page once, into a private copy, and
+  uses only the copy. It drops a buffer whose copy has ``num_buffers`` 0 or
+  larger than the ring.
+* ``virtio_net`` replaces the pool of a queue without a reset of the
+  virtqueue if the device does not use the DMA API. The buffers of the old
+  pool stay in the ring and return to that pool when the stack frees them.
+  The new pool fills the slots that the device frees, so a few hundred
+  packets per queue after the restart take the copy path. This mode needs no
+  ``VIRTIO_F_RING_RESET``, and it does not depend on how a host handles a
+  queue reset. A device that uses the DMA API (``VIRTIO_F_ACCESS_PLATFORM``)
+  resets the virtqueue at the stop, because ``page_pool_destroy()`` unmaps
+  every page of a pool that maps DMA, also a posted one. Such a device needs
+  ``VIRTIO_F_RING_RESET``, and registration fails with ``EOPNOTSUPP``
+  without it.
+* The pools of a ``virtio_net`` queue live while the device exists.
+  ``virtnet_open()`` replaces a pool whose provider came or went while the
+  interface was down. While the interface is down, ``ndo_queue_mem_alloc()``
   returns ``-ENETDOWN``.
 * ``netdevsim`` has a test aid. If the pool of a queue has a provider of
   readable pages, the receive path moves the payload of each frame into pool
