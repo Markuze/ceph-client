@@ -4,6 +4,7 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/dma-buf.h>
+#include <linux/mm.h>
 #include <linux/socket.h>
 #include <net/page_pool/types.h>
 #include <net/net_trackers.h>
@@ -165,6 +166,49 @@ static inline struct io_zcrx_ifq *io_pp_to_ifq(struct page_pool *pp)
 	return pp->mp_priv;
 }
 
+/*
+ * Return true if no one outside the area holds a reference to the page. The
+ * area holds one reference. Each PTE of a user mapping holds one reference
+ * and one map count. Every other reference belongs to an outsider, for
+ * example a socket buffer in a transmit queue or a pinned user buffer. The
+ * provider must not hand the page to a device while an outsider holds it.
+ *
+ * The function reads the map count, the reference count, the map count and
+ * the reference count again. It returns true only if both pairs agree and the
+ * reference count is one above the map count. The kernel takes the reference
+ * of a PTE before it raises the map count, and it lowers the map count before
+ * it drops the reference. The reads are ordered to match. A single mmap() or
+ * munmap() step of the area between the reads changes one of the four values
+ * in a way that the checks see, so the function returns false. A false
+ * result is harmless: the caller keeps the page in limbo and asks again
+ * later. A false "quiet" would let a device write a page that an outsider
+ * still reads, and the checks exclude it.
+ *
+ * Every PTE of an area page belongs to a mapping of the area, so the count is
+ * exact. The kernel maps an area page nowhere else: TCP_ZEROCOPY_RECEIVE
+ * copies it, see net_mp_page_nomap(), and fork() does not copy the mapping. A
+ * process that maps the area through an imported instance maps the area too.
+ */
+static inline bool io_zcrx_page_is_quiet(struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	int mapped, refs;
+
+	mapped = folio_mapcount(folio);
+	/* Read the map count before the reference count, see above. */
+	smp_rmb();
+	refs = folio_ref_count(folio);
+	/* Read the reference count before the second map count. */
+	smp_rmb();
+	if (mapped != folio_mapcount(folio))
+		return false;
+	/* Read the second map count before the second reference count. */
+	smp_rmb();
+	if (refs != folio_ref_count(folio))
+		return false;
+	return refs == 1 + mapped;
+}
+
 #if defined(CONFIG_IO_URING_ZCRX)
 int io_zcrx_ctrl(struct io_ring_ctx *ctx, void __user *arg, unsigned nr_arg);
 int io_register_zcrx(struct io_ring_ctx *ctx,
@@ -195,6 +239,8 @@ void io_zcrx_kmem_free_area(struct io_zcrx_area *area);
 int io_zcrx_kmem_map(struct io_zcrx_ifq *ifq, struct device *dev);
 void io_zcrx_kmem_unmap(struct io_zcrx_ifq *ifq, struct io_zcrx_area *area);
 void io_zcrx_kmem_return_slot(struct io_zcrx_area *area, u32 idx);
+void io_zcrx_kmem_park_slot(struct page_pool *pp, struct io_zcrx_area *area,
+			    u32 idx);
 bool io_zcrx_kmem_lookup(const struct io_zcrx_area *area,
 			 const struct page *page, u32 *slot);
 netmem_ref io_pp_maio_alloc_netmems(struct page_pool *pp, gfp_t gfp);

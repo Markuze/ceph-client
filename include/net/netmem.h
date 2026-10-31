@@ -358,6 +358,40 @@ static inline bool netmem_is_pfmemalloc(netmem_ref netmem)
 	return page_is_pfmemalloc(netmem_to_page(netmem));
 }
 
+/*
+ * A memory provider of readable pages (PP_MP_F_READABLE) gives its pages to
+ * devices again without the page allocator. If anyone else mapped such a page
+ * into user space, the mapping would show the frames that a device writes into
+ * the page later, also those of other flows. Only the provider may map its
+ * pages. It marks each page with PG_owner_2 before anyone else can reach the
+ * page, and it never clears the mark. The page allocator clears it when it
+ * frees the page. So the page carries the mark in every state: in a pool, in a
+ * socket buffer, parked by the provider, and held by someone after the
+ * provider is gone.
+ *
+ * Anonymous memory and the page cache use PG_owner_2 too. Their pages have a
+ * mapping, and code that maps the pages of socket buffers refuses a page with
+ * a mapping first. A page without a mapping that another owner marked for its
+ * own reasons is copied instead of mapped, which costs a copy and leaks
+ * nothing.
+ */
+static inline void net_mp_page_set_nomap(struct page *page)
+{
+	folio_set_owner_2(page_folio(page));
+}
+
+/**
+ * net_mp_page_nomap - tell whether a memory provider forbids mapping a page
+ * @page: a page that is not part of a compound page
+ *
+ * Return: true if a memory provider owns @page and no one else may map it into
+ * user space, see net_mp_page_set_nomap().
+ */
+static inline bool net_mp_page_nomap(const struct page *page)
+{
+	return folio_test_owner_2(page_folio(page));
+}
+
 static inline unsigned long netmem_get_dma_addr(netmem_ref netmem)
 {
 	return netmem_to_nmdesc(netmem)->dma_addr;

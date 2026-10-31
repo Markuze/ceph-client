@@ -267,6 +267,7 @@
 #include <linux/errqueue.h>
 #include <linux/static_key.h>
 #include <linux/btf.h>
+#include <kunit/visibility.h>
 
 #include <net/icmp.h>
 #include <net/inet_common.h>
@@ -1908,7 +1909,7 @@ static skb_frag_t *skb_advance_to_frag(struct sk_buff *skb, u32 offset_skb,
 	return frag;
 }
 
-static bool can_map_frag(const skb_frag_t *frag)
+VISIBLE_IF_KUNIT bool tcp_can_map_frag(const skb_frag_t *frag)
 {
 	struct page *page;
 
@@ -1921,19 +1922,23 @@ static bool can_map_frag(const skb_frag_t *frag)
 
 	if (PageCompound(page) || page->mapping)
 		return false;
+	/* A memory provider hands this page to a device again: copy it. */
+	if (net_mp_page_nomap(page))
+		return false;
 
 	return true;
 }
+EXPORT_SYMBOL_IF_KUNIT(tcp_can_map_frag);
 
 static int find_next_mappable_frag(const skb_frag_t *frag,
 				   int remaining_in_skb)
 {
 	int offset = 0;
 
-	if (likely(can_map_frag(frag)))
+	if (likely(tcp_can_map_frag(frag)))
 		return 0;
 
-	while (offset < remaining_in_skb && !can_map_frag(frag)) {
+	while (offset < remaining_in_skb && !tcp_can_map_frag(frag)) {
 		offset += skb_frag_size(frag);
 		++frag;
 	}

@@ -131,9 +131,13 @@ int io_zcrx_kmem_import(struct io_zcrx_ifq *ifq, struct io_zcrx_mem *mem,
 	 * pointer and its magic. A page that no pool owns must show a null
 	 * pointer. net_mp_page_clear_page_pool() is for pages that a pool
 	 * stamped, and it warns about the poison, which looks like a DMA index.
+	 * Only the mapping of the area may map an area page, so mark each page
+	 * before anyone else can reach it, see net_mp_page_set_nomap().
 	 */
-	for (i = 0; i < nr_pages; i++)
+	for (i = 0; i < nr_pages; i++) {
 		net_mp_page_init(pages[i]);
+		net_mp_page_set_nomap(pages[i]);
+	}
 
 	mem->pages = pages;
 	mem->size = area_reg->len;
@@ -297,47 +301,6 @@ bool io_zcrx_kmem_lookup(const struct io_zcrx_area *area,
 	return true;
 }
 
-/*
- * Return true if no one outside the area holds a reference to the page. The
- * area holds one reference. Each PTE of a user mapping holds one reference
- * and one map count. Every other reference belongs to an outsider, for
- * example a socket buffer in a transmit queue or a pinned user buffer. The
- * provider must not hand the page to a device while an outsider holds it.
- *
- * The function reads the map count, the reference count, the map count and
- * the reference count again. It returns true only if both pairs agree and the
- * reference count is one above the map count. The kernel takes the reference
- * of a PTE before it raises the map count, and it lowers the map count before
- * it drops the reference. The reads are ordered to match. A single mmap() or
- * munmap() step of the area between the reads changes one of the four values
- * in a way that the checks see, so the function returns false. A false
- * result is harmless: the caller keeps the page in limbo and asks again
- * later. A false "quiet" would let a device write a page that an outsider
- * still reads, and the checks exclude it.
- *
- * A mapping of the page by another process counts as a mapping of the area.
- * The caller cannot tell the two apart.
- */
-static bool io_zcrx_page_is_quiet(struct page *page)
-{
-	struct folio *folio = page_folio(page);
-	int mapped, refs;
-
-	mapped = folio_mapcount(folio);
-	/* Read the map count before the reference count, see above. */
-	smp_rmb();
-	refs = folio_ref_count(folio);
-	/* Read the reference count before the second map count. */
-	smp_rmb();
-	if (mapped != folio_mapcount(folio))
-		return false;
-	/* Read the second map count before the second reference count. */
-	smp_rmb();
-	if (refs != folio_ref_count(folio))
-		return false;
-	return refs == 1 + mapped;
-}
-
 static void io_zcrx_limbo_push(struct io_zcrx_area *area, u32 idx)
 {
 	struct io_zcrx_kmem *kmem = area->kmem;
@@ -382,6 +345,28 @@ void io_zcrx_kmem_return_slot(struct io_zcrx_area *area, u32 idx)
 		io_zcrx_maio_stat_add(area->ifq,
 				      offsetof(struct zcrx_stats, limbo_enter), 1);
 	}
+}
+
+/*
+ * The refill ring dropped the last pool reference of a slot whose page is not
+ * quiet, and @pp, the pool that refills, owns the page. The page must not go
+ * to the device. Let @pp release it to the provider, which parks the slot in
+ * limbo, as for a page that a pool releases.
+ *
+ * The caller is filling the alloc cache of @pp. The pool would recycle the page
+ * into that cache if the page had no reference but the area's when the pool
+ * looks, for example if the outsider and the mapping left after the test. The
+ * reference that the function holds across the put prevents that, so the page
+ * always takes the release path.
+ */
+void io_zcrx_kmem_park_slot(struct page_pool *pp, struct io_zcrx_area *area,
+			    u32 idx)
+{
+	struct page *page = area->mem.pages[idx];
+
+	get_page(page);
+	page_pool_put_unrefed_netmem(pp, page_to_netmem(page), -1, false);
+	put_page(page);
 }
 
 /*

@@ -487,6 +487,84 @@ static void zcrx_maio_refill_ring(struct kunit *test)
 	zt_env_exit(test, &env);
 }
 
+/*
+ * A slot that the user returns through the refill ring goes back to its pool
+ * only if no outsider holds its page. A pipe after a splice of another socket
+ * that shares the page is such an outsider, and so is a transmit queue after a
+ * send of the slot. The PTE of the mapping of the area is not.
+ */
+static void zcrx_maio_refill_outsider(struct kunit *test)
+{
+	struct page **drain = kunit_kcalloc(test, 2 * ZT_BATCH, sizeof(*drain), GFP_KERNEL);
+	struct page *p, *q;
+	struct zt_env env;
+	unsigned int n;
+	u64 off;
+	u32 idx;
+
+	KUNIT_ASSERT_NOT_NULL(test, drain);
+
+	/* A page that only the area and its mapping hold returns at once. */
+	zt_env_init(test, &env, 2 * ZT_BATCH, 1);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	get_page(p);
+	atomic_inc(&p->_mapcount);
+	zt_hold(test, &env, p);
+	KUNIT_ASSERT_TRUE(test, io_zcrx_maio_page_off(env.ifq, p, &off));
+	zt_rqe(&env, off);
+	n = zt_drain_cache(test, env.pp[0], drain, 2 * ZT_BATCH);
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_EXPECT_PTR_EQ(test, q, p);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_enter, 0ULL);
+	atomic_dec(&p->_mapcount);
+	put_page(p);
+	zt_free(env.pp[0], q);
+	while (n--)
+		zt_free(env.pp[0], drain[n]);
+	zt_env_exit(test, &env);
+
+	/* With an outsider, the refill takes the entry and parks the slot. */
+	zt_env_init(test, &env, 2 * ZT_BATCH, 1);
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	idx = zt_slot(test, env.ifq, p);
+	get_page(p);
+	atomic_inc(&p->_mapcount);
+	zt_hold(test, &env, p);
+	get_page(p);
+	KUNIT_ASSERT_TRUE(test, io_zcrx_maio_page_off(env.ifq, p, &off));
+	zt_rqe(&env, off);
+	n = zt_drain_cache(test, env.pp[0], drain, 2 * ZT_BATCH);
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	drain[n++] = q;
+	KUNIT_EXPECT_PTR_NE(test, q, p);
+	KUNIT_EXPECT_EQ(test, env.ifq->rq.ring->head, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&env.area->user_refs[idx]), 0);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->state[idx], IO_ZCRX_KSLOT_LIMBO);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_enter, 1ULL);
+	KUNIT_EXPECT_NULL(test, p->pp);
+
+	/* The outsider leaves. The reclaim finds the page when the freelist runs low. */
+	n += zt_drain_cache(test, env.pp[0], drain + n, 2 * ZT_BATCH - n);
+	put_page(p);
+	q = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_EXPECT_PTR_EQ(test, q, p);
+	KUNIT_EXPECT_EQ(test, env.stats->limbo_leave, 1ULL);
+	KUNIT_EXPECT_EQ(test, env.stats->exhaust_count, 0ULL);
+
+	/* Undo the imitation of the mapping and return every page. */
+	atomic_dec(&p->_mapcount);
+	put_page(p);
+	zt_free(env.pp[0], q);
+	while (n--)
+		zt_free(env.pp[0], drain[n]);
+	zt_env_exit(test, &env);
+}
+
 /* Copy pages come from the freelist, have no pool and obey the same test. */
 static void zcrx_maio_copy_page(struct kunit *test)
 {
@@ -671,6 +749,94 @@ static void zcrx_maio_teardown(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, page_count(p), 1);
 	put_page(p);
 }
+
+#ifdef CONFIG_MMU
+#define ZT_MAP_PAGES	16
+
+/* Tell whether TCP_ZEROCOPY_RECEIVE may map @page, a whole page at offset 0. */
+static bool zt_can_map(struct page *page)
+{
+	skb_frag_t frag;
+
+	skb_frag_fill_page_desc(&frag, page, 0, PAGE_SIZE);
+	return tcp_can_map_frag(&frag);
+}
+
+/*
+ * No process but the one of the instance may map an area page. A device
+ * writes the page again, so a mapping would show the frames of other flows.
+ * TCP copies an area page in every state: free, in a pool, in a socket buffer
+ * with or without a pool reference, in limbo, as a copy page, and after the
+ * instance is gone while a socket buffer still holds it. A fallback page is
+ * an ordinary page, and TCP may map it.
+ */
+static void zcrx_maio_no_user_map(struct kunit *test)
+{
+	struct page *held[ZT_MAP_PAGES], *ordinary, *p, *q;
+	unsigned int i, n = 0, mappable = 0;
+	struct sk_buff *skb;
+	struct zt_env env;
+	u64 off;
+
+	ordinary = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ordinary);
+	KUNIT_EXPECT_TRUE(test, zt_can_map(ordinary));
+	__free_page(ordinary);
+
+	zt_env_init(test, &env, ZT_MAP_PAGES, 1);
+	for (i = 0; i < ZT_MAP_PAGES; i++)
+		mappable += zt_can_map(env.area->mem.pages[i]);
+	KUNIT_EXPECT_EQ(test, mappable, 0U);
+
+	/* A copy page, taken before the pool takes the free pages. */
+	q = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_EXPECT_FALSE(test, zt_can_map(q));
+	io_zcrx_maio_page_put(env.ifq, q);
+
+	/* In a pool, carried by a socket buffer that holds a pool reference. */
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	skb = alloc_skb(0, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	skb_add_rx_frag(skb, 0, p, 0, PAGE_SIZE, PAGE_SIZE);
+	skb_mark_for_recycle(skb);
+	KUNIT_EXPECT_FALSE(test, tcp_can_map_frag(&skb_shinfo(skb)->frags[0]));
+	consume_skb(skb);
+
+	/* Carried by a socket buffer that holds a plain reference. */
+	p = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	skb = alloc_skb(0, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	get_page(p);
+	skb_add_rx_frag(skb, 0, p, 0, PAGE_SIZE, PAGE_SIZE);
+	KUNIT_EXPECT_FALSE(test, tcp_can_map_frag(&skb_shinfo(skb)->frags[0]));
+
+	/* The pool releases the page while the socket buffer holds it: limbo. */
+	zt_free(env.pp[0], p);
+	KUNIT_EXPECT_EQ(test, env.area->kmem->state[zt_slot(test, env.ifq, p)],
+			IO_ZCRX_KSLOT_LIMBO);
+	KUNIT_EXPECT_FALSE(test, tcp_can_map_frag(&skb_shinfo(skb)->frags[0]));
+
+	/* With every other area page taken, the pool hands out a fallback page. */
+	while ((q = zt_alloc(env.pp[0])) && io_zcrx_maio_page_off(env.ifq, q, &off)) {
+		KUNIT_ASSERT_LT(test, n, (unsigned int)ZT_MAP_PAGES);
+		held[n++] = q;
+	}
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_EXPECT_TRUE(test, zt_can_map(q));
+	zt_free(env.pp[0], q);
+	for (i = 0; i < n; i++)
+		zt_free(env.pp[0], held[i]);
+	zt_env_exit(test, &env);
+
+	/* The instance is gone. The socket buffer holds the last reference. */
+	KUNIT_EXPECT_EQ(test, page_count(p), 1);
+	KUNIT_EXPECT_FALSE(test, tcp_can_map_frag(&skb_shinfo(skb)->frags[0]));
+	consume_skb(skb);
+}
+#endif
 
 /* The instance of a ring is found by its id and kept by a reference. */
 static void zcrx_maio_get_put(struct kunit *test)
@@ -1531,10 +1697,14 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_lookup),
 	KUNIT_CASE(zcrx_maio_states),
 	KUNIT_CASE(zcrx_maio_refill_ring),
+	KUNIT_CASE(zcrx_maio_refill_outsider),
 	KUNIT_CASE(zcrx_maio_copy_page),
 	KUNIT_CASE(zcrx_maio_owned),
 	KUNIT_CASE(zcrx_maio_mapped),
 	KUNIT_CASE(zcrx_maio_teardown),
+#ifdef CONFIG_MMU
+	KUNIT_CASE(zcrx_maio_no_user_map),
+#endif
 	KUNIT_CASE(zcrx_maio_get_put),
 	KUNIT_CASE(zcrx_maio_slot_off),
 	KUNIT_CASE(zcrx_maio_copy_refill),
