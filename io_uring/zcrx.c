@@ -724,8 +724,16 @@ static void io_close_queue(struct io_zcrx_ifq *ifq)
 		else if (ifq->if_rxq != -1)
 			netif_mp_close_rxq(netdev, ifq->if_rxq, &p);
 
-		scoped_guard(mutex, &ifq->pp_lock)
+		/*
+		 * A driver can take a provider off a queue and leave the
+		 * buffers that its pool posted in the ring, and virtio_net
+		 * does. A MAIO area stays mapped until the last pool is gone,
+		 * see io_zcrx_ifq_free().
+		 */
+		if (!ifq->maio) {
+			guard(mutex)(&ifq->pp_lock);
 			io_zcrx_unmap_areas(ifq);
+		}
 		netdev_unlock(netdev);
 		netdev_put(netdev, &netdev_tracker);
 	}
@@ -745,6 +753,15 @@ static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
 	if (WARN_ON_ONCE(ifq->master_ctx))
 		return;
 
+	/*
+	 * Every page pool of the instance is gone: each held a reference. No
+	 * ring of a device holds a page of a MAIO area any more, so its DMA
+	 * mapping can go now.
+	 */
+	if (ifq->maio) {
+		guard(mutex)(&ifq->pp_lock);
+		io_zcrx_unmap_areas(ifq);
+	}
 	for (i = 0; i < ifq->nr_areas; i++)
 		io_zcrx_free_area(ifq, ifq->areas[i]);
 	if (ifq->mm_account)
@@ -1659,7 +1676,9 @@ static void io_pp_uninstall(void *mp_priv, struct netdev_rx_queue *rxq)
 	struct io_zcrx_ifq *ifq = mp_priv;
 
 	guard(mutex)(&ifq->pp_lock);
-	io_zcrx_unmap_areas(ifq);
+	/* The pools of a MAIO instance can still have pages in the rings. */
+	if (!ifq->maio)
+		io_zcrx_unmap_areas(ifq);
 	io_zcrx_drop_netdev(ifq);
 
 	p->mp_ops = NULL;
