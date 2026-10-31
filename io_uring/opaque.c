@@ -13,7 +13,9 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/rps.h>
 #include <net/tcp.h>
+#include <trace/events/sock.h>
 #include <uapi/linux/io_uring/opaque.h>
 
 #include "io_uring.h"
@@ -2938,27 +2940,91 @@ static void io_opaque_tx_unused(struct io_opaque_store *store, struct io_opaque_
 	kfree(tx);
 }
 
-static void io_opaque_tx_claim(struct io_opaque_store *store, struct io_opaque_tx *tx)
+/* A queue that is about to hold a request is not idle. */
+static void io_opaque_tx_busy(struct io_opaque_store *store, struct io_opaque_tx *tx)
 {
 	lockdep_assert_held(&store->tx_lock);
 	if (!list_empty(&tx->idle)) {
 		list_del_init(&tx->idle);
 		store->nr_txs_idle--;
 	}
+}
+
+static void io_opaque_tx_claim(struct io_opaque_store *store, struct io_opaque_tx *tx)
+{
+	io_opaque_tx_busy(store, tx);
 	tx->admitting++;
 }
 
 /*
- * Queue @op behind the frames already admitted for @sk. Returns 1 when @op is
- * the head and may send, 0 when it waits (its phase is set before tx_lock is
- * dropped, so a release cannot miss it) or a negative errno. The handle is
- * resolved between the two tx_lock sections, with tables held alone; a queue
- * that fails in that window cancels @op afterwards. A vector leaves tables
- * once its references are taken, and builds its cursor there; one whose block
- * is too small leaves it earlier, to grow the block, and is resolved again.
+ * Resolve what @op names and take its references: the handles under tables,
+ * and then, without it, the block and the cursor. A vector leaves tables once
+ * its references are taken; one whose block is too small leaves it earlier, to
+ * grow the block, and is resolved again.
+ */
+static int io_opaque_tx_acquire(struct io_opaque_req *op)
+{
+	int ret;
+
+	scoped_guard(mutex, &op->store->tables)
+		ret = io_opaque_send_acquire(op);
+	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
+		ret = io_opaque_vec_finish(op, ret);
+	return ret;
+}
+
+/*
+ * The admission of a request that found frames ahead of it. It takes its
+ * references before it waits, so that a LAST send parked behind another has
+ * consumed its object, and joins the queue afterwards, in a second tx_lock
+ * hold: a queue that fails in between cancels it. It holds tables alone, not
+ * the socket. Returns as io_opaque_tx_join() does.
+ */
+static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx)
+{
+	struct io_opaque_store *store = op->store;
+	int ret = io_opaque_tx_acquire(op);
+
+	spin_lock(&store->tx_lock);
+	tx->admitting--;
+	if (ret || tx->failed) {
+		bool pinned = !ret;
+
+		io_opaque_tx_unused(store, tx);
+		spin_unlock(&store->tx_lock);
+		if (!pinned)
+			return ret;
+		/* The head failed after the check: the pin goes, LAST stays consumed. */
+		io_opaque_send_unpin(op);
+		return -ECANCELED;
+	}
+	op->tx = tx;
+	list_add_tail(&op->send, &tx->requests);
+	ret = io_opaque_tx_head(tx) == op;
+	if (!ret)
+		io_opaque_tx_park(op);
+	spin_unlock(&store->tx_lock);
+	return ret;
+}
+
+/*
+ * Queue @op behind the frames already admitted for @sk. Returns
+ * IO_OPAQUE_TX_WAIT when it waits for one (its phase is set before tx_lock is
+ * dropped, so a release cannot miss it), IO_OPAQUE_TX_HEAD when it is the head
+ * and holds its references, IO_OPAQUE_TX_SETTLE when it is the head and has
+ * not taken them yet, or a negative errno.
+ *
+ * A request that finds its queue empty links itself as the head in the one
+ * tx_lock hold that finds out, and takes its references later, from
+ * io_opaque_tx_settle_head(), with the socket owned. Nothing can join the
+ * queue ahead of it, and a head cannot fail the queue, so nothing that
+ * settling does is undone by the queue. A request that finds frames ahead
+ * takes its references now, and may find itself the head when it is done
+ * (io_opaque_tx_settle()). A queue that has failed refuses it.
+ *
  * @op->req is not used; the caller enrolls a waiting request for cancellation.
  */
-VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk)
+VISIBLE_IF_KUNIT int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_tx *tx, *spare = NULL;
@@ -2994,53 +3060,33 @@ VISIBLE_IF_KUNIT int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *s
 			spare = NULL;
 		}
 	}
-	if (tx->failed)
+	if (tx->failed) {
 		ret = -ECANCELED;
-	else
+	} else if (list_empty(&tx->requests)) {
+		io_opaque_tx_busy(store, tx);
+		op->tx = tx;
+		list_add_tail(&op->send, &tx->requests);
+		ret = IO_OPAQUE_TX_SETTLE;
+	} else {
 		io_opaque_tx_claim(store, tx);
+	}
 	spin_unlock(&store->tx_lock);
 	kfree(spare);
 	if (ret)
 		return ret;
-
-	scoped_guard(mutex, &store->tables)
-		ret = io_opaque_send_acquire(op);
-	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
-		ret = io_opaque_vec_finish(op, ret);
-
-	spin_lock(&store->tx_lock);
-	tx->admitting--;
-	if (ret || tx->failed) {
-		bool pinned = !ret;
-
-		io_opaque_tx_unused(store, tx);
-		spin_unlock(&store->tx_lock);
-		if (!pinned)
-			return ret;
-		/* The head failed after the check: the pin goes, LAST stays consumed. */
-		io_opaque_send_unpin(op);
-		return -ECANCELED;
-	}
-	op->tx = tx;
-	list_add_tail(&op->send, &tx->requests);
-	ret = io_opaque_tx_head(tx) == op;
-	if (!ret)
-		io_opaque_tx_park(op);
-	spin_unlock(&store->tx_lock);
-	return ret;
+	return io_opaque_tx_settle(op, tx);
 }
 
-static int io_opaque_tx_enter(struct io_opaque_req *op, struct sock *sk)
+/*
+ * Take the references of a head that io_opaque_tx_join() left to settle, with
+ * the socket owned where it can be. Nothing is taken and nothing removed when
+ * this fails, and the request is still the head: it leaves the queue through
+ * io_opaque_tx_put(), which hands the queue to whoever waits behind it and does
+ * not fail it, since nothing of this frame was sent.
+ */
+VISIBLE_IF_KUNIT int io_opaque_tx_settle_head(struct io_opaque_req *op)
 {
-	int ret = io_opaque_tx_admit(op, sk);
-
-	if (ret < 0)
-		return ret;
-	if (ret)
-		return 0;
-	/* The ring lock keeps the wakeup from running before the request is listed. */
-	io_opaque_enroll(op);
-	return IOU_ISSUE_SKIP_COMPLETE;
+	return io_opaque_tx_acquire(op);
 }
 
 /*
@@ -3091,6 +3137,28 @@ VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req
 	return next;
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Join and settle in one call, for the tests that have no socket to own.
+ * io_opaque_send() does the second step with the socket owned. A head whose
+ * references cannot be taken leaves its queue here; the tests that use this
+ * have no ring to wake a follower with, and queue none behind such a head.
+ */
+int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk)
+{
+	int ret = io_opaque_tx_join(op, sk);
+
+	if (ret != IO_OPAQUE_TX_SETTLE)
+		return ret;
+	ret = io_opaque_tx_settle_head(op);
+	if (ret) {
+		WARN_ON_ONCE(io_opaque_tx_release(op));
+		return ret;
+	}
+	return IO_OPAQUE_TX_HEAD;
+}
+#endif
+
 static void io_opaque_tx_put(struct io_opaque_req *op)
 {
 	struct io_opaque_req *next;
@@ -3122,14 +3190,71 @@ VISIBLE_IF_KUNIT bool io_opaque_send_splices(const struct io_opaque_req *op)
 	return op->length > max;
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/* tcp_sendmsg_locked() calls made by sends, for a test to tell them from sock_sendmsg()'s. */
+atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_SEND_LOCKED_CALL()	atomic_long_inc(&io_opaque_send_locked_calls)
+#else
+#define IO_OPAQUE_SEND_LOCKED_CALL()	((void)0)
+#endif
+
+/*
+ * Whether a send may call tcp_sendmsg_locked() on @sk where sock_sendmsg()
+ * would end up in tcp_sendmsg(): plain TCP, whose sendmsg no ULP (kTLS,
+ * espintcp) or socket map has replaced, which they do with a copy of tcp_prot
+ * that sk_prot_creator does not follow. A socket with no local port has not
+ * connected. TCP's proto has inet_send_prepare() leave it unbound, so this
+ * does not change what a send does, and only keeps such a socket on the
+ * ordinary path. A ULP is installed under the socket lock, so the answer holds
+ * only while the caller owns the socket; before that it is a hint.
+ */
+VISIBLE_IF_KUNIT bool io_opaque_send_direct(const struct sock *sk)
+{
+	const struct proto *prot = READ_ONCE(sk->sk_prot);
+	/* Written when the socket binds or connects; a stale zero only spoils a hint. */
+	u16 port = data_race(inet_sk(sk)->inet_num);
+
+	return prot->sendmsg == tcp_sendmsg && prot == sk->sk_prot_creator && port;
+}
+
+static u32 io_opaque_send_msg_flags(const struct io_opaque_req *op, unsigned int issue_flags)
+{
+	u32 flags = MSG_NOSIGNAL | op->msg_flags;
+
+	if (issue_flags & IO_URING_F_NONBLOCK)
+		flags |= MSG_DONTWAIT;
+	return flags;
+}
+
+/*
+ * One issue of an object send. A request that is not the head of its
+ * destination's queue parks. The head sends its frame, prefix, body and
+ * suffix, from where it stopped, and the frame leaves the queue once all of it
+ * is queued to TCP.
+ *
+ * On a plain TCP socket (io_opaque_send_direct()) the head does all of that
+ * under one lock_sock(): it takes the references it has not taken yet, calls
+ * tcp_sendmsg_locked() for each part of the frame, hands the queue on, lets go
+ * of its references and only then releases the socket. While the socket is
+ * unowned, ACKs and the transmit that autocorking left queued run under its
+ * spinlock, for as long as they take, and the sender's next lock_sock() waits
+ * for them; the less the sender does in that window, the less often it does.
+ * Any other socket takes its references first and goes through sock_sendmsg()
+ * for each part, with the ring lock dropped around it.
+ *
+ * Under IO_URING_F_UNLOCKED the ring lock is dropped before the socket is
+ * taken and held again once it is released; an inline issue holds it
+ * throughout, as it holds it across sock_sendmsg().
+ */
 int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
 	struct socket *sock = sock_from_file(req->file);
+	struct sock *sk = NULL;
 	struct msghdr msg;
 	struct kvec vec;
 	u32 body_end;
-	bool body, splice = false;
+	bool body, splice = false, fresh, owned = false;
 	int ret;
 
 	io_ring_submit_lock(req->ctx, issue_flags);
@@ -3146,16 +3271,53 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 		if (ret)
 			goto finish;
 	}
-	ret = io_opaque_tx_enter(op, sock->sk);
-	if (ret)
+	sk = sock->sk;
+	ret = io_opaque_tx_join(op, sk);
+	if (ret < 0)
 		goto out;
+	if (ret == IO_OPAQUE_TX_WAIT) {
+		/* The ring lock keeps the wakeup from running before the request is listed. */
+		io_opaque_enroll(op);
+		ret = IOU_ISSUE_SKIP_COMPLETE;
+		goto out;
+	}
+	fresh = ret == IO_OPAQUE_TX_SETTLE;
+
+	if (io_opaque_send_direct(sk)) {
+		/*
+		 * The hint says plain TCP. What sock_sendmsg() would ask the
+		 * security hook for each part of the frame it is asked once, for
+		 * what is left of it, before the socket is taken.
+		 */
+		io_ring_submit_unlock(req->ctx, issue_flags);
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
+		ret = security_socket_sendmsg(sock, &msg, op->total_length - op->progress);
+		if (ret) {
+			io_ring_submit_lock(req->ctx, issue_flags);
+			goto finish;
+		}
+		sock_rps_record_flow(sk);
+		lock_sock(sk);
+		owned = io_opaque_send_direct(sk);
+		if (!owned) {
+			release_sock(sk);
+			io_ring_submit_lock(req->ctx, issue_flags);
+		}
+	}
+	if (fresh) {
+		ret = io_opaque_tx_settle_head(op);
+		if (ret) {
+			/* Nothing was taken or sent: the frame behind this one goes now. */
+			io_opaque_tx_put(op);
+			goto leave;
+		}
+	}
 	op->tx_started = true;
 
 again:
 	memset(&msg, 0, sizeof(msg));
-	msg.msg_flags = MSG_NOSIGNAL | op->msg_flags;
-	if (issue_flags & IO_URING_F_NONBLOCK)
-		msg.msg_flags |= MSG_DONTWAIT;
+	msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
 	body_end = op->prefix_length + op->length;
 	body = op->length && op->progress >= op->prefix_length &&
 	       op->progress < body_end;
@@ -3179,10 +3341,17 @@ again:
 	}
 	if (!body)
 		iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &vec, 1, vec.iov_len);
-	/* io-wq may block in TCP; other requests must retain access to the ring. */
-	io_ring_submit_unlock(req->ctx, issue_flags);
-	ret = sock_sendmsg(sock, &msg);
-	io_ring_submit_lock(req->ctx, issue_flags);
+	if (owned) {
+		IO_OPAQUE_SEND_LOCKED_CALL();
+		ret = tcp_sendmsg_locked(sk, &msg, iov_iter_count(&msg.msg_iter));
+		if (trace_sock_send_length_enabled())
+			trace_sock_send_length(sk, ret, 0);
+	} else {
+		/* io-wq may block in TCP; other requests must retain access to the ring. */
+		io_ring_submit_unlock(req->ctx, issue_flags);
+		ret = sock_sendmsg(sock, &msg);
+		io_ring_submit_lock(req->ctx, issue_flags);
+	}
 	if (ret > 0) {
 		if (body) {
 			op->iter = msg.msg_iter;
@@ -3190,15 +3359,25 @@ again:
 				io_opaque_count(IO_OPAQUE_STAT_BODY_COPIED, ret);
 		}
 		op->progress += ret;
-		if (op->progress < op->total_length && !iov_iter_count(&msg.msg_iter))
+		if (op->progress < op->total_length && !iov_iter_count(&msg.msg_iter)) {
+			/*
+			 * TCP lets go of the socket while it waits for room, and a
+			 * protocol may have taken it over by then: ask again.
+			 */
+			if (owned && !io_opaque_send_direct(sk)) {
+				release_sock(sk);
+				io_ring_submit_lock(req->ctx, issue_flags);
+				owned = false;
+			}
 			goto again;
+		}
 		if (op->progress < op->total_length && !(req->flags & REQ_F_NOWAIT)) {
 			ret = -EAGAIN;
-			goto out;
+			goto leave;
 		}
 	} else if (ret == -EAGAIN && (issue_flags & IO_URING_F_NONBLOCK) &&
 		   !(req->flags & REQ_F_NOWAIT)) {
-		goto out;
+		goto leave;
 	}
 finish:
 	if (ret == -ERESTARTSYS)
@@ -3209,8 +3388,21 @@ finish:
 		ret = op->progress;
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
+	if (owned) {
+		/* The references go with the socket still owned, not under the ring lock. */
+		io_opaque_send_unpin(op);
+		release_sock(sk);
+		io_ring_submit_lock(req->ctx, issue_flags);
+	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	ret = IOU_COMPLETE;
+	goto out;
+leave:
+	/* Hand the ring lock back; whatever the request still holds, it keeps. */
+	if (owned) {
+		release_sock(sk);
+		io_ring_submit_lock(req->ctx, issue_flags);
+	}
 out:
 	io_ring_submit_unlock(req->ctx, issue_flags);
 	return ret;

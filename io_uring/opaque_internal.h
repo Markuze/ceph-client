@@ -32,6 +32,14 @@
 /* Backing segments all ranges of one vectored send may span; more is EMSGSIZE. */
 #define IO_OPAQUE_SEND_VEC_SEGS	4096
 
+/* What io_opaque_tx_join() returns besides an error. */
+/* Queued behind another frame and parked, with its references taken. */
+#define IO_OPAQUE_TX_WAIT	0
+/* The head of its queue, with its references taken. */
+#define IO_OPAQUE_TX_HEAD	1
+/* The head of its queue, still to take its references. */
+#define IO_OPAQUE_TX_SETTLE	2
+
 struct io_opaque_backing {
 	refcount_t refs;
 	struct page *page;
@@ -233,9 +241,10 @@ struct io_opaque_store {
 	refcount_t users;
 	struct io_uring_opaque_config config;
 	/*
-	 * Handles and candidates; never held during copies or I/O. Attach takes
-	 * it with its socket owned, so nothing may take a socket lock while
-	 * holding it.
+	 * Handles and candidates; never held during copies or I/O. Attach and
+	 * the admission of a send take it with the socket owned, so nothing may
+	 * take a socket lock while holding it, or wait for anything that holds
+	 * one for long.
 	 */
 	struct mutex tables;
 	struct io_opaque_slot *objects;
@@ -381,10 +390,14 @@ void io_opaque_vec_build(struct io_opaque_req *op);
 int io_opaque_vec_finish(struct io_opaque_req *op, int ret);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_stepped;
+int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk);
+int io_opaque_tx_settle_head(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
+bool io_opaque_send_direct(const struct sock *sk);
+extern atomic_long_t io_opaque_send_locked_calls;
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);

@@ -439,7 +439,11 @@ and FREE can already be submitted together in one ``io_uring_enter``.
 
 Object sends are FIFO per shared store and destination socket. Only the queue
 head polls for write space; later requests reuse their own request state as
-queue entries. This ordering does not cover plain writes or other stores.
+queue entries. A send that finds its queue free takes its references and gives
+them back while it owns the destination socket, and one for a socket whose TCP
+sendmsg has been replaced, by kTLS or a socket map for example, takes the
+ordinary send path instead. This ordering does not cover plain writes or other
+stores.
 
 Backing and memory management
 =============================
