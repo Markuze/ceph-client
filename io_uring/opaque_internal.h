@@ -480,9 +480,13 @@ int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
 int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);
 void io_opaque_cursor_prepay(struct io_opaque_send_cursor *cursor, const struct iov_iter *iter);
 void io_opaque_cursor_refund(struct io_opaque_send_cursor *cursor);
-int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
-			   unsigned int issue_flags);
+int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
+			    const struct io_opaque_req *op);
 extern atomic_long_t io_opaque_send_locked_calls;
+extern void (*io_opaque_send_part)(const struct msghdr *msg,
+				   const struct io_opaque_send_cursor *cursor,
+				   bool owned);
+extern int io_opaque_send_poison;
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);

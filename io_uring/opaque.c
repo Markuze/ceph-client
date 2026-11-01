@@ -3824,8 +3824,32 @@ VISIBLE_IF_KUNIT bool io_opaque_send_splices(const struct io_opaque_req *op)
 /* tcp_sendmsg_locked() calls made by sends, for a test to tell them from sock_sendmsg()'s. */
 atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_SEND_LOCKED_CALL()	atomic_long_inc(&io_opaque_send_locked_calls)
+/*
+ * Called with the message of every part of a frame, just before it goes to TCP
+ * (@owned) or to sock_sendmsg(), and the send's cursor, for a test to look at.
+ */
+void (*io_opaque_send_part)(const struct msghdr *msg,
+			    const struct io_opaque_send_cursor *cursor, bool owned);
+#define IO_OPAQUE_SEND_PART(msg, cursor, owned)				\
+	do {								\
+		if (io_opaque_send_part)				\
+			io_opaque_send_part((msg), (cursor), (owned));	\
+	} while (0)
+/*
+ * A byte that a test fills the message and the cursor of a send with before they
+ * are set (-1: leave them), so that a field that is read before it is written
+ * does not get away with a zero.
+ */
+int io_opaque_send_poison = -1;
+#define IO_OPAQUE_SEND_POISON(p)					\
+	do {								\
+		if (io_opaque_send_poison >= 0)				\
+			memset((p), io_opaque_send_poison, sizeof(*(p)));	\
+	} while (0)
 #else
 #define IO_OPAQUE_SEND_LOCKED_CALL()	((void)0)
+#define IO_OPAQUE_SEND_PART(msg, cursor, owned)	((void)(msg), (void)(cursor), (void)(owned))
+#define IO_OPAQUE_SEND_POISON(p)	((void)(p))
 #endif
 
 /*
@@ -3879,15 +3903,18 @@ static u32 io_opaque_send_msg_flags(const struct io_opaque_req *op, unsigned int
  * It is asked with the socket not owned, because a hook may take the socket
  * lock itself: AppArmor's finds the address with getname(), which does, and
  * would wait for the owner of the socket for ever.
+ *
+ * @msg is the message of the issue, as it is before any part is made of it: the
+ * flags of the issue, no address, no control data, no bytes. It is the one the
+ * parts are sent with, as it is for the first sock_sendmsg() of the other path,
+ * so the issue zeroes one message and not two.
  */
-VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
-					     unsigned int issue_flags)
+VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
+					     const struct io_opaque_req *op)
 {
-	struct msghdr msg = { .msg_flags = io_opaque_send_msg_flags(op, issue_flags) };
-
-	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_security, sock, op, issue_flags);
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_security, sock, msg, op);
 	lockdep_assert_not_held(&sock->sk->sk_lock);
-	return security_socket_sendmsg(sock, &msg, op->total_length - op->progress);
+	return security_socket_sendmsg(sock, msg, op->total_length - op->progress);
 }
 
 /*
@@ -3917,14 +3944,20 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
 	struct socket *sock = sock_from_file(req->file);
-	struct io_opaque_send_cursor cursor = { .uarg.ops = &io_opaque_cursor_ops };
+	/*
+	 * Neither is zeroed on entry, as CONFIG_INIT_STACK_ALL_ZERO would: the message
+	 * is zeroed once below, and the cursor is set when a body is managed.
+	 */
+	struct io_opaque_send_cursor cursor __uninitialized;
+	struct msghdr msg __uninitialized;
 	struct sock *sk = NULL;
-	struct msghdr msg;
 	struct kvec vec;
 	u32 body_end;
 	bool body = false, splice = false, managed, fresh, left, owned = false;
 	int ret, sec = 0;
 
+	IO_OPAQUE_SEND_POISON(&cursor);
+	IO_OPAQUE_SEND_POISON(&msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
 		ret = -EOPNOTSUPP;
@@ -3951,6 +3984,13 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	}
 	fresh = ret == IO_OPAQUE_TX_SETTLE;
 
+	/*
+	 * The one message of the issue, zeroed once: TCP and the security hooks read
+	 * the address and the control data, which are none. Each part sets the fields
+	 * it uses, and no other.
+	 */
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
 	if (io_opaque_send_direct(sk)) {
 		/*
 		 * The hint says plain TCP; the socket decides once it is owned.
@@ -3958,7 +3998,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 		 * says is applied below, after the references are taken.
 		 */
 		io_ring_submit_unlock(req->ctx, issue_flags);
-		sec = io_opaque_send_security(sock, op, issue_flags);
+		sec = io_opaque_send_security(sock, &msg, op);
 		sock_rps_record_flow(sk);
 		lock_sock(sk);
 		owned = io_opaque_send_direct(sk);
@@ -3983,9 +4023,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	}
 
 again:
-	memset(&msg, 0, sizeof(msg));
 	managed = false;
-	msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
 	body_end = op->prefix_length + op->length;
 	body = op->length && op->progress >= op->prefix_length &&
 	       op->progress < body_end;
@@ -4001,6 +4039,12 @@ again:
 		splice = io_opaque_send_splices(op);
 		managed = splice && owned && io_opaque_sends_managed(sk);
 		if (managed) {
+			/*
+			 * The ubuf_info is whole, as it was. Of the rest io_opaque_cursor_prepay()
+			 * sets the count of folios before anything reads it, and the folios and
+			 * their credits are read below that count only.
+			 */
+			cursor.uarg = (struct ubuf_info) { .ops = &io_opaque_cursor_ops };
 			msg.msg_flags |= MSG_ZEROCOPY;
 			msg.msg_ubuf = &cursor.uarg;
 			msg.sg_from_iter = io_opaque_sg_from_iter;
@@ -4019,6 +4063,7 @@ again:
 		IO_OPAQUE_SEND_LOCKED_CALL();
 		if (managed)
 			io_opaque_cursor_prepay(&cursor, &msg.msg_iter);
+		IO_OPAQUE_SEND_PART(&msg, &cursor, true);
 		ret = tcp_sendmsg_locked(sk, &msg, iov_iter_count(&msg.msg_iter));
 		/* However the call ended, what the ubufs did not take goes back. */
 		if (managed)
@@ -4028,6 +4073,7 @@ again:
 	} else {
 		/* io-wq may block in TCP; other requests must retain access to the ring. */
 		io_ring_submit_unlock(req->ctx, issue_flags);
+		IO_OPAQUE_SEND_PART(&msg, &cursor, false);
 		ret = sock_sendmsg(sock, &msg);
 		io_ring_submit_lock(req->ctx, issue_flags);
 	}
@@ -4049,6 +4095,13 @@ sent:
 				io_ring_submit_lock(req->ctx, issue_flags);
 				owned = false;
 			}
+			/*
+			 * The next part sets the fields it uses; it must not find the
+			 * body's ubuf and fill, or its zerocopy flag.
+			 */
+			msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
+			msg.msg_ubuf = NULL;
+			msg.sg_from_iter = NULL;
 			goto again;
 		}
 		if (op->progress < op->total_length && !(req->flags & REQ_F_NOWAIT)) {

@@ -1698,6 +1698,9 @@ struct opaque_test_params {
 	bool copy_per_page;
 	bool send_managed;
 	bool send_prepay;
+	int send_poison;
+	void (*send_part)(const struct msghdr *msg, const struct io_opaque_send_cursor *cursor,
+			  bool owned);
 };
 
 static void opaque_test_params_restore(void *arg)
@@ -1711,6 +1714,8 @@ static void opaque_test_params_restore(void *arg)
 	io_opaque_copy_per_page = saved->copy_per_page;
 	io_opaque_send_managed = saved->send_managed;
 	io_opaque_send_prepay = saved->send_prepay;
+	io_opaque_send_poison = saved->send_poison;
+	io_opaque_send_part = saved->send_part;
 }
 
 /* Tests that change the tunables restore them even when an assertion fails. */
@@ -1726,6 +1731,8 @@ static void opaque_test_params_save(struct kunit *test)
 	saved->copy_per_page = io_opaque_copy_per_page;
 	saved->send_managed = io_opaque_send_managed;
 	saved->send_prepay = io_opaque_send_prepay;
+	saved->send_poison = io_opaque_send_poison;
+	saved->send_part = io_opaque_send_part;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_params_restore,
 							saved), 0);
 }
@@ -3395,13 +3402,25 @@ static void opaque_put_spy_expect(struct kunit *test, unsigned int last)
  */
 static unsigned int opaque_hook_calls;
 
-static int opaque_test_security_probe(struct socket *sock, const struct io_opaque_req *op,
-				      unsigned int issue_flags)
+static int opaque_test_security_probe(struct socket *sock, struct msghdr *msg,
+				      const struct io_opaque_req *op)
 {
+	struct kunit *test = kunit_get_current_test();
 	struct sock *sk = sock->sk;
 	bool owned = sock_owned_by_user_nocheck(sk);
+	struct msghdr want;
 
-	KUNIT_EXPECT_FALSE(kunit_get_current_test(), owned);
+	KUNIT_EXPECT_FALSE(test, owned);
+	/*
+	 * The message is the issue's own, zeroed once (by io_opaque_send(), even where the stack
+	 * held something else): the flags of the issue and nothing more. io-wq issues with
+	 * IO_URING_F_UNLOCKED and the rest are not allowed to block.
+	 */
+	memset(&want, 0, sizeof(want));
+	want.msg_flags = msg->msg_flags;
+	KUNIT_EXPECT_MEMEQ(test, msg, &want, sizeof(want));
+	KUNIT_EXPECT_EQ(test, msg->msg_flags & ~MSG_DONTWAIT,
+			(MSG_NOSIGNAL | op->msg_flags) & ~MSG_DONTWAIT);
 	opaque_hook_calls++;
 	if (!owned) {
 		lock_sock(sk);
@@ -3417,8 +3436,132 @@ struct opaque_send_case {
 	bool copy;		/* TCP copies the body instead of splicing it */
 	bool unlocked;		/* issued as io-wq does, else inline under the ring lock */
 	bool frame_only;	/* a reply made of the frame alone */
+	bool unmanaged;		/* send_managed is N: a body that is not copied is spliced */
+	bool prepay;		/* send_prepay is Y */
 	u32 prefix, suffix;
 };
+
+/*
+ * What each part of a frame was sent with, as io_opaque_send_part() saw it just
+ * before the part went to TCP: the message, the cursor, and whether the socket
+ * was owned.
+ */
+#define OPAQUE_PARTS_MAX	8
+
+static struct {
+	unsigned int n;
+	struct {
+		struct msghdr msg;
+		struct io_opaque_send_cursor cursor;
+		bool own_ubuf, owned;
+	} part[OPAQUE_PARTS_MAX];
+} opaque_parts;
+
+static void opaque_test_part(const struct msghdr *msg, const struct io_opaque_send_cursor *cursor,
+			     bool owned)
+{
+	unsigned int n = opaque_parts.n++;
+
+	if (n >= OPAQUE_PARTS_MAX)
+		return;
+	opaque_parts.part[n].msg = *msg;
+	opaque_parts.part[n].cursor = *cursor;
+	opaque_parts.part[n].own_ubuf = msg->msg_ubuf == &cursor->uarg;
+	opaque_parts.part[n].owned = owned;
+}
+
+/* How the body of a send goes to TCP. */
+enum {
+	OPAQUE_BODY_COPY,	/* TCP copies it */
+	OPAQUE_BODY_SPLICE,	/* page references (MSG_SPLICE_PAGES) */
+	OPAQUE_BODY_MANAGED,	/* managed fragments, with the send's ubuf and fill */
+};
+
+struct opaque_part_want {
+	u32 flags;
+	size_t bytes;
+	bool kvec;
+};
+
+/*
+ * The parts a frame is sent in, with what each is sent with. The flags of the
+ * issue are in all of them. The prefix, and the body when a suffix follows, say
+ * that more is coming. A body that is not copied says how it is not: MSG_ZEROCOPY
+ * with the send's ubuf and fill, or MSG_SPLICE_PAGES. The parts after the body
+ * have none of that, and neither has any field but these: no address, no control
+ * data, no ubuf, no fill.
+ */
+static unsigned int opaque_parts_want(struct opaque_part_want *w, u32 base, u32 prefix, u32 body,
+				      u32 suffix, int mode)
+{
+	unsigned int n = 0;
+
+	if (!body) {
+		w[n++] = (struct opaque_part_want) {
+			.flags = base, .bytes = prefix + suffix, .kvec = true,
+		};
+		return n;
+	}
+	if (prefix)
+		w[n++] = (struct opaque_part_want) {
+			.flags = base | MSG_MORE, .bytes = prefix, .kvec = true,
+		};
+	w[n] = (struct opaque_part_want) { .flags = base, .bytes = body };
+	if (suffix)
+		w[n].flags |= MSG_MORE;
+	if (mode == OPAQUE_BODY_MANAGED)
+		w[n].flags |= MSG_ZEROCOPY;
+	else if (mode == OPAQUE_BODY_SPLICE)
+		w[n].flags |= MSG_SPLICE_PAGES;
+	n++;
+	if (suffix)
+		w[n++] = (struct opaque_part_want) { .flags = base, .bytes = suffix, .kvec = true };
+	return n;
+}
+
+/*
+ * The parts that the send logged are the parts of the frame, each with its own message:
+ * everything in it that is not set for the part is zero, to the last padding byte.
+ */
+static void opaque_parts_expect(struct kunit *test, const struct opaque_part_want *want,
+				unsigned int n, int mode, bool owned)
+{
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, opaque_parts.n, n);
+	for (i = 0; i < n; i++) {
+		bool managed = mode == OPAQUE_BODY_MANAGED && !want[i].kvec && want[i].bytes;
+		const struct msghdr *got = &opaque_parts.part[i].msg;
+		struct msghdr zero;
+
+		memset(&zero, 0, sizeof(zero));
+		zero.msg_iter = got->msg_iter;
+		zero.msg_flags = want[i].flags;
+		if (managed) {
+			zero.msg_ubuf = got->msg_ubuf;
+			zero.sg_from_iter = io_opaque_sg_from_iter;
+		}
+		KUNIT_EXPECT_MEMEQ_MSG(test, got, &zero, sizeof(zero), "part %u of %u", i, n);
+		KUNIT_EXPECT_EQ_MSG(test, iov_iter_count(&got->msg_iter), want[i].bytes,
+				    "part %u of %u", i, n);
+		KUNIT_EXPECT_EQ_MSG(test, iov_iter_is_kvec(&got->msg_iter), want[i].kvec,
+				    "part %u of %u", i, n);
+		KUNIT_EXPECT_EQ_MSG(test, opaque_parts.part[i].owned, owned, "part %u of %u", i, n);
+		KUNIT_EXPECT_EQ_MSG(test, opaque_parts.part[i].own_ubuf, managed,
+				    "part %u of %u", i, n);
+		if (managed) {
+			const struct io_opaque_send_cursor *cursor = &opaque_parts.part[i].cursor;
+
+			/* The cursor as TCP has it: its ops, and a count that prepay set. */
+			KUNIT_EXPECT_PTR_EQ(test, cursor->uarg.ops, &io_opaque_cursor_ops);
+			KUNIT_EXPECT_EQ(test, refcount_read(&cursor->uarg.refcnt), 0);
+			KUNIT_EXPECT_EQ(test, cursor->uarg.flags, (u8)0);
+			KUNIT_EXPECT_LE(test, cursor->nr, (u8)IO_OPAQUE_PREPAY_FOLIOS);
+			if (!io_opaque_send_prepay)
+				KUNIT_EXPECT_EQ(test, cursor->nr, (u8)0);
+		}
+	}
+}
 
 /*
  * Run one send of @c on request 0 of the fixture, with no cleanup after it, and
@@ -3437,6 +3580,9 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	};
 	u32 body = c->frame_only ? 0 : c->vector ? 6500 : 40000;
 	u32 total = c->prefix + body + c->suffix, parts, at, i;
+	struct opaque_part_want want_part[3];
+	unsigned int nwant;
+	int mode;
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
 	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
 	u8 *frame = kunit_kmalloc(test, c->prefix + c->suffix + 1, GFP_KERNEL);
@@ -3502,6 +3648,10 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	KUNIT_ASSERT_TRUE(test, op->resolved);
 
 	io_opaque_send_copy_max = c->copy ? SZ_1M : 0;
+	io_opaque_send_managed = !c->unmanaged;
+	io_opaque_send_prepay = c->prepay;
+	memset(&opaque_parts, 0, sizeof(opaque_parts));
+	WRITE_ONCE(io_opaque_send_part, opaque_test_part);
 	opaque_put_spy_start(test, w->tx->sk);
 	if (c->unlocked) {
 		ret = io_opaque_send(&w->req[0], IO_URING_F_UNLOCKED);
@@ -3511,6 +3661,7 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 		mutex_unlock(&w->ctx->uring_lock);
 	}
 	opaque_put_spy_stop(test);
+	WRITE_ONCE(io_opaque_send_part, NULL);
 	lockdep_assert_none_held_once();
 	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
 	/* LAST holds the table's reference, and its put frees the object: after the socket. */
@@ -3521,6 +3672,12 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	/* One call per part of the frame; the frame alone is a single part. */
 	parts = c->frame_only ? 1 : !!c->prefix + 1 + !!c->suffix;
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls) - calls, (long)parts);
+	/* Each part had its own message: its flags, and no field of another part's. */
+	mode = c->copy ? OPAQUE_BODY_COPY : c->unmanaged ? OPAQUE_BODY_SPLICE : OPAQUE_BODY_MANAGED;
+	nwant = opaque_parts_want(want_part, MSG_NOSIGNAL | (c->unlocked ? 0 : MSG_DONTWAIT),
+				  c->prefix, body, c->suffix, mode);
+	KUNIT_EXPECT_EQ(test, nwant, parts);
+	opaque_parts_expect(test, want_part, nwant, mode, true);
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED) - copied,
 			c->copy ? (u64)body : 0);
 	/* What the send held it has given back itself: there is no cleanup in this test. */
@@ -3589,6 +3746,60 @@ static void opaque_send_locked_path(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(cases); i++)
 		opaque_wire_send(test, w, store, &cases[i]);
 	KUNIT_EXPECT_EQ(test, opaque_hook_calls, (unsigned int)ARRAY_SIZE(cases));
+	kunit_deactivate_static_stub(test, io_opaque_send_security);
+}
+
+/*
+ * Every part of a frame goes to TCP in a message made for it: the flags of the
+ * issue, more to come after the prefix and after a body that has a suffix, and for
+ * a body how it is not copied (MSG_ZEROCOPY with the send's ubuf and fill, or
+ * MSG_SPLICE_PAGES); and nothing of the part before it, so the prefix and the suffix have no
+ * ubuf, no fill and no zerocopy flag after a managed body, and no field of any part but the
+ * flags and the data is set. The three ways of sending a body, ranged and vectored, with
+ * and without a prefix and a suffix, prepaying or not, with the stack of the send full of
+ * 0xa5 and without: opaque_wire_send() holds the message of each part to the last byte
+ * (opaque_parts_expect()), and the security hook's, which the issue shares with them, to
+ * its flags alone.
+ */
+static void opaque_send_msghdr_parts(struct kunit *test)
+{
+	static const struct opaque_send_case cases[] = {
+		{ },
+		{ .prefix = 24 },
+		{ .suffix = 8 },
+		{ .prefix = 24, .suffix = 8 },
+		{ .prefix = 24, .suffix = 8, .last = true },
+		{ .prefix = 24, .suffix = 8, .vector = true },
+		{ .prefix = 24, .suffix = 8, .copy = true },
+		{ .prefix = 24, .suffix = 8, .vector = true, .copy = true },
+		{ .prefix = 24, .suffix = 8, .unmanaged = true },
+		{ .prefix = 24, .suffix = 8, .vector = true, .unmanaged = true },
+		{ .suffix = 8, .unmanaged = true },
+		{ .prefix = 24, .suffix = 8, .prepay = true },
+		{ .prefix = 24, .suffix = 8, .vector = true, .prepay = true },
+		{ .vector = true, .prepay = true },
+		{ .prepay = true },
+		{ .prefix = 16, .suffix = 16, .frame_only = true },
+		{ .prefix = 16, .frame_only = true, .unlocked = true },
+		{ .prefix = 24, .unlocked = true },
+		{ .prefix = 24, .suffix = 8, .unlocked = true, .vector = true, .last = true },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	unsigned int i, poison;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_params_save(test);
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_hook_calls = 0;
+	kunit_activate_static_stub(test, io_opaque_send_security, opaque_test_security_probe);
+	for (poison = 0; poison < 2; poison++) {
+		io_opaque_send_poison = poison ? 0xa5 : -1;
+		for (i = 0; i < ARRAY_SIZE(cases); i++)
+			opaque_wire_send(test, w, store, &cases[i]);
+	}
+	KUNIT_EXPECT_EQ(test, opaque_hook_calls, 2U * ARRAY_SIZE(cases));
 	kunit_deactivate_static_stub(test, io_opaque_send_security);
 }
 
@@ -6636,10 +6847,10 @@ static bool opaque_test_direct(const struct sock *sk)
 }
 
 /* The security hook on a socket that is sent on directly: it refuses, or says EAGAIN, once. */
-static int opaque_test_security(struct socket *sock, const struct io_opaque_req *op,
-				unsigned int issue_flags)
+static int opaque_test_security(struct socket *sock, struct msghdr *msg,
+				const struct io_opaque_req *op)
 {
-	int ret = opaque_test_security_probe(sock, op, issue_flags);
+	int ret = opaque_test_security_probe(sock, msg, op);
 
 	return ret ?: opaque_refuse_now();
 }
@@ -9058,8 +9269,13 @@ static void opaque_send_prepay_balance(struct kunit *test)
 	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
 	opaque_units_object(test, store, source, units);
 
-	for (prepay = 0; prepay < 2; prepay++) {
-		io_opaque_send_prepay = prepay;
+	/*
+	 * The cursor of the send is not zeroed, and what it holds when prepay finds it is what
+	 * was on the stack: the second round has 0xa5 in every byte of it.
+	 */
+	for (prepay = 0; prepay < 4; prepay++) {
+		io_opaque_send_prepay = prepay & 1;
+		io_opaque_send_poison = prepay & 2 ? 0xa5 : -1;
 		for (c = 0; c < ARRAY_SIZE(cases); c++) {
 			bool framed = cases[c].prefix || cases[c].suffix;
 			struct opaque_managed before, after;
@@ -9075,8 +9291,8 @@ static void opaque_send_prepay_balance(struct kunit *test)
 			refs = after.refs - before.refs;
 			gets = after.gets - before.gets;
 			/* Knob off: every reference is the fill's. On: none, for so few folios. */
-			KUNIT_EXPECT_EQ_MSG(test, gets, prepay ? 0ULL : refs, "case %u prepay %u",
-					    c, prepay);
+			KUNIT_EXPECT_EQ_MSG(test, gets, prepay & 1 ? 0ULL : refs,
+					    "case %u prepay %u", c, prepay);
 			KUNIT_EXPECT_GE_MSG(test, refs, (u64)cases[c].refs, "case %u prepay %u",
 					    c, prepay);
 			if (!framed) {
@@ -9677,6 +9893,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_copy_policy),
 	KUNIT_CASE(opaque_send_loopback),
 	KUNIT_CASE(opaque_send_locked_path),
+	KUNIT_CASE(opaque_send_msghdr_parts),
 	KUNIT_CASE(opaque_send_locked_eagain),
 	KUNIT_CASE(opaque_send_locked_short),
 	KUNIT_CASE(opaque_send_locked_error),
