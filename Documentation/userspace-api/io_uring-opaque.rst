@@ -712,8 +712,8 @@ Evaluation parameters
 =====================
 
 The destination unit cache, the unit size, inline manual compaction, the
-compaction copy loop, the send copy threshold and managed fragments are
-selected by parameters under
+compaction copy loop, the send copy threshold, managed fragments and prepaid
+references are selected by parameters under
 ``/sys/module/io_uring_opaque/parameters/``, writable by root at run time or
 set on the kernel command line as ``io_uring_opaque.<name>=<value>``. They
 exist for measurement, are not ABI and may change or disappear. The defaults
@@ -743,6 +743,17 @@ the page-split copy it replaces.
     plain TCP socket that the send owns. N takes a page reference for each
     fragment, as ``MSG_SPLICE_PAGES`` does, which is what every other socket
     does. Read at each send.
+``send_prepay`` (default N)
+    Y makes a managed send take, before TCP allocates its first skb, the folio
+    references that the ubufs of its skbs will want, and its fill hand them to
+    the ubufs without an atomic of its own; N takes each in the fill, when a
+    ubuf first uses a folio. A send prepays when its bytes lie in at most four
+    folios and thirty-two segments: for each folio, a reference for the skb
+    that the send joins and for every skb that its segments or its bytes can
+    fill. A ubuf that finds the credit of its folio spent, or the folio not
+    prepaid, takes its own, and the references that no ubuf took go back when
+    TCP returns, however the call ended: complete, short, an error or EAGAIN.
+    Read at each send.
 
 The same directory holds read-only counters summed over all stores. They are
 cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
@@ -778,6 +789,11 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     Skbs given a ubuf for managed fragments, and the folio references those
     ubufs took: one for each distinct folio that the fragments of the skbs
     sharing a ubuf use, taken once however many fragments use it.
+``stat_send_folio_gets``
+    The references of ``stat_send_folio_refs`` that the fill took with an
+    atomic of its own. All of them with ``send_prepay`` off; with it on, those
+    that a send did not have in hand, which is none where its prepayment was
+    enough.
 ``stat_send_frag_fallback``
     Fills of an skb that already had fragments of its own, such as the one a
     prefix starts, which took a page reference for each fragment instead.

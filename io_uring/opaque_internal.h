@@ -233,6 +233,7 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_FOLIO_REFS,
 	IO_OPAQUE_STAT_SEND_FRAG_FALLBACK,
 	IO_OPAQUE_STAT_SEND_UBUF_COPIED,
+	IO_OPAQUE_STAT_SEND_FOLIO_GETS,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -249,6 +250,8 @@ static inline void io_opaque_count(enum io_opaque_stat_item item, u64 delta)
 
 u64 io_opaque_stat_read(enum io_opaque_stat_item item);
 
+struct io_opaque_send_cursor;
+
 /*
  * The ubuf_info of the skbs that carry a send's managed fragments (see
  * io_opaque_link_skb()): one per skb, shared by the skbs that are derived from it.
@@ -257,8 +260,36 @@ struct io_opaque_ubuf {
 	struct ubuf_info uarg;
 	/* Entries of folio[]. */
 	u8 nr;
+	/*
+	 * The send whose link_skb() has just been called, if it has folio
+	 * references to hand out; the fill that follows takes it and clears it, so
+	 * that it never outlives the call.
+	 */
+	struct io_opaque_send_cursor *cursor;
 	/* The distinct folios of the fragments of the skbs that share the ubuf. */
 	struct folio *folio[MAX_SKB_FRAGS];
+};
+
+/*
+ * A managed send prepays its folio references when it is short of folios and of
+ * segments, as many as these (io_opaque_cursor_prepay()).
+ */
+#define IO_OPAQUE_PREPAY_FOLIOS	4
+#define IO_OPAQUE_PREPAY_SEGS	32
+
+/*
+ * What msg_ubuf points at during one managed tcp_sendmsg_locked(): the ops that
+ * skb_zerocopy_iter_stream() finds link_skb() through, and the folio references
+ * that the send took before TCP allocated any skb, for the fill to give the
+ * ubufs of the skbs without an atomic of its own.
+ */
+struct io_opaque_send_cursor {
+	struct ubuf_info uarg;
+	/* Entries of folio[] and credit[]. */
+	u8 nr;
+	struct folio *folio[IO_OPAQUE_PREPAY_FOLIOS];
+	/* References on folio[] that the send holds and no ubuf has taken. */
+	unsigned int credit[IO_OPAQUE_PREPAY_FOLIOS];
 };
 
 /* Evaluation tunables; module parameters, not ABI. */
@@ -268,6 +299,7 @@ extern unsigned int io_opaque_inline_compact_max;
 extern bool io_opaque_copy_per_page;
 extern unsigned int io_opaque_send_copy_max;
 extern bool io_opaque_send_managed;
+extern bool io_opaque_send_prepay;
 
 struct io_opaque_store {
 	refcount_t refs;
@@ -442,9 +474,12 @@ void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
 extern const struct ubuf_info_ops io_opaque_ubuf_ops;
+extern const struct ubuf_info_ops io_opaque_cursor_ops;
 u8 io_opaque_ubuf_flags(void);
 int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
 int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);
+void io_opaque_cursor_prepay(struct io_opaque_send_cursor *cursor, const struct iov_iter *iter);
+void io_opaque_cursor_refund(struct io_opaque_send_cursor *cursor);
 int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
 			   unsigned int issue_flags);
 extern atomic_long_t io_opaque_send_locked_calls;
