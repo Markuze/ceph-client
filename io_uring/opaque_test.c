@@ -2672,6 +2672,7 @@ static void opaque_params_sysfs(struct kunit *test)
 		"io_uring_opaque.stat_send_folio_gets",
 		"io_uring_opaque.stat_send_admit_fast",
 		"io_uring_opaque.stat_send_admit_slow",
+		"io_uring_opaque.stat_send_ubuf_reused",
 	};
 	const struct kernel_param *framing_copied =
 		opaque_test_param("io_uring_opaque.stat_framing_copied");
@@ -10969,6 +10970,588 @@ static void opaque_ubuf_complete_atomic(struct kunit *test)
 }
 
 /*
+ * The pool of ubufs that a store keeps. A test makes a pool and the cursor of a send that names
+ * it, as io_opaque_send() hands one to TCP, and closes the pool as the store would unless the
+ * test has done so already. The skbs of a test are linked to a ubuf through that cursor.
+ */
+struct opaque_pool {
+	struct io_opaque_ubuf_pool *pool;
+	struct io_opaque_send_cursor cursor;
+	bool closed;
+};
+
+static void opaque_pool_close_action(void *arg)
+{
+	struct opaque_pool *p = arg;
+
+	if (!p->closed)
+		io_opaque_ubuf_pool_close(p->pool);
+}
+
+static struct opaque_pool *opaque_pool_new(struct kunit *test)
+{
+	struct opaque_pool *p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	p->pool = io_opaque_ubuf_pool_new();
+	KUNIT_ASSERT_NOT_NULL(test, p->pool);
+	p->cursor = opaque_new_cursor();
+	p->cursor.pool = p->pool;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_pool_close_action, p), 0);
+	return p;
+}
+
+static void opaque_pool_close(struct opaque_pool *p)
+{
+	p->closed = true;
+	io_opaque_ubuf_pool_close(p->pool);
+}
+
+/* A skb with a ubuf, as TCP has link_skb() give it one for the cursor of a send. */
+static struct sk_buff *opaque_pool_skb(struct kunit *test, struct opaque_pool *p)
+{
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	skb->ip_summed = CHECKSUM_PARTIAL;
+	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, &p->cursor.uarg), 0);
+	KUNIT_ASSERT_NOT_NULL(test, skb_zcopy(skb));
+	return skb;
+}
+
+static struct io_opaque_ubuf *opaque_skb_ubuf(struct sk_buff *skb)
+{
+	return container_of(skb_zcopy(skb), struct io_opaque_ubuf, uarg);
+}
+
+/* The ubufs made and not yet freed, the pools, and the counters that say what the ubufs did. */
+struct opaque_pool_snap {
+	long live, pools;
+	u64 skbs, reused, copied;
+};
+
+static void opaque_pool_read(struct opaque_pool_snap *m)
+{
+	m->live = atomic_long_read(&io_opaque_ubufs_live);
+	m->pools = atomic_long_read(&io_opaque_ubuf_pools_live);
+	m->skbs = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_MANAGED_SKBS);
+	m->reused = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_UBUF_REUSED);
+	m->copied = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_UBUF_COPIED);
+}
+
+/* The ubufs that a pool holds on its list of those that completed, and in its stock. */
+static unsigned int opaque_pool_held(struct io_opaque_ubuf_pool *pool, unsigned int *stocked)
+{
+	const struct llist_node *node;
+	unsigned int done = 0;
+
+	*stocked = 0;
+	/* A closed pool has a sentinel for a list, which is not a ubuf. */
+	for (node = READ_ONCE(pool->done.first);
+	     node && node != (void *)1UL && done < 4 * IO_OPAQUE_UBUF_POOL_MAX; node = node->next)
+		done++;
+	for (node = pool->stock; node && *stocked < 4 * IO_OPAQUE_UBUF_POOL_MAX; node = node->next)
+		(*stocked)++;
+	/*
+	 * A list that goes round, as one with a ubuf on it twice does, is a failure that ends
+	 * here: it is cut, so that closing the pool does not go round for ever.
+	 */
+	if (done >= 4 * IO_OPAQUE_UBUF_POOL_MAX || *stocked >= 4 * IO_OPAQUE_UBUF_POOL_MAX) {
+		KUNIT_FAIL(kunit_get_current_test(), "the list of the pool goes round");
+		WRITE_ONCE(pool->done.first, NULL);
+		pool->stock = NULL;
+	}
+	return done;
+}
+
+/* What the pool of @p holds: @on_list of the ubufs that completed, and @in_stock taken out. */
+#define OPAQUE_POOL_HELD(test, p, on_list, in_stock)				\
+	do {									\
+		unsigned int __stock, __done = opaque_pool_held((p)->pool, &__stock);	\
+										\
+		KUNIT_EXPECT_EQ(test, __done, (unsigned int)(on_list));		\
+		KUNIT_EXPECT_EQ(test, __stock, (unsigned int)(in_stock));	\
+	} while (0)
+
+/*
+ * A skb gets the ubuf of one that completed, and gets it whole, as a ubuf made new is: one
+ * reference, no folios, none of the cursor of the send that had it before, the flags and the ops
+ * of one of ours. The cache is not asked while the pool has one: the ubufs made stay as many as
+ * the skbs that are in use at once, however many skbs there are, and the counter says which
+ * were reused.
+ */
+static void opaque_ubuf_pool_reuse(struct kunit *test)
+{
+	struct opaque_pool *p = opaque_pool_new(test);
+	struct opaque_pool_snap before, after;
+	struct io_opaque_ubuf *first, *u;
+	struct opaque_splice f;
+	struct iov_iter iter;
+	struct sk_buff *skb;
+	unsigned int i;
+
+	opaque_splice_setup(test, &f);
+	opaque_pool_read(&before);
+	/* The pool is empty: the cache gives the first, which counts the pool among its owners. */
+	skb = opaque_pool_skb(test, p);
+	first = opaque_skb_ubuf(skb);
+	KUNIT_EXPECT_PTR_EQ(test, first->pool, p->pool);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 2U);
+	OPAQUE_POOL_HELD(test, p, 0, 0);
+	iov_iter_bvec(&iter, ITER_SOURCE, f.op.replacement->bvec, f.op.replacement->nr, 80000);
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(skb, &iter, 6000), 0);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	kfree_skb(skb);
+	/* It let go of its folio and went to the pool, not to the cache. */
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&first->uarg.refcnt), 0U);
+	OPAQUE_POOL_HELD(test, p, 1, 0);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, 1L);
+	KUNIT_EXPECT_EQ(test, after.reused, before.reused);
+
+	/* Every skb after it gets that one, and nothing else is made. */
+	for (i = 0; i < 6; i++) {
+		skb = opaque_pool_skb(test, p);
+		u = opaque_skb_ubuf(skb);
+		KUNIT_EXPECT_PTR_EQ(test, u, first);
+		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 1U);
+		KUNIT_EXPECT_EQ(test, u->nr, 0);
+		KUNIT_EXPECT_PTR_EQ(test, u->cursor, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, u->uarg.ops, &io_opaque_ubuf_ops);
+		KUNIT_EXPECT_EQ(test, u->uarg.flags, io_opaque_ubuf_flags());
+		KUNIT_EXPECT_PTR_EQ(test, u->pool, p->pool);
+		OPAQUE_POOL_HELD(test, p, 0, 0);
+		iov_iter_bvec(&iter, ITER_SOURCE, f.op.replacement->bvec, f.op.replacement->nr,
+			      80000);
+		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(skb, &iter, 40000), 0);
+		KUNIT_EXPECT_EQ(test, u->nr, 2);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+		kfree_skb(skb);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+		OPAQUE_POOL_HELD(test, p, 1, 0);
+	}
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, 1L);
+	KUNIT_EXPECT_EQ(test, after.reused - before.reused, 6ULL);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 7ULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 2U);
+	opaque_splice_done(&f);
+}
+
+/*
+ * A ubuf that a clone, a split or a tap holds is not the pool's: it completes when the last
+ * skb that holds it is freed, not the first, nobody else gets it meanwhile, and it is whole while
+ * it is held, with its count, its folios and its fragments' pages. The device's skb and a clone
+ * for a tap share a shinfo, which holds one count; a split gives each skb a count on the ubuf; a
+ * tap that the receive path copies for lets go of its count and keeps its copy.
+ */
+enum {
+	OPAQUE_SHARE_CLONE,
+	OPAQUE_SHARE_SPLIT,
+	OPAQUE_SHARE_TAP_HELD,
+	OPAQUE_SHARE_TAP_COPIED,
+	OPAQUE_SHARE_NR,
+};
+
+static void opaque_ubuf_pool_share_one(struct kunit *test, unsigned int how)
+{
+	bool copied = how == OPAQUE_SHARE_TAP_COPIED;
+	struct opaque_pool *p = opaque_pool_new(test);
+	struct opaque_pool_snap before, after;
+	struct sk_buff *skb, *twin, *other, *next;
+	struct io_opaque_ubuf *u;
+	struct opaque_splice f;
+
+	opaque_splice_setup(test, &f);
+	if (copied)
+		kunit_activate_static_stub(test, io_opaque_ubuf_flags, opaque_test_ubuf_no_waiver);
+	skb = opaque_pool_skb(test, p);
+	u = opaque_skb_ubuf(skb);
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(skb, &f.iter, 80000), 0);
+	KUNIT_ASSERT_EQ(test, u->nr, 3);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 2);
+	opaque_pool_read(&before);
+
+	if (how == OPAQUE_SHARE_SPLIT) {
+		twin = alloc_skb(0, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, twin);
+		twin->ip_summed = CHECKSUM_PARTIAL;
+		skb_split(skb, twin, 40000);
+		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 2U);
+	} else {
+		twin = skb_clone(skb, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, twin);
+		/* A clone shares the shinfo, which holds the one count. */
+		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 1U);
+		/* What the receive path does with it for a tap: hands it on, or copies it. */
+		if (how != OPAQUE_SHARE_CLONE)
+			KUNIT_EXPECT_EQ(test, skb_orphan_frags_rx(twin, GFP_KERNEL), 0);
+	}
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.copied - before.copied, copied ? 1ULL : 0ULL);
+	if (copied) {
+		/* The tap has bytes of its own and no ubuf; the device's skb has the one count. */
+		KUNIT_EXPECT_NULL(test, skb_zcopy(twin));
+		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 1U);
+	} else {
+		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(twin), &u->uarg);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), &u->uarg);
+
+	/* A skb that wants a ubuf while this one is held gets another, from the cache. */
+	other = opaque_pool_skb(test, p);
+	KUNIT_EXPECT_PTR_NE(test, opaque_skb_ubuf(other), u);
+	OPAQUE_POOL_HELD(test, p, 0, 0);
+
+	/* The device's skb goes. The twin still holds the ubuf and its folios, unless it copied. */
+	kfree_skb(skb);
+	KUNIT_EXPECT_EQ(test, u->nr, 3);
+	if (copied) {
+		OPAQUE_POOL_HELD(test, p, 1, 0);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	} else {
+		OPAQUE_POOL_HELD(test, p, 0, 0);
+		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 1U);
+		KUNIT_EXPECT_GE(test, page_count(f.units[0]), 2);
+		KUNIT_EXPECT_GE(test, page_count(f.units[1]), 2);
+		KUNIT_EXPECT_GE(test, page_count(f.units[2]), 2);
+	}
+	/* The last one goes and the ubuf is the pool's, once, with every page given back. */
+	kfree_skb(twin);
+	OPAQUE_POOL_HELD(test, p, 1, 0);
+	KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 0U);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 1);
+
+	/* The next skb gets that ubuf, and the other is not disturbed. */
+	next = opaque_pool_skb(test, p);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_skb_ubuf(next), u);
+	KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 1U);
+	KUNIT_EXPECT_EQ(test, u->nr, 0);
+	OPAQUE_POOL_HELD(test, p, 0, 0);
+	kfree_skb(next);
+	kfree_skb(other);
+	OPAQUE_POOL_HELD(test, p, 2, 0);
+	if (copied)
+		kunit_deactivate_static_stub(test, io_opaque_ubuf_flags);
+	opaque_splice_done(&f);
+}
+
+static void opaque_ubuf_pool_share(struct kunit *test)
+{
+	unsigned int how;
+
+	for (how = 0; how < OPAQUE_SHARE_NR; how++)
+		opaque_ubuf_pool_share_one(test, how);
+}
+
+/*
+ * The pool holds as many ubufs as it has room for, and refuses the rest, which the cache gets
+ * back, so none is lost and the cache is asked only when the pool is empty. The send side takes
+ * all that has completed at once into a stock that it hands out of, and what the pool holds is
+ * the stock and the list, which may each be as long as the bound. Every skb in use has a ubuf of
+ * its own: no two are the same, which a ubuf kept twice would not be.
+ */
+static void opaque_ubuf_pool_bound(struct kunit *test)
+{
+	const unsigned int max = IO_OPAQUE_UBUF_POOL_MAX, many = 2 * max + 5;
+	struct sk_buff **skb = kunit_kcalloc(test, many, sizeof(*skb), GFP_KERNEL);
+	struct opaque_pool *p = opaque_pool_new(test);
+	struct opaque_pool_snap before, after;
+	unsigned int i, j, done, stocked;
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	opaque_pool_read(&before);
+	for (i = 0; i < max + 7; i++)
+		skb[i] = opaque_pool_skb(test, p);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)max + 7);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 1 + max + 7);
+	for (i = 0; i < max + 7; i++)
+		kfree_skb(skb[i]);
+	/* The pool took the first of those that completed and the cache took the rest back. */
+	OPAQUE_POOL_HELD(test, p, max, 0);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)max);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 1 + max);
+
+	/* They are given out before the cache is asked, each to one skb. */
+	for (i = 0; i < max; i++) {
+		skb[i] = opaque_pool_skb(test, p);
+		for (j = 0; j < i; j++)
+			KUNIT_EXPECT_PTR_NE(test, opaque_skb_ubuf(skb[i]), opaque_skb_ubuf(skb[j]));
+	}
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)max);
+	KUNIT_EXPECT_EQ(test, after.reused - before.reused, (u64)max);
+	OPAQUE_POOL_HELD(test, p, 0, 0);
+	/* And the next is the cache's. */
+	skb[max] = opaque_pool_skb(test, p);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)max + 1);
+	for (i = 0; i <= max; i++)
+		kfree_skb(skb[i]);
+	OPAQUE_POOL_HELD(test, p, max, 0);
+
+	/*
+	 * The list full, one skb takes it all into the stock, and the skbs still in use complete
+	 * onto the list again: the pool holds the stock and a full list, and no more.
+	 */
+	for (i = 0; i < many; i++)
+		skb[i] = opaque_pool_skb(test, p);
+	/* The first max came from the pool, the rest are the cache's. */
+	for (i = 0; i < max; i++)
+		kfree_skb(skb[i]);
+	OPAQUE_POOL_HELD(test, p, max, 0);
+	skb[0] = opaque_pool_skb(test, p);
+	OPAQUE_POOL_HELD(test, p, 0, max - 1);
+	for (i = max; i < many; i++)
+		kfree_skb(skb[i]);
+	done = opaque_pool_held(p->pool, &stocked);
+	KUNIT_EXPECT_EQ(test, done, max);
+	KUNIT_EXPECT_EQ(test, stocked, max - 1);
+	kfree_skb(skb[0]);
+	done = opaque_pool_held(p->pool, &stocked);
+	KUNIT_EXPECT_LE(test, done, max);
+	KUNIT_EXPECT_LE(test, done + stocked, 2 * max);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 1 + done + stocked);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)(done + stocked));
+	opaque_pool_close(p);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live, before.live);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools - 1);
+}
+
+/*
+ * A store goes with skbs still holding its ubufs: it frees the ubufs the pool holds, those on the
+ * list and those in the stock, refuses the ones that complete later, which the cache gets, and
+ * the pool itself is freed with the last of them, whenever that is. The folios of the skbs
+ * that outlive the store are put back as they always were.
+ */
+static void opaque_ubuf_pool_teardown(struct kunit *test)
+{
+	struct opaque_pool *p = opaque_pool_new(test);
+	struct opaque_pool_snap before, after;
+	struct sk_buff *skb[10], *held;
+	struct opaque_splice f;
+	struct iov_iter iter;
+	unsigned int i;
+
+	opaque_splice_setup(test, &f);
+	opaque_pool_read(&before);
+	for (i = 0; i < ARRAY_SIZE(skb); i++) {
+		skb[i] = opaque_pool_skb(test, p);
+		iov_iter_bvec(&iter, ITER_SOURCE, f.op.replacement->bvec, f.op.replacement->nr,
+			      80000);
+		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(skb[i], &iter, 1000), 0);
+	}
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1 + (int)ARRAY_SIZE(skb));
+	/* Four complete and are the pool's, and a skb takes them out of the list into the stock. */
+	for (i = 0; i < 4; i++)
+		kfree_skb(skb[i]);
+	OPAQUE_POOL_HELD(test, p, 4, 0);
+	held = opaque_pool_skb(test, p);
+	OPAQUE_POOL_HELD(test, p, 0, 3);
+	/* Two more complete after that and are on the list. */
+	kfree_skb(skb[4]);
+	kfree_skb(skb[5]);
+	OPAQUE_POOL_HELD(test, p, 2, 3);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)ARRAY_SIZE(skb));
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 1U + ARRAY_SIZE(skb));
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1 + 4);
+
+	/* The store goes: what the pool held is freed, which is five ubufs. */
+	opaque_pool_close(p);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)ARRAY_SIZE(skb) - 5);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 5U);
+	OPAQUE_POOL_HELD(test, p, 0, 0);
+	/* The pool refuses what completes now, and its folios go back as before. */
+	for (i = 6; i < ARRAY_SIZE(skb); i++) {
+		kfree_skb(skb[i]);
+		OPAQUE_POOL_HELD(test, p, 0, 0);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1 + (int)(ARRAY_SIZE(skb) - 1 - i));
+	}
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, 1L);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools);
+	KUNIT_EXPECT_EQ(test, refcount_read(&p->pool->refs), 1U);
+	/* The ubuf of the last skb is the pool's last reference, and goes with it. */
+	kfree_skb(held);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live, before.live);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools - 1);
+	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+	opaque_splice_done(&f);
+}
+
+/*
+ * A real store has a pool from the moment it is made, and closes it when its last reference goes:
+ * a ubuf that completed is freed with it, one that an skb still holds is freed when that skb is,
+ * and the pool, which the store's going does not free while it has one, goes with the last.
+ */
+static void opaque_ubuf_pool_store(struct kunit *test)
+{
+	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct io_uring_opaque_config cfg = {
+		.hard_limit = 64 * PAGE_SIZE, .compact_headroom = 4 * OPAQUE_TEST_UNIT,
+		.max_object_size = SZ_64K, .max_objects = 4, .max_streams = 1,
+		.max_extents = 64, .max_requests = 4,
+	};
+	struct io_opaque_send_cursor cursor = opaque_new_cursor();
+	struct opaque_pool_snap before, after;
+	struct sk_buff *skb[3];
+	struct io_opaque_store *store;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	opaque_test_params_save(test);
+	io_opaque_cache_bytes = 0;
+	ctx->user = get_current_user();
+	opaque_pool_read(&before);
+	store = io_opaque_alloc(ctx, &cfg);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+	KUNIT_ASSERT_NOT_NULL(test, store->ubuf_pool);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.pools - before.pools, 1L);
+	/* The cursor of a send of this store, as io_opaque_send() sets it. */
+	cursor.pool = READ_ONCE(store->ubuf_pool);
+	for (i = 0; i < ARRAY_SIZE(skb); i++) {
+		skb[i] = alloc_skb(0, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, skb[i]);
+		KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb[i], &cursor.uarg), 0);
+	}
+	/* One of three completes and is the pool's; the store goes with the other two. */
+	kfree_skb(skb[0]);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, 3L);
+	io_opaque_put(store);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, 2L);
+	KUNIT_EXPECT_EQ(test, after.pools - before.pools, 1L);
+	kfree_skb(skb[1]);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, 1L);
+	kfree_skb(skb[2]);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live, before.live);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools);
+	free_uid(ctx->user);
+}
+
+/*
+ * The ubuf of a pool completes where the last skb is freed, and that is often a softirq: the ACK
+ * that frees a sent skb, a consumer that copies. It is put on the list there and taken by the
+ * next skb in the task, with only atomics in between.
+ */
+static void opaque_ubuf_pool_atomic(struct kunit *test)
+{
+	struct opaque_atomic *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+	unsigned int copy;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	for (copy = 0; copy < 2; copy++) {
+		struct opaque_pool *p = opaque_pool_new(test);
+		struct opaque_pool_snap before, after;
+		struct io_opaque_ubuf *u;
+		struct opaque_splice f;
+		struct sk_buff *skb;
+
+		opaque_splice_setup(test, &f);
+		skb = opaque_pool_skb(test, p);
+		u = opaque_skb_ubuf(skb);
+		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(skb, &f.iter, 80000), 0);
+		a->skb = skb;
+		a->copy = copy;
+		a->softirq = false;
+		a->ret = -1;
+		init_completion(&a->done);
+		tasklet_setup(&a->tasklet, opaque_atomic_fn);
+		opaque_pool_read(&before);
+		tasklet_schedule(&a->tasklet);
+		KUNIT_ASSERT_TRUE(test, wait_for_completion_timeout(&a->done, 5 * HZ));
+		tasklet_kill(&a->tasklet);
+		opaque_pool_read(&after);
+		KUNIT_EXPECT_TRUE(test, a->softirq);
+		KUNIT_EXPECT_EQ(test, a->ret, copy ? 0 : -1);
+		KUNIT_EXPECT_EQ(test, after.copied - before.copied, (u64)copy);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 1);
+		OPAQUE_POOL_HELD(test, p, 1, 0);
+		skb = opaque_pool_skb(test, p);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_skb_ubuf(skb), u);
+		kfree_skb(skb);
+		opaque_splice_done(&f);
+	}
+}
+
+/*
+ * Over TCP: the sends of a store that has a pool take their ubufs from it. The ACKs free the skbs
+ * and the ubufs go to the pool, in whatever context they come, and the next sends have them: the
+ * cache makes only the ubufs that the sends could not take, and the store's going gives the
+ * rest back.
+ */
+static void opaque_send_managed_pool(struct kunit *test)
+{
+	static const struct opaque_send_case cases[] = {
+		{ .unlocked = true },
+		{ },
+		{ .vector = true },
+		{ .prefix = 24, .suffix = 8 },
+		{ .vector = true, .last = true },
+		{ .prefix = 24, .suffix = 8, .prep = true },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct opaque_pool *p = opaque_pool_new(test);
+	struct opaque_pool_snap before, after;
+	unsigned int round, i, tries, done, stocked;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	store->ubuf_pool = p->pool;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_pool_read(&before);
+	for (round = 0; round < 3; round++) {
+		for (i = 0; i < ARRAY_SIZE(cases); i++) {
+			opaque_wire_send(test, w, store, &cases[i]);
+			opaque_wire_acked(w->tx->sk);
+		}
+	}
+	/* The skbs are freed as the ACKs and the reads come; then every ubuf is in the pool. */
+	for (tries = 0; tries < 100; tries++) {
+		done = opaque_pool_held(p->pool, &stocked);
+		opaque_pool_read(&after);
+		if (after.live - before.live == (long)(done + stocked))
+			break;
+		msleep(20);
+	}
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)(done + stocked));
+	KUNIT_EXPECT_GT(test, after.reused - before.reused, 0ULL);
+	/* Every skb had its ubuf from the pool or from the cache, and none was refused. */
+	KUNIT_EXPECT_EQ(test, (u64)(after.live - before.live) + after.reused - before.reused,
+			after.skbs - before.skbs);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+	store->ubuf_pool = NULL;
+	opaque_pool_close(p);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live, before.live);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools - 1);
+}
+
+/*
  * SEND_ZC's notification and IORING_SEND_ZC_NO_RX_COPY, the counterpart of the managed sends
  * above that a registered-buffer send gets by asking for it. The notifications are built by
  * hand, as io_alloc_notif() and io_send_zc_prep() leave them, with no ring behind them, and
@@ -11319,6 +11902,13 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_prepay_error),
 	KUNIT_CASE(opaque_send_prepay_sockerr),
 	KUNIT_CASE(opaque_ubuf_complete_atomic),
+	KUNIT_CASE(opaque_ubuf_pool_reuse),
+	KUNIT_CASE(opaque_ubuf_pool_share),
+	KUNIT_CASE(opaque_ubuf_pool_bound),
+	KUNIT_CASE(opaque_ubuf_pool_teardown),
+	KUNIT_CASE(opaque_ubuf_pool_store),
+	KUNIT_CASE(opaque_ubuf_pool_atomic),
+	KUNIT_CASE(opaque_send_managed_pool),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}

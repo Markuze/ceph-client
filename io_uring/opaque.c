@@ -50,6 +50,8 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_vec_cleanup(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream);
 static void io_opaque_tx_put(struct io_opaque_req *op);
+VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
+VISIBLE_IF_KUNIT void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool);
 
 static bool io_opaque_budget_ready(struct io_opaque_req *op, unsigned long now)
 {
@@ -683,6 +685,8 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 		INIT_LIST_HEAD(&store->objects[i].candidate);
 	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
 	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
+	/* Not having one is fine: the ubufs of a store without a pool come from the cache alone. */
+	store->ubuf_pool = io_opaque_ubuf_pool_new();
 	return store;
 free_store:
 	bitmap_free(store->stream_used);
@@ -763,6 +767,8 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic_read(&store->requests));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_opaque_txs_free(store);
+	io_opaque_ubuf_pool_close(store->ubuf_pool);
+	store->ubuf_pool = NULL;
 	io_unaccount_mem(store->user, store->mm,
 			 (store->config.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
 	obj_cgroup_put(store->objcg);
@@ -3532,7 +3538,8 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
  * use, and drops them when the last of those is freed, from whatever context
  * that is: the ACK that frees a sent skb, the sender's own backlog, the
  * completion of a device, a tap that held a clone (io_opaque_ubuf_complete()).
- * It has no pointer to the request, the store or the version. A send gives
+ * It has no pointer to the request, the store or the version; it points to a
+ * pool that the store made, which it keeps alive. A send gives
  * back its references on its version as it did, and a LAST send hands the
  * extents back to the store as it did: what holds the pages then is the
  * ubuf, as it was TCP's references before, and the unit cache keeps a unit
@@ -3569,6 +3576,177 @@ VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
 	return IO_OPAQUE_UBUF_FLAGS;
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Ubufs taken from the cache and not yet given back to it, and pools made and not yet
+ * freed, for a test to say that they are all back.
+ */
+atomic_long_t io_opaque_ubufs_live = ATOMIC_LONG_INIT(0);
+atomic_long_t io_opaque_ubuf_pools_live = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_UBUF_TAKEN()		atomic_long_inc(&io_opaque_ubufs_live)
+#define IO_OPAQUE_UBUF_GIVEN()		atomic_long_dec(&io_opaque_ubufs_live)
+#define IO_OPAQUE_UBUF_POOL_MADE()	atomic_long_inc(&io_opaque_ubuf_pools_live)
+#define IO_OPAQUE_UBUF_POOL_GONE()	atomic_long_dec(&io_opaque_ubuf_pools_live)
+#else
+#define IO_OPAQUE_UBUF_TAKEN()		((void)0)
+#define IO_OPAQUE_UBUF_GIVEN()		((void)0)
+#define IO_OPAQUE_UBUF_POOL_MADE()	((void)0)
+#define IO_OPAQUE_UBUF_POOL_GONE()	((void)0)
+#endif
+
+/*
+ * A ubuf is made for each skb that gets fragments and freed where the last skb
+ * that shares it is, which is an ACK on whatever CPU gets it: the sender takes
+ * from the cache what other CPUs give back to it. A store keeps the ubufs that
+ * have completed, up to IO_OPAQUE_UBUF_POOL_MAX of them on a list that any context
+ * can push to and a few more that the send side holds, and a send takes one of
+ * those before it asks the cache. Nothing about what a ubuf holds changes: it
+ * drops its folios when its last skb goes, whole until then for as long as an skb,
+ * a clone, a split or a tap of one holds it, and it is not kept longer than the
+ * pool has room for.
+ *
+ * The pool is the store's, because that is what a send is accounted to, but no skb
+ * has a pointer to the store or to the ring, and either may be gone while an
+ * skb waits in a queue for an ACK or at a tap. So the ubuf points to the pool, and
+ * the pool is freed by the last ubuf that points to it: the count of its
+ * references is one for the store and one for each ubuf made by the cache for it
+ * and not yet given back, which a ubuf that is only reused does not touch. A store
+ * that goes closes the pool: the ubufs it holds are freed, and a ubuf that
+ * completes later is refused and freed to the cache as it would be with no pool.
+ *
+ * The two ends. A completion pushes with a compare-and-exchange, and nothing else:
+ * it runs in softirq, in the context of a task closing a socket, or with interrupts
+ * off, on any CPU. The send side runs with the socket owned, but for any socket and
+ * any ring of the store, in a task that may be preempted: it takes whatever has
+ * been pushed in one exchange, into a stock that it hands out of under a lock that
+ * no completion takes, so that the head of the list is touched once for each batch
+ * and not once for each skb. Closing a pool takes the list with a sentinel in its
+ * place, so that a ubuf that completes after it finds the pool closed on its own
+ * push and is not left on a list that nobody takes. The nr that bounds the list is
+ * not exact: it is set to nothing when the list is taken, and a ubuf that completes
+ * at that moment may be on the list and not counted. A pool therefore holds at most
+ * twice IO_OPAQUE_UBUF_POOL_MAX ubufs and a few more, in done and in stock, and no
+ * more than the skbs of the store ever had in flight.
+ */
+#define IO_OPAQUE_UBUF_POOL_CLOSED	((struct llist_node *)1UL)
+
+VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void)
+{
+	struct io_opaque_ubuf_pool *pool = kzalloc_obj(*pool, GFP_KERNEL_ACCOUNT);
+
+	if (!pool)
+		return NULL;
+	refcount_set(&pool->refs, 1);
+	spin_lock_init(&pool->lock);
+	IO_OPAQUE_UBUF_POOL_MADE();
+	return pool;
+}
+
+static void io_opaque_ubuf_pool_unref(struct io_opaque_ubuf_pool *pool)
+{
+	if (refcount_dec_and_test(&pool->refs)) {
+		IO_OPAQUE_UBUF_POOL_GONE();
+		kfree(pool);
+	}
+}
+
+/* Give a ubuf that nothing holds back to the cache, and let go of the pool that it was made for. */
+static void io_opaque_ubuf_free(struct io_opaque_ubuf *u)
+{
+	struct io_opaque_ubuf_pool *pool = u->pool;
+
+	kmem_cache_free(io_opaque_ubuf_cache, u);
+	IO_OPAQUE_UBUF_GIVEN();
+	if (pool)
+		io_opaque_ubuf_pool_unref(pool);
+}
+
+/* Free a chain of ubufs that were in a pool. */
+static void io_opaque_ubuf_free_chain(struct llist_node *node)
+{
+	while (node) {
+		struct llist_node *next = node->next;
+
+		io_opaque_ubuf_free(llist_entry(node, struct io_opaque_ubuf, node));
+		node = next;
+	}
+}
+
+/*
+ * Keep a ubuf that has completed, if its pool is open and has room: true, and it is
+ * the pool's, to be taken by the send side. False, and it is the caller's to free.
+ * Any context, any CPU, and nothing but atomics.
+ */
+static bool io_opaque_ubuf_pool_push(struct io_opaque_ubuf_pool *pool, struct io_opaque_ubuf *u)
+{
+	struct llist_node *first;
+
+	if (atomic_inc_return(&pool->nr) > IO_OPAQUE_UBUF_POOL_MAX)
+		goto refused;
+	first = READ_ONCE(pool->done.first);
+	do {
+		if (first == IO_OPAQUE_UBUF_POOL_CLOSED)
+			goto refused;
+		u->node.next = first;
+	} while (!try_cmpxchg(&pool->done.first, &first, &u->node));
+	return true;
+refused:
+	atomic_dec(&pool->nr);
+	return false;
+}
+
+/*
+ * A ubuf for a new skb from the pool, or none. The send side takes everything that
+ * the completions have pushed in one exchange when its stock has run out, and hands
+ * out of the stock one at a time. pool->lock is for the sends of the store, which
+ * run on many sockets and rings; the completions never take it.
+ */
+VISIBLE_IF_KUNIT struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool)
+{
+	struct llist_node *node;
+
+	spin_lock(&pool->lock);
+	node = pool->stock;
+	if (!node) {
+		node = READ_ONCE(pool->done.first);
+		while (node && node != IO_OPAQUE_UBUF_POOL_CLOSED &&
+		       !try_cmpxchg(&pool->done.first, &node, NULL))
+			;
+		if (node == IO_OPAQUE_UBUF_POOL_CLOSED)
+			node = NULL;
+		if (node)
+			atomic_set(&pool->nr, 0);
+	}
+	if (node)
+		pool->stock = node->next;
+	spin_unlock(&pool->lock);
+	return node ? llist_entry(node, struct io_opaque_ubuf, node) : NULL;
+}
+
+/*
+ * The store has gone, with no send running: free what the pool holds, and refuse what
+ * completes from now on, which is freed as it would be without a pool. The pool
+ * itself goes with the last of the ubufs that skbs still hold, if there are any, for
+ * which the store's reference is dropped last.
+ */
+VISIBLE_IF_KUNIT void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool)
+{
+	struct llist_node *done, *stock;
+
+	if (!pool)
+		return;
+	done = xchg(&pool->done.first, IO_OPAQUE_UBUF_POOL_CLOSED);
+	if (WARN_ON_ONCE(done == IO_OPAQUE_UBUF_POOL_CLOSED))
+		done = NULL;
+	spin_lock(&pool->lock);
+	stock = pool->stock;
+	pool->stock = NULL;
+	spin_unlock(&pool->lock);
+	io_opaque_ubuf_free_chain(done);
+	io_opaque_ubuf_free_chain(stock);
+	io_opaque_ubuf_pool_unref(pool);
+}
+
 /* The pages go back, whichever context frees the last skb that shares the ubuf. */
 static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
 {
@@ -3582,7 +3760,10 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
 		return;
 	for (i = 0; i < u->nr; i++)
 		folio_put(u->folio[i]);
-	kmem_cache_free(io_opaque_ubuf_cache, u);
+	/* Whole until here, and nothing holds it from here: another skb may have it at once. */
+	if (u->pool && io_opaque_ubuf_pool_push(u->pool, u))
+		return;
+	io_opaque_ubuf_free(u);
 }
 
 /*
@@ -3608,19 +3789,22 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * the send's stack, and the pointer lives from here to the next statement of
  * skb_zerocopy_iter_stream().
  *
- * TCP does not set skb->sk on a skb of its write queue, so the allocation has
- * no socket to take its mask from. GFP_KERNEL is what a user's socket
- * allocates its skbs with.
+ * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
+ * the cursor names the pool and has one, else the cache's. TCP does not set
+ * skb->sk on a skb of its write queue, so the allocation has no socket to take
+ * its mask from. GFP_KERNEL is what a user's socket allocates its skbs with.
  */
 VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 {
 	struct io_opaque_send_cursor *cursor = NULL;
+	struct io_opaque_ubuf_pool *pool = NULL;
 	struct ubuf_info *cur = skb_zcopy(skb);
 	struct io_opaque_ubuf *u;
 
 	/* TCP passes the send's cursor; a caller that is not a send passes none. */
 	if (uarg && uarg->ops == &io_opaque_cursor_ops) {
 		cursor = container_of(uarg, struct io_opaque_send_cursor, uarg);
+		pool = cursor->pool;
 		if (!cursor->nr)
 			cursor = NULL;
 	}
@@ -3632,9 +3816,19 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 			container_of(cur, struct io_opaque_ubuf, uarg)->cursor = cursor;
 		return 0;
 	}
-	u = kmem_cache_alloc(io_opaque_ubuf_cache, GFP_KERNEL);
-	if (!u)
-		return -ENOMEM;
+	u = pool ? io_opaque_ubuf_pool_get(pool) : NULL;
+	if (u) {
+		io_opaque_count(IO_OPAQUE_STAT_SEND_UBUF_REUSED, 1);
+	} else {
+		u = kmem_cache_alloc(io_opaque_ubuf_cache, GFP_KERNEL);
+		if (!u)
+			return -ENOMEM;
+		IO_OPAQUE_UBUF_TAKEN();
+		/* The pool lasts as long as a ubuf made for it does. */
+		if (pool)
+			refcount_inc(&pool->refs);
+		u->pool = pool;
+	}
 	u->uarg.ops = &io_opaque_ubuf_ops;
 	u->uarg.flags = io_opaque_ubuf_flags();
 	refcount_set(&u->uarg.refcnt, 1);
@@ -4244,6 +4438,7 @@ again:
 			 * their credits are read below that count only.
 			 */
 			cursor.uarg = (struct ubuf_info) { .ops = &io_opaque_cursor_ops };
+			cursor.pool = READ_ONCE(op->store->ubuf_pool);
 			msg.msg_flags |= MSG_ZEROCOPY;
 			msg.msg_ubuf = &cursor.uarg;
 			msg.sg_from_iter = io_opaque_sg_from_iter;

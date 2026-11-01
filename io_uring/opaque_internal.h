@@ -4,6 +4,7 @@
 
 #include <linux/bitmap.h>
 #include <linux/bvec.h>
+#include <linux/llist.h>
 #include <linux/net.h>
 #include <linux/percpu.h>
 #include <linux/sizes.h>
@@ -224,6 +225,7 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_FOLIO_GETS,
 	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
 	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
+	IO_OPAQUE_STAT_SEND_UBUF_REUSED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -250,14 +252,42 @@ struct io_opaque_ubuf {
 	struct ubuf_info uarg;
 	/* Entries of folio[]. */
 	u8 nr;
-	/*
-	 * The send whose link_skb() has just been called, if it has folio
-	 * references to hand out; the fill that follows takes it and clears it, so
-	 * that it never outlives the call.
-	 */
-	struct io_opaque_send_cursor *cursor;
+	union {
+		/*
+		 * The send whose link_skb() has just been called, if it has folio
+		 * references to hand out; the fill that follows takes it and clears it,
+		 * so that it never outlives the call.
+		 */
+		struct io_opaque_send_cursor *cursor;
+		/* Link in the pool of a ubuf that has completed and is waiting for a skb. */
+		struct llist_node node;
+	};
+	/* Where the ubuf goes when its last skb is freed; none for one that is only freed. */
+	struct io_opaque_ubuf_pool *pool;
 	/* The distinct folios of the fragments of the skbs that share the ubuf. */
 	struct folio *folio[MAX_SKB_FRAGS];
+};
+
+/*
+ * The ubufs of a store that have completed, kept for the next skbs (see
+ * io_opaque_ubuf_pool_get()). Completions, which run in any context on any CPU,
+ * push to done with a compare-and-exchange; the send side, which runs under the
+ * socket lock but for many sockets and rings at a time, takes all of done at once
+ * into stock, and hands out of that, under lock. nr counts what was pushed since
+ * done was last taken, so that done holds IO_OPAQUE_UBUF_POOL_MAX at most.
+ *
+ * refs is one for the store and one for every ubuf of the pool that has not been
+ * freed to the cache, wherever it is (in an skb, in done, in stock): the pool
+ * outlives the store and the ring for as long as an skb waits for an ACK.
+ */
+#define IO_OPAQUE_UBUF_POOL_MAX	128
+
+struct io_opaque_ubuf_pool {
+	refcount_t refs;
+	struct llist_head done ____cacheline_aligned_in_smp;
+	atomic_t nr;
+	spinlock_t lock ____cacheline_aligned_in_smp;
+	struct llist_node *stock;
 };
 
 /*
@@ -275,6 +305,8 @@ struct io_opaque_ubuf {
  */
 struct io_opaque_send_cursor {
 	struct ubuf_info uarg;
+	/* The pool of the send's store, for the ubufs of its skbs; or none. */
+	struct io_opaque_ubuf_pool *pool;
 	/* Entries of folio[] and credit[]. */
 	u8 nr;
 	struct folio *folio[IO_OPAQUE_PREPAY_FOLIOS];
@@ -341,6 +373,8 @@ struct io_opaque_store {
 	atomic_t extents;
 	atomic_t requests;
 	atomic_t memory_mode;
+	/* Completed ubufs of managed sends, for the next skbs; none if there was no memory. */
+	struct io_opaque_ubuf_pool *ubuf_pool;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
 	spinlock_t wait_lock;
 	/*
@@ -470,6 +504,11 @@ bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
 extern const struct ubuf_info_ops io_opaque_ubuf_ops;
 extern const struct ubuf_info_ops io_opaque_cursor_ops;
+extern atomic_long_t io_opaque_ubufs_live;
+extern atomic_long_t io_opaque_ubuf_pools_live;
+struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
+void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool);
+struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool);
 u8 io_opaque_ubuf_flags(void);
 int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
 int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);

@@ -394,7 +394,11 @@ completion of the skb holds one reference on each distinct folio that the skb
 uses until the last skb that shares it is freed, wherever that is. Like the
 page references that TCP held before, it ends with the data and not with the
 send: it does not hold the request, the store or the version, and a LAST send
-still frees the object when it is done. Because the completion is not a
+still frees the object when it is done. The completion itself, once its last skb
+is freed and its folios are released, is kept by the store for the next skb, up
+to a small number of them, instead of being freed and allocated again for each;
+the store frees them when it goes, and one that an skb still holds then is freed
+when that skb is, as it would be with no store. Because the completion is not a
 notification that anyone waits for, the receive path does not copy the skb on
 its way to a packet socket or to a socket of this host, which may hold it as
 long as it likes, as it may hold a spliced page. On any other socket, such as
@@ -809,6 +813,10 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     path that holds a clone, such as a packet socket or a socket of this host,
     does not copy it, and neither does the transmit path, so it stays at zero;
     a count means that something copied the data of a managed send.
+``stat_send_ubuf_reused``
+    Skbs of ``stat_send_managed_skbs`` that were given a ubuf which an earlier
+    skb had finished with and the store had kept, instead of one allocated for
+    them.
 ``stat_send_admit_fast``, ``stat_send_admit_slow``
     Vectored sends admitted in one pass over their entries, and those whose
     request had a block too short for the segments that their ranges span,
