@@ -6453,6 +6453,175 @@ static void opaque_send_vec_prep_errors(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
 }
 
+/*
+ * Count the calls that cleanup and prep make to the puts and to the growth of a
+ * block, and pass them on: what they were called with, and whether that was
+ * anything.
+ */
+static struct {
+	unsigned int data, data_null, stream, stream_null, grow;
+} opaque_calls;
+
+static void opaque_test_data_put_count(struct io_opaque_store *store, struct io_opaque_data *data)
+{
+	struct kunit *test = kunit_get_current_test();
+
+	if (data)
+		opaque_calls.data++;
+	else
+		opaque_calls.data_null++;
+	kunit_deactivate_static_stub(test, io_opaque_data_put);
+	io_opaque_data_put(store, data);
+	kunit_activate_static_stub(test, io_opaque_data_put, opaque_test_data_put_count);
+}
+
+static void opaque_test_stream_put_count(struct io_opaque_stream *stream)
+{
+	struct kunit *test = kunit_get_current_test();
+
+	if (stream)
+		opaque_calls.stream++;
+	else
+		opaque_calls.stream_null++;
+	kunit_deactivate_static_stub(test, io_opaque_stream_put);
+	io_opaque_stream_put(stream);
+	kunit_activate_static_stub(test, io_opaque_stream_put, opaque_test_stream_put_count);
+}
+
+static int opaque_test_grow_count(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep)
+{
+	struct kunit *test = kunit_get_current_test();
+	int ret;
+
+	opaque_calls.grow++;
+	kunit_deactivate_static_stub(test, io_opaque_vec_grow);
+	ret = io_opaque_vec_grow(op, nr, segs, keep);
+	kunit_activate_static_stub(test, io_opaque_vec_grow, opaque_test_grow_count);
+	return ret;
+}
+
+/*
+ * Cleanup puts what the request holds and calls nothing for what it does not: a
+ * send that was prepared and never issued holds no version and no stream, one
+ * that is admitted holds its version once, a vector holds a pin for each run of
+ * entries that name a handle and leaves the request's own version alone. The
+ * puts are counted by what they were called with, and a put of nothing is a
+ * call for nothing.
+ */
+static void opaque_cleanup_calls(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_test_object(test, store);
+	struct opaque_prep *p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	const u64 h = io_opaque_handle(0, 9);
+	struct io_uring_opaque_send_entry ent[3] = {
+		{ .handle = h, .off = 0, .len = 1000 },
+		{ .handle = h, .off = 5, .len = 10 },
+		{ .handle = h, .off = 79000, .len = 1000 },
+	};
+	struct io_opaque_req *op;
+	unsigned long addr;
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	opaque_prep_init(test, p, store);
+	addr = opaque_uvec_map(test);
+	opaque_uvec_put(test, addr, ent, sizeof(ent));
+	kunit_activate_static_stub(test, io_opaque_data_put, opaque_test_data_put_count);
+	kunit_activate_static_stub(test, io_opaque_stream_put, opaque_test_stream_put_count);
+
+	/* Prepared and never issued. */
+	opaque_prep_sqe(p, 0, h, 5, 100);
+	KUNIT_ASSERT_EQ(test, opaque_prep_send(p, &op), 0);
+	memset(&opaque_calls, 0, sizeof(opaque_calls));
+	opaque_prep_done(p);
+	KUNIT_EXPECT_EQ(test, opaque_calls.data, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.data_null, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.stream, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.stream_null, 0U);
+
+	/* Admitted: its version is put, once. */
+	opaque_prep_sqe(p, 0, h, 5, 100);
+	KUNIT_ASSERT_EQ(test, opaque_prep_send(p, &op), 0);
+	mutex_lock(&store->tables);
+	KUNIT_ASSERT_EQ(test, io_opaque_send_acquire(op), 0);
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+	memset(&opaque_calls, 0, sizeof(opaque_calls));
+	opaque_prep_done(p);
+	KUNIT_EXPECT_EQ(test, opaque_calls.data, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.data_null, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.stream, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.stream_null, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+
+	/* A vector of three entries of one handle: one pin, put once, and nothing else. */
+	opaque_prep_sqe(p, IORING_OPAQUE_SEND_VECTOR, addr, 0, ARRAY_SIZE(ent));
+	KUNIT_ASSERT_EQ(test, opaque_prep_send(p, &op), 0);
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+	memset(&opaque_calls, 0, sizeof(opaque_calls));
+	opaque_prep_done(p);
+	KUNIT_EXPECT_EQ(test, opaque_calls.data, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.data_null, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.stream, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_calls.stream_null, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+	kunit_deactivate_static_stub(test, io_opaque_data_put);
+	kunit_deactivate_static_stub(test, io_opaque_stream_put);
+}
+
+/*
+ * Prep asks for a block only when the request has none that holds its entries.
+ * A request is given back the block of the last one, unless it was big, and
+ * that block is not grown for entries it holds: a block for three is kept for
+ * three and for two, and is grown once for five and then kept for five. Under
+ * KASAN a cached request is cleared when it is taken, so none has a block and
+ * each asks.
+ */
+static void opaque_send_vec_prep_grows(struct kunit *test)
+{
+	static const u32 sizes[] = { 3, 3, 2, 5, 5, 4, 3, 5 };
+	/* Asks of a request with a block kept: the first, and the one that outgrows it. */
+	static const bool grows[] = { true, false, false, true, false, false, false, false };
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_test_object(test, store);
+	struct opaque_prep *p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	const u64 h = io_opaque_handle(0, 9);
+	struct io_uring_opaque_send_entry *ent;
+	struct io_opaque_req *op;
+	unsigned long addr;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	ent = kunit_kcalloc(test, 8, sizeof(*ent), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ent);
+	for (i = 0; i < 8; i++)
+		ent[i] = (struct io_uring_opaque_send_entry) { .handle = h, .off = i, .len = 1 };
+	opaque_prep_init(test, p, store);
+	addr = opaque_uvec_map(test);
+	opaque_uvec_put(test, addr, ent, 8 * sizeof(*ent));
+	memset(&opaque_calls, 0, sizeof(opaque_calls));
+	kunit_activate_static_stub(test, io_opaque_vec_grow, opaque_test_grow_count);
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		unsigned int before = opaque_calls.grow;
+
+		opaque_prep_sqe(p, IORING_OPAQUE_SEND_VECTOR, addr, 0, sizes[i]);
+		KUNIT_ASSERT_EQ(test, opaque_prep_send(p, &op), 0);
+		KUNIT_EXPECT_EQ_MSG(test, opaque_calls.grow - before,
+				    (IS_ENABLED(CONFIG_KASAN) || grows[i]) ? 1U : 0U,
+				    "prep %u of %u entries", i, sizes[i]);
+		KUNIT_EXPECT_GE(test, op->vec->cap_nr, sizes[i]);
+		KUNIT_EXPECT_GE(test, op->vec->cap_segs, sizes[i]);
+		KUNIT_EXPECT_EQ(test, op->length, sizes[i]);
+		KUNIT_EXPECT_MEMEQ(test, op->vec->ent, ent, sizes[i] * sizeof(*ent));
+		opaque_prep_done(p);
+	}
+	kunit_deactivate_static_stub(test, io_opaque_vec_grow);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+}
+
 static void opaque_test_noop_work(struct work_struct *work)
 {
 }
@@ -9923,6 +10092,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_build_pinned),
 	KUNIT_CASE(opaque_send_vec_prep),
 	KUNIT_CASE(opaque_send_vec_prep_errors),
+	KUNIT_CASE(opaque_cleanup_calls),
+	KUNIT_CASE(opaque_send_vec_prep_grows),
 	KUNIT_CASE(opaque_policy_chunks),
 	KUNIT_CASE(opaque_extents_free_wakes_once),
 	KUNIT_CASE(opaque_extents_free_wakes_all),

@@ -594,6 +594,7 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 
 VISIBLE_IF_KUNIT void io_opaque_stream_put(struct io_opaque_stream *stream)
 {
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_stream_put, stream);
 	if (stream && refcount_dec_and_test(&stream->refs)) {
 		io_opaque_extents_free(stream->store, &stream->extents);
 		fput(stream->file);
@@ -2393,9 +2394,14 @@ void io_opaque_cleanup(struct io_kiocb *req)
 				       store->objects[op->slot].generation);
 		mutex_unlock(&store->tables);
 	}
+	/*
+	 * A send that has run to its end holds no frame, no version and no stream,
+	 * and a call that is made to find that out is a call for nothing.
+	 */
 	if (req->opcode == IORING_OP_OPAQUE_OBJ_SEND) {
 		io_opaque_tx_put(op);
-		kfree(op->framing);
+		if (op->framing)
+			kfree(op->framing);
 		if (op->frame_charge)
 			io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
 	}
@@ -2403,13 +2409,14 @@ void io_opaque_cleanup(struct io_kiocb *req)
 		io_opaque_vec_cleanup(op);
 	if (op->op == IORING_OPAQUE_CREATE)
 		io_opaque_create_release(op);
-	else
+	else if (op->data)
 		io_opaque_data_put(store, op->data);
 	if (op->op == IORING_OPAQUE_COMPACT) {
 		io_opaque_data_put(store, op->replacement);
 		io_opaque_compact_end(op);
 	}
-	io_opaque_stream_put(op->stream);
+	if (op->stream)
+		io_opaque_stream_put(op->stream);
 	if (op->counted)
 		atomic_dec(&store->requests);
 	lockdep_assert_held(&req->ctx->uring_lock);
@@ -2520,10 +2527,24 @@ atomic_long_t io_opaque_vec_counted = ATOMIC_LONG_INIT(0);
 #endif
 
 /*
+ * Whether the request's block, if it has one, holds @nr entries and @segs
+ * segments already. A request that is made ready for a vector holds no
+ * reference in its block, which is what the warning says.
+ */
+static inline bool io_opaque_vec_fits(const struct io_opaque_vec *vec, u32 nr, u32 segs)
+{
+	if (!vec)
+		return false;
+	WARN_ON_ONCE(vec->pinned);
+	return vec->cap_nr >= nr && vec->cap_segs >= segs;
+}
+
+/*
  * Make room in the request's block for @nr entries and @segs segments, keeping
- * its first @keep entries. A block that is big enough stays as it is. This
- * allocates, so tables must not be held, and the send must hold no reference
- * yet: what admission recorded about the versions is not carried over.
+ * its first @keep entries. A block that is big enough stays as it is, and a
+ * caller that can tell (io_opaque_vec_fits()) does not call. This allocates, so
+ * tables must not be held, and the send must hold no reference yet: what
+ * admission recorded about the versions is not carried over.
  */
 VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep)
 {
@@ -2531,10 +2552,9 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_vec_grow, op, nr, segs, keep);
 	lockdep_assert_not_held(&op->store->tables);
+	if (io_opaque_vec_fits(old, nr, segs))
+		return 0;
 	if (old) {
-		WARN_ON_ONCE(old->pinned);
-		if (old->cap_nr >= nr && old->cap_segs >= segs)
-			return 0;
 		nr = max(nr, old->cap_nr);
 		segs = max(segs, old->cap_segs);
 	}
@@ -3032,9 +3052,11 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 	if (op->offset || !nr || nr > IORING_OPAQUE_SEND_VEC_MAX)
 		return -EINVAL;
 	/* Every entry spans a segment; admission grows the block if some span more. */
-	ret = io_opaque_vec_grow(op, nr, nr, 0);
-	if (ret)
-		return ret;
+	if (!io_opaque_vec_fits(op->vec, nr, nr)) {
+		ret = io_opaque_vec_grow(op, nr, nr, 0);
+		if (ret)
+			return ret;
+	}
 	return io_opaque_vec_copy_in(op, u64_to_user_ptr(op->handle), nr);
 }
 
@@ -3265,7 +3287,9 @@ VISIBLE_IF_KUNIT int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk
 		io_opaque_tx_claim(store, tx);
 	}
 	spin_unlock(&store->tx_lock);
-	kfree(spare);
+	/* Only a queue that another ring made first leaves one. */
+	if (unlikely(spare))
+		kfree(spare);
 	if (ret)
 		return ret;
 	return io_opaque_tx_settle(op, tx);
