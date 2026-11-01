@@ -3489,6 +3489,23 @@ static bool io_opaque_ubuf_holds(const struct io_opaque_ubuf *u, const struct fo
 }
 
 /*
+ * The page of a segment of a send's cursor. It is the first page of its folio,
+ * and the offset counts from it: io_opaque_extent_new() and io_opaque_append()
+ * keep the compound head of a backing and the offset from the head, compaction
+ * and CREATE fill whole compound pages from offset 0, and the cursor only moves
+ * the offset up and the length down inside a segment (io_opaque_vec_span(),
+ * io_opaque_send_iter() and the fill itself). So a segment is a fragment as it
+ * stands, with no lookup of its folio and no cut where the folio ends; a kernel
+ * with CONFIG_DEBUG_VM checks both.
+ */
+static inline struct page *io_opaque_seg_page(const struct bio_vec *bv)
+{
+	VM_WARN_ON_ONCE_PAGE(PageTail(bv->bv_page), bv->bv_page);
+	VM_WARN_ON_ONCE((size_t)bv->bv_offset + bv->bv_len > page_size(bv->bv_page));
+	return bv->bv_page;
+}
+
+/*
  * Add the bytes of @from to @skb as managed fragments, at most @length of
  * them: what a splice would add, with a folio's reference taken once for the
  * ubuf and not once for each fragment, and no page reference in the skb. A
@@ -3500,6 +3517,12 @@ static bool io_opaque_ubuf_holds(const struct io_opaque_ubuf *u, const struct fo
  * has its folio in the ubuf. The list can hold as many folios as an skb has
  * fragments, which it does if the skb is the only one to use the ubuf, as it
  * is while the skb is managed; one that is full ends the fill like a full skb.
+ *
+ * Per fragment, the loop is io_sg_from_iter()'s: the segment is the fragment
+ * (io_opaque_seg_page()), to which the fill adds the test against the last
+ * fragment and, when the folio is not that fragment's, a look at the ubuf's
+ * list. The cursor is advanced here, as io_sg_from_iter() advances it, and not
+ * walked again by iov_iter_advance().
  *
  * A skb that has fragments of its own cannot be managed: the fill takes a
  * reference for each, as a splice does (a framed send's prefix is copied into
@@ -3517,6 +3540,8 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 	unsigned long segs = from->nr_segs;
 	size_t skip = from->iov_offset;
 	size_t left = min(from->count, length), added = 0;
+	struct page *held = NULL;
+	skb_frag_t *last = NULL;
 	struct io_opaque_ubuf *u;
 	int ret = 0;
 
@@ -3532,15 +3557,18 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 		/* TCP takes -EFAULT as the end of the send, and no other error is worth more. */
 		return spliced < 0 ? -EFAULT : 0;
 	}
-	if (!nr)
-		shinfo->flags |= SKBFL_MANAGED_FRAG_REFS;
 	u = container_of(uarg, struct io_opaque_ubuf, uarg);
+	if (!nr) {
+		shinfo->flags |= SKBFL_MANAGED_FRAG_REFS;
+	} else {
+		/* Every fragment of a managed skb is the head of a folio that the ubuf holds. */
+		last = &shinfo->frags[nr - 1];
+		held = skb_frag_page(last);
+	}
 
 	while (left) {
-		size_t boff, part, foff;
-		struct folio *folio;
 		struct page *page;
-		skb_frag_t *last = nr ? &shinfo->frags[nr - 1] : NULL;
+		size_t off, part;
 
 		/* The cursor holds as many bytes as its count says, or the count is wrong. */
 		if (unlikely(!segs)) {
@@ -3548,36 +3576,39 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 			break;
 		}
 		part = min(bv->bv_len - skip, left);
-		if (!part) {
+		if (unlikely(!part)) {
 			bv++;
 			segs--;
 			skip = 0;
 			continue;
 		}
-		boff = bv->bv_offset + skip;
-		page = bv->bv_page + (boff >> PAGE_SHIFT);
-		folio = page_folio(page);
-		foff = folio_page_idx(folio, page) * PAGE_SIZE + offset_in_page(boff);
-		part = min(part, folio_size(folio) - foff);
+		page = io_opaque_seg_page(bv);
+		off = bv->bv_offset + skip;
 
-		if (last && skb_frag_page(last) == folio_page(folio, 0) &&
-		    skb_frag_off(last) + skb_frag_size(last) == foff) {
+		if (last && skb_frag_page(last) == page &&
+		    skb_frag_off(last) + skb_frag_size(last) == off) {
 			skb_frag_size_add(last, part);
 		} else {
 			if (nr >= limit) {
 				ret = -EMSGSIZE;
 				break;
 			}
-			if (!io_opaque_ubuf_holds(u, folio)) {
-				if (u->nr == ARRAY_SIZE(u->folio)) {
-					ret = -EMSGSIZE;
-					break;
+			if (page != held) {
+				struct folio *folio = page_folio(page);
+
+				if (!io_opaque_ubuf_holds(u, folio)) {
+					if (u->nr == ARRAY_SIZE(u->folio)) {
+						ret = -EMSGSIZE;
+						break;
+					}
+					folio_get(folio);
+					u->folio[u->nr++] = folio;
+					refs++;
 				}
-				folio_get(folio);
-				u->folio[u->nr++] = folio;
-				refs++;
+				held = page;
 			}
-			__skb_fill_page_desc_noacc(shinfo, nr++, folio_page(folio, 0), foff, part);
+			last = &shinfo->frags[nr];
+			__skb_fill_page_desc_noacc(shinfo, nr++, page, off, part);
 		}
 		added += part;
 		left -= part;
@@ -3590,7 +3621,11 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 	}
 	shinfo->nr_frags = nr;
 	skb_len_add(skb, added);
-	iov_iter_advance(from, added);
+	/* What iov_iter_advance(from, added) comes to, without walking the segments again. */
+	from->bvec = bv;
+	from->nr_segs = segs;
+	from->iov_offset = skip;
+	from->count -= added;
 	if (refs)
 		io_opaque_count(IO_OPAQUE_STAT_SEND_FOLIO_REFS, refs);
 	return ret;

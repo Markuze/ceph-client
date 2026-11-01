@@ -7496,6 +7496,409 @@ static void opaque_managed_fill_limits(struct kunit *test)
 }
 
 /*
+ * The units of a splice fixture can be given a pattern of their own, one that tells
+ * every position of every unit from the others, so that a test can tell the bytes
+ * that an skb points at from the bytes it should have.
+ */
+static u8 opaque_unit_byte(unsigned int unit, size_t pos)
+{
+	return (pos * 131 + pos / 257 + unit * 17) & 0xff;
+}
+
+static void opaque_unit_pattern(const struct opaque_splice *f)
+{
+	unsigned int i;
+	size_t pos;
+
+	for (i = 0; i < ARRAY_SIZE(f->units); i++)
+		for (pos = 0; pos < page_size(f->units[i]); pos++)
+			((u8 *)page_address(f->units[i]))[pos] = opaque_unit_byte(i, pos);
+}
+
+/*
+ * The first @len bytes of @skb are those of the segments from @bv on, the first begun
+ * @skip bytes in: what a fill was asked to add, in the order it was asked.
+ */
+static void opaque_expect_unit_bytes(struct kunit *test, const struct opaque_splice *f,
+				     struct sk_buff *skb, const struct bio_vec *bv, size_t skip,
+				     size_t len, u8 *got, u8 *want)
+{
+	size_t at = 0, k;
+
+	while (at < len) {
+		size_t part = min_t(size_t, bv->bv_len - skip, len - at);
+		int unit = ARRAY_SIZE(f->units);
+
+		while (--unit >= 0 && f->units[unit] != bv->bv_page)
+			;
+		KUNIT_ASSERT_GE(test, unit, 0);
+		for (k = 0; k < part; k++)
+			want[at + k] = opaque_unit_byte(unit, bv->bv_offset + skip + k);
+		at += part;
+		skip = 0;
+		bv++;
+	}
+	KUNIT_ASSERT_EQ(test, skb_copy_bits(skb, 0, got, len), 0);
+	KUNIT_EXPECT_MEMEQ(test, got, want, len);
+}
+
+/*
+ * Ranges in several folios, in the order a send gives them. Ranges that touch in a
+ * folio are one fragment. A range in a folio that the skb used before, with another
+ * between, is a fragment of its own and not a reference: the folio is in the ubuf, and
+ * the list is how the fill knows. The ubuf lists its folios in the order the skb first
+ * used them, and the fragments point at the first page of a folio however far into it
+ * the bytes are, at the bytes that the ranges name.
+ */
+static void opaque_managed_fill_folios(struct kunit *test)
+{
+	static const struct {
+		int unit;
+		u32 off, len;
+	} r[] = {
+		/* A fragment of unit 0, and the range that extends it. */
+		{ 0, 100, 1000 }, { 0, 1100, 500 },
+		/* A second folio. */
+		{ 1, 0, 2000 },
+		/* Unit 0 again, further on: a fragment, and the range that extends that. */
+		{ 0, 3 * PAGE_SIZE + 17, 700 }, { 0, 3 * PAGE_SIZE + 717, 300 },
+		/* A third folio. */
+		{ 2, 10, 400 },
+		/* Unit 1 where its first fragment ended, another folio's fragment between. */
+		{ 1, 2000, 100 },
+	};
+	static const struct {
+		int unit;
+		u32 off, size;
+	} frags[] = {
+		{ 0, 100, 1500 }, { 1, 0, 2000 }, { 0, 3 * PAGE_SIZE + 17, 1000 },
+		{ 2, 10, 400 }, { 1, 2000, 100 },
+	};
+	const size_t total = 5000;
+	u8 *got = kunit_kmalloc(test, total, GFP_KERNEL);
+	u8 *want = kunit_kmalloc(test, total, GFP_KERNEL);
+	struct opaque_managed before, after;
+	struct bio_vec bv[ARRAY_SIZE(r)];
+	struct io_opaque_ubuf *u;
+	struct opaque_splice f;
+	struct iov_iter iter;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	opaque_splice_setup(test, &f);
+	opaque_unit_pattern(&f);
+	for (i = 0; i < ARRAY_SIZE(r); i++)
+		bvec_set_page(&bv[i], f.units[r[i].unit], r[i].len, r[i].off);
+	iov_iter_bvec(&iter, ITER_SOURCE, bv, ARRAY_SIZE(bv), total);
+	u = opaque_managed_skb(test, &f);
+	opaque_managed_read(&before);
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, total), 0);
+	opaque_managed_read(&after);
+
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 0UL);
+	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)total);
+	KUNIT_ASSERT_EQ(test, skb_shinfo(f.skb)->nr_frags, (int)ARRAY_SIZE(frags));
+	for (i = 0; i < ARRAY_SIZE(frags); i++) {
+		skb_frag_t *frag = &skb_shinfo(f.skb)->frags[i];
+
+		KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(frag), f.units[frags[i].unit]);
+		KUNIT_EXPECT_EQ(test, skb_frag_off(frag), frags[i].off);
+		KUNIT_EXPECT_EQ(test, skb_frag_size(frag), frags[i].size);
+	}
+	/* Three folios, in the order they were first used, and a reference for each. */
+	KUNIT_ASSERT_EQ(test, u->nr, 3);
+	for (i = 0; i < 3; i++) {
+		KUNIT_EXPECT_PTR_EQ(test, u->folio[i], page_folio(f.units[i]));
+		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 2);
+	}
+	KUNIT_EXPECT_EQ(test, after.refs - before.refs, 3ULL);
+	KUNIT_EXPECT_EQ(test, after.fallback, before.fallback);
+	opaque_expect_unit_bytes(test, &f, f.skb, bv, 0, total, got, want);
+	kfree_skb(f.skb);
+	for (i = 0; i < 3; i++)
+		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1);
+	opaque_splice_done(&f);
+}
+
+/*
+ * The cursor after a fill is where iov_iter_advance() leaves it for the bytes the fill
+ * added, wherever the fill stops: inside a segment or at the end of one, with the first
+ * segment already begun, and for every length up to all that is left. The skb points at
+ * the bytes of the ranges.
+ */
+static void opaque_managed_fill_cursor(struct kunit *test)
+{
+	static const struct {
+		int unit;
+		u32 off, len;
+	} r[] = {
+		{ 0, 3 * PAGE_SIZE + 5, 400 }, { 0, 4 * PAGE_SIZE, 300 }, { 1, 17, 500 },
+		{ 2, 0, 100 }, { 0, 5 * PAGE_SIZE + 2, 1 }, { 1, 5000, 800 },
+	};
+	const size_t begun = 123;
+	struct bio_vec bv[ARRAY_SIZE(r)];
+	struct iov_iter start;
+	struct opaque_splice f;
+	size_t total = 0, len;
+	u8 *got, *want;
+	unsigned int i;
+
+	opaque_splice_setup(test, &f);
+	opaque_unit_pattern(&f);
+	for (i = 0; i < ARRAY_SIZE(r); i++) {
+		bvec_set_page(&bv[i], f.units[r[i].unit], r[i].len, r[i].off);
+		total += r[i].len;
+	}
+	got = kunit_kmalloc(test, total, GFP_KERNEL);
+	want = kunit_kmalloc(test, total, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	/* The first segment is begun when the fill is called, as a send's second call finds it. */
+	iov_iter_bvec(&start, ITER_SOURCE, bv, ARRAY_SIZE(bv), total);
+	iov_iter_advance(&start, begun);
+	for (len = 0; len <= total - begun; len++) {
+		struct iov_iter had = start, left = start;
+		struct io_opaque_ubuf *u;
+
+		kfree_skb(f.skb);
+		f.skb = alloc_skb(0, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, f.skb);
+		u = opaque_managed_skb(test, &f);
+		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &had, len), 0);
+		iov_iter_advance(&left, len);
+		KUNIT_ASSERT_PTR_EQ(test, had.bvec, left.bvec);
+		KUNIT_ASSERT_EQ(test, had.nr_segs, left.nr_segs);
+		KUNIT_ASSERT_EQ(test, had.iov_offset, left.iov_offset);
+		KUNIT_ASSERT_EQ(test, had.count, left.count);
+		KUNIT_ASSERT_EQ(test, f.skb->len, (unsigned int)len);
+		KUNIT_ASSERT_LE(test, u->nr, 3);
+		if (len)
+			opaque_expect_unit_bytes(test, &f, f.skb, bv, begun, len, got, want);
+	}
+	kfree_skb(f.skb);
+	opaque_splice_done(&f);
+}
+
+/* Set the fragment limit for the rest of the test. */
+static void opaque_max_frags_restore(void *arg)
+{
+	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, (int)(long)arg);
+}
+
+static void opaque_max_frags_set(struct kunit *test, int frags)
+{
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_max_frags_restore,
+				(void *)(long)READ_ONCE(net_hotdata.sysctl_max_skb_frags)), 0);
+	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, frags);
+}
+
+/*
+ * At the fragment limit a range that touches the last fragment still extends it, as a
+ * splice's does, and the one after that, which does not, is where the fill stops. It
+ * takes no reference for it and leaves the cursor at it. The limit is the sysctl's, also
+ * when that is lower than the ubuf could hold.
+ */
+static void opaque_managed_fill_at_limit(struct kunit *test)
+{
+	static const int limits[] = { 0, 4, 1 };
+	unsigned int c;
+
+	for (c = 0; c < ARRAY_SIZE(limits); c++) {
+		unsigned int limit = limits[c];
+		struct opaque_managed before, after;
+		struct io_opaque_ubuf *u;
+		struct opaque_splice f;
+		struct iov_iter iter;
+		struct bio_vec *bv;
+		size_t total = 0;
+		unsigned int i;
+
+		if (!limit)
+			limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+		else if (limit >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
+			continue;
+		else
+			opaque_max_frags_set(test, limit);
+		bv = kunit_kcalloc(test, limit + 2, sizeof(*bv), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, bv);
+		opaque_splice_setup(test, &f);
+		/* 100-byte fragments with gaps, a range that touches the last, one that cannot. */
+		for (i = 0; i < limit; i++)
+			bvec_set_page(&bv[i], f.units[0], 100, i * 200);
+		bvec_set_page(&bv[limit], f.units[0], 50, (limit - 1) * 200 + 100);
+		bvec_set_page(&bv[limit + 1], f.units[0], 80, (limit + 1) * 200);
+		for (i = 0; i < limit + 2; i++)
+			total += bv[i].bv_len;
+		iov_iter_bvec(&iter, ITER_SOURCE, bv, limit + 2, total);
+		u = opaque_managed_skb(test, &f);
+		opaque_managed_read(&before);
+		KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, total), -EMSGSIZE);
+		opaque_managed_read(&after);
+		KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, (int)limit);
+		KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)(limit * 100 + 50));
+		KUNIT_EXPECT_EQ(test, skb_frag_size(&skb_shinfo(f.skb)->frags[limit - 1]), 150U);
+		KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 80UL);
+		KUNIT_EXPECT_EQ(test, u->nr, 1);
+		KUNIT_EXPECT_EQ(test, after.refs - before.refs, 1ULL);
+		/* Full: nothing more, no reference, and the cursor stays. */
+		KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, total), -EMSGSIZE);
+		KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)(limit * 100 + 50));
+		KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 80UL);
+		opaque_managed_read(&after);
+		KUNIT_EXPECT_EQ(test, after.refs - before.refs, 1ULL);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 2);
+		kfree_skb(f.skb);
+		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
+		opaque_splice_done(&f);
+	}
+}
+
+/*
+ * What the fill relies on of a version's segments: each is the first page of its folio, and
+ * ends inside it. They are what the paths that make a version make of its extents.
+ */
+static void opaque_expect_segments(struct kunit *test, const struct io_opaque_data *data)
+{
+	u32 i;
+
+	for (i = 0; i < data->nr; i++) {
+		const struct bio_vec *bv = &data->bvec[i];
+
+		KUNIT_EXPECT_FALSE_MSG(test, PageTail(bv->bv_page), "segment %u", i);
+		KUNIT_EXPECT_GT_MSG(test, bv->bv_len, 0U, "segment %u", i);
+		KUNIT_EXPECT_LE_MSG(test, (size_t)bv->bv_offset + bv->bv_len,
+				    (size_t)page_size(bv->bv_page), "segment %u", i);
+	}
+}
+
+/*
+ * The whole of @data through the managed fill, as many skbs as it takes, and the bytes of the skbs
+ * are those of the version, which the caller read into @want.
+ */
+static void opaque_expect_object_fill(struct kunit *test, struct io_opaque_data *data,
+				      const u8 *want)
+{
+	u8 *got = kunit_kmalloc(test, data->length, GFP_KERNEL);
+	struct iov_iter iter;
+	size_t done = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	iov_iter_bvec(&iter, ITER_SOURCE, data->bvec, data->nr, data->length);
+	while (iov_iter_count(&iter)) {
+		struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, skb);
+		KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, NULL), 0);
+		ret = io_opaque_sg_from_iter(skb, &iter, iov_iter_count(&iter));
+		KUNIT_ASSERT_TRUE(test, ret == 0 || ret == -EMSGSIZE);
+		KUNIT_ASSERT_GT(test, skb->len, 0U);
+		KUNIT_ASSERT_LE(test, done + skb->len, data->length);
+		KUNIT_ASSERT_EQ(test, skb_copy_bits(skb, 0, got + done, skb->len), 0);
+		done += skb->len;
+		kfree_skb(skb);
+	}
+	KUNIT_EXPECT_EQ(test, done, (size_t)data->length);
+	KUNIT_EXPECT_MEMEQ(test, got, want, data->length);
+}
+
+/*
+ * Versions as the paths that make them make them, sent through the managed fill: extents of
+ * compound pages at odd offsets, across pages and beyond the first, and the same compacted into
+ * units of every order the unit cache allows, whole units and a tail. In each the segments are
+ * the first pages of their folios and end inside them, and the skbs point at the version's bytes.
+ */
+static void opaque_managed_fill_objects(struct kunit *test)
+{
+	static const unsigned int orders[] = { 0, 1, IO_OPAQUE_UNIT_ORDER, IO_OPAQUE_MAX_ORDER };
+	struct io_opaque_store *store = opaque_test_store(test);
+	u32 length = 2 * OPAQUE_TEST_UNIT + PAGE_SIZE + 369;
+	struct io_opaque_data *runs = opaque_runs_data(test, store, length);
+	u8 *want = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	opaque_expect_segments(test, runs);
+	opaque_test_copy(runs, want);
+	opaque_expect_object_fill(test, runs, want);
+	io_opaque_data_put(store, runs);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+
+	for (i = 0; i < ARRAY_SIZE(orders); i++) {
+		struct io_opaque_store *s = opaque_test_store(test);
+		struct io_opaque_data *data = opaque_sparse_data(test, s);
+		struct io_opaque_req op = { .store = s, .data = data };
+
+		io_opaque_unit_cache_init(s, 4, orders[i]);
+		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_drain, s), 0);
+		opaque_test_copy(data, want);
+		KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&op), 0);
+		opaque_expect_segments(test, op.replacement);
+		/* The first unit is whole, and of the order of the cache. */
+		KUNIT_EXPECT_EQ_MSG(test, compound_order(op.replacement->bvec[0].bv_page),
+				    orders[i], "order %u", orders[i]);
+		opaque_expect_object_fill(test, op.replacement, want);
+		io_opaque_data_put(s, op.replacement);
+		op.replacement = NULL;
+		io_opaque_compact_end(&op);
+		io_opaque_data_put(s, data);
+	}
+}
+
+/*
+ * A capture makes extents of what skbs carry, and the segments of those are the first pages of
+ * their folios whichever page of the folio a frag names: a frag on a tail page, at an offset
+ * that is not in its page and that crosses into the next, and on the first page itself.
+ */
+static void opaque_managed_fill_captured(struct kunit *test)
+{
+	static const struct { unsigned int page; u32 off, len; } r[] = {
+		{ 2, 100, 2000 }, { 1, 3000, 4000 }, { 0, 5000, 900 }, { 3, 0, 4096 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, 2);
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	u8 *want = kunit_kmalloc(test, 16 * PAGE_SIZE, GFP_KERNEL);
+	struct io_opaque_stream stream;
+	u32 at = 0, i, k;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	for (k = 0; k < page_size(page); k++)
+		((u8 *)page_address(page))[k] = (k * 131 + k / 251) & 0xff;
+	opaque_test_stream(&stream, store);
+	for (i = 0; i < ARRAY_SIZE(r); i++) {
+		struct sk_buff *skb = opaque_test_frag(test, page + r[i].page, r[i].off, r[i].len);
+
+		KUNIT_ASSERT_EQ(test, io_opaque_capture(&stream, skb, 0, r[i].len, false),
+				(int)r[i].len);
+		kfree_skb(skb);
+		for (k = 0; k < r[i].len; k++)
+			want[at + k] = ((r[i].page * PAGE_SIZE + r[i].off + k) * 131 +
+					(r[i].page * PAGE_SIZE + r[i].off + k) / 251) & 0xff;
+		at += r[i].len;
+	}
+	/* The extents are the version, in the order they were captured. */
+	list_splice_init(&stream.extents, &data->extents);
+	data->length = at;
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, data->nr, (u32)ARRAY_SIZE(r));
+	opaque_expect_segments(test, data);
+	for (i = 0; i < ARRAY_SIZE(r); i++) {
+		KUNIT_EXPECT_PTR_EQ(test, data->bvec[i].bv_page, page);
+		KUNIT_EXPECT_EQ(test, data->bvec[i].bv_offset, r[i].page * PAGE_SIZE + r[i].off);
+		KUNIT_EXPECT_EQ(test, data->bvec[i].bv_len, r[i].len);
+	}
+	opaque_expect_object_fill(test, data, want);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	put_page(page);
+}
+
+/*
  * An skb that has fragments of its own cannot be managed: a framed send's
  * prefix is one. The body is then filled as a splice fills it, with a page
  * reference for each fragment and none in the ubuf, and the fill is counted.
@@ -7965,6 +8368,11 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_managed_fill_runs),
 	KUNIT_CASE(opaque_managed_fill_adjacent),
 	KUNIT_CASE(opaque_managed_fill_limits),
+	KUNIT_CASE(opaque_managed_fill_folios),
+	KUNIT_CASE(opaque_managed_fill_cursor),
+	KUNIT_CASE(opaque_managed_fill_at_limit),
+	KUNIT_CASE(opaque_managed_fill_objects),
+	KUNIT_CASE(opaque_managed_fill_captured),
 	KUNIT_CASE(opaque_managed_fill_fallback),
 	KUNIT_CASE(opaque_managed_link),
 	KUNIT_CASE(opaque_ubuf_complete_atomic),
