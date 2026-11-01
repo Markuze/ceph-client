@@ -40,6 +40,8 @@
 #define IO_OPAQUE_SEEK_STRIDE	16
 /* Slots of the table of handles that a policy change walks while it holds tables. */
 #define IO_OPAQUE_POLICY_CHUNK	256
+/* Chunks, and so backings, that a stream allocates at a time. */
+#define IO_OPAQUE_BLOCK_CHUNKS	32
 
 /* What io_opaque_tx_join() returns besides an error. */
 /* Queued behind another frame and parked, with its references taken. */
@@ -102,10 +104,29 @@ struct io_opaque_extent {
 	bool embedded;
 };
 
-/* One allocation for the common capture; splits allocate only an extent. */
+struct io_opaque_block;
+
+/* The common capture: a backing and its first extent. A split allocates only an extent. */
 struct io_opaque_chunk {
 	struct io_opaque_backing backing;
 	struct io_opaque_extent extent;
+	struct io_opaque_block *block;
+};
+
+/*
+ * Chunks are allocated in blocks, so that a stream that keeps a page per
+ * fragment allocates once per IO_OPAQUE_BLOCK_CHUNKS pages and not once per
+ * page. @live counts what keeps the block: a chunk until its backing is
+ * released, and in the current block of a stream the chunks that are still to
+ * be handed out and the hold of the stream. The last to let go frees the block.
+ * A chunk of CREATE or compaction is a block of its own.
+ */
+struct io_opaque_block {
+	refcount_t live;
+	u32 nr;
+	/* Chunks handed out; changed by the stream that owns the block, under its lock. */
+	u32 used;
+	struct io_opaque_chunk chunk[];
 };
 
 struct io_opaque_data {
@@ -205,6 +226,8 @@ struct io_opaque_stream {
 	struct file *file;
 	struct sock_rx_owner owner;
 	struct list_head extents;
+	/* The block that capture takes its next chunk from, or NULL. */
+	struct io_opaque_block *block;
 	struct list_head reads;
 	struct rb_root_cached decisions;
 	struct io_opaque_req *collector;
@@ -271,6 +294,8 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_PAGES_STOLEN,
 	IO_OPAQUE_STAT_PAGES_HELD,
 	IO_OPAQUE_STAT_PAGES_COPIED,
+	/* Blocks of chunks that streams allocated. */
+	IO_OPAQUE_STAT_CHUNK_BLOCKS,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -423,6 +448,11 @@ int io_opaque_compact_start(struct io_opaque_req *op);
 int io_opaque_set_policy(struct io_opaque_req *op);
 
 #if IS_ENABLED(CONFIG_KUNIT)
+struct io_opaque_extent *io_opaque_stream_extent_new(struct io_opaque_stream *stream,
+						     struct page *page, u32 offset,
+						     u32 length, u64 start,
+						     unsigned int flags);
+void io_opaque_block_retire(struct io_opaque_stream *stream);
 void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation);
 void io_opaque_extent_free(struct io_opaque_store *store,
 			   struct io_opaque_extent *extent);

@@ -118,6 +118,7 @@ IO_OPAQUE_STAT_PARAM(stat_body_copied, IO_OPAQUE_STAT_BODY_COPIED);
 IO_OPAQUE_STAT_PARAM(stat_pages_stolen, IO_OPAQUE_STAT_PAGES_STOLEN);
 IO_OPAQUE_STAT_PARAM(stat_pages_held, IO_OPAQUE_STAT_PAGES_HELD);
 IO_OPAQUE_STAT_PARAM(stat_pages_copied, IO_OPAQUE_STAT_PAGES_COPIED);
+IO_OPAQUE_STAT_PARAM(stat_chunk_blocks, IO_OPAQUE_STAT_CHUNK_BLOCKS);
 
 static void io_opaque_auto_compact(struct io_opaque_store *store);
 

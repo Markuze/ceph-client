@@ -102,6 +102,7 @@ static void opaque_capture_identity(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, page_count(page), 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_clone_copy(struct kunit *test)
@@ -129,6 +130,7 @@ static void opaque_capture_clone_copy(struct kunit *test)
 	kunmap_local(mapped);
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_shared_copy(struct kunit *test)
@@ -163,6 +165,7 @@ static void opaque_capture_shared_copy(struct kunit *test)
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_compound(struct kunit *test)
@@ -186,6 +189,7 @@ static void opaque_capture_compound(struct kunit *test)
 	kfree_skb(skb);
 	io_opaque_extents_free(store, &stream.extents);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_oversized(struct kunit *test)
@@ -218,6 +222,7 @@ static void opaque_capture_oversized(struct kunit *test)
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_budget(struct kunit *test)
@@ -244,6 +249,7 @@ static void opaque_capture_budget(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(first);
 	put_page(second);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_gaps(struct kunit *test)
@@ -274,6 +280,7 @@ static void opaque_capture_gaps(struct kunit *test)
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_copy_pack(struct kunit *test)
@@ -309,6 +316,7 @@ static void opaque_capture_copy_pack(struct kunit *test)
 	}
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_partial_pressure(struct kunit *test)
@@ -336,6 +344,7 @@ static void opaque_capture_partial_pressure(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(first);
 	put_page(second);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_capture_private_budget(struct kunit *test)
@@ -371,6 +380,7 @@ static void opaque_capture_private_budget(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_split_shared_charge(struct kunit *test)
@@ -456,6 +466,146 @@ static void opaque_capture_page_stats(struct kunit *test)
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(page);
+	io_opaque_block_retire(&stream);
+}
+
+/* The extent of a stream for a page of its own; the backing takes the reference to the page. */
+static struct io_opaque_extent *opaque_block_extent(struct kunit *test,
+						    struct io_opaque_stream *stream, u64 start)
+{
+	struct page *page = alloc_page(GFP_KERNEL);
+	struct io_opaque_extent *extent;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	extent = io_opaque_stream_extent_new(stream, page, 0, 128, start, 0);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	list_add_tail(&extent->list, &stream->extents);
+	return extent;
+}
+
+static struct io_opaque_block *opaque_block_of(struct io_opaque_extent *extent)
+{
+	return container_of(extent->backing, struct io_opaque_chunk, backing)->block;
+}
+
+/*
+ * The chunks of a stream come in blocks. A block lives until the stream has
+ * let go of it and the backing of every chunk that it handed out is released,
+ * in whatever order, and not longer. The test keeps a reference of its own to
+ * the blocks that it counts, so it frees them, as the last holder, and a
+ * release that goes wrong shows in the count.
+ */
+static void opaque_block_lifetime(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_extent *ext[IO_OPAQUE_BLOCK_CHUNKS + 8];
+	struct io_opaque_block *first, *second, *third;
+	unsigned int i, n = ARRAY_SIZE(ext);
+	u64 blocks = io_opaque_stat_read(IO_OPAQUE_STAT_CHUNK_BLOCKS);
+
+	opaque_test_stream(&stream, store);
+	KUNIT_EXPECT_NULL(test, stream.block);
+
+	/* The first chunk makes a block: every chunk and the stream hold it. */
+	ext[0] = opaque_block_extent(test, &stream, 0);
+	first = opaque_block_of(ext[0]);
+	KUNIT_EXPECT_PTR_EQ(test, stream.block, first);
+	KUNIT_EXPECT_EQ(test, first->used, 1U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&first->live), IO_OPAQUE_BLOCK_CHUNKS + 1);
+	refcount_inc(&first->live);
+	for (i = 1; i < IO_OPAQUE_BLOCK_CHUNKS; i++) {
+		ext[i] = opaque_block_extent(test, &stream, i * 128);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_block_of(ext[i]), first);
+	}
+	/* The last chunk uses the block up, and the stream lets go of it. */
+	KUNIT_EXPECT_NULL(test, stream.block);
+	KUNIT_EXPECT_EQ(test, first->used, (u32)IO_OPAQUE_BLOCK_CHUNKS);
+	KUNIT_EXPECT_EQ(test, refcount_read(&first->live), IO_OPAQUE_BLOCK_CHUNKS + 1);
+
+	/* The next chunks are in another block, which the stream keeps. */
+	for (; i < n; i++)
+		ext[i] = opaque_block_extent(test, &stream, i * 128);
+	second = stream.block;
+	KUNIT_ASSERT_NOT_NULL(test, second);
+	KUNIT_EXPECT_PTR_NE(test, second, first);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_block_of(ext[n - 1]), second);
+	KUNIT_EXPECT_EQ(test, second->used, n - IO_OPAQUE_BLOCK_CHUNKS);
+	refcount_inc(&second->live);
+	KUNIT_EXPECT_EQ(test, refcount_read(&second->live), IO_OPAQUE_BLOCK_CHUNKS + 2);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), (int)n);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)n * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_CHUNK_BLOCKS), blocks + 2);
+
+	/* Free the first block's chunks out of order: each takes one hold off the block. */
+	for (i = 0; i < IO_OPAQUE_BLOCK_CHUNKS; i++) {
+		io_opaque_extent_free(store, ext[(i * 7) % IO_OPAQUE_BLOCK_CHUNKS]);
+		KUNIT_EXPECT_EQ(test, refcount_read(&first->live),
+				IO_OPAQUE_BLOCK_CHUNKS + 1 - (int)i - 1);
+	}
+	/* Only the test holds it now, and its release is the one that frees it. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&first->live), 1);
+	KUNIT_EXPECT_TRUE(test, refcount_dec_and_test(&first->live));
+	kfree(first);
+
+	/* The second block is not freed while the stream may hand out more chunks. */
+	for (i = n; i-- > IO_OPAQUE_BLOCK_CHUNKS;)
+		io_opaque_extent_free(store, ext[i]);
+	KUNIT_EXPECT_PTR_EQ(test, stream.block, second);
+	KUNIT_EXPECT_EQ(test, refcount_read(&second->live), IO_OPAQUE_BLOCK_CHUNKS + 2 - 8);
+	/* Retired, it keeps only the test's hold. */
+	io_opaque_block_retire(&stream);
+	KUNIT_EXPECT_NULL(test, stream.block);
+	KUNIT_EXPECT_EQ(test, refcount_read(&second->live), 1);
+	KUNIT_EXPECT_TRUE(test, refcount_dec_and_test(&second->live));
+	kfree(second);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+
+	/* A block retired with chunks out lives until the last of them is released. */
+	for (i = 0; i < 3; i++)
+		ext[i] = opaque_block_extent(test, &stream, i * 128);
+	third = opaque_block_of(ext[0]);
+	refcount_inc(&third->live);
+	io_opaque_block_retire(&stream);
+	KUNIT_EXPECT_EQ(test, refcount_read(&third->live), 3 + 1);
+	io_opaque_extent_free(store, ext[1]);
+	io_opaque_extent_free(store, ext[2]);
+	KUNIT_EXPECT_EQ(test, refcount_read(&third->live), 1 + 1);
+	io_opaque_extent_free(store, ext[0]);
+	KUNIT_EXPECT_TRUE(test, refcount_dec_and_test(&third->live));
+	kfree(third);
+
+	/* A chunk made alone is a block of its own, which its release frees. */
+	{
+		LIST_HEAD(alone);
+		struct page *page = alloc_page(GFP_KERNEL);
+		struct io_opaque_extent *lone;
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		lone = io_opaque_extent_new(store, page, 0, 128, 0, 0);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(lone));
+		list_add(&lone->list, &alone);
+		third = opaque_block_of(lone);
+		KUNIT_EXPECT_EQ(test, third->nr, 1U);
+		KUNIT_EXPECT_EQ(test, refcount_read(&third->live), 1);
+		refcount_inc(&third->live);
+		io_opaque_extent_free(store, lone);
+		KUNIT_EXPECT_EQ(test, refcount_read(&third->live), 1);
+		KUNIT_EXPECT_TRUE(test, refcount_dec_and_test(&third->live));
+		kfree(third);
+	}
+
+	/* Without the test's hold the last release frees the block: KASAN sees a mistake. */
+	for (i = 0; i < 3; i++)
+		ext[i] = opaque_block_extent(test, &stream, i * 128);
+	io_opaque_block_retire(&stream);
+	io_opaque_extent_free(store, ext[2]);
+	io_opaque_extent_free(store, ext[0]);
+	io_opaque_extent_free(store, ext[1]);
+	KUNIT_EXPECT_NULL(test, stream.block);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
 static void opaque_keep_restore(struct kunit *test)
@@ -1597,6 +1747,7 @@ static void opaque_collect_gate(struct kunit *test)
 	mutex_unlock(&stream.lock);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	put_page(page);
+	io_opaque_block_retire(&stream);
 }
 
 static void opaque_forward_only_versions(struct kunit *test)
@@ -7042,6 +7193,7 @@ static void opaque_maio_pool_ref(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_slot_state(test, ifq, page), (u32)IO_ZCRX_KSLOT_OWNED);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7130,6 +7282,7 @@ static void opaque_maio_page_ref(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	opaque_pool_free(pp, pooled);
 	io_zcrx_maio_page_put(ifq, plain);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7206,6 +7359,7 @@ static void opaque_maio_copy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_slots_in(ifq, IO_ZCRX_KSLOT_OWNED), 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7265,6 +7419,7 @@ static void opaque_maio_shared_copy(struct kunit *test)
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, area->free_count, nfree);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7324,6 +7479,7 @@ static void opaque_maio_fallback_copy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	for (i = 0; i < OPAQUE_BATCH; i++)
 		opaque_pool_free(pp, held[i]);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7393,6 +7549,7 @@ static void opaque_maio_extents(struct kunit *test)
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7455,6 +7612,7 @@ static void opaque_maio_exhausted(struct kunit *test)
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, area->free_count, 2U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7497,6 +7655,7 @@ static void opaque_maio_compact(struct kunit *test)
 	io_opaque_data_put(store, data);
 	io_opaque_data_put(plain, sparse);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	io_opaque_block_retire(&stream);
 }
 
 /*
@@ -7602,6 +7761,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_partial_pressure),
 	KUNIT_CASE(opaque_capture_private_budget),
 	KUNIT_CASE(opaque_split_shared_charge),
+	KUNIT_CASE(opaque_block_lifetime),
 	KUNIT_CASE(opaque_release_units),
 	KUNIT_CASE(opaque_capture_page_stats),
 	KUNIT_CASE(opaque_keep_restore),

@@ -330,10 +330,69 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 #endif
 }
 
-struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
-					      struct page *page, u32 offset,
-					      u32 length, u64 start,
-					      unsigned int flags)
+/* Let go of @refs of what keeps @block; the last frees it. */
+static void io_opaque_block_put(struct io_opaque_block *block, unsigned int refs)
+{
+	if (refcount_sub_and_test(refs, &block->live))
+		kfree(block);
+}
+
+/*
+ * The stream hands out no more chunks of its current block: it lets go of the
+ * ones that are left and of its hold. The chunks handed out keep the block.
+ */
+VISIBLE_IF_KUNIT void io_opaque_block_retire(struct io_opaque_stream *stream)
+{
+	struct io_opaque_block *block = stream->block;
+
+	if (!block)
+		return;
+	stream->block = NULL;
+	io_opaque_block_put(block, block->nr - block->used + 1);
+}
+
+/* The next chunk of the current block of @stream, in a new block if that is used up. */
+static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *stream)
+{
+	struct io_opaque_block *block = stream->block;
+	struct io_opaque_chunk *chunk;
+
+	if (!block) {
+		block = kzalloc_flex(*block, chunk, IO_OPAQUE_BLOCK_CHUNKS, GFP_KERNEL_ACCOUNT);
+		if (!block)
+			return NULL;
+		block->nr = IO_OPAQUE_BLOCK_CHUNKS;
+		/* Every chunk, to be handed out or released, and the hold of the stream. */
+		refcount_set(&block->live, block->nr + 1);
+		stream->block = block;
+		io_opaque_count(IO_OPAQUE_STAT_CHUNK_BLOCKS, 1);
+	}
+	chunk = &block->chunk[block->used++];
+	chunk->block = block;
+	if (block->used == block->nr)
+		io_opaque_block_retire(stream);
+	return chunk;
+}
+
+/* A chunk in a block of its own, for the callers that make one extent at a time. */
+static struct io_opaque_chunk *io_opaque_chunk_alone(void)
+{
+	struct io_opaque_block *block = kzalloc_flex(*block, chunk, 1, GFP_KERNEL_ACCOUNT);
+
+	if (!block)
+		return NULL;
+	block->nr = 1;
+	block->used = 1;
+	refcount_set(&block->live, 1);
+	block->chunk[0].block = block;
+	return &block->chunk[0];
+}
+
+static struct io_opaque_extent *io_opaque_extent_make(struct io_opaque_store *store,
+						      struct io_opaque_stream *stream,
+						      struct page *page, u32 offset,
+						      u32 length, u64 start,
+						      unsigned int flags)
 {
 	bool reserved = flags & IO_OPAQUE_EXT_RESERVED;
 	/* The memory cgroup pays for a page only if no other owner does. */
@@ -347,7 +406,7 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 		goto no_space;
 	if (memcg && io_opaque_memcg_charge(store, charge))
 		goto no_memory;
-	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
+	chunk = stream ? io_opaque_chunk_take(stream) : io_opaque_chunk_alone();
 	if (!chunk) {
 		if (memcg)
 			io_opaque_memcg_uncharge(store, charge);
@@ -375,6 +434,22 @@ no_memory:
 no_space:
 	atomic_dec(&store->extents);
 	return ERR_PTR(-ENOBUFS);
+}
+
+struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
+					      struct page *page, u32 offset,
+					      u32 length, u64 start,
+					      unsigned int flags)
+{
+	return io_opaque_extent_make(store, NULL, page, offset, length, start, flags);
+}
+
+/* As io_opaque_extent_new(), for capture: the chunk comes from a block of the stream. */
+VISIBLE_IF_KUNIT struct io_opaque_extent *
+io_opaque_stream_extent_new(struct io_opaque_stream *stream, struct page *page,
+			    u32 offset, u32 length, u64 start, unsigned int flags)
+{
+	return io_opaque_extent_make(stream->store, stream, page, offset, length, start, flags);
 }
 
 /*
@@ -447,12 +522,14 @@ static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opa
 		kfree(extent);
 	atomic_dec(&store->extents);
 	if (refcount_dec_and_test(&backing->refs)) {
-		charge = backing->charge;
+		struct io_opaque_chunk *chunk;
 
+		charge = backing->charge;
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
 		io_opaque_backing_put(store, backing);
-		kfree(container_of(backing, struct io_opaque_chunk, backing));
+		chunk = container_of(backing, struct io_opaque_chunk, backing);
+		io_opaque_block_put(chunk->block, 1);
 	}
 	return charge;
 }
@@ -656,6 +733,7 @@ VISIBLE_IF_KUNIT void io_opaque_stream_put(struct io_opaque_stream *stream)
 {
 	if (stream && refcount_dec_and_test(&stream->refs)) {
 		io_opaque_extents_free(stream->store, &stream->extents);
+		io_opaque_block_retire(stream);
 		fput(stream->file);
 		mutex_destroy(&stream->lock);
 		kfree(stream);
@@ -1465,7 +1543,7 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 			flags = IO_OPAQUE_EXT_RESERVED;
 		else if (hold != IO_OPAQUE_HOLD_PAGE)
 			flags = IO_OPAQUE_EXT_NO_MEMCG;
-		extent = io_opaque_extent_new(stream->store, page, offset, length, start, flags);
+		extent = io_opaque_stream_extent_new(stream, page, offset, length, start, flags);
 		if (IS_ERR(extent))
 			return PTR_ERR(extent);
 		if (hold == IO_OPAQUE_HOLD_POOL)
@@ -1673,6 +1751,8 @@ VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream)
 	write_unlock_bh(&sock->sk->sk_callback_lock);
 	release_sock(sock->sk);
 	io_opaque_extents_free(stream->store, &stream->extents);
+	/* No capture will follow: the chunks that are left in the block can go. */
+	io_opaque_block_retire(stream);
 	stream->undecided = 0;
 	io_opaque_stream_process(stream);
 	wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN | EPOLLHUP);
