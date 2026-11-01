@@ -394,6 +394,70 @@ static void opaque_split_shared_charge(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
+/* The last release gives back every reference that the backing holds, of the kind it holds. */
+static void opaque_release_units(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_extent *extent;
+	struct page *page = alloc_page(GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	/* The test keeps one reference, and the backing holds three. */
+	page_ref_add(page, 3);
+	extent = io_opaque_extent_new(store, page, 0, 128, 0, 0);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PAGE);
+	KUNIT_EXPECT_EQ(test, extent->backing->units, (u16)1);
+	extent->backing->units = 3;
+	KUNIT_EXPECT_EQ(test, page_count(page), 4);
+	io_opaque_extent_free(store, extent);
+	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	put_page(page);
+}
+
+/*
+ * The counters tell how capture got its pages: by a reference of its own, or by
+ * copying into a page of its own. Bytes that join a page already held add
+ * nothing.
+ */
+static void opaque_capture_page_stats(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct page *page = alloc_page(GFP_KERNEL);
+	u64 held = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD);
+	u64 copied = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_COPIED);
+	u64 stolen = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN);
+	struct sk_buff *skb;
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	opaque_test_stream(&stream, store);
+	skb = opaque_test_frag(test, page, 0, 512);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 512, false), 512);
+	stream.next = 512;
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD), held + 1);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_COPIED), copied);
+	kfree_skb(skb);
+
+	/* Linear packets are copied, and eight of them fill one page. */
+	for (i = 0; i < 8; i++) {
+		skb = alloc_skb(64, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, skb);
+		memset(skb_put(skb, 64), i, 64);
+		KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 64, false), 64);
+		stream.next += 64;
+		kfree_skb(skb);
+	}
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_COPIED), copied + 1);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD), held + 1);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN), stolen);
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	put_page(page);
+}
+
 static void opaque_keep_restore(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
@@ -2520,7 +2584,7 @@ static void opaque_create_uses_cache(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, op.data->dense);
 	extent = list_first_entry(&op.data->extents, struct io_opaque_extent, list);
 	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, unit);
-	KUNIT_EXPECT_TRUE(test, extent->backing->owned);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_UNIT);
 	KUNIT_EXPECT_EQ(test, store->cache.hits, 1ULL);
 	opaque_test_copy(op.data, after);
 	KUNIT_EXPECT_TRUE(test, !memcmp(pattern, after, op.length));
@@ -6952,7 +7016,7 @@ static void opaque_maio_pool_ref(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, page);
 	KUNIT_EXPECT_EQ(test, extent->offset, 128U);
 	KUNIT_EXPECT_TRUE(test, extent->backing->area);
-	KUNIT_EXPECT_TRUE(test, extent->backing->pool);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_MAIO);
 	KUNIT_EXPECT_FALSE(test, extent->backing->copied);
 	/* A pool reference, not a page reference. */
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&page->pp_ref_count), 2L);
@@ -6978,6 +7042,34 @@ static void opaque_maio_pool_ref(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_slot_state(test, ifq, page), (u32)IO_ZCRX_KSLOT_OWNED);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * A backing that holds several pool references gives all of them back, and the
+ * pool gets the page once.
+ */
+static void opaque_maio_pool_units(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 2 * OPAQUE_BATCH);
+	struct page_pool *pp = io_zcrx_maio_test_pool(test, ifq);
+	struct io_opaque_store *store = opaque_maio_store(test, ifq);
+	struct io_opaque_extent *extent;
+	struct page *page = opaque_pool_page(test, pp);
+
+	/* The reference of the driver passes to the backing, and so do two more. */
+	io_zcrx_maio_page_get(ifq, page);
+	io_zcrx_maio_page_get(ifq, page);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&page->pp_ref_count), 3L);
+	extent = io_opaque_extent_new(store, page, 0, 128, 0, IO_OPAQUE_EXT_NO_MEMCG);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	extent->backing->ref = IO_OPAQUE_REF_MAIO;
+	extent->backing->units = 3;
+	KUNIT_EXPECT_TRUE(test, ptr_ring_empty(&pp->ring));
+	io_opaque_extent_free(store, extent);
+	KUNIT_EXPECT_FALSE(test, ptr_ring_empty(&pp->ring));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&page->pp_ref_count), 1L);
+	KUNIT_EXPECT_EQ(test, atomic_read(&pp->pages_state_release_cnt), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
 /*
@@ -7008,7 +7100,7 @@ static void opaque_maio_page_ref(struct kunit *test)
 	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
 	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, pooled);
 	KUNIT_EXPECT_TRUE(test, extent->backing->area);
-	KUNIT_EXPECT_FALSE(test, extent->backing->pool);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PAGE);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&pooled->pp_ref_count), 1L);
 	KUNIT_EXPECT_EQ(test, page_count(pooled), 3);
 	kfree_skb(skb);
@@ -7024,7 +7116,7 @@ static void opaque_maio_page_ref(struct kunit *test)
 	extent = list_last_entry(&stream.extents, struct io_opaque_extent, list);
 	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, plain);
 	KUNIT_EXPECT_TRUE(test, extent->backing->area);
-	KUNIT_EXPECT_FALSE(test, extent->backing->pool);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PAGE);
 	KUNIT_EXPECT_EQ(test, page_count(plain), 3);
 	kfree_skb(skb);
 	KUNIT_EXPECT_EQ(test, page_count(plain), 2);
@@ -7096,7 +7188,7 @@ static void opaque_maio_copy(struct kunit *test)
 		KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(ifq, extent->backing->page, &off));
 		KUNIT_EXPECT_TRUE(test, extent->backing->copied);
 		KUNIT_EXPECT_TRUE(test, extent->backing->area);
-		KUNIT_EXPECT_TRUE(test, extent->backing->pool);
+		KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_MAIO);
 		KUNIT_EXPECT_NULL(test, extent->backing->page->pp);
 	}
 	/* The head and the two fragments stay ordinary: the skb still holds them. */
@@ -7465,7 +7557,7 @@ static void opaque_maio_create(struct kunit *test)
 		struct io_uring_opaque_extent pair = io_opaque_extent_pair(store, extent);
 
 		KUNIT_EXPECT_FALSE(test, extent->backing->area);
-		KUNIT_EXPECT_FALSE(test, extent->backing->pool);
+		KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_UNIT);
 		KUNIT_EXPECT_EQ(test, pair.area_off, IORING_OPAQUE_EXTENT_UNMAPPED);
 		KUNIT_EXPECT_EQ(test, pair.len, (u64)extent->length);
 		total += pair.len;
@@ -7510,6 +7602,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_partial_pressure),
 	KUNIT_CASE(opaque_capture_private_budget),
 	KUNIT_CASE(opaque_split_shared_charge),
+	KUNIT_CASE(opaque_release_units),
+	KUNIT_CASE(opaque_capture_page_stats),
 	KUNIT_CASE(opaque_keep_restore),
 	KUNIT_CASE(opaque_compact_versions),
 	KUNIT_CASE(opaque_compact_watermarks),
@@ -7583,6 +7677,7 @@ static struct kunit_case opaque_cases[] = {
 #ifdef CONFIG_IO_URING_ZCRX_KUNIT_TEST
 	KUNIT_CASE(opaque_maio_bind),
 	KUNIT_CASE(opaque_maio_pool_ref),
+	KUNIT_CASE(opaque_maio_pool_units),
 	KUNIT_CASE(opaque_maio_page_ref),
 	KUNIT_CASE(opaque_maio_copy),
 	KUNIT_CASE(opaque_maio_shared_copy),

@@ -13,6 +13,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/page_pool/helpers.h>
 #include <net/rps.h>
 #include <net/tcp.h>
 #include <trace/events/sock.h>
@@ -355,6 +356,9 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 	refcount_set(&chunk->backing.refs, 1);
 	chunk->backing.page = compound_head(page);
 	chunk->backing.charge = charge;
+	/* The reference of the caller passes to the backing; the caller may set another kind. */
+	chunk->backing.ref = IO_OPAQUE_REF_PAGE;
+	chunk->backing.units = 1;
 	chunk->backing.accounted = memcg && store->objcg;
 	chunk->extent.backing = &chunk->backing;
 	chunk->extent.start = start;
@@ -371,6 +375,60 @@ no_memory:
 no_space:
 	atomic_dec(&store->extents);
 	return ERR_PTR(-ENOBUFS);
+}
+
+/*
+ * Drop the @units references of a page pool page, the way napi_pp_put_page()
+ * drops the one of an skb fragment: the last one hands the page back to its
+ * pool, which recycles it unless somebody else still holds a page reference.
+ */
+static void io_opaque_pp_put(struct page *page, unsigned int units)
+{
+	netmem_ref netmem = page_to_netmem(page);
+
+	if (!IS_ENABLED(CONFIG_PAGE_POOL)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	if (page_pool_unref_netmem(netmem, units))
+		return;
+	page_pool_put_unrefed_netmem(netmem_get_pp(netmem), netmem, -1, false);
+}
+
+/*
+ * Give back what a backing holds of its page, as its kind says. The last
+ * extent of the backing is gone, so nobody reads the page through it any more.
+ */
+static void io_opaque_backing_put(struct io_opaque_store *store,
+				  struct io_opaque_backing *backing)
+{
+	unsigned int units = backing->units;
+
+	switch (backing->ref) {
+	case IO_OPAQUE_REF_PAGE:
+		/* An outsider reference to a page of the area is a page reference too. */
+		folio_put_refs(page_folio(backing->page), units);
+		break;
+	case IO_OPAQUE_REF_PP:
+		io_opaque_pp_put(backing->page, units);
+		break;
+	case IO_OPAQUE_REF_MAIO:
+		/*
+		 * A pool reference of a bound store ends in the instance. The
+		 * store holds its own reference to the instance until every
+		 * backing is gone, so the call is valid here.
+		 */
+		while (units--)
+			io_zcrx_maio_page_put(store->maio, backing->page);
+		break;
+	case IO_OPAQUE_REF_UNIT:
+		/* A cached unit leaves the object charge; it is not payload held. */
+		io_opaque_unit_put(store, backing->page);
+		break;
+	default:
+		/* A pending backing holds nothing: the skb still owns its reference. */
+		WARN_ON_ONCE(1);
+	}
 }
 
 /*
@@ -393,20 +451,7 @@ static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opa
 
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
-		/*
-		 * A pool reference of a bound store ends in the instance. The
-		 * store holds its own reference to the instance until every
-		 * backing is gone, so the call is valid here. A cached unit
-		 * leaves the object charge; it is not payload held. Any other
-		 * page, an outsider reference to the area included, is an
-		 * ordinary page reference.
-		 */
-		if (backing->pool)
-			io_zcrx_maio_page_put(store->maio, backing->page);
-		else if (backing->owned)
-			io_opaque_unit_put(store, backing->page);
-		else
-			put_page(backing->page);
+		io_opaque_backing_put(store, backing);
 		kfree(container_of(backing, struct io_opaque_chunk, backing));
 	}
 	return charge;
@@ -1328,6 +1373,16 @@ static bool io_opaque_retain(struct io_opaque_store *store,
 	return true;
 }
 
+/* The kind of reference that a backing holds on a page that the capture got this way. */
+static enum io_opaque_ref io_opaque_hold_ref(const struct io_opaque_store *store,
+					     enum io_opaque_hold hold)
+{
+	/* A copy page of a bound store has a pool reference, of the area. */
+	if (hold == IO_OPAQUE_HOLD_POOL || (hold == IO_OPAQUE_HOLD_COPY && store->maio))
+		return IO_OPAQUE_REF_MAIO;
+	return IO_OPAQUE_REF_PAGE;
+}
+
 /*
  * Take a page for the bytes that the capture copies. A bound store takes a
  * free page of the area, and the area has none when it is empty. Another store
@@ -1421,7 +1476,9 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 		/* A bound store copies every byte outside the area into it. */
 		extent->backing->area = hold == IO_OPAQUE_HOLD_AREA ||
 					hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
-		extent->backing->pool = hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
+		extent->backing->ref = io_opaque_hold_ref(stream->store, hold);
+		io_opaque_count(copied ? IO_OPAQUE_STAT_PAGES_COPIED :
+				IO_OPAQUE_STAT_PAGES_HELD, 1);
 		new_backing = true;
 	}
 	list_add_tail(&extent->list, list);
@@ -2309,7 +2366,7 @@ VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 		}
 		op->create_reserved -= page_size(page);
 		extent->backing->copied = true;
-		extent->backing->owned = true;
+		extent->backing->ref = IO_OPAQUE_REF_UNIT;
 		list_add_tail(&extent->list, &op->data->extents);
 		while (written < chunk) {
 			u32 bytes = min_t(u32, chunk - written, PAGE_SIZE);

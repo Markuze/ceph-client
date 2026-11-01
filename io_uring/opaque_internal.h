@@ -51,22 +51,46 @@
 
 struct io_zcrx_ifq;
 
+/*
+ * What a backing holds of its page, which is how the last release gives it
+ * back. The unit is one reference of that kind.
+ */
+enum io_opaque_ref {
+	/*
+	 * Nothing yet: capture has not decided whether the skb passes its
+	 * reference on or the backing takes one. No backing is released in
+	 * this state.
+	 */
+	IO_OPAQUE_REF_PENDING,
+	/* A page reference, dropped with folio_put_refs(). */
+	IO_OPAQUE_REF_PAGE,
+	/*
+	 * A page pool fragment reference, as the stack takes for an skb marked
+	 * for recycling. The last one hands the page back to its pool.
+	 */
+	IO_OPAQUE_REF_PP,
+	/*
+	 * A pool reference of the MAIO instance that the store binds. The
+	 * last one goes through io_zcrx_maio_page_put().
+	 */
+	IO_OPAQUE_REF_MAIO,
+	/* A destination unit of compaction or CREATE, which the unit cache may keep. */
+	IO_OPAQUE_REF_UNIT,
+};
+
 struct io_opaque_backing {
 	refcount_t refs;
+	u32 filled;
 	struct page *page;
 	u64 charge;
-	u32 filled;
+	/* How many references of kind @ref the backing holds on the page. */
+	u16 units;
+	/* An enum io_opaque_ref. */
+	u8 ref;
 	bool copied;
 	bool accounted;
-	/* Compaction or CREATE destination the unit cache may keep. */
-	bool owned;
 	/* The page is in the area of the MAIO instance that the store binds. */
 	bool area;
-	/*
-	 * The reference to the page is a pool reference of that instance. The
-	 * last release goes through io_zcrx_maio_page_put(), not put_page().
-	 */
-	bool pool;
 };
 
 struct io_opaque_extent {
@@ -243,6 +267,10 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_COMPACT_BYTES,
 	IO_OPAQUE_STAT_FRAMING_COPIED,
 	IO_OPAQUE_STAT_BODY_COPIED,
+	/* Pages that capture got by the reference of the skb, by its own reference, by a copy. */
+	IO_OPAQUE_STAT_PAGES_STOLEN,
+	IO_OPAQUE_STAT_PAGES_HELD,
+	IO_OPAQUE_STAT_PAGES_COPIED,
 	IO_OPAQUE_STAT_NR,
 };
 

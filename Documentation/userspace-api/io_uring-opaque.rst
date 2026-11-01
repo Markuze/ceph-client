@@ -779,6 +779,11 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
 ``stat_framing_copied``, ``stat_body_copied``
     Prefix and suffix bytes copied from user memory into request storage, and
     body bytes TCP copied under ``send_copy_max``.
+``stat_pages_stolen``, ``stat_pages_held``, ``stat_pages_copied``
+    Pages of received bytes that capture kept by taking over the reference of
+    the skb that carried them, by taking a reference of its own, and by
+    copying the bytes into a page of its own. A page that more bytes join
+    counts once.
 
 Stores in the area of a MAIO instance
 =====================================

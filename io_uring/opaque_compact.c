@@ -115,6 +115,9 @@ IO_OPAQUE_STAT_PARAM(stat_compact_auto, IO_OPAQUE_STAT_COMPACT_AUTO);
 IO_OPAQUE_STAT_PARAM(stat_compact_bytes, IO_OPAQUE_STAT_COMPACT_BYTES);
 IO_OPAQUE_STAT_PARAM(stat_framing_copied, IO_OPAQUE_STAT_FRAMING_COPIED);
 IO_OPAQUE_STAT_PARAM(stat_body_copied, IO_OPAQUE_STAT_BODY_COPIED);
+IO_OPAQUE_STAT_PARAM(stat_pages_stolen, IO_OPAQUE_STAT_PAGES_STOLEN);
+IO_OPAQUE_STAT_PARAM(stat_pages_held, IO_OPAQUE_STAT_PAGES_HELD);
+IO_OPAQUE_STAT_PARAM(stat_pages_copied, IO_OPAQUE_STAT_PAGES_COPIED);
 
 static void io_opaque_auto_compact(struct io_opaque_store *store);
 
@@ -445,7 +448,7 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 			ret = PTR_ERR(extent);
 			goto out;
 		}
-		extent->backing->owned = true;
+		extent->backing->ref = IO_OPAQUE_REF_UNIT;
 		op->reserved -= page_size(page);
 		list_add_tail(&extent->list, &op->replacement->extents);
 		ret = io_opaque_compact_copy(op, &cursor, page, chunk);
