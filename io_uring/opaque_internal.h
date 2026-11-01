@@ -343,7 +343,10 @@ struct io_opaque_store {
 	atomic_t memory_mode;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
 	spinlock_t wait_lock;
-	/* TX queues: the tree, every queue's requests and failed flag. Never with tables. */
+	/*
+	 * TX queues: the tree, every queue's requests and failed flag. Never with tables;
+	 * after the socket, which an inline send owns when it joins.
+	 */
 	spinlock_t tx_lock;
 	struct list_head budget_waits;
 	struct list_head copies;

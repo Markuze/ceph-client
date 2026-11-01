@@ -1134,15 +1134,23 @@ static void opaque_tx_idle_cache(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&store->txs_idle));
 }
 
-/* Lock order: tables alone around the handle; tx_lock before wait_lock to park and wake. */
+static void opaque_test_sock_release(void *sock)
+{
+	sock_release(sock);
+}
+
+/*
+ * Lock order: tables alone around the handle; tx_lock before wait_lock to park and wake; and,
+ * for an inline send, which joins and takes its references once it owns the socket, the socket
+ * before tx_lock, wait_lock and tables, none of which is held when the socket is taken.
+ */
 static void opaque_tx_lock_order(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_data *data = opaque_test_object(test, store);
 	struct sock *sk = kunit_kzalloc(test, sizeof(*sk), GFP_KERNEL);
-	struct io_opaque_req a, b;
-
-	KUNIT_ASSERT_NOT_NULL(test, sk);
+	struct io_opaque_req a, b, c, d, e;
+	struct socket *sock;
 	opaque_test_tx_op(&a, store);
 	opaque_test_tx_op(&b, store);
 	a.handle = io_opaque_handle(0, 9);
@@ -1168,6 +1176,52 @@ static void opaque_tx_lock_order(struct kunit *test)
 	lockdep_assert_none_held_once();
 	io_opaque_data_put(store, a.data);
 	io_opaque_data_put(store, b.data);
+
+	/*
+	 * With the socket owned, as an inline send joins: a real socket, whose lockdep class is
+	 * the sends'. The head links (the socket, then tx_lock) and takes its references (the
+	 * socket, then tables), a frame behind it takes its references and parks (the socket,
+	 * then tables, then tx_lock and wait_lock), and the head hands the queue on, all before
+	 * the socket is let go. The reverse order of any of them is a splat here and in every
+	 * other test that takes the socket.
+	 */
+	KUNIT_ASSERT_EQ(test, sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock),
+			0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_sock_release, sock), 0);
+	opaque_test_tx_op(&c, store);
+	opaque_test_tx_op(&d, store);
+	opaque_test_tx_op(&e, store);
+	c.handle = a.handle;
+	d.handle = a.handle;
+	e.handle = a.handle;
+	c.length = 100;
+	d.length = 100;
+	e.length = 100;
+	lock_sock(sock->sk);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&c, sock->sk), IO_OPAQUE_TX_SETTLE);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_settle_head(&c), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&d, sock->sk), IO_OPAQUE_TX_WAIT);
+	KUNIT_EXPECT_EQ(test, d.phase, IO_OPAQUE_SEND_WAIT);
+	opaque_test_tx_done(&c, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&c), &d);
+	/* A frame that was parked and is looked at again, still not the head, parks again. */
+	d.phase = IO_OPAQUE_IDLE;
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&d, sock->sk), IO_OPAQUE_TX_HEAD);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&e, sock->sk), IO_OPAQUE_TX_WAIT);
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&e, sock->sk), IO_OPAQUE_TX_WAIT);
+	opaque_test_tx_done(&d, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&d), &e);
+	e.phase = IO_OPAQUE_IDLE;
+	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&e, sock->sk), IO_OPAQUE_TX_HEAD);
+	opaque_test_tx_done(&e, true);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&e), NULL);
+	release_sock(sock->sk);
+	lockdep_assert_none_held_once();
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+	io_opaque_data_put(store, c.data);
+	io_opaque_data_put(store, d.data);
+	io_opaque_data_put(store, e.data);
+
 	mutex_lock(&store->tables);
 	data = io_opaque_detach(store, &store->objects[0]);
 	mutex_unlock(&store->tables);
@@ -7380,12 +7434,15 @@ static void opaque_extents_free_wakes_once(struct kunit *test)
 /*
  * What the send finds when it asks whether the socket is plain, which it does
  * first, on either path, before it asks the security hook or takes the socket:
- * a frame that joins the queue behind it, and a protocol that takes the socket
- * over at the n-th time it is asked, as a ULP or a socket map would. The real
- * answer is given.
+ * a protocol that takes the socket over at the n-th time it is asked, as a ULP
+ * or a socket map would. The real answer is given. And a frame that joins the
+ * queue behind the head after the head has joined and before it takes its
+ * references, which is where a frame that arrives meanwhile finds it: the head
+ * joins once it owns the socket, so no earlier moment will do.
  */
 static struct {
 	unsigned int calls, swap_at;
+	struct sock *sk;
 	struct io_opaque_req *follower;
 	int joined;
 } opaque_direct;
@@ -7395,13 +7452,24 @@ static bool opaque_test_direct(const struct sock *sk)
 	struct kunit *test = kunit_get_current_test();
 	bool ret;
 
-	if (++opaque_direct.calls == 1 && opaque_direct.follower)
-		opaque_direct.joined = io_opaque_tx_join(opaque_direct.follower, (struct sock *)sk);
-	if (opaque_direct.calls == opaque_direct.swap_at)
+	if (++opaque_direct.calls == opaque_direct.swap_at)
 		((struct sock *)sk)->sk_prot = &opaque_test_proto;
 	kunit_deactivate_static_stub(test, io_opaque_send_direct);
 	ret = io_opaque_send_direct(sk);
 	kunit_activate_static_stub(test, io_opaque_send_direct, opaque_test_direct);
+	return ret;
+}
+
+static int opaque_test_settle_after_join(struct io_opaque_req *op)
+{
+	struct kunit *test = kunit_get_current_test();
+	int ret;
+
+	if (opaque_direct.follower)
+		opaque_direct.joined = io_opaque_tx_join(opaque_direct.follower, opaque_direct.sk);
+	kunit_deactivate_static_stub(test, io_opaque_tx_settle_head);
+	ret = io_opaque_tx_settle_head(op);
+	kunit_activate_static_stub(test, io_opaque_tx_settle_head, opaque_test_settle_after_join);
 	return ret;
 }
 
@@ -7469,8 +7537,10 @@ static void opaque_security_run(struct kunit *test, bool direct, int err, bool l
 	}
 	KUNIT_ASSERT_EQ(test, io_opaque_send_direct(sk), direct);
 	memset(&opaque_direct, 0, sizeof(opaque_direct));
+	opaque_direct.sk = sk;
 	opaque_direct.follower = follower;
 	kunit_activate_static_stub(test, io_opaque_send_direct, opaque_test_direct);
+	kunit_activate_static_stub(test, io_opaque_tx_settle_head, opaque_test_settle_after_join);
 
 	mutex_lock(&w->ctx->uring_lock);
 	ret = io_opaque_send(&w->req[0], IO_URING_F_NONBLOCK);
@@ -7548,6 +7618,7 @@ static void opaque_security_run(struct kunit *test, bool direct, int err, bool l
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	kunit_deactivate_static_stub(test, io_opaque_send_direct);
+	kunit_deactivate_static_stub(test, io_opaque_tx_settle_head);
 	if (direct)
 		kunit_deactivate_static_stub(test, io_opaque_send_security);
 }
@@ -7592,6 +7663,260 @@ static struct io_opaque_req *opaque_wire_vec(struct kunit *test, struct opaque_w
 	w->req[i].async_data = op;
 	w->req[i].flags = 0;
 	return op;
+}
+
+/*
+ * What the joins of the issues of a test saw: how many, with the socket owned, with the ring
+ * lock held, and how many times the security hook had been asked by then.
+ */
+static struct {
+	unsigned int calls, owned, ring_locked, hooks;
+} opaque_join_spy;
+
+static int opaque_test_join_spy(struct io_opaque_req *op, struct sock *sk)
+{
+	struct kunit *test = kunit_get_current_test();
+	int ret;
+
+	opaque_join_spy.calls++;
+	opaque_join_spy.owned += sock_owned_by_user_nocheck(sk);
+	opaque_join_spy.ring_locked += mutex_is_locked(&op->req->ctx->uring_lock);
+	opaque_join_spy.hooks = opaque_hook_calls;
+	kunit_deactivate_static_stub(test, io_opaque_tx_join);
+	ret = io_opaque_tx_join(op, sk);
+	kunit_activate_static_stub(test, io_opaque_tx_join, opaque_test_join_spy);
+	return ret;
+}
+
+/* The number of requests on the ring's list of those that wait for cancellation. */
+static unsigned int opaque_wait_list_len(struct io_ring_ctx *ctx)
+{
+	struct io_opaque_req *op;
+	unsigned int nr = 0;
+
+	list_for_each_entry(op, &ctx->opaque_waits, cancel)
+		nr++;
+	return nr;
+}
+
+/*
+ * Where a send joins its queue. An inline issue on a plain TCP socket joins once it owns the
+ * socket, after it has asked the security hook, with the ring lock held; an io-wq issue, which
+ * lists a request that waits under the ring lock, joins before the hook and the socket; and a
+ * socket that is not plain is never owned by the issue, and joins unowned. A head finds its
+ * queue free whichever way it joins, and sends the frame.
+ */
+static void opaque_send_join_place(struct kunit *test)
+{
+	static const struct {
+		bool unlocked, plain;
+		unsigned int owned, hooks;
+	} cases[] = {
+		/* inline, plain: joined owned, after the hook */
+		{ false, true, 1, 1 },
+		/* io-wq, plain: joined unowned, before the hook */
+		{ true, true, 0, 0 },
+		/* inline, replaced proto: joined unowned, and the hook is sock_sendmsg()'s */
+		{ false, false, 0, 0 },
+		{ true, false, 0, 0 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 4000, GFP_KERNEL);
+	struct sock *sk;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_sndbuf(sk, SZ_1M);
+	opaque_test_proto = tcp_prot;
+	opaque_test_proto.sendmsg = opaque_test_sendmsg;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_proto_restore, sk), 0);
+	kunit_activate_static_stub(test, io_opaque_send_security, opaque_test_security_probe);
+	kunit_activate_static_stub(test, io_opaque_tx_join, opaque_test_join_spy);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct io_opaque_req *op;
+		int ret;
+
+		lock_sock(sk);
+		sk->sk_prot = cases[i].plain ? &tcp_prot : &opaque_test_proto;
+		release_sock(sk);
+		KUNIT_ASSERT_EQ(test, io_opaque_send_direct(sk), cases[i].plain);
+		op = opaque_wire_req(test, w, store, 0, 0, 100, 4000);
+		memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
+		memset(&opaque_join_spy, 0, sizeof(opaque_join_spy));
+		opaque_hook_calls = 0;
+		ret = opaque_wire_issue(w, 0, cases[i].unlocked);
+		lockdep_assert_none_held_once();
+		KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 4000);
+		KUNIT_EXPECT_EQ_MSG(test, opaque_join_spy.calls, 1U, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, opaque_join_spy.owned, cases[i].owned, "case %u", i);
+		/* An inline issue holds the ring lock for the join, and so does an io-wq issue. */
+		KUNIT_EXPECT_EQ_MSG(test, opaque_join_spy.ring_locked, 1U, "case %u", i);
+		/* The hook is asked with the socket not owned, before the join or after it. */
+		KUNIT_EXPECT_EQ_MSG(test, opaque_join_spy.hooks, cases[i].hooks, "case %u", i);
+		KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+		KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+		opaque_wire_read(test, w, got, 0, 4000);
+		KUNIT_EXPECT_MEMEQ(test, got, source + 100, 4000);
+		/* The ordinary path leaves the references to cleanup, which here is the test. */
+		KUNIT_EXPECT_PTR_EQ(test, op->data, cases[i].plain ? NULL : data);
+		io_opaque_data_put(store, op->data);
+		op->data = NULL;
+	}
+	kunit_deactivate_static_stub(test, io_opaque_tx_join);
+	kunit_deactivate_static_stub(test, io_opaque_send_security);
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * A request that finds a frame ahead of it, or is looked at again with the frame still
+ * ahead, parks, and an inline issue has taken the socket to find that out: it lets it go
+ * before it parks and before it returns, holding nothing of the socket's, and is listed once
+ * for cancellation under the ring lock it still holds. It has not sent a byte. An io-wq issue
+ * parks without the hook or the socket. The head is promoted when the frame ahead of it has
+ * gone, and when it is issued again it sends after it.
+ */
+static void opaque_send_parked_under_socket(struct kunit *test)
+{
+	const struct io_uring_opaque_send_entry ent[6] = {
+		[0 ... 5] = { .handle = io_opaque_handle(0, 9), .off = 0, .len = 80000 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 6 * 80000 + 300, GFP_KERNEL);
+	struct io_opaque_req *head, *follower;
+	unsigned int done = 0, tries, hooks;
+	struct io_opaque_tx *tx;
+	struct sock *sk;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_sndbuf(sk, SZ_32K);
+	opaque_hook_calls = 0;
+	kunit_activate_static_stub(test, io_opaque_send_security, opaque_test_security_probe);
+	kunit_activate_static_stub(test, io_opaque_tx_join, opaque_test_join_spy);
+	memset(&opaque_join_spy, 0, sizeof(opaque_join_spy));
+	/* The head queues what fits, and keeps its place at the front. */
+	head = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent), 0);
+	head->req = &w->req[0];
+	head->op = U16_MAX;
+	INIT_LIST_HEAD(&head->wait);
+	INIT_LIST_HEAD(&head->cancel);
+	INIT_LIST_HEAD(&head->send);
+	io_opaque_send_resolve(head);
+	w->req[0].async_data = head;
+	follower = opaque_wire_req(test, w, store, 1, 0, 200, 300);
+	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, false), -EAGAIN);
+	tx = head->tx;
+	KUNIT_ASSERT_NOT_NULL(test, tx);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.owned, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_hook_calls, 1U);
+
+	/* An inline issue behind it: the socket is taken, the join says wait, the socket goes. */
+	memset(&opaque_join_spy, 0, sizeof(opaque_join_spy));
+	ret = opaque_wire_issue(w, 1, false);
+	lockdep_assert_none_held_once();
+	KUNIT_ASSERT_EQ(test, ret, IOU_ISSUE_SKIP_COMPLETE);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.calls, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.owned, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.hooks, 2U);
+	KUNIT_EXPECT_EQ(test, opaque_hook_calls, 2U);
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&w->ctx->uring_lock));
+	KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_SEND_WAIT);
+	KUNIT_EXPECT_PTR_EQ(test, follower->tx, tx);
+	KUNIT_EXPECT_PTR_EQ(test, follower->data, data);
+	KUNIT_EXPECT_EQ(test, follower->progress, 0ULL);
+	KUNIT_EXPECT_EQ(test, w->req[1].cqe.res, 0);
+	KUNIT_EXPECT_EQ(test, opaque_wait_list_len(w->ctx), 1U);
+	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&tx->requests, struct io_opaque_req, send),
+			    head);
+
+	/* Looked at again with the head still ahead: parks again, and is listed once. */
+	memset(&opaque_join_spy, 0, sizeof(opaque_join_spy));
+	ret = opaque_wire_issue(w, 1, false);
+	KUNIT_ASSERT_EQ(test, ret, IOU_ISSUE_SKIP_COMPLETE);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.owned, 1U);
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_SEND_WAIT);
+	KUNIT_EXPECT_EQ(test, opaque_wait_list_len(w->ctx), 1U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 3);
+
+	/* The same from io-wq: no hook, no socket, and the ring lock back as it found it. */
+	hooks = opaque_hook_calls;
+	memset(&opaque_join_spy, 0, sizeof(opaque_join_spy));
+	ret = opaque_wire_issue(w, 1, true);
+	KUNIT_ASSERT_EQ(test, ret, IOU_ISSUE_SKIP_COMPLETE);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.owned, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_join_spy.ring_locked, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_hook_calls, hooks);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&w->ctx->uring_lock));
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	KUNIT_EXPECT_EQ(test, opaque_wait_list_len(w->ctx), 1U);
+	kunit_deactivate_static_stub(test, io_opaque_tx_join);
+
+	/* The peer reads, and the head sends the rest of its frame, which frees the queue. */
+	opaque_put_spy_start(test, sk);
+	for (tries = 0; tries < 4000; tries++) {
+		ret = opaque_wire_issue(w, 0, false);
+		if (ret == IOU_COMPLETE)
+			break;
+		KUNIT_ASSERT_EQ(test, ret, -EAGAIN);
+		done += opaque_wire_drain(w, got + done, 6 * 80000 - done);
+		usleep_range(500, 1000);
+	}
+	opaque_put_spy_stop(test);
+	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 6 * 80000);
+	KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+	KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_FALSE(test, follower->canceled);
+	KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&w->ctx->work_list, &w->ctx->work_head),
+			    &w->req[1].io_task_work.node);
+	/* Resumed as the task work does it, it is the head, sends, and the bytes follow. */
+	list_del_init(&follower->cancel);
+	follower->phase = IO_OPAQUE_IDLE;
+	KUNIT_EXPECT_EQ(test, opaque_wait_list_len(w->ctx), 0U);
+	ret = opaque_wire_issue(w, 1, false);
+	lockdep_assert_none_held_once();
+	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[1].cqe.res, 300);
+	KUNIT_EXPECT_PTR_EQ(test, follower->tx, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, follower->data, NULL);
+	opaque_wire_read(test, w, got, done, 6 * 80000 + 300);
+	for (tries = 0; tries < 6; tries++)
+		KUNIT_EXPECT_MEMEQ(test, got + tries * 80000, source, 80000);
+	KUNIT_EXPECT_MEMEQ(test, got + 6 * 80000, source + 200, 300);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	kunit_deactivate_static_stub(test, io_opaque_send_security);
+	mutex_lock(&store->tables);
+	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+	mutex_unlock(&store->tables);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
 /* What the window of an admission that has to grow its block saw, and the frame it lets in. */
@@ -10459,6 +10784,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_locked_last_versions),
 	KUNIT_CASE(opaque_send_fallback),
 	KUNIT_CASE(opaque_send_security_refusal),
+	KUNIT_CASE(opaque_send_join_place),
+	KUNIT_CASE(opaque_send_parked_under_socket),
 	KUNIT_CASE(opaque_send_locked_admit_fails),
 	KUNIT_CASE(opaque_send_direct_switch),
 	KUNIT_CASE(opaque_send_locked_blocking),
