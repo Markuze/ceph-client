@@ -2520,33 +2520,6 @@ atomic_long_t io_opaque_vec_counted = ATOMIC_LONG_INIT(0);
 #endif
 
 /*
- * Check @nr entries copied from user memory; return the body they add up to
- * and the largest of them. A handle may repeat, and a range may too.
- */
-VISIBLE_IF_KUNIT int io_opaque_vec_check(const struct io_uring_opaque_send_entry *ent, u32 nr,
-					 u32 *total, u32 *max_len)
-{
-	u64 sum = 0, end;
-	u32 longest = 0, i;
-
-	BUILD_BUG_ON(sizeof(*ent) != 24);
-	if (!nr || nr > IORING_OPAQUE_SEND_VEC_MAX)
-		return -EINVAL;
-	for (i = 0; i < nr; i++) {
-		if (ent[i].__resv || !ent[i].len ||
-		    check_add_overflow(ent[i].off, (u64)ent[i].len, &end))
-			return -EINVAL;
-		sum += ent[i].len;
-		if (sum > INT_MAX)
-			return -EINVAL;
-		longest = max(longest, ent[i].len);
-	}
-	*total = sum;
-	*max_len = longest;
-	return 0;
-}
-
-/*
  * Make room in the request's block for @nr entries and @segs segments, keeping
  * its first @keep entries. A block that is big enough stays as it is. This
  * allocates, so tables must not be held, and the send must hold no reference
@@ -2594,18 +2567,15 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 }
 
 /*
- * The @nr entries are in the block: validate them and make the request what
- * its length and offset say about a send, a body of their total at no offset.
+ * The @nr entries are in the block and add up to @total bytes, the largest being
+ * @longest: make the request what its length and offset say about a send, a body
+ * of their total at no offset.
  */
-VISIBLE_IF_KUNIT int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr)
+VISIBLE_IF_KUNIT void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total,
+					   u32 longest)
 {
 	struct io_opaque_vec *vec = op->vec;
-	u32 total, longest;
-	int ret;
 
-	ret = io_opaque_vec_check(vec->ent, nr, &total, &longest);
-	if (ret)
-		return ret;
 	vec->nr = nr;
 	vec->nr_segs = 0;
 	vec->pinned = 0;
@@ -2613,7 +2583,55 @@ VISIBLE_IF_KUNIT int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr)
 	op->handle = 0;
 	op->offset = 0;
 	op->length = total;
+}
+
+/*
+ * Read the @nr entries at @uent into the request's block and check them as they
+ * are read, in the one pass that SEND_ZC makes over its iovecs
+ * (copy_iovec_from_user()). A copy_from_user() would also check the block as a
+ * heap object that the copy must not overrun, and a pass over the copy would
+ * check the entries. Each field is read from user memory once and what is checked
+ * is what is kept, so an array that changes meanwhile cannot make the block
+ * differ from what was checked. @nr is from one to IORING_OPAQUE_SEND_VEC_MAX,
+ * and the block holds that many.
+ *
+ * An entry must name a range: no reserved bits, at least a byte, and an end that
+ * does not pass U64_MAX. The lengths add up to the body, which with the frame
+ * must fit an int. A handle may repeat, and a range may too. All of the entries
+ * are read before one that is not valid is refused, so that a fault is -EFAULT
+ * whatever they hold, as it is when the copy comes first. Returns 0, with the
+ * request made of the vector by io_opaque_vec_commit(), or an error, with the
+ * block as far as it was read.
+ */
+VISIBLE_IF_KUNIT int io_opaque_vec_copy_in(struct io_opaque_req *op,
+					   const struct io_uring_opaque_send_entry __user *uent,
+					   u32 nr)
+{
+	struct io_uring_opaque_send_entry *ent = op->vec->ent;
+	u32 longest = 0, i;
+	bool bad = false;
+	u64 sum = 0, end;
+
+	BUILD_BUG_ON(sizeof(*ent) != 24);
+	scoped_user_read_access_size(uent, array_size(nr, sizeof(*uent)), efault) {
+		for (i = 0; i < nr; i++) {
+			unsafe_get_user(ent[i].handle, &uent[i].handle, efault);
+			unsafe_get_user(ent[i].off, &uent[i].off, efault);
+			unsafe_get_user(ent[i].len, &uent[i].len, efault);
+			unsafe_get_user(ent[i].__resv, &uent[i].__resv, efault);
+			bad |= !!ent[i].__resv | !ent[i].len |
+			       check_add_overflow(ent[i].off, (u64)ent[i].len, &end);
+			sum += ent[i].len;
+			longest = max(longest, ent[i].len);
+		}
+	}
+	/* The sum only grows, and a thousand lengths of 32 bits cannot overflow it. */
+	if (bad || sum > INT_MAX)
+		return -EINVAL;
+	io_opaque_vec_commit(op, nr, sum, longest);
 	return 0;
+efault:
+	return -EFAULT;
 }
 
 /*
@@ -3017,10 +3035,7 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 	ret = io_opaque_vec_grow(op, nr, nr, 0);
 	if (ret)
 		return ret;
-	if (copy_from_user(op->vec->ent, u64_to_user_ptr(op->handle),
-			   array_size(nr, sizeof(*op->vec->ent))))
-		return -EFAULT;
-	return io_opaque_vec_commit(op, nr);
+	return io_opaque_vec_copy_in(op, u64_to_user_ptr(op->handle), nr);
 }
 
 int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)

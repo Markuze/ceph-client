@@ -451,10 +451,10 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 void io_opaque_send_resolve(struct io_opaque_req *op);
 int io_opaque_send_acquire(struct io_opaque_req *op);
-int io_opaque_vec_check(const struct io_uring_opaque_send_entry *ent, u32 nr,
-			u32 *total, u32 *max_len);
 int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
-int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr);
+void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total, u32 longest);
+int io_opaque_vec_copy_in(struct io_opaque_req *op,
+			  const struct io_uring_opaque_send_entry __user *uent, u32 nr);
 void io_opaque_vec_release(struct io_opaque_req *op);
 void io_opaque_vec_build(struct io_opaque_req *op);
 int io_opaque_vec_finish(struct io_opaque_req *op, int ret);

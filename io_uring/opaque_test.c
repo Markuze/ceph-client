@@ -9,6 +9,7 @@
 #include <linux/mman.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
+#include <linux/prandom.h>
 #include <linux/random.h>
 #include <linux/rtnetlink.h>
 #include <linux/sched/user.h>
@@ -3003,6 +3004,34 @@ static void opaque_send_loopback(struct kunit *test)
 }
 
 /*
+ * The rules for the entries of a vector, as prep applied them when it copied
+ * all of them and walked the copy (io_opaque_vec_check(), which the copy-in
+ * took over): the verdict, the body the entries add up to and the largest of
+ * them. The copy-in is held to it. A handle may repeat, and a range may too.
+ */
+static int opaque_vec_model(const struct io_uring_opaque_send_entry *ent, u32 nr, u32 *total,
+			    u32 *max_len)
+{
+	u64 sum = 0, end;
+	u32 longest = 0, i;
+
+	if (!nr || nr > IORING_OPAQUE_SEND_VEC_MAX)
+		return -EINVAL;
+	for (i = 0; i < nr; i++) {
+		if (ent[i].__resv || !ent[i].len ||
+		    check_add_overflow(ent[i].off, (u64)ent[i].len, &end))
+			return -EINVAL;
+		sum += ent[i].len;
+		if (sum > INT_MAX)
+			return -EINVAL;
+		longest = max(longest, ent[i].len);
+	}
+	*total = sum;
+	*max_len = longest;
+	return 0;
+}
+
+/*
  * Vectored OBJ_SEND: one SQE names several object ranges, and the body is
  * their concatenation. The request owns a block with the entries, a reference
  * per entry and the combined segments; a test frees it with the request.
@@ -3019,6 +3048,7 @@ static struct io_opaque_req *opaque_vec_new(struct kunit *test, struct io_opaque
 					    u32 nr, u16 flags)
 {
 	struct io_opaque_req *op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
+	u32 total, longest;
 
 	KUNIT_ASSERT_NOT_NULL(test, op);
 	op->store = store;
@@ -3026,8 +3056,89 @@ static struct io_opaque_req *opaque_vec_new(struct kunit *test, struct io_opaque
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_vec_free, op), 0);
 	KUNIT_ASSERT_EQ(test, io_opaque_vec_grow(op, nr, nr, 0), 0);
 	memcpy(op->vec->ent, ent, array_size(nr, sizeof(*ent)));
-	KUNIT_ASSERT_EQ(test, io_opaque_vec_commit(op, nr), 0);
+	KUNIT_ASSERT_EQ(test, opaque_vec_model(ent, nr, &total, &longest), 0);
+	io_opaque_vec_commit(op, nr, total, longest);
 	return op;
+}
+
+/* A request with a block for @nr entries and none in it, as prep leaves it before the copy. */
+static struct io_opaque_req *opaque_vec_blank(struct kunit *test, struct io_opaque_store *store,
+					      u32 nr)
+{
+	struct io_opaque_req *op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, op);
+	op->store = store;
+	op->send_flags = IORING_OPAQUE_SEND_VECTOR;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_vec_free, op), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vec_grow(op, nr, nr, 0), 0);
+	return op;
+}
+
+/*
+ * User memory for entries: ten pages hold the most that a vector can with room to
+ * spare. Page 4 is unmapped, for a copy to fault on when it reaches it.
+ */
+#define OPAQUE_UVEC_PAGES	10
+#define OPAQUE_UVEC_HOLE	4
+
+static unsigned long opaque_uvec_map(struct kunit *test)
+{
+	unsigned long addr = kunit_vm_mmap(test, NULL, 0, OPAQUE_UVEC_PAGES * PAGE_SIZE,
+					   PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0);
+
+	if (!addr || addr >= TASK_SIZE)
+		kunit_skip(test, "no userspace mapping for the entries");
+	return addr;
+}
+
+static void opaque_uvec_hole(struct kunit *test, unsigned long addr)
+{
+	KUNIT_ASSERT_EQ(test, vm_munmap(addr + OPAQUE_UVEC_HOLE * PAGE_SIZE, PAGE_SIZE), 0);
+}
+
+static void opaque_uvec_put(struct kunit *test, unsigned long addr, const void *src, size_t bytes)
+{
+	KUNIT_ASSERT_EQ(test, copy_to_user((void __user *)addr, src, bytes), 0UL);
+}
+
+/* Copy @nr entries from user address @addr into the block of @op, which holds 0xa5 at first. */
+static int opaque_vec_copy(struct io_opaque_req *op, unsigned long addr, u32 nr)
+{
+	memset(op->vec->ent, 0xa5, array_size(nr, sizeof(*op->vec->ent)));
+	op->vec->nr = 0xa5a5a5a5;
+	op->vec->nr_segs = 0xa5a5a5a5;
+	op->vec->pinned = 0xa5a5a5a5;
+	op->vec->max_len = 0xa5a5a5a5;
+	op->length = 0xa5a5a5a5;
+	op->handle = 0xa5a5a5a5a5a5a5a5ULL;
+	op->offset = 0xa5a5a5a5a5a5a5a5ULL;
+	return io_opaque_vec_copy_in(op, (const void __user *)addr, nr);
+}
+
+/*
+ * The copy-in of @nr entries at @addr, which hold @ent, gives the verdict of the
+ * model, and a request made of the vector when it is a yes: the entries as they
+ * are, the body of their sum, the largest of them, nothing pinned.
+ */
+static void opaque_vec_expect_copy(struct kunit *test, struct io_opaque_req *op,
+				   unsigned long addr, const struct io_uring_opaque_send_entry *ent,
+				   u32 nr)
+{
+	u32 total = 0, longest = 0;
+	int want = opaque_vec_model(ent, nr, &total, &longest);
+
+	KUNIT_ASSERT_EQ(test, opaque_vec_copy(op, addr, nr), want);
+	if (want)
+		return;
+	KUNIT_EXPECT_MEMEQ(test, op->vec->ent, ent, array_size(nr, sizeof(*ent)));
+	KUNIT_EXPECT_EQ(test, op->length, total);
+	KUNIT_EXPECT_EQ(test, op->vec->max_len, longest);
+	KUNIT_EXPECT_EQ(test, op->vec->nr, nr);
+	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+	KUNIT_EXPECT_EQ(test, op->handle, 0ULL);
+	KUNIT_EXPECT_EQ(test, op->offset, 0ULL);
 }
 
 /* Make the block hold @segs segments, so that admission has no need to grow it. */
@@ -4138,7 +4249,12 @@ static void opaque_attach_lock_order(struct kunit *test)
 	io_opaque_stream_put(stream);
 }
 
-/* The entries are checked as a whole, without looking at any handle. */
+/*
+ * The entries are checked as a whole, without looking at any handle: as they
+ * are read from user memory, and with the answers the model gives. Where the
+ * number of entries is wrong prep says so before it reads any
+ * (opaque_send_vec_prep_errors()).
+ */
 static void opaque_send_vec_check(struct kunit *test)
 {
 	static const struct io_uring_opaque_send_entry bad[] = {
@@ -4148,51 +4264,321 @@ static void opaque_send_vec_check(struct kunit *test)
 		{ .handle = 1, .off = U64_MAX - 9, .len = 10 },
 		{ .handle = 1, .off = 0, .len = U32_MAX },		/* more than a send holds */
 	};
-	struct io_uring_opaque_send_entry *ent = kunit_kcalloc(test, IORING_OPAQUE_SEND_VEC_MAX + 1,
+	struct io_uring_opaque_send_entry *ent = kunit_kcalloc(test, IORING_OPAQUE_SEND_VEC_MAX,
 							       sizeof(*ent), GFP_KERNEL);
-	u32 total = 0, longest = 0, i;
+	struct io_opaque_req *op = opaque_vec_blank(test, opaque_test_store(test),
+						    IORING_OPAQUE_SEND_VEC_MAX);
+	unsigned long addr = opaque_uvec_map(test);
+	u32 i;
 
 	KUNIT_ASSERT_NOT_NULL(test, ent);
-	for (i = 0; i <= IORING_OPAQUE_SEND_VEC_MAX; i++)
+	for (i = 0; i < IORING_OPAQUE_SEND_VEC_MAX; i++)
 		ent[i] = (struct io_uring_opaque_send_entry) { .handle = 1, .off = i, .len = 10 };
 	/* One entry to the maximum; the body is the sum. */
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 1, &total, &longest), 0);
-	KUNIT_EXPECT_EQ(test, total, 10U);
-	KUNIT_EXPECT_EQ(test, longest, 10U);
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, IORING_OPAQUE_SEND_VEC_MAX, &total,
-						  &longest), 0);
-	KUNIT_EXPECT_EQ(test, total, 10U * IORING_OPAQUE_SEND_VEC_MAX);
-	/* None, or more than fit. */
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 0, &total, &longest), -EINVAL);
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, IORING_OPAQUE_SEND_VEC_MAX + 1, &total,
-						  &longest), -EINVAL);
+	opaque_uvec_put(test, addr, ent, array_size(IORING_OPAQUE_SEND_VEC_MAX, sizeof(*ent)));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 1), 0);
+	KUNIT_EXPECT_EQ(test, op->length, 10U);
+	KUNIT_EXPECT_EQ(test, op->vec->max_len, 10U);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, IORING_OPAQUE_SEND_VEC_MAX), 0);
+	KUNIT_EXPECT_EQ(test, op->length, 10U * IORING_OPAQUE_SEND_VEC_MAX);
 	for (i = 0; i < ARRAY_SIZE(bad); i++) {
 		ent[1] = bad[i];
-		KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 2, &total, &longest), -EINVAL);
+		opaque_uvec_put(test, addr, ent, 2 * sizeof(*ent));
+		KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 2), -EINVAL);
 		/* Only the entries named are looked at. */
-		KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 1, &total, &longest), 0);
+		KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 1), 0);
 	}
 	/* A range may end exactly at U64_MAX. */
 	ent[1] = (struct io_uring_opaque_send_entry) {
 		.handle = 1, .off = U64_MAX - 10, .len = 10,
 	};
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 2, &total, &longest), 0);
+	opaque_uvec_put(test, addr, ent, 2 * sizeof(*ent));
+	opaque_vec_expect_copy(test, op, addr, ent, 2);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 2), 0);
 	/* The body fits INT_MAX, which the whole frame must too. */
 	ent[0].len = 1U << 30;
 	ent[1] = (struct io_uring_opaque_send_entry) { .handle = 1, .off = 0, .len = 1U << 30 };
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 2, &total, &longest), -EINVAL);
+	opaque_uvec_put(test, addr, ent, 2 * sizeof(*ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 2), -EINVAL);
 	ent[1].len--;
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 2, &total, &longest), 0);
-	KUNIT_EXPECT_EQ(test, total, (u32)INT_MAX);
-	KUNIT_EXPECT_EQ(test, longest, 1U << 30);
+	opaque_uvec_put(test, addr, ent, 2 * sizeof(*ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 2), 0);
+	KUNIT_EXPECT_EQ(test, op->length, (u32)INT_MAX);
+	KUNIT_EXPECT_EQ(test, op->vec->max_len, 1U << 30);
 	/* A handle, even a range, may repeat. */
 	ent[0] = (struct io_uring_opaque_send_entry) { .handle = 1, .off = 0, .len = 100 };
 	ent[1] = ent[0];
 	ent[2] = (struct io_uring_opaque_send_entry) { .handle = 2, .off = 5, .len = 300 };
 	ent[3] = ent[0];
-	KUNIT_EXPECT_EQ(test, io_opaque_vec_check(ent, 4, &total, &longest), 0);
-	KUNIT_EXPECT_EQ(test, total, 600U);
-	KUNIT_EXPECT_EQ(test, longest, 300U);
+	opaque_uvec_put(test, addr, ent, 4 * sizeof(*ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 4), 0);
+	KUNIT_EXPECT_EQ(test, op->length, 600U);
+	KUNIT_EXPECT_EQ(test, op->vec->max_len, 300U);
+}
+
+/*
+ * What is copied in is the vector: every field of every entry, the body of
+ * their sum and the largest of them, and the request holds nothing yet. Vectors
+ * of every size, with a body that just fits, entries that end at U64_MAX and
+ * repeated handles and ranges.
+ */
+static void opaque_vec_copy_in(struct kunit *test)
+{
+	static const u32 sizes[] = { 1, 2, 3, 7, 8, 9, 63, 64, 255, 256, 1023,
+				     IORING_OPAQUE_SEND_VEC_MAX };
+	struct io_uring_opaque_send_entry *ent = kunit_kcalloc(test, IORING_OPAQUE_SEND_VEC_MAX,
+							       sizeof(*ent), GFP_KERNEL);
+	struct io_opaque_req *op = opaque_vec_blank(test, opaque_test_store(test),
+						    IORING_OPAQUE_SEND_VEC_MAX);
+	unsigned long addr = opaque_uvec_map(test);
+	unsigned int k;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ent);
+	for (k = 0; k < ARRAY_SIZE(sizes); k++) {
+		/* Different in every field, so that a field read twice, or not at all, shows. */
+		for (i = 0; i < sizes[k]; i++)
+			ent[i] = (struct io_uring_opaque_send_entry) {
+				.handle = 0x0123456789abcdefULL + i * 0x1000001ULL,
+				.off = 0x123456789aULL + i,
+				.len = 1 + (i * 37) % 5000,
+			};
+		opaque_uvec_put(test, addr, ent, sizes[k] * sizeof(*ent));
+		opaque_vec_expect_copy(test, op, addr, ent, sizes[k]);
+		KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, sizes[k]), 0);
+	}
+	/* The largest body there is: the most entries, and a sum of exactly INT_MAX. */
+	for (i = 0; i < IORING_OPAQUE_SEND_VEC_MAX; i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = 1, .off = 0, .len = 1U << 21,
+		};
+	ent[IORING_OPAQUE_SEND_VEC_MAX - 1].len--;
+	opaque_uvec_put(test, addr, ent, IORING_OPAQUE_SEND_VEC_MAX * sizeof(*ent));
+	opaque_vec_expect_copy(test, op, addr, ent, IORING_OPAQUE_SEND_VEC_MAX);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, IORING_OPAQUE_SEND_VEC_MAX), 0);
+	KUNIT_EXPECT_EQ(test, op->length, (u32)INT_MAX);
+	KUNIT_EXPECT_EQ(test, op->vec->max_len, 1U << 21);
+	/* One byte more is too much, in the last entry as in the first. */
+	ent[IORING_OPAQUE_SEND_VEC_MAX - 1].len++;
+	opaque_uvec_put(test, addr, ent, IORING_OPAQUE_SEND_VEC_MAX * sizeof(*ent));
+	opaque_vec_expect_copy(test, op, addr, ent, IORING_OPAQUE_SEND_VEC_MAX);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, IORING_OPAQUE_SEND_VEC_MAX), -EINVAL);
+	/* Entries that end at U64_MAX, a handle that repeats and a range that does. */
+	ent[0] = (struct io_uring_opaque_send_entry) { .handle = 7, .off = U64_MAX - 9, .len = 9 };
+	ent[1] = (struct io_uring_opaque_send_entry) { .handle = 7, .off = U64_MAX - 9, .len = 9 };
+	ent[2] = (struct io_uring_opaque_send_entry) {
+		.handle = U64_MAX, .off = U64_MAX - 1, .len = 1,
+	};
+	ent[3] = (struct io_uring_opaque_send_entry) { .handle = 0, .off = 0, .len = U32_MAX >> 2 };
+	opaque_uvec_put(test, addr, ent, 4 * sizeof(*ent));
+	opaque_vec_expect_copy(test, op, addr, ent, 4);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 4), 0);
+	KUNIT_EXPECT_EQ(test, op->vec->max_len, U32_MAX >> 2);
+}
+
+/*
+ * Each way an entry can be wrong, in the first, a middle and the last place of
+ * a vector: a reserved field in use, no bytes, an end past U64_MAX, and a sum
+ * past INT_MAX however it is reached. All are -EINVAL, as they were when the
+ * copy came before the check, and the answer is the model's.
+ */
+static void opaque_vec_copy_in_invalid(struct kunit *test)
+{
+	static const struct io_uring_opaque_send_entry bad[] = {
+		{ .handle = 1, .off = 0, .len = 10, .__resv = 1 },
+		{ .handle = 1, .off = 0, .len = 10, .__resv = 0x80000000 },
+		{ .handle = 1, .off = 0, .len = 10, .__resv = U32_MAX },
+		{ .handle = 1, .off = 0, .len = 0 },
+		{ .handle = 1, .off = U64_MAX, .len = 1 },
+		{ .handle = 1, .off = U64_MAX - 9, .len = 11 },
+		{ .handle = 1, .off = 1ULL << 63, .len = 1U << 31 },
+		{ .handle = 1, .off = 0, .len = U32_MAX },
+		{ .handle = 1, .off = 0, .len = (u32)INT_MAX + 1 },
+	};
+	static const unsigned int at[] = { 0, 3, 7 };
+	struct io_opaque_req *op = opaque_vec_blank(test, opaque_test_store(test), 8);
+	struct io_uring_opaque_send_entry ent[8];
+	unsigned long addr = opaque_uvec_map(test);
+	unsigned int i, k, j;
+
+	for (i = 0; i < ARRAY_SIZE(bad); i++) {
+		for (k = 0; k < ARRAY_SIZE(at); k++) {
+			for (j = 0; j < ARRAY_SIZE(ent); j++)
+				ent[j] = (struct io_uring_opaque_send_entry) {
+					.handle = 1, .off = 100 * j, .len = 10 + j,
+				};
+			ent[at[k]] = bad[i];
+			opaque_uvec_put(test, addr, ent, sizeof(ent));
+			KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, ARRAY_SIZE(ent)), -EINVAL);
+			opaque_vec_expect_copy(test, op, addr, ent, ARRAY_SIZE(ent));
+		}
+	}
+	/* Lengths that add up to a multiple of 2^32, and to one more: the sum is not 32 bits. */
+	ent[0] = (struct io_uring_opaque_send_entry) { .handle = 1, .off = 0, .len = 1U << 31 };
+	ent[1] = ent[0];
+	opaque_uvec_put(test, addr, ent, 2 * sizeof(*ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 2), -EINVAL);
+	ent[0].len = U32_MAX;
+	ent[1].len = 2;
+	opaque_uvec_put(test, addr, ent, 2 * sizeof(*ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 2), -EINVAL);
+	/*
+	 * A sum past INT_MAX from entries that are each fine: eight of 2^28 are a
+	 * byte too many, and a byte less in the first, a middle or the last of
+	 * them makes INT_MAX exactly.
+	 */
+	for (j = 0; j < ARRAY_SIZE(ent); j++)
+		ent[j] = (struct io_uring_opaque_send_entry) {
+			.handle = 1, .off = 0, .len = 1U << 28,
+		};
+	opaque_uvec_put(test, addr, ent, sizeof(ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, ARRAY_SIZE(ent)), -EINVAL);
+	opaque_vec_expect_copy(test, op, addr, ent, ARRAY_SIZE(ent));
+	for (k = 0; k < ARRAY_SIZE(at); k++) {
+		ent[at[k]].len--;
+		opaque_uvec_put(test, addr, ent, sizeof(ent));
+		KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, ARRAY_SIZE(ent)), 0);
+		KUNIT_EXPECT_EQ(test, op->length, (u32)INT_MAX);
+		opaque_vec_expect_copy(test, op, addr, ent, ARRAY_SIZE(ent));
+		ent[at[k]].len++;
+	}
+}
+
+/*
+ * A copy-in that reaches memory that is not there says -EFAULT, whatever it has
+ * read: the entries before the hole are fine, and so is a vector that ends where
+ * the hole starts, an entry that the hole cuts after any number of its bytes
+ * (the reserved field is the last four, and is read), an entry that is not valid
+ * and is followed by the hole (the copy came first, so the fault was said first),
+ * and an address that is not user memory at all. The block is good for the next
+ * vector.
+ */
+static void opaque_vec_copy_in_fault(struct kunit *test)
+{
+	struct io_opaque_req *op = opaque_vec_blank(test, opaque_test_store(test), 4);
+	const struct io_uring_opaque_send_entry good = { .handle = 1, .off = 0, .len = 10 };
+	struct io_uring_opaque_send_entry ent[4];
+	unsigned long addr = opaque_uvec_map(test), hole, at;
+	unsigned int k, d;
+
+	opaque_uvec_hole(test, addr);
+	hole = addr + OPAQUE_UVEC_HOLE * PAGE_SIZE;
+	for (k = 0; k < ARRAY_SIZE(ent); k++)
+		ent[k] = (struct io_uring_opaque_send_entry) {
+			.handle = 1, .off = 100 * k, .len = 10 + k,
+		};
+
+	/* The vector ends where the hole starts: all of it is there. */
+	at = hole - sizeof(ent);
+	opaque_uvec_put(test, at, ent, sizeof(ent));
+	opaque_vec_expect_copy(test, op, at, ent, ARRAY_SIZE(ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, at, ARRAY_SIZE(ent)), 0);
+	/* The hole takes the last d bytes of the last entry; the last four are __resv. */
+	for (d = 1; d < sizeof(*ent); d++) {
+		at = hole - sizeof(ent) + d;
+		opaque_uvec_put(test, at, ent, sizeof(ent) - d);
+		KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, at, ARRAY_SIZE(ent)), -EFAULT);
+	}
+	/* The hole is where entry k begins. */
+	for (k = 0; k < ARRAY_SIZE(ent); k++) {
+		at = hole - k * sizeof(*ent);
+		opaque_uvec_put(test, at, ent, k * sizeof(*ent));
+		KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, at, ARRAY_SIZE(ent)), -EFAULT);
+	}
+	/* An entry that is not valid, then the hole: -EFAULT. Without the hole, -EINVAL. */
+	ent[0].len = 0;
+	at = hole - 2 * sizeof(*ent);
+	opaque_uvec_put(test, at, ent, 2 * sizeof(*ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, at, ARRAY_SIZE(ent)), -EFAULT);
+	ent[3].__resv = 1;
+	at = hole - sizeof(ent);
+	opaque_uvec_put(test, at, ent, sizeof(ent));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, at, ARRAY_SIZE(ent)), -EINVAL);
+	/* Not user memory: null, the end of user space, a vector running off it, kernel space. */
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, 0, 1), -EFAULT);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, TASK_SIZE - 12, 1), -EFAULT);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, TASK_SIZE - sizeof(*ent), 2), -EFAULT);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, TASK_SIZE, 1), -EFAULT);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, (unsigned long)-24, 1), -EFAULT);
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, (unsigned long)-1, ARRAY_SIZE(ent)), -EFAULT);
+	/* The block is as good as it was. */
+	opaque_uvec_put(test, addr, &good, sizeof(good));
+	KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, addr, 1), 0);
+	KUNIT_EXPECT_EQ(test, op->length, 10U);
+}
+
+/*
+ * The copy-in is the model on vectors that are made up: entries whose fields lie
+ * on the edges of the rules, in vectors of up to sixteen, in memory that is all
+ * there or runs into the hole. Enough of them go and enough are refused.
+ */
+static void opaque_vec_copy_in_model(struct kunit *test)
+{
+	static const u64 offs[] = {
+		0, 1, 4095, 1ULL << 32, U64_MAX - 20, U64_MAX - 10, U64_MAX - 9, U64_MAX - 1,
+		U64_MAX,
+	};
+	static const u32 lens[] = {
+		0, 1, 2, 10, 4096, 1U << 20, 1U << 27, 1U << 28, 1U << 30, INT_MAX,
+		(u32)INT_MAX + 1, U32_MAX,
+	};
+	struct io_opaque_req *op = opaque_vec_blank(test, opaque_test_store(test), 16);
+	struct io_uring_opaque_send_entry ent[16];
+	unsigned long addr = opaque_uvec_map(test), hole, at;
+	unsigned int iter, valid = 0, invalid = 0, faults = 0;
+	u32 i, nr, cut, total, longest;
+	struct rnd_state rs;
+	bool cut_by_hole;
+
+	opaque_uvec_hole(test, addr);
+	hole = addr + OPAQUE_UVEC_HOLE * PAGE_SIZE;
+	prandom_seed_state(&rs, 0x5eed1234);
+	for (iter = 0; iter < 3000; iter++) {
+		nr = 1 + prandom_u32_state(&rs) % ARRAY_SIZE(ent);
+		for (i = 0; i < nr; i++) {
+			ent[i].handle = prandom_u32_state(&rs) % 4 ?
+					prandom_u32_state(&rs) : U64_MAX;
+			ent[i].off = prandom_u32_state(&rs) % 5 ?
+				     prandom_u32_state(&rs) % 100000 :
+				     offs[prandom_u32_state(&rs) % ARRAY_SIZE(offs)];
+			ent[i].len = prandom_u32_state(&rs) % 12 ?
+				     1 + prandom_u32_state(&rs) % 5000 :
+				     lens[prandom_u32_state(&rs) % ARRAY_SIZE(lens)];
+			ent[i].__resv = prandom_u32_state(&rs) % 64 ? 0 : prandom_u32_state(&rs);
+		}
+		switch (prandom_u32_state(&rs) % 4) {
+		case 0:		/* in the pages before the hole */
+			at = addr + prandom_u32_state(&rs) % (OPAQUE_UVEC_HOLE * PAGE_SIZE -
+							      nr * sizeof(*ent));
+			opaque_uvec_put(test, at, ent, nr * sizeof(*ent));
+			cut_by_hole = false;
+			break;
+		case 1:		/* the hole takes the end of it */
+			cut = 1 + prandom_u32_state(&rs) % (nr * sizeof(*ent) - 1);
+			at = hole - cut;
+			opaque_uvec_put(test, at, ent, cut);
+			cut_by_hole = true;
+			break;
+		default:	/* in the pages after the hole */
+			at = hole + PAGE_SIZE + prandom_u32_state(&rs) % PAGE_SIZE;
+			opaque_uvec_put(test, at, ent, nr * sizeof(*ent));
+			cut_by_hole = false;
+			break;
+		}
+		if (cut_by_hole) {
+			KUNIT_EXPECT_EQ(test, opaque_vec_copy(op, at, nr), -EFAULT);
+			faults++;
+			continue;
+		}
+		opaque_vec_expect_copy(test, op, at, ent, nr);
+		if (opaque_vec_model(ent, nr, &total, &longest))
+			invalid++;
+		else
+			valid++;
+	}
+	KUNIT_EXPECT_GT(test, valid, 300U);
+	KUNIT_EXPECT_GT(test, invalid, 300U);
+	KUNIT_EXPECT_GT(test, faults, 300U);
 }
 
 /* Every entry sees the version published when the vector is admitted, not before or after. */
@@ -5769,6 +6155,91 @@ static void opaque_send_vec_prep(struct kunit *test)
 	opaque_prep_done(p);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+}
+
+/*
+ * What prep says of a vector it cannot take, and what it leaves behind. The
+ * number of entries is looked at before any is read, so a number that is wrong
+ * is -EINVAL even where the entries are not there to be read, and so is an
+ * offset; entries that are not there are -EFAULT; entries that are wrong are
+ * -EINVAL. A request that fails holds nothing, and the one after it gets its
+ * block back.
+ */
+static void opaque_send_vec_prep_errors(struct kunit *test)
+{
+	static const struct {
+		u64 off;
+		u32 len;
+		bool nowhere;
+		int result;
+	} errs[] = {
+		{ 0, 0, true, -EINVAL },
+		{ 0, 0, false, -EINVAL },
+		{ 0, IORING_OPAQUE_SEND_VEC_MAX + 1, true, -EINVAL },
+		{ 0, IORING_OPAQUE_SEND_VEC_MAX + 1, false, -EINVAL },
+		{ 0, U32_MAX, true, -EINVAL },
+		{ 1, 3, true, -EINVAL },
+		{ 1, 3, false, -EINVAL },
+		{ 0, 3, true, -EFAULT },
+		{ 0, IORING_OPAQUE_SEND_VEC_MAX, true, -EFAULT },
+		{ 0, 3, false, 0 },
+		{ 0, IORING_OPAQUE_SEND_VEC_MAX, false, 0 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_test_object(test, store);
+	struct opaque_prep *p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	const u64 h = io_opaque_handle(0, 9);
+	struct io_uring_opaque_send_entry *ent;
+	struct io_opaque_req *op;
+	unsigned long addr, where, hole;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	ent = kunit_kcalloc(test, IORING_OPAQUE_SEND_VEC_MAX, sizeof(*ent), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ent);
+	for (i = 0; i < IORING_OPAQUE_SEND_VEC_MAX; i++)
+		ent[i] = (struct io_uring_opaque_send_entry) { .handle = h, .off = i, .len = 1 };
+	opaque_prep_init(test, p, store);
+	addr = opaque_uvec_map(test);
+	opaque_uvec_put(test, addr, ent, IORING_OPAQUE_SEND_VEC_MAX * sizeof(*ent));
+	for (i = 0; i < ARRAY_SIZE(errs); i++) {
+		where = errs[i].nowhere ? 0 : addr;
+		opaque_prep_sqe(p, IORING_OPAQUE_SEND_VECTOR, where, errs[i].off, errs[i].len);
+		KUNIT_EXPECT_EQ(test, opaque_prep_send(p, &op), errs[i].result);
+		if (!errs[i].result) {
+			KUNIT_EXPECT_EQ(test, op->length, errs[i].len);
+			KUNIT_EXPECT_EQ(test, op->vec->nr, errs[i].len);
+			KUNIT_EXPECT_MEMEQ(test, op->vec->ent, ent, errs[i].len * sizeof(*ent));
+			KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		}
+		opaque_prep_done(p);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	}
+	/* Entries that are not there: the hole cuts the vector after two entries of three. */
+	opaque_uvec_hole(test, addr);
+	hole = addr + OPAQUE_UVEC_HOLE * PAGE_SIZE;
+	opaque_uvec_put(test, hole - 2 * sizeof(*ent), ent, 2 * sizeof(*ent));
+	opaque_prep_sqe(p, IORING_OPAQUE_SEND_VECTOR, hole - 2 * sizeof(*ent), 0, 3);
+	KUNIT_EXPECT_EQ(test, opaque_prep_send(p, &op), -EFAULT);
+	opaque_prep_done(p);
+	/* Entries that are wrong, the last of them: the whole vector was read. */
+	ent[2].len = 0;
+	opaque_uvec_put(test, addr, ent, 3 * sizeof(*ent));
+	opaque_prep_sqe(p, IORING_OPAQUE_SEND_VECTOR, addr, 0, 3);
+	KUNIT_EXPECT_EQ(test, opaque_prep_send(p, &op), -EINVAL);
+	opaque_prep_done(p);
+	/* The request after the failures is a request like any other. */
+	ent[2].len = 1;
+	opaque_uvec_put(test, addr, ent, 3 * sizeof(*ent));
+	opaque_prep_sqe(p, IORING_OPAQUE_SEND_VECTOR, addr, 0, 3);
+	KUNIT_ASSERT_EQ(test, opaque_prep_send(p, &op), 0);
+	KUNIT_EXPECT_EQ(test, op->length, 3U);
+	KUNIT_EXPECT_EQ(test, opaque_vec_admit(op), 0);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+	opaque_prep_done(p);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
 }
 
 static void opaque_test_noop_work(struct work_struct *work)
@@ -9217,6 +9688,10 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_locked_blocking),
 	KUNIT_CASE(opaque_attach_lock_order),
 	KUNIT_CASE(opaque_send_vec_check),
+	KUNIT_CASE(opaque_vec_copy_in),
+	KUNIT_CASE(opaque_vec_copy_in_invalid),
+	KUNIT_CASE(opaque_vec_copy_in_fault),
+	KUNIT_CASE(opaque_vec_copy_in_model),
 	KUNIT_CASE(opaque_send_vec_acquire),
 	KUNIT_CASE(opaque_send_vec_pin_once),
 	KUNIT_CASE(opaque_send_vec_iter),
@@ -9230,6 +9705,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_grow_retry),
 	KUNIT_CASE(opaque_send_vec_build_pinned),
 	KUNIT_CASE(opaque_send_vec_prep),
+	KUNIT_CASE(opaque_send_vec_prep_errors),
 	KUNIT_CASE(opaque_policy_chunks),
 	KUNIT_CASE(opaque_extents_free_wakes_once),
 	KUNIT_CASE(opaque_extents_free_wakes_all),
