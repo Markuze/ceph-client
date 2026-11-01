@@ -121,26 +121,15 @@ struct io_opaque_tx {
 };
 
 /*
- * Where one range of a vectored send starts in the version it pins. Admission
- * finds it under tables; the cursor is built from it once tables is dropped.
- */
-struct io_opaque_vec_start {
-	/* The first segment of the range. */
-	u32 seg;
-	/* Bytes of that segment before the range. */
-	u32 skip;
-};
-
-/*
  * What a vectored send needs besides the request: its entries, copied at prep,
- * the version each pins, where each starts in it and the segments of the
- * combined cursor. One block holds the header and the four arrays, so that
- * growing it is one allocation.
+ * the version each pins and the segments of the combined cursor, which
+ * admission stores as it finds the ranges. One block holds the header and the
+ * three arrays, so that growing it is one allocation.
  */
 struct io_opaque_vec {
 	/* Entries, from the SQE. */
 	u32 nr;
-	/* Segments of the combined cursor, from io_opaque_vec_build(). */
+	/* Segments of the combined cursor, from admission. */
 	u32 nr_segs;
 	/*
 	 * Entries of pin[] that admission has set. The version of each is kept
@@ -155,7 +144,6 @@ struct io_opaque_vec {
 	u32 max_len;
 	struct io_uring_opaque_send_entry *ent;
 	struct io_opaque_data **pin;
-	struct io_opaque_vec_start *start;
 	struct bio_vec *bv;
 };
 
@@ -234,6 +222,8 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_FRAG_FALLBACK,
 	IO_OPAQUE_STAT_SEND_UBUF_COPIED,
 	IO_OPAQUE_STAT_SEND_FOLIO_GETS,
+	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
+	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -308,11 +298,12 @@ struct io_opaque_store {
 	/*
 	 * Handles and candidates; never held during copies or I/O, and for a time
 	 * that the request bounds: what admission does under it is a lookup per
-	 * entry, the segments its ranges span up to the limit, and for each range
-	 * a walk that the version's anchors keep to about two strides and a
-	 * binary search. Attach and the admission of a send take it with the
-	 * socket owned, so nothing may take a socket lock while holding it, or
-	 * wait for anything that holds one for long.
+	 * entry, the segments its ranges span up to the limit, which it counts and
+	 * stores in the request's block, and for each range a walk that the
+	 * version's anchors keep to about two strides and a binary search. Attach
+	 * and the admission of a send take it with the socket owned, so nothing
+	 * may take a socket lock while holding it, or wait for anything that holds
+	 * one for long.
 	 */
 	struct mutex tables;
 	struct io_opaque_slot *objects;
@@ -456,13 +447,13 @@ void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total, u32 longe
 int io_opaque_vec_copy_in(struct io_opaque_req *op,
 			  const struct io_uring_opaque_send_entry __user *uent, u32 nr);
 void io_opaque_vec_release(struct io_opaque_req *op);
-void io_opaque_vec_build(struct io_opaque_req *op);
 int io_opaque_vec_finish(struct io_opaque_req *op, int ret);
 int io_opaque_apply_policy(struct io_opaque_store *store,
 			   const struct io_uring_opaque_policy *policy);
 extern unsigned int io_opaque_policy_chunk;
 extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
 extern unsigned int io_opaque_send_vec_segs;
+extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;
 extern atomic_long_t io_opaque_vec_counted;
 extern atomic_long_t io_opaque_budget_wakes;

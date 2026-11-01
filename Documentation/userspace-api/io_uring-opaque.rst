@@ -803,6 +803,13 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     path that holds a clone, such as a packet socket or a socket of this host,
     does not copy it, and neither does the transmit path, so it stays at zero;
     a count means that something copied the data of a managed send.
+``stat_send_admit_fast``, ``stat_send_admit_slow``
+    Vectored sends admitted in one pass over their entries, and those whose
+    request had a block too short for the segments that their ranges span,
+    which grew it and resolved the vector again, however often that took. The
+    block of a request is kept for the next, so a send is slow when its
+    request is new or its ranges span more segments than any before it did. A
+    send of one range is neither, and neither is a vector that fails.
 
 Validation and reproduction
 ===========================
