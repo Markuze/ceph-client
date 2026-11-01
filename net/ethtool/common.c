@@ -824,6 +824,18 @@ int ethtool_check_max_channel(struct net_device *dev,
 		return -EINVAL;
 	}
 
+	/* A provider of readable pages covers every receive queue. A new
+	 * queue would run without it, and its packets would take the slow
+	 * path unnoticed.
+	 */
+	if (max_mp_in_use && dev_has_readable_mp(dev) &&
+	    channels.combined_count + channels.rx_count != dev->real_num_rx_queues) {
+		if (info)
+			GENL_SET_ERR_MSG(info,
+					 "channel count is fixed by a readable memory provider");
+		return -EINVAL;
+	}
+
 	return 0;
 }
 

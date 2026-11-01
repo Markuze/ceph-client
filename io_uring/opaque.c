@@ -23,6 +23,7 @@
 #include "opaque_internal.h"
 #include "rsrc.h"
 #include "tw.h"
+#include "zcrx.h"
 
 bool io_opaque_cache_init(struct io_ring_ctx *ctx)
 {
@@ -331,8 +332,11 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
-					      bool reserved)
+					      unsigned int flags)
 {
+	bool reserved = flags & IO_OPAQUE_EXT_RESERVED;
+	/* The memory cgroup pays for a page only if no other owner does. */
+	bool memcg = !(flags & (IO_OPAQUE_EXT_RESERVED | IO_OPAQUE_EXT_NO_MEMCG));
 	struct io_opaque_chunk *chunk;
 	u64 charge = page_size(compound_head(page));
 
@@ -340,18 +344,18 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 		return ERR_PTR(-ENOBUFS);
 	if (!reserved && !io_opaque_charge(store, charge, true))
 		goto no_space;
-	if (!reserved && io_opaque_memcg_charge(store, charge))
+	if (memcg && io_opaque_memcg_charge(store, charge))
 		goto no_memory;
 	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
 	if (!chunk) {
-		if (!reserved)
+		if (memcg)
 			io_opaque_memcg_uncharge(store, charge);
 		goto no_memory;
 	}
 	refcount_set(&chunk->backing.refs, 1);
 	chunk->backing.page = compound_head(page);
 	chunk->backing.charge = charge;
-	chunk->backing.accounted = !reserved && store->objcg;
+	chunk->backing.accounted = memcg && store->objcg;
 	chunk->extent.backing = &chunk->backing;
 	chunk->extent.start = start;
 	chunk->extent.offset = offset + (page - compound_head(page)) * PAGE_SIZE;
@@ -389,8 +393,17 @@ static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opa
 
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
-		/* A cached unit leaves the object charge; it is not payload held. */
-		if (backing->owned)
+		/*
+		 * A pool reference of a bound store ends in the instance. The
+		 * store holds its own reference to the instance until every
+		 * backing is gone, so the call is valid here. A cached unit
+		 * leaves the object charge; it is not payload held. Any other
+		 * page, an outsider reference to the area included, is an
+		 * ordinary page reference.
+		 */
+		if (backing->pool)
+			io_zcrx_maio_page_put(store->maio, backing->page);
+		else if (backing->owned)
 			io_opaque_unit_put(store, backing->page);
 		else
 			put_page(backing->page);
@@ -469,6 +482,7 @@ int io_opaque_vector(struct io_opaque_data *data)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
+	bool mapped = true;
 	u32 nr = 0, anchors;
 	size_t bytes;
 	u64 at = 0;
@@ -479,6 +493,7 @@ int io_opaque_vector(struct io_opaque_data *data)
 		if (extent->backing != previous)
 			data->charge += extent->backing->charge;
 		previous = extent->backing;
+		mapped &= extent->backing->area;
 	}
 	anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
 	/* Where the anchors start. An overflow saturates, and the allocation fails. */
@@ -490,6 +505,7 @@ int io_opaque_vector(struct io_opaque_data *data)
 		return -ENOMEM;
 	data->anchor = anchors ? (void *)data->bvec + bytes : NULL;
 	data->nr = nr;
+	data->mapped = nr && mapped;
 	nr = 0;
 	list_for_each_entry(extent, &data->extents, list) {
 		if (anchors && !(nr % IO_OPAQUE_SEEK_STRIDE))
@@ -605,11 +621,13 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 					const struct io_uring_opaque_config *config)
 {
 	struct io_uring_opaque_config cfg = *config;
+	struct io_zcrx_ifq *maio = NULL;
 	struct io_opaque_store *store;
 	int ret;
 	u32 i;
 
-	if (cfg.flags || cfg.__resv1 || cfg.__resv2 ||
+	if ((cfg.flags & ~IORING_OPAQUE_CFG_MAIO) || cfg.__resv1 ||
+	    (cfg.zcrx_id && !(cfg.flags & IORING_OPAQUE_CFG_MAIO)) ||
 	    !mem_is_zero(cfg.__resv, sizeof(cfg.__resv)))
 		return ERR_PTR(-EINVAL);
 	if (!cfg.hard_limit || cfg.hard_limit > SZ_1T ||
@@ -632,13 +650,28 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	      cfg.low_watermark >= cfg.high_watermark ||
 	      cfg.high_watermark > cfg.hard_limit - cfg.compact_headroom - cfg.reply_reserve)))
 		return ERR_PTR(-EINVAL);
+	/*
+	 * The caller holds the lock of the ring, which io_zcrx_maio_get()
+	 * needs. The store keeps the reference to the instance until
+	 * io_opaque_free(), and so it outlives every page of the store.
+	 */
+	if (cfg.flags & IORING_OPAQUE_CFG_MAIO) {
+		if (!IS_ENABLED(CONFIG_IO_URING_ZCRX))
+			return ERR_PTR(-EOPNOTSUPP);
+		maio = io_zcrx_maio_get(ctx, cfg.zcrx_id);
+		if (!maio)
+			return ERR_PTR(-ENXIO);
+	}
 	store = kzalloc_obj(*store, GFP_KERNEL_ACCOUNT);
-	if (!store)
-		return ERR_PTR(-ENOMEM);
+	if (!store) {
+		ret = -ENOMEM;
+		goto put_maio;
+	}
 	refcount_set(&store->refs, 1);
 	refcount_set(&store->users, 1);
 	store->config = cfg;
 	io_opaque_unit_cache_setup(store);
+	store->maio = maio;
 	store->objects = kvcalloc(cfg.max_objects, sizeof(*store->objects),
 				  GFP_KERNEL_ACCOUNT);
 	store->streams = kvcalloc(cfg.max_streams, sizeof(*store->streams),
@@ -688,6 +721,9 @@ free_store:
 	kvfree(store->streams);
 	kvfree(store->objects);
 	kfree(store);
+put_maio:
+	if (maio)
+		io_zcrx_maio_put(maio);
 	return ERR_PTR(ret);
 }
 
@@ -761,6 +797,12 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic_read(&store->requests));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_opaque_txs_free(store);
+	/*
+	 * Every backing is gone. The last ones released their pages into the
+	 * instance, so the reference ends after them.
+	 */
+	if (store->maio)
+		io_zcrx_maio_put(store->maio);
 	io_unaccount_mem(store->user, store->mm,
 			 (store->config.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
 	obj_cgroup_put(store->objcg);
@@ -1213,9 +1255,106 @@ static struct io_opaque_extent *io_opaque_capture_tail(struct io_opaque_stream *
 	return list_last_entry_or_null(list, struct io_opaque_extent, list);
 }
 
-static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
-			    u32 offset, u32 length, bool take_ref, bool copied)
+/*
+ * How the capture holds the page of a new backing. The last two kinds exist
+ * only for a store that binds a MAIO instance.
+ */
+enum io_opaque_hold {
+	/* A page reference, taken here. */
+	IO_OPAQUE_HOLD_PAGE,
+	/*
+	 * A page reference to an area page, taken here, when no pool reference
+	 * is possible. Either no pool of the instance owns the page, or the skb
+	 * holds only a page reference to it. The page is an outsider page for
+	 * the area. For example, the process may have passed it to a send as
+	 * user memory, and the send came back over loopback. The bytes are
+	 * visible through the mapping, so the backing counts as in the area.
+	 * If a pool owns the page when it returns, the instance parks the page
+	 * in limbo until this reference ends.
+	 */
+	IO_OPAQUE_HOLD_AREA,
+	/*
+	 * A pool reference to an area page, taken here. A pool of the instance
+	 * owns the page.
+	 */
+	IO_OPAQUE_HOLD_POOL,
+	/*
+	 * A copy page. The reference of the caller passes to the backing. The
+	 * page is a page of the area if the store binds an instance.
+	 */
+	IO_OPAQUE_HOLD_COPY,
+};
+
+/*
+ * Decide how a store holds a page that an skb carries. Return false if the
+ * capture must copy the bytes.
+ *
+ * A store without an instance holds every page by a page reference. A store
+ * with an instance keeps all the bytes that it captures in the area, so that
+ * the process sees them through its mapping:
+ *
+ * - A page outside the area is copied. This includes a fallback page, which
+ *   a pool of the instance got from the page allocator.
+ * - An area page that a pool of the instance owns is held by a pool reference.
+ *   The pool reference keeps the page out of the pool. When the last holder
+ *   drops it, the page goes back to the pool and not to limbo. A pool
+ *   reference is valid only if the skb holds one too. The pool then owns the
+ *   page for as long as the skb lives, and a concurrent release cannot happen
+ *   between the test and the reference. An skb that is not marked for page pool
+ *   recycling holds a page reference. The pool can release the page at any
+ *   time, so the page counts as an outsider page.
+ * - Any other area page is held by a page reference.
+ *
+ * The kernel never parses the bytes of an object, and nothing in this file
+ * relies on them staying constant. The process can write them through the
+ * mapping. A length or a checksum is never read from them.
+ */
+static bool io_opaque_retain(struct io_opaque_store *store,
+			     const struct sk_buff *skb, struct page *page,
+			     enum io_opaque_hold *hold)
 {
+	u64 off;
+
+	if (!store->maio) {
+		*hold = IO_OPAQUE_HOLD_PAGE;
+		return true;
+	}
+	if (!io_zcrx_maio_page_off(store->maio, page, &off))
+		return false;
+	if (skb->pp_recycle && io_zcrx_maio_page_owned(store->maio, page))
+		*hold = IO_OPAQUE_HOLD_POOL;
+	else
+		*hold = IO_OPAQUE_HOLD_AREA;
+	return true;
+}
+
+/*
+ * Take a page for the bytes that the capture copies. A bound store takes a
+ * free page of the area, and the area has none when it is empty. Another store
+ * allocates a page. The caller owns the reference to the page.
+ */
+static struct page *io_opaque_copy_page(struct io_opaque_store *store)
+{
+	u64 off;
+
+	if (store->maio)
+		return io_zcrx_maio_copy_page(store->maio, &off);
+	return alloc_page(GFP_KERNEL_ACCOUNT);
+}
+
+static void io_opaque_copy_page_put(struct io_opaque_store *store,
+				    struct page *page)
+{
+	if (store->maio)
+		io_zcrx_maio_page_put(store->maio, page);
+	else
+		put_page(page);
+}
+
+static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
+			    u32 offset, u32 length, enum io_opaque_hold hold)
+{
+	bool copied = hold == IO_OPAQUE_HOLD_COPY;
 	struct io_opaque_req *op = io_opaque_capture_keep(stream);
 	struct list_head *list = &stream->extents;
 	struct io_opaque_extent *extent, *tail;
@@ -1255,17 +1394,34 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 		refcount_inc(&extent->backing->refs);
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
+		bool bound = !!stream->store->maio;
+		unsigned int flags = 0;
 
 		/* Leave room for dense copies of a private KEEP's remaining bytes. */
 		if (!copied && op && op->data->charge + stream->need_bytes + left >
 		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
-		extent = io_opaque_extent_new(stream->store, page, offset, length, start, copied);
+		/*
+		 * The caller charged a copy page. The memory cgroup of the
+		 * store does not pay for an area page, because the area was
+		 * allocated and accounted when the instance was registered.
+		 */
+		if (copied)
+			flags = IO_OPAQUE_EXT_RESERVED;
+		else if (hold != IO_OPAQUE_HOLD_PAGE)
+			flags = IO_OPAQUE_EXT_NO_MEMCG;
+		extent = io_opaque_extent_new(stream->store, page, offset, length, start, flags);
 		if (IS_ERR(extent))
 			return PTR_ERR(extent);
-		if (take_ref)
+		if (hold == IO_OPAQUE_HOLD_POOL)
+			io_zcrx_maio_page_get(stream->store->maio, page);
+		else if (!copied)
 			get_page(page);
 		extent->backing->copied = copied;
+		/* A bound store copies every byte outside the area into it. */
+		extent->backing->area = hold == IO_OPAQUE_HOLD_AREA ||
+					hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
+		extent->backing->pool = hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
 		new_backing = true;
 	}
 	list_add_tail(&extent->list, list);
@@ -1293,6 +1449,7 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 	bool copy_frags;
 	struct sk_buff *child;
 	u64 retain_limit = io_opaque_rx_limit(stream->store);
+	enum io_opaque_hold hold;
 	u32 chunk;
 	int i, ret = -EFAULT;
 
@@ -1307,10 +1464,11 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 			struct page *page = virt_to_page(data);
 
 			/* A compound allocation larger than the limit can never fit. */
-			if (page_size(compound_head(page)) > retain_limit)
+			if (page_size(compound_head(page)) > retain_limit ||
+			    !io_opaque_retain(stream->store, skb, page, &hold))
 				goto copy;
 			ret = io_opaque_append(stream, page, offset_in_page(data),
-					       chunk, true, false);
+					       chunk, hold);
 		} else {
 			goto copy;
 		}
@@ -1327,10 +1485,11 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 			continue;
 		}
 		chunk = min(start + size - offset, len);
-		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit)
+		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit ||
+		    !io_opaque_retain(stream->store, skb, skb_frag_page(frag), &hold))
 			goto copy;
 		ret = io_opaque_append(stream, skb_frag_page(frag),
-				       skb_frag_off(frag) + offset - start, chunk, true, false);
+				       skb_frag_off(frag) + offset - start, chunk, hold);
 		if (ret == -ENOBUFS)
 			goto copy;
 		goto head_done;
@@ -1361,7 +1520,13 @@ copy:
 			stream->need_bytes = PAGE_SIZE;
 			if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
 				return -ENOBUFS;
-			page = alloc_page(GFP_KERNEL_ACCOUNT);
+			/*
+			 * An empty area fails like a failed allocation. The
+			 * collector then waits IO_OPAQUE_ALLOC_RETRY_MS and
+			 * retries, and the stream and its captured prefix stay
+			 * as they are.
+			 */
+			page = io_opaque_copy_page(stream->store);
 			if (!page) {
 				io_opaque_uncharge(stream->store, PAGE_SIZE);
 				return -ENOMEM;
@@ -1372,9 +1537,9 @@ copy:
 		ret = skb_copy_bits(skb, offset, mapped + pos, chunk);
 		kunmap_local(mapped);
 		if (!ret)
-			ret = io_opaque_append(stream, page, pos, chunk, false, true);
+			ret = io_opaque_append(stream, page, pos, chunk, IO_OPAQUE_HOLD_COPY);
 		if (ret < 0 && allocated) {
-			put_page(page);
+			io_opaque_copy_page_put(stream->store, page);
 			io_opaque_uncharge(stream->store, PAGE_SIZE);
 		}
 	}
@@ -1783,13 +1948,15 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	slot->data = op->data;
 	if (op->data->forward_only)
 		*object_flags = IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
+	if (op->data->mapped)
+		*object_flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
 	store->nr_objects++;
 	op->data = NULL;
 	slot->reserved = false;
 	op->slot_reserved = false;
 	slot->born = jiffies;
 	slot->retry = jiffies;
-	if (!slot->data->dense && !slot->data->forward_only &&
+	if (!slot->data->dense && !slot->data->forward_only && !slot->data->mapped &&
 	    (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
 		list_add_tail(&slot->candidate, &store->candidates);
 		queue_delayed_work(system_dfl_wq, &store->compact_work,
@@ -1873,7 +2040,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -ENXIO;
 	if (READ_ONCE(sqe->fd) != -1 || READ_ONCE(sqe->rw_flags) ||
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
-	    cmd > IORING_OPAQUE_AVAILABLE ||
+	    cmd > IORING_OPAQUE_OBJECT_EXTENTS ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
 	control = cmd == IORING_OPAQUE_FREE || cmd == IORING_OPAQUE_STAT ||
@@ -1932,6 +2099,13 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		if (op->handle || !op->addr)
 			return -EINVAL;
 	}
+	if (cmd == IORING_OPAQUE_OBJECT_EXTENTS) {
+		/* A buffer of size 0 asks for the size that the vector needs. */
+		if (op->length && !op->addr)
+			return -EINVAL;
+		if (!store->maio)
+			return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -1958,7 +2132,8 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 			refcount_inc(&op->stream->refs);
 			op->req->file = get_file(op->stream->file);
 		}
-	} else if (cmd == IORING_OPAQUE_READ_OBJECT || cmd == IORING_OPAQUE_OBJECT_STAT) {
+	} else if (cmd == IORING_OPAQUE_READ_OBJECT || cmd == IORING_OPAQUE_OBJECT_STAT ||
+		   cmd == IORING_OPAQUE_OBJECT_EXTENTS) {
 		slot = io_opaque_lookup(store, op->handle);
 		if (!slot || !slot->data) {
 			ret = -ESTALE;
@@ -2028,6 +2203,56 @@ static int io_opaque_stat_copy(struct io_opaque_req *op, const void *stat, u32 s
 	return copy_struct_to_user(op->addr, op->length, stat, size, NULL);
 }
 
+/*
+ * The pair that names the bytes of an extent in the area of the instance of
+ * the store: the area offset of the page, plus the offset of the extent in the
+ * page. An extent outside the area gets IORING_OPAQUE_EXTENT_UNMAPPED. Capture
+ * copies every byte outside the area into it, so a captured object has none.
+ * IORING_OPAQUE_CREATE copies into ordinary pages even in a bound store, so
+ * all the extents of a created object are of this kind. The mark and the lookup
+ * together keep the answer true for both.
+ */
+VISIBLE_IF_KUNIT struct io_uring_opaque_extent
+io_opaque_extent_pair(struct io_opaque_store *store, const struct io_opaque_extent *extent)
+{
+	struct io_uring_opaque_extent pair = {
+		.area_off = IORING_OPAQUE_EXTENT_UNMAPPED,
+		.len = extent->length,
+	};
+	u64 page_off;
+
+	if (extent->backing->area &&
+	    io_zcrx_maio_page_off(store->maio, extent->backing->page, &page_off))
+		pair.area_off = page_off + extent->offset;
+	return pair;
+}
+
+/*
+ * Write the extents of the object of @op to the user buffer, and return the
+ * number of bytes. *@needed is the size of the whole vector. The list of
+ * extents does not change after the object is published, and nr counts it.
+ */
+static int io_opaque_extents(struct io_opaque_req *op, u64 *needed)
+{
+	struct io_opaque_extent *extent;
+	u64 done = 0;
+
+	*needed = (u64)op->data->nr * sizeof(struct io_uring_opaque_extent);
+	if (op->length < *needed)
+		return -EOVERFLOW;
+	list_for_each_entry(extent, &op->data->extents, list) {
+		struct io_uring_opaque_extent pair = io_opaque_extent_pair(op->store, extent);
+
+		/* Never write past the vector that the buffer was checked for. */
+		if (WARN_ON_ONCE(done == *needed))
+			break;
+		if (copy_to_user(op->addr + done, &pair, sizeof(pair)))
+			return -EFAULT;
+		done += sizeof(pair);
+	}
+	return done;
+}
+
 static int io_opaque_stat(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
@@ -2075,7 +2300,8 @@ VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 			goto out;
 		}
 		chunk = min_t(u64, op->length - done, PAGE_SIZE << order);
-		extent = io_opaque_extent_new(store, page, 0, chunk, done, true);
+		extent = io_opaque_extent_new(store, page, 0, chunk, done,
+					      IO_OPAQUE_EXT_RESERVED);
 		if (IS_ERR(extent)) {
 			io_opaque_unit_put(store, page);
 			ret = PTR_ERR(extent);
@@ -2155,6 +2381,7 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
 	struct io_opaque_store *store = op->store;
+	u64 needed = 0;
 	int ret;
 
 	if (op->op == IORING_OPAQUE_CREATE)
@@ -2204,6 +2431,8 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 
 			if (op->data->forward_only)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
+			if (op->data->mapped)
+				stat.flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
 			mutex_lock(&store->tables);
 			slot = io_opaque_lookup(store, op->handle);
 			if (slot && slot->compacting)
@@ -2211,6 +2440,9 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 			mutex_unlock(&store->tables);
 			ret = io_opaque_stat_copy(op, &stat, sizeof(stat));
 		}
+		break;
+	case IORING_OPAQUE_OBJECT_EXTENTS:
+		ret = io_opaque_extents(op, &needed);
 		break;
 	case IORING_OPAQUE_STREAM_STAT:
 		{
@@ -2254,7 +2486,11 @@ out:
 	if (ret != IOU_ISSUE_SKIP_COMPLETE) {
 		if (ret < 0)
 			req_set_fail(req);
-		io_req_set_res(req, ret, 0);
+		/* An EXTENTS buffer that is too small learns the size it needs. */
+		if (ret == -EOVERFLOW && op->op == IORING_OPAQUE_OBJECT_EXTENTS)
+			io_req_set_res32(req, ret, 0, needed, 0);
+		else
+			io_req_set_res(req, ret, 0);
 		ret = IOU_COMPLETE;
 	}
 	io_ring_submit_unlock(req->ctx, issue_flags);

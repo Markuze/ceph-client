@@ -4,13 +4,16 @@
 io_uring opaque TCP payload objects
 ===================================
 
-OPAQUE_OBJ retains immutable TCP payloads in the kernel. Applications inspect
-framing through bounded copies, select complete payload ranges, and transmit
-or cache those ranges through generation handles. The payload is never mapped
-into the application's address space. Eligible ordinary RX pages are retained;
-unsafe backing is copied into independently owned pages. An allocation larger
-than the entire capture limit also uses this fallback so that small stores can
-make progress.
+OPAQUE_OBJ retains TCP payloads in the kernel. Applications inspect framing
+through bounded copies, select complete payload ranges, and transmit or cache
+those ranges through generation handles. The payload is not mapped into the
+application's address space, and the application cannot change it. One
+exception exists. A privileged process can bind a store to the area of a MAIO
+zcrx instance. It maps the area, and it reads and writes the payload in place.
+See "Stores in the area of a MAIO instance". Eligible ordinary RX pages are
+retained; unsafe backing is copied into independently owned pages. An
+allocation larger than the entire capture limit also uses this fallback so
+that small stores can make progress.
 
 Registration and sharing
 ========================
@@ -18,14 +21,16 @@ Registration and sharing
 Enable ``CONFIG_IO_URING_OPAQUE_OBJ``. Create a ring with
 ``IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN`` and either
 ``IORING_SETUP_CQE32`` or ``IORING_SETUP_CQE_MIXED``. Ordinary 64-byte SQEs
-suffice. No network device configuration or CAP_NET_ADMIN is required.
+suffice. A store that binds no MAIO instance needs no network device
+configuration and no CAP_NET_ADMIN.
 
 Register through ``IORING_REGISTER_OPAQUE_STORE`` with ``nr_args = 1`` and
 ``struct io_uring_opaque_register``. Set ``size`` to the argument size,
 ``flags = 0``, ``fd = -1``, ``store_id = 0``, ``config`` to the address of
 ``struct io_uring_opaque_config`` and ``config_size`` to its size. Reserved
 fields are zero. The returned ``store_id`` selects the store in that ring.
-The feature has no dependency on ZCRX, page-pool or busy-poll support.
+The feature has no dependency on ZCRX, page-pool or busy-poll support. Only the
+optional binding of a store to a MAIO instance needs ``CONFIG_IO_URING_ZCRX``.
 
 Use the same registration operation with ``IORING_OPAQUE_REG_EXPORT``,
 ``fd = -1`` and an existing ``store_id`` to obtain a close-on-exec store
@@ -65,7 +70,8 @@ Registration IDs are ring local; stream and object handles, limits and policy
 belong to the shared store. The last ring/export-descriptor user stops
 collection and automatic work; ring references remain until requests drain
 before the store is destroyed. A store descriptor supports export/import,
-not payload mapping or refill queues. No new syscall is introduced.
+not payload mapping or refill queues. The area of a bound store maps through
+its MAIO instance. No new syscall is introduced.
 
 Receive and range decisions
 ===========================
@@ -159,18 +165,12 @@ linking/cancellation retain their usual meaning. CQE suppression is rejected.
        consuming them. Length is capacity. If no bytes are available at the
        requested offset, arm asynchronously for the first bytes. Result is
        the actual copied count, or zero at EOF. There is no WAITALL option.
-   * - AVAILABLE
-     - Query the contiguous unclassified byte count without consuming or
-       copying payload. ``addr`` is the stream token, ``off`` the stream
-       offset, ``len`` a capacity from 1 through INT_MAX, and ``addr3`` zero.
-       Like INSPECT, it waits for the first byte, stops at a consumed gap,
-       returns zero only at EOF, and shares its cancellation, error, demand
-       and first-byte conflict rules. The returned count is limited by ``len``.
    * - RECV_OBJECT
      - Consume a selected range into private assembly. Publish an object only
        when the entire range and its vector are complete. Result is length;
        the first extra CQE word holds the generation handle and the second
-       holds ``IORING_OPAQUE_OBJECT_F_FORWARD_ONLY`` or zero.
+       holds ``IORING_OPAQUE_OBJECT_F_FORWARD_ONLY``,
+       ``IORING_OPAQUE_OBJECT_F_MAPPED``, both, or zero.
    * - DISCARD
      - Consume unwanted buffered or future stream bytes. Future bytes can be
        skipped without allocating backing, even when the store is full.
@@ -181,21 +181,44 @@ linking/cancellation retain their usual meaning. CQE suppression is rejected.
        Already pinned backing versions and TCP page references remain valid.
    * - STAT / OBJECT_STAT / STREAM_STAT
      - Copy a size-versioned UAPI structure; ``len`` is the output buffer size.
-       STAT uses a zero handle and offset.
+       STAT uses a zero handle and offset. The flags of OBJECT_STAT include
+       ``IORING_OPAQUE_OBJECT_F_MAPPED`` for an object in the area of a MAIO
+       instance.
    * - STREAM_CLOSE
      - Release the receive claim and undecided bytes, terminate pending ranges,
        and remove the stream token. Published objects remain independent.
    * - COMPACT
      - Replace backing under the same object handle; result is zero on success.
+       An object that has ``IORING_OPAQUE_OBJECT_F_MAPPED`` returns
+       ``EOPNOTSUPP``.
    * - SET_POLICY
      - Replace automatic compaction policy from the supplied UAPI structure.
        Handle and offset are zero; ``len`` supplies the size-versioned input size.
+       Automatic compaction skips an object that has
+       ``IORING_OPAQUE_OBJECT_F_MAPPED``.
    * - CREATE
      - Copy userspace bytes into a new complete immutable object without TCP.
        Handle and offset are zero; ``addr3`` names the source and ``len``
        supplies its positive length, at most INT_MAX. Result is length;
        the extra CQE words report the generation handle and forwarding-only
-       classification, as for RECV_OBJECT.
+       classification, as for RECV_OBJECT. The object is never
+       ``IORING_OPAQUE_OBJECT_F_MAPPED``, not even in a store that binds a MAIO
+       instance.
+   * - AVAILABLE
+     - Query the contiguous unclassified byte count without consuming or
+       copying payload. ``addr`` is the stream token, ``off`` the stream
+       offset, ``len`` a capacity from 1 through INT_MAX, and ``addr3`` zero.
+       Like INSPECT, it waits for the first byte, stops at a consumed gap,
+       returns zero only at EOF, and shares its cancellation, error, demand
+       and first-byte conflict rules. The returned count is limited by ``len``.
+   * - OBJECT_EXTENTS
+     - List where the bytes of an object are in the area of the MAIO instance
+       that the store binds. The handle is in ``addr``, the buffer in
+       ``addr3``, and its size in ``len``. The result is the number of bytes
+       that the kernel wrote: one ``struct io_uring_opaque_extent`` for each
+       extent. ``EOVERFLOW`` and the needed size in the first extra word
+       mean that the buffer is too small. A store that binds no instance
+       returns ``EOPNOTSUPP``.
 
 CREATE copies synchronously at execution, not preparation, like READ_OBJECT.
 It holds the ring submission mutex while allocating, copying and publishing.
@@ -248,7 +271,8 @@ and continues processing other CQEs while the kernel assembles that range
 privately. The RECV_OBJECT request's sole successful CQE is its object-ready
 notification: user_data identifies the request, result is the complete length,
 the first extra word contains the handle, and the second reports whether
-lowmem admission made it forwarding-only. There is no per-fragment object
+lowmem admission made it forwarding-only and whether the object is in the area
+of a MAIO instance. There is no per-fragment object
 ID or second success notification. READ_OBJECT inspects an already complete
 object and cannot wait for future TCP bytes.
 
@@ -417,10 +441,12 @@ including all prefix, body and suffix bytes, not peer delivery or acknowledgment
 An error/short result counts the prefix of the complete response, including
 cases where no body byte was queued. The consumed flag is independent of that
 total. No user-buffer reuse notification is
-needed: the payload cannot be overwritten by userspace, and TCP owns ordinary
-page references. FREE after queued sends can invalidate the handle while TCP
-still retains those pages. SEND_LAST does this without a separate FREE SQE or
-CQE and transfers a reference rather than adding and dropping a send pin.
+needed: userspace cannot overwrite the payload of a store that binds no MAIO
+instance, and TCP owns ordinary page references. A process can overwrite the
+payload of a bound store, see "Writes". FREE after queued sends can invalidate
+the handle while TCP still retains those pages. SEND_LAST does this without a
+separate FREE SQE or CQE and transfers a reference rather than adding and
+dropping a send pin.
 An ordinary SEND awaiting first issue has not acquired its backing reference;
 users must order handle release accordingly.
 
@@ -754,6 +780,184 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     Prefix and suffix bytes copied from user memory into request storage, and
     body bytes TCP copied under ``send_copy_max``.
 
+Stores in the area of a MAIO instance
+=====================================
+
+A store can bind a MAIO zcrx instance. A MAIO instance owns an area of kernel
+pages, and it installs a provider of readable pages on the receive queues of a
+device. See ``Documentation/networking/iou-zcrx.rst``. A *bound* store keeps
+every byte that it captures from a stream in the area. A process with
+``CAP_NET_ADMIN`` maps the area read-write. It then reads and writes the bytes
+of such an object in place. The object interface does not change. The bytes of
+an object that ``IORING_OPAQUE_CREATE`` made are the exception: the process
+supplied them, and the kernel keeps them outside the area (see Create below).
+The binding is optional and needs ``CONFIG_IO_URING_ZCRX``. A store that is not
+bound behaves as the rest of this document describes.
+
+The word "immutable" in this document names the list of pages of a backing
+version. It does not name the bytes of a bound store. The kernel never relies
+on the bytes of an object for its own safety. It copies framing from user
+memory before admission. It reads the bytes of an object only to copy or to
+transmit them. It never reads a length or a checksum from them.
+
+Binding
+-------
+
+Set ``IORING_OPAQUE_CFG_MAIO`` in ``flags`` of ``struct io_uring_opaque_config``
+and the zcrx id of the instance in ``zcrx_id``. The instance belongs to the
+ring that registers the store. It is a MAIO instance that this ring
+registered or imported. Registration takes the instance under the lock of
+the ring. These errors are possible:
+
+* ``EINVAL``: ``zcrx_id`` is not 0 and the flag is not set, or a flag is
+  unknown.
+* ``ENXIO``: the ring has no MAIO instance with this id. A zcrx instance that
+  is not a MAIO instance does not count.
+* ``EOPNOTSUPP``: the kernel has no ``CONFIG_IO_URING_ZCRX``.
+
+A configuration with ``IORING_OPAQUE_CFG_MAIO`` and a ``zcrx_id`` of 0 binds
+the instance with id 0. One store binds one instance. The store registration
+checks no capability. The ring needs the instance, and the registration or
+the export of the instance carries the check for ``CAP_NET_ADMIN``.
+
+A ring that imports the store through ``IORING_OPAQUE_REG_IMPORT`` shares the
+binding of the creating ring. The importing ring does not need the instance.
+It needs an import of the instance to map the area.
+
+Lifetime
+--------
+
+The store holds a reference to the instance from registration until the
+store is freed. The store is freed after its last object released its pages.
+The instance can be unregistered first, for example when the ring that
+registered it exits while another ring holds the imported store. The area
+then stays, and the store keeps taking free pages from it. The objects keep
+their pages, and READ_OBJECT, EXTENTS, new objects and FREE work. A ring that
+has no instance cannot map the area. A mapping that exists stays valid.
+The store can also end first. Its objects then release their pages into the
+instance, and the owner of the instance sees the free pages again.
+
+The provider of the instance can go away while a bound store holds pages. A
+queue restart, the removal of the provider and the removal of the device do
+that. A page pool that still has pages held by objects cannot finish its
+destruction. The kernel can log a stalled pool shutdown for it. The pool ends
+when the objects release the pages.
+
+Capture
+-------
+
+A bound store decides for each page of a socket buffer how to hold it:
+
+* A page that a page pool of the instance owns in the area is held by a pool
+  reference. The socket buffer must be marked for page pool recycling
+  (``skb->pp_recycle``). Only such a buffer holds a pool reference of its own,
+  and that reference keeps the pool fields of the page stable. The pool
+  reference of the store keeps the page out of the pool. When the last holder
+  drops its reference, the page returns to the pool.
+* Another page of the area is an *outsider page*. For example, the process
+  can send its own area memory with ``SEND_ZC`` and receive it back over
+  loopback. An outsider page, and a page that a pool owns but an unmarked
+  socket buffer holds, is held by a plain page reference. The bytes are in
+  the area, so the object counts as mapped. The page waits in limbo when a
+  pool releases it while the store holds it.
+* The store copies every other byte into free pages of the area. These are
+  *copy pages*. The copied bytes include the bytes in pages outside the area.
+  They include the bytes in fallback pages that a pool got from the page
+  allocator. They also include the bytes that the capture copies today: those
+  of shared and cloned socket buffers, and those over the capture limit. The
+  store fills a copy page before it takes the next one.
+
+``copied_bytes`` in STAT counts the bytes that the capture copied. A byte
+that the store holds by reference is not in it. A bound store copies into area
+pages, and an unbound store copies into pages of its own. The retention limit,
+the extent limits, the watermarks and the forwarding-only classification
+apply as before.
+
+The area pages of a bound store are not charged to the memory cgroup of the
+store. The instance accounted the area when it was registered. The bytes that
+the store holds count against ``hard_limit`` as for any page. The store
+registration reserves ``hard_limit`` against the locked memory limit, as for
+an unbound store, on top of the pages of the area. The two charges can cover
+the same pages.
+
+The area can have no free page when the capture needs a copy page. The
+capture then behaves as when a page allocation fails. RECV_OBJECT posts no
+CQE. The collector waits 50 milliseconds and tries again. The stream stays
+valid, and the captured prefix stays. The request finishes when objects are
+freed and pages return. ``IORING_OP_ASYNC_CANCEL`` ends it with ``ECANCELED``
+and restores its prefix. A RECV_OBJECT that needs more pages than the area can
+ever give waits until the application cancels it. A quota failure is
+different. It completes the request with ``ENOBUFS``.
+
+Create
+------
+
+``IORING_OPAQUE_CREATE`` works in a bound store as in an unbound one. It copies
+the bytes of the process into ordinary pages, from the unit cache or the page
+allocator, and not into the area. The process has the bytes already, so there
+is nothing to make visible to it. The object does not have
+``IORING_OPAQUE_OBJECT_F_MAPPED``, ``IORING_OPAQUE_OBJECT_EXTENTS`` lists each
+of its extents with ``IORING_OPAQUE_EXTENT_UNMAPPED``, and FREE returns no page
+to the area. The area does not pay for the object. The bytes that it holds count
+against ``hard_limit`` as for any page. Sends of the object, READ_OBJECT and
+FREE work as for any other object.
+
+Extents
+-------
+
+``IORING_OPAQUE_OBJECT_EXTENTS`` lists where the bytes of an object are in
+the area. Set the handle in ``addr``, the size of the buffer in ``len`` and
+the address of the buffer in ``addr3``. ``off`` is 0. The kernel writes one
+``struct io_uring_opaque_extent`` for each extent, in object order::
+
+  struct io_uring_opaque_extent {
+    __u64 area_off;
+    __u64 len;
+  };
+
+``area_off`` has the zcrx offset format: the area id in the bits from
+``IORING_ZCRX_AREA_SHIFT`` and the byte offset in the area below. The mapping
+of the area gives the bytes at ``area_off & ((1ULL << IORING_ZCRX_AREA_SHIFT)
+- 1)``. An extent does not cross a page. The ``len`` values of all extents add
+up to the length of the object. The result is the number of bytes written.
+
+If the buffer is too small, nothing is written. The result is ``EOVERFLOW``
+and the first extra CQE word holds the needed size. A request with ``len`` 0
+and ``addr3`` 0 asks for the size in this way. A ``len`` that is not 0 with an
+``addr3`` of 0, or an ``off`` that is not 0, gives ``EINVAL``. A stale handle
+gives ``ESTALE``. A store without an instance gives ``EOPNOTSUPP``, also for a
+stale handle. ``IORING_OPAQUE_EXTENT_UNMAPPED`` is the ``area_off`` of an
+extent that is not in the area. Every extent of an object that CREATE made has
+it, also in a bound store. An object that a bound store captured has none.
+
+``IORING_OPAQUE_OBJECT_F_MAPPED`` says that every extent of the object is in
+the area. The flag is in ``flags`` of OBJECT_STAT and in the second extra word
+of the RECV_OBJECT completion, next to ``IORING_OPAQUE_OBJECT_F_FORWARD_ONLY``.
+It is set for every object that a bound store captured. An object that CREATE
+made never has it, and neither has an object of an unbound store.
+
+Writes
+------
+
+The process can write the bytes of an object through the mapping. A write is
+visible to every holder of the page. The holders are other objects that share
+it, sends in flight, and sockets whose segments reference it. A send transmits
+the bytes that are present when TCP builds the segment. A write that races a
+send is a race of the application, as with ``SEND_ZC`` buffers. On a device
+without checksum offload, TCP can sum the bytes when it builds the segment. A
+write after that makes the sum wrong, and the peer drops the segment. This
+race does not affect the safety of the kernel.
+
+Compaction
+----------
+
+A dense copy would move the bytes out of the area. So a manual COMPACT of an
+object with ``IORING_OPAQUE_OBJECT_F_MAPPED`` returns ``EOPNOTSUPP``. Automatic
+compaction skips these objects. It does so for an object that exists when the
+policy changes and for an object that arrives later. The same policy still
+compacts the objects of an unbound store, and an object that CREATE made in a
+bound store is dense already.
+
 Validation and reproduction
 ===========================
 
@@ -850,6 +1054,15 @@ cache leaves capture admission and watermarks unchanged.
 ``CONFIG_KUNIT`` is required. Compaction and tests compile as separate source
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.
+
+The selftest also binds stores to a MAIO instance. Most of these tests use
+``ZCRX_REG_NODEV``, so every byte arrives by copy into the area. They need
+``CAP_NET_ADMIN`` and ``CONFIG_IO_URING_ZCRX``. Two tests use a ``netdevsim``
+port with a peer port in a second network namespace. The pool of the port
+puts the payload into pages of the area, and the store holds them by pool
+reference. These two tests need ``CONFIG_NETDEVSIM``, ``CONFIG_NET_NS`` and
+root. A test skips when its requirement is missing. The KUnit tests of
+bound stores also need ``CONFIG_IO_URING_ZCRX_KUNIT_TEST``.
 
 To test without replacing the host kernel, build ``bzImage`` with loopback,
 initramfs and serial-console support, build a static test, and use the optional

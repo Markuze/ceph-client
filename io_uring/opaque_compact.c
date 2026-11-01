@@ -438,7 +438,8 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 			goto out;
 		}
 		chunk = min_t(u64, length - done, PAGE_SIZE << order);
-		extent = io_opaque_extent_new(store, page, 0, chunk, done, true);
+		extent = io_opaque_extent_new(store, page, 0, chunk, done,
+					      IO_OPAQUE_EXT_RESERVED);
 		if (IS_ERR(extent)) {
 			io_opaque_unit_put(store, page);
 			ret = PTR_ERR(extent);
@@ -578,6 +579,9 @@ int io_opaque_compact_start(struct io_opaque_req *op)
 		slot = io_opaque_lookup(store, op->handle);
 		if (!slot || !slot->data)
 			return -ESTALE;
+		/* A dense copy would move the bytes out of the area. */
+		if (slot->data->mapped)
+			return -EOPNOTSUPP;
 		if (slot->compacting)
 			return -EBUSY;
 		if (slot->data->dense)
@@ -644,7 +648,7 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 		struct io_opaque_slot *slot = &store->objects[i];
 
 		if (automatic && slot->data && !slot->data->dense && !slot->data->forward_only &&
-		    list_empty(&slot->candidate)) {
+		    !slot->data->mapped && list_empty(&slot->candidate)) {
 			list_add_tail(&slot->candidate, &store->candidates);
 			slot->retry = jiffies;
 		} else if (!automatic) {

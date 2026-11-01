@@ -49,6 +49,8 @@
 /* The head of its queue, still to take its references. */
 #define IO_OPAQUE_TX_SETTLE	2
 
+struct io_zcrx_ifq;
+
 struct io_opaque_backing {
 	refcount_t refs;
 	struct page *page;
@@ -58,6 +60,13 @@ struct io_opaque_backing {
 	bool accounted;
 	/* Compaction or CREATE destination the unit cache may keep. */
 	bool owned;
+	/* The page is in the area of the MAIO instance that the store binds. */
+	bool area;
+	/*
+	 * The reference to the page is a pool reference of that instance. The
+	 * last release goes through io_zcrx_maio_page_put(), not put_page().
+	 */
+	bool pool;
 };
 
 struct io_opaque_extent {
@@ -90,6 +99,12 @@ struct io_opaque_data {
 	u32 nr;
 	bool dense;
 	bool forward_only;
+	/*
+	 * Every extent is in the area of the MAIO instance of the store. Set
+	 * when the vector is built. A dense copy would move the bytes out of
+	 * the area, so compaction skips these objects.
+	 */
+	bool mapped;
 };
 
 struct io_opaque_slot {
@@ -280,6 +295,13 @@ struct io_opaque_store {
 	struct mm_struct *mm;
 	struct mem_cgroup *memcg;
 	struct obj_cgroup *objcg;
+	/*
+	 * The MAIO instance that the store binds, or NULL. A bound store keeps
+	 * every byte in area pages. The store holds one reference to the
+	 * instance until io_opaque_free(), which runs after the last backing is
+	 * gone, so the area outlives all pages that a backing holds.
+	 */
+	struct io_zcrx_ifq *maio;
 	atomic64_t bytes;
 	atomic64_t copied;
 	atomic64_t compacted;
@@ -341,10 +363,14 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 	       store->config.reply_reserve;
 }
 
+/* Flags of io_opaque_extent_new(). */
+#define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store already */
+#define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
+
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
-					      bool reserved);
+					      unsigned int flags);
 struct io_opaque_data *io_opaque_data_alloc(void);
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);
@@ -429,5 +455,7 @@ extern atomic_long_t io_opaque_send_locked_calls;
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);
+struct io_uring_opaque_extent
+io_opaque_extent_pair(struct io_opaque_store *store, const struct io_opaque_extent *extent);
 #endif
 #endif

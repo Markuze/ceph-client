@@ -272,16 +272,35 @@ static int page_pool_init(struct page_pool *pool,
 
 	xa_init_flags(&pool->dma_mapped, XA_FLAGS_ALLOC1);
 
-	if (pool->slow.flags & PP_FLAG_ALLOW_UNREADABLE_NETMEM) {
-		netdev_assert_locked(pool->slow.netdev);
+	if (pool->slow.flags & (PP_FLAG_ALLOW_UNREADABLE_NETMEM |
+				PP_FLAG_PRIVATE_HEADERS)) {
+		const struct pp_memory_provider_params *mpp;
+
+		/*
+		 * A driver can create its pools before it registers the
+		 * device, and no provider can be installed by then.
+		 */
+		netdev_assert_locked_or_invisible(pool->slow.netdev);
 		rxq = __netif_get_rx_queue(pool->slow.netdev,
 					   pool->slow.queue_idx);
-		pool->mp_priv = rxq->mp_params.mp_priv;
-		pool->mp_ops = rxq->mp_params.mp_ops;
+		mpp = &rxq->mp_params;
+
+		/* PP_FLAG_PRIVATE_HEADERS says only that no header sits in
+		 * a pool page. That is enough for a provider of readable
+		 * pages. A provider of unreadable memory needs the driver to
+		 * state PP_FLAG_ALLOW_UNREADABLE_NETMEM.
+		 */
+		if ((pool->slow.flags & PP_FLAG_ALLOW_UNREADABLE_NETMEM) ||
+		    (mpp->flags & PP_MP_F_READABLE)) {
+			pool->mp_priv = mpp->mp_priv;
+			pool->mp_ops = mpp->mp_ops;
+			pool->mp_readable = !!(mpp->flags & PP_MP_F_READABLE);
+		}
 	}
 
 	if (pool->mp_ops) {
-		if (!pool->dma_map || !pool->dma_sync) {
+		/* A provider of readable pages needs no DMA mapping. */
+		if (!pool->mp_readable && (!pool->dma_map || !pool->dma_sync)) {
 			err = -EOPNOTSUPP;
 			goto free_ptr_ring;
 		}
@@ -771,7 +790,11 @@ static void page_pool_return_netmem(struct page_pool *pool, netmem_ref netmem)
 	put = true;
 	if (static_branch_unlikely(&page_pool_mem_providers) && pool->mp_ops)
 		put = pool->mp_ops->release_netmem(pool, netmem);
-	else
+	/* A provider that returns true leaves the netmem to the pool. It was
+	 * allocated by the pool, see net_mp_alloc_fallback(), and the pool
+	 * unmaps it.
+	 */
+	if (put)
 		__page_pool_release_netmem_dma(pool, netmem);
 
 	/* This may be the last page returned, releasing the pool, so
@@ -1123,8 +1146,11 @@ static void page_pool_empty_ring(struct page_pool *pool)
 
 	/* Empty recycle ring */
 	while ((netmem = (__force netmem_ref)ptr_ring_consume_bh(&pool->ring))) {
-		/* Verify the refcnt invariant of cached pages */
-		if (!(netmem_ref_count(netmem) == 1))
+		/* Verify the refcnt invariant of cached pages. A provider
+		 * of readable pages may map its pages into user space after
+		 * the pool cached them. Each mapping holds a reference.
+		 */
+		if (!pool->mp_readable && !(netmem_ref_count(netmem) == 1))
 			pr_crit("%s() page_pool refcnt %d violation\n",
 				__func__, netmem_ref_count(netmem));
 
@@ -1361,4 +1387,62 @@ void net_mp_niov_clear_page_pool(struct net_iov *niov)
 	netmem_ref netmem = net_iov_to_netmem(niov);
 
 	page_pool_clear_pp_info(netmem);
+}
+
+/* Allocate netmem for a provider of readable pages that has none left. The
+ * pool allocates an ordinary page as it does without a provider: it maps the
+ * page for DMA if the pool maps DMA, stamps the page and counts it as held.
+ * It may fill the alloc cache with more pages of the same kind. Only the
+ * allocation side of the pool may call it, from ->alloc_netmems() with an
+ * empty alloc cache. The provider returns true from ->release_netmem() for
+ * such a page, so that the pool unmaps and frees it.
+ */
+netmem_ref net_mp_alloc_fallback(struct page_pool *pool, gfp_t gfp)
+{
+	if (WARN_ON_ONCE(!pool->mp_readable || pool->alloc.count))
+		return 0;
+
+	return __page_pool_alloc_netmems_slow(pool, gfp);
+}
+
+bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr)
+{
+	return page_pool_set_dma_addr_netmem(page_to_netmem(page), addr);
+}
+
+/* Prepare a page that a memory provider got from the page allocator. The
+ * allocator leaves list pointers, for example LIST_POISON1, in the words that
+ * hold pp_magic and pp. Clear them, so that the page shows no pool and
+ * page_pool_set_pp_info() can stamp it later. The words hold no pool state
+ * yet, so do not check them, as net_mp_page_clear_page_pool() does: list
+ * poison sets bits of the DMA index in pp_magic.
+ */
+void net_mp_page_init(struct page *page)
+{
+	netmem_ref netmem = page_to_netmem(page);
+
+	netmem_to_nmdesc(netmem)->pp_magic = 0;
+	netmem_set_pp(netmem, NULL);
+}
+
+/* Associate a page that a memory provider owns with a page pool. Should
+ * follow with a matching net_mp_page_clear_page_pool(). Only the allocation
+ * side of the pool may call it, as for net_mp_niov_set_page_pool().
+ */
+void net_mp_page_set_page_pool(struct page_pool *pool, struct page *page)
+{
+	netmem_ref netmem = page_to_netmem(page);
+
+	page_pool_set_pp_info(pool, netmem);
+
+	pool->pages_state_hold_cnt++;
+	trace_page_pool_state_hold(pool, netmem, pool->pages_state_hold_cnt);
+}
+
+/* Disassociate a page from a page pool. Should only be used in the
+ * ->release_netmem() path.
+ */
+void net_mp_page_clear_page_pool(struct page *page)
+{
+	page_pool_clear_pp_info(page_to_netmem(page));
 }

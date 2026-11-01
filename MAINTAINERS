@@ -13756,6 +13756,7 @@ T:	git https://github.com/isilence/linux.git zcrx/for-next
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/axboe/linux.git
 S:	Maintained
 F:	io_uring/zcrx.*
+F:	io_uring/zcrx_*
 
 IO_URING BPF-OPS
 M:	Pavel Begunkov <asml.silence@gmail.com>

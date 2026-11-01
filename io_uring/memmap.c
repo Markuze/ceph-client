@@ -103,6 +103,15 @@ enum {
 	IO_REGION_F_SINGLE_REF			= 4,
 };
 
+/* The number of pages that io_create_region() charged to the user for @mr. */
+unsigned long io_region_nr_accounted(struct io_mapped_region *mr)
+{
+	/* a compound region was accounted for the whole allocation */
+	if (mr->flags & IO_REGION_F_SINGLE_REF)
+		return 1UL << get_order(io_region_size(mr));
+	return mr->nr_pages;
+}
+
 void io_free_region(struct user_struct *user, struct io_mapped_region *mr)
 {
 	if (mr->pages) {
@@ -120,15 +129,8 @@ void io_free_region(struct user_struct *user, struct io_mapped_region *mr)
 	}
 	if ((mr->flags & IO_REGION_F_VMAP) && mr->ptr)
 		vunmap(mr->ptr);
-	if (mr->nr_pages && user) {
-		unsigned long nr_accounted = mr->nr_pages;
-
-		/* a compound region was accounted for the whole allocation */
-		if (mr->flags & IO_REGION_F_SINGLE_REF)
-			nr_accounted = 1UL << get_order(io_region_size(mr));
-
-		__io_unaccount_mem(user, nr_accounted);
-	}
+	if (mr->nr_pages && user)
+		__io_unaccount_mem(user, io_region_nr_accounted(mr));
 
 	memset(mr, 0, sizeof(*mr));
 }
@@ -274,6 +276,9 @@ static struct io_mapped_region *io_mmap_get_region(struct io_ring_ctx *ctx,
 	case IORING_MAP_OFF_ZCRX_REGION:
 		id = (offset & ~IORING_OFF_MMAP_MASK) >> IORING_OFF_ZCRX_SHIFT;
 		return io_zcrx_get_region(ctx, id);
+	case IORING_MAP_OFF_ZCRX_AREA:
+		id = (offset & ~IORING_OFF_MMAP_MASK) >> IORING_OFF_ZCRX_SHIFT;
+		return io_zcrx_get_area_region(ctx, id);
 	}
 	return NULL;
 }
@@ -334,6 +339,17 @@ __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
 	case IORING_OFF_SQ_RING:
 	case IORING_OFF_CQ_RING:
 		page_limit = (sz + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		break;
+	case IORING_MAP_OFF_ZCRX_AREA:
+		/*
+		 * The pages belong to the kernel and the area. A private
+		 * mapping would copy a page on the first write. Mappings
+		 * must not be inherited by a child and must stay out of
+		 * core dumps.
+		 */
+		if (!(vma->vm_flags & VM_SHARED))
+			return -EINVAL;
+		vm_flags_set(vma, VM_DONTDUMP | VM_DONTCOPY);
 		break;
 	}
 

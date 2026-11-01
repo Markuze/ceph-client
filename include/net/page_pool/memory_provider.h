@@ -11,6 +11,10 @@ struct sk_buff;
 
 struct memory_provider_ops {
 	netmem_ref (*alloc_netmems)(struct page_pool *pool, gfp_t gfp);
+	/* Returns false if the provider keeps the netmem. Returns true if the
+	 * pool must unmap and free it. Only a provider of readable pages
+	 * returns true, for netmem from net_mp_alloc_fallback().
+	 */
 	bool (*release_netmem)(struct page_pool *pool, netmem_ref netmem);
 	int (*init)(struct page_pool *pool);
 	void (*destroy)(struct page_pool *pool);
@@ -22,6 +26,12 @@ struct memory_provider_ops {
 bool net_mp_niov_set_dma_addr(struct net_iov *niov, dma_addr_t addr);
 void net_mp_niov_set_page_pool(struct page_pool *pool, struct net_iov *niov);
 void net_mp_niov_clear_page_pool(struct net_iov *niov);
+
+netmem_ref net_mp_alloc_fallback(struct page_pool *pool, gfp_t gfp);
+bool net_mp_page_set_dma_addr(struct page *page, dma_addr_t addr);
+void net_mp_page_init(struct page *page);
+void net_mp_page_set_page_pool(struct page_pool *pool, struct page *page);
+void net_mp_page_clear_page_pool(struct page *page);
 
 int netif_mp_open_rxq(struct net_device *dev, unsigned int rxq_idx,
 		      const struct pp_memory_provider_params *p,

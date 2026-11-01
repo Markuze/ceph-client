@@ -35,24 +35,19 @@
  */
 #define ZCRX_REFILL_CAP MIN(64 * ZCRX_MAX_FRAGS_PER_PAGE, 1024)
 
-#define IO_ZCRX_AREA_SUPPORTED_FLAGS	(IORING_ZCRX_AREA_DMABUF)
+#define IO_ZCRX_AREA_SUPPORTED_FLAGS	(IORING_ZCRX_AREA_DMABUF |\
+					 IORING_ZCRX_AREA_KERNEL)
 #define ZCRX_MAX_AREAS			1024
-
-#define IO_DMA_ATTR (DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
 
 static inline u32 zcrx_next_area_id(struct io_zcrx_ifq *zcrx)
 {
 	return zcrx->nr_areas;
 }
 
-static inline u64 zcrx_area_id_to_token(u32 area_id)
+/* The offset that maps the area of a MAIO instance, for this ring's zcrx id. */
+static inline u64 zcrx_area_mmap_offset(u32 zcrx_id)
 {
-	return (u64)area_id << IORING_ZCRX_AREA_SHIFT;
-}
-
-static inline struct io_zcrx_ifq *io_pp_to_ifq(struct page_pool *pp)
-{
-	return pp->mp_priv;
+	return IORING_MAP_OFF_ZCRX_AREA + ((u64)zcrx_id << IORING_OFF_ZCRX_SHIFT);
 }
 
 static inline struct io_zcrx_area *io_zcrx_iov_to_area(const struct net_iov *niov)
@@ -73,15 +68,48 @@ static bool zcrx_set_ring_ctx(struct io_zcrx_ifq *zcrx,
 	return true;
 }
 
-static inline struct page *io_zcrx_iov_page(const struct net_iov *niov)
+static inline struct io_zcrx_slot io_zcrx_niov_slot(const struct net_iov *niov)
 {
-	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
-	unsigned niov_pages_shift;
+	return (struct io_zcrx_slot){
+		.area	= io_zcrx_iov_to_area(niov),
+		.idx	= net_iov_idx(niov),
+	};
+}
+
+/* The first page of a slot. A slot of a kernel area is one page. */
+static inline struct page *io_zcrx_slot_page(struct io_zcrx_slot slot)
+{
+	struct io_zcrx_area *area = slot.area;
+	unsigned int slot_pages_shift;
 
 	lockdep_assert(!area->mem.is_dmabuf);
 
-	niov_pages_shift = area->ifq->niov_shift - PAGE_SHIFT;
-	return area->mem.pages[net_iov_idx(niov) << niov_pages_shift];
+	slot_pages_shift = area->ifq->niov_shift - PAGE_SHIFT;
+	return area->mem.pages[slot.idx << slot_pages_shift];
+}
+
+static inline netmem_ref io_zcrx_slot_netmem(struct io_zcrx_slot slot)
+{
+	if (slot.area->mem.is_kernel)
+		return page_to_netmem(slot.area->mem.pages[slot.idx]);
+	return net_iov_to_netmem(&slot.area->nia.niovs[slot.idx]);
+}
+
+static inline atomic_t *io_zcrx_slot_uref(struct io_zcrx_slot slot)
+{
+	return &slot.area->user_refs[slot.idx];
+}
+
+/*
+ * The zcrx offset of byte @off of a slot: the area token in the top bits and
+ * the byte offset in the area below it. The slot index shifts in 64 bits,
+ * because an area can hold more than 4 GiB.
+ */
+static inline u64 io_zcrx_slot_off(const struct io_zcrx_ifq *ifq,
+				   struct io_zcrx_slot slot, u32 off)
+{
+	return zcrx_area_id_to_token(slot.area->area_id) +
+	       ((u64)slot.idx << ifq->niov_shift) + off;
 }
 
 static int io_area_max_shift(struct io_zcrx_mem *mem)
@@ -275,10 +303,14 @@ out_err:
 	return ret;
 }
 
-static void io_release_area_mem(struct io_zcrx_mem *mem)
+static void io_release_area_mem(struct io_zcrx_area *area)
 {
+	struct io_zcrx_mem *mem = &area->mem;
+
 	if (mem->is_dmabuf) {
 		io_release_dmabuf(mem);
+	} else if (mem->is_kernel) {
+		io_zcrx_kmem_release(area);
 	} else if (mem->pages) {
 		unpin_user_pages(mem->pages, mem->nr_folios);
 		sg_free_table(mem->sgt);
@@ -298,8 +330,23 @@ static int io_import_area(struct io_zcrx_ifq *ifq,
 		return -EINVAL;
 	if (area_reg->rq_area_token)
 		return -EINVAL;
-	if (area_reg->__resv2[0] || area_reg->__resv2[1])
+	if (area_reg->mmap_offset || area_reg->__resv2)
 		return -EINVAL;
+
+	/* A MAIO instance has a kernel area, and only a MAIO instance has one. */
+	if (!!(area_reg->flags & IORING_ZCRX_AREA_KERNEL) != ifq->maio)
+		return -EINVAL;
+	if (ifq->maio) {
+		if ((area_reg->flags & IORING_ZCRX_AREA_DMABUF) ||
+		    area_reg->addr || area_reg->dmabuf_fd)
+			return -EINVAL;
+		ret = io_validate_user_buf_range(0, area_reg->len);
+		if (ret)
+			return ret;
+		if (area_reg->len & ~PAGE_MASK)
+			return -EINVAL;
+		return io_zcrx_kmem_import(ifq, mem, area_reg);
+	}
 
 	ret = io_validate_user_buf_range(area_reg->addr, area_reg->len);
 	if (ret)
@@ -321,6 +368,10 @@ static void __io_zcrx_unmap_area(struct io_zcrx_ifq *ifq,
 
 	if (!area || !area->is_mapped)
 		return;
+	if (area->mem.is_kernel) {
+		io_zcrx_kmem_unmap(ifq, area);
+		return;
+	}
 	area->is_mapped = false;
 
 	if (area->nia.niovs) {
@@ -379,16 +430,9 @@ struct io_zcrx_args {
 
 static const struct memory_provider_ops io_uring_pp_zc_ops;
 
-static inline atomic_t *io_get_user_counter(struct net_iov *niov)
+static bool io_zcrx_put_uref(struct io_zcrx_slot slot, unsigned int refs)
 {
-	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
-
-	return &area->user_refs[net_iov_idx(niov)];
-}
-
-static bool io_zcrx_put_niov_uref(struct net_iov *niov, unsigned refs)
-{
-	atomic_t *uref = io_get_user_counter(niov);
+	atomic_t *uref = io_zcrx_slot_uref(slot);
 	int old;
 
 	old = atomic_read(uref);
@@ -400,9 +444,9 @@ static bool io_zcrx_put_niov_uref(struct net_iov *niov, unsigned refs)
 	return true;
 }
 
-static void io_zcrx_get_niov_uref(struct net_iov *niov)
+static void io_zcrx_get_uref(struct io_zcrx_slot slot)
 {
-	atomic_inc(io_get_user_counter(niov));
+	atomic_inc(io_zcrx_slot_uref(slot));
 }
 
 static void io_fill_zcrx_offsets(struct io_uring_zcrx_offsets *offsets)
@@ -457,12 +501,14 @@ static void io_zcrx_free_area(struct io_zcrx_ifq *ifq,
 {
 	if (WARN_ON_ONCE(area->is_mapped))
 		return;
-	io_release_area_mem(&area->mem);
+	io_release_area_mem(area);
 
 	if (area->mem.account_pages)
 		io_unaccount_mem(ifq->user, ifq->mm_account,
 				 area->mem.account_pages);
 
+	if (area->kmem)
+		io_zcrx_kmem_free_area(area);
 	kvfree(area->freelist);
 	kvfree(area->nia.niovs);
 	kvfree(area->user_refs);
@@ -519,6 +565,9 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 	}
 	if (ifq->niov_shift && ifq->niov_shift != buf_size_shift)
 		return -EINVAL;
+	/* A slot of a kernel area is one page. */
+	if (ifq->maio && buf_size_shift != PAGE_SHIFT)
+		return -EINVAL;
 	if (!ifq->dev && buf_size_shift != PAGE_SHIFT)
 		return -EOPNOTSUPP;
 
@@ -544,10 +593,13 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 	area->nia.num_niovs = nr_iovs;
 
 	ret = -ENOMEM;
-	area->nia.niovs = kvmalloc_objs(area->nia.niovs[0], nr_iovs,
-					GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-	if (!area->nia.niovs)
-		goto err;
+	/* The slots of a kernel area are the pages of the area. */
+	if (!area->mem.is_kernel) {
+		area->nia.niovs = kvmalloc_objs(area->nia.niovs[0], nr_iovs,
+						GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!area->nia.niovs)
+			goto err;
+	}
 
 	area->freelist = kvmalloc_array(nr_iovs, sizeof(area->freelist[0]),
 					GFP_KERNEL_ACCOUNT | __GFP_ZERO);
@@ -560,11 +612,17 @@ static int __zcrx_create_area(struct io_zcrx_ifq *ifq,
 		goto err;
 
 	for (i = 0; i < nr_iovs; i++) {
-		struct net_iov *niov = &area->nia.niovs[i];
-
-		net_iov_init(niov, &area->nia, NET_IOV_IOURING);
+		if (!area->mem.is_kernel)
+			net_iov_init(&area->nia.niovs[i], &area->nia,
+				     NET_IOV_IOURING);
 		area->freelist[i] = i;
 		atomic_set(&area->user_refs[i], 0);
+	}
+
+	if (area->mem.is_kernel) {
+		ret = io_zcrx_kmem_init_area(area);
+		if (ret)
+			goto err;
 	}
 
 	if (ifq->dev) {
@@ -612,6 +670,7 @@ static struct io_zcrx_ifq *io_zcrx_ifq_alloc(struct io_ring_ctx *ctx)
 	mutex_init(&ifq->pp_lock);
 	refcount_set(&ifq->refs, 1);
 	refcount_set(&ifq->user_refs, 1);
+	refcount_set(&ifq->maio_users, 1);
 	return ifq;
 }
 
@@ -625,13 +684,34 @@ static void io_zcrx_drop_netdev(struct io_zcrx_ifq *ifq)
 	ifq->netdev = NULL;
 }
 
+/*
+ * Remove the provider of a MAIO instance from the receive queues that have
+ * it. Each queue stops, drops its pool of area pages and starts again with
+ * an ordinary pool. The caller holds the netdev lock.
+ */
+static void zcrx_close_maio_queues(struct net_device *netdev,
+				   struct io_zcrx_ifq *ifq,
+				   const struct pp_memory_provider_params *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < ifq->nr_rxq; i++) {
+		/* The core refuses to remove a queue that has a provider. */
+		if (WARN_ON_ONCE(i >= netdev->real_num_rx_queues))
+			break;
+		netif_mp_close_rxq(netdev, i, p);
+	}
+	ifq->nr_rxq = 0;
+}
+
 static void io_close_queue(struct io_zcrx_ifq *ifq)
 {
 	struct net_device *netdev;
 	netdevice_tracker netdev_tracker;
 	struct pp_memory_provider_params p = {
-		.mp_ops = &io_uring_pp_zc_ops,
+		.mp_ops = ifq->maio ? &io_uring_pp_maio_ops : &io_uring_pp_zc_ops,
 		.mp_priv = ifq,
+		.flags = ifq->maio ? PP_MP_F_READABLE : 0,
 	};
 
 	scoped_guard(mutex, &ifq->pp_lock) {
@@ -642,28 +722,49 @@ static void io_close_queue(struct io_zcrx_ifq *ifq)
 
 	if (netdev) {
 		netdev_lock(netdev);
-		if (ifq->if_rxq != -1)
+		if (ifq->maio)
+			zcrx_close_maio_queues(netdev, ifq, &p);
+		else if (ifq->if_rxq != -1)
 			netif_mp_close_rxq(netdev, ifq->if_rxq, &p);
 
-		scoped_guard(mutex, &ifq->pp_lock)
+		/*
+		 * A driver can take a provider off a queue and leave the
+		 * buffers that its pool posted in the ring, and virtio_net
+		 * does. A MAIO area stays mapped until the last pool is gone,
+		 * see io_zcrx_ifq_free().
+		 */
+		if (!ifq->maio) {
+			guard(mutex)(&ifq->pp_lock);
 			io_zcrx_unmap_areas(ifq);
+		}
 		netdev_unlock(netdev);
 		netdev_put(netdev, &netdev_tracker);
 	}
 	ifq->if_rxq = -1;
+	/* The device may have dropped the provider itself, see io_pp_uninstall(). */
+	ifq->nr_rxq = 0;
 }
 
 static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
 {
 	int i;
 
-	if (WARN_ON_ONCE(ifq->if_rxq != -1))
+	if (WARN_ON_ONCE(ifq->if_rxq != -1 || ifq->nr_rxq))
 		return;
 	if (WARN_ON_ONCE(ifq->netdev != NULL))
 		return;
 	if (WARN_ON_ONCE(ifq->master_ctx))
 		return;
 
+	/*
+	 * Every page pool of the instance is gone: each held a reference. No
+	 * ring of a device holds a page of a MAIO area any more, so its DMA
+	 * mapping can go now.
+	 */
+	if (ifq->maio) {
+		guard(mutex)(&ifq->pp_lock);
+		io_zcrx_unmap_areas(ifq);
+	}
 	for (i = 0; i < ifq->nr_areas; i++)
 		io_zcrx_free_area(ifq, ifq->areas[i]);
 	if (ifq->mm_account)
@@ -678,21 +779,26 @@ static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
 	kfree(ifq);
 }
 
-static void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq)
+void io_put_zcrx_ifq(struct io_zcrx_ifq *ifq)
 {
 	if (refcount_dec_and_test(&ifq->refs))
 		io_zcrx_ifq_free(ifq);
 }
 
-static void io_zcrx_return_niov_freelist(struct net_iov *niov)
+static void io_zcrx_return_slot_freelist(struct io_zcrx_slot slot)
 {
-	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
+	struct io_zcrx_area *area = slot.area;
 	struct io_zcrx_ifq *ifq = area->ifq;
+
+	if (area->mem.is_kernel) {
+		io_zcrx_kmem_return_slot(area, slot.idx);
+		return;
+	}
 
 	guard(spinlock_bh)(&ifq->alloc_lock);
 	if (WARN_ON_ONCE(area->free_count >= area->nia.num_niovs))
 		return;
-	area->freelist[area->free_count++] = net_iov_idx(niov);
+	area->freelist[area->free_count++] = slot.idx;
 }
 
 static struct net_iov *zcrx_get_free_niov(struct io_zcrx_area *area)
@@ -708,16 +814,17 @@ static struct net_iov *zcrx_get_free_niov(struct io_zcrx_area *area)
 	return &area->nia.niovs[niov_idx];
 }
 
-static void io_zcrx_return_niov(struct net_iov *niov)
+static void io_zcrx_return_slot(struct io_zcrx_slot slot)
 {
-	netmem_ref netmem = net_iov_to_netmem(niov);
+	netmem_ref netmem = io_zcrx_slot_netmem(slot);
+	struct page_pool *pp = netmem_get_pp(netmem);
 
-	if (!niov->desc.pp) {
-		/* copy fallback allocated niovs */
-		io_zcrx_return_niov_freelist(niov);
+	if (!pp) {
+		/* copy fallback allocated slots */
+		io_zcrx_return_slot_freelist(slot);
 		return;
 	}
-	page_pool_put_unrefed_netmem(niov->desc.pp, netmem, -1, false);
+	page_pool_put_unrefed_netmem(pp, netmem, -1, false);
 }
 
 static void io_zcrx_scrub_area(struct io_zcrx_ifq *ifq, struct io_zcrx_area *area)
@@ -726,14 +833,14 @@ static void io_zcrx_scrub_area(struct io_zcrx_ifq *ifq, struct io_zcrx_area *are
 
 	/* Reclaim back all buffers given to the user space. */
 	for (i = 0; i < area->nia.num_niovs; i++) {
-		struct net_iov *niov = &area->nia.niovs[i];
+		struct io_zcrx_slot slot = { .area = area, .idx = i };
 		int nr;
 
-		if (!atomic_read(io_get_user_counter(niov)))
+		if (!atomic_read(io_zcrx_slot_uref(slot)))
 			continue;
-		nr = atomic_xchg(io_get_user_counter(niov), 0);
-		if (nr && !page_pool_unref_netmem(net_iov_to_netmem(niov), nr))
-			io_zcrx_return_niov(niov);
+		nr = atomic_xchg(io_zcrx_slot_uref(slot), 0);
+		if (nr && !page_pool_unref_netmem(io_zcrx_slot_netmem(slot), nr))
+			io_zcrx_return_slot(slot);
 	}
 }
 
@@ -744,6 +851,44 @@ static void io_zcrx_scrub(struct io_zcrx_ifq *ifq)
 	guard(mutex)(&ifq->pp_lock);
 	for (i = 0; i < ifq->nr_areas; i++)
 		io_zcrx_scrub_area(ifq, ifq->areas[i]);
+}
+
+/*
+ * The area of a MAIO instance has no user left: no ring or file holds the
+ * instance, and no store binds it. Its page pools can keep the instance for
+ * long, see io_zcrx_kmem_close(), and it keeps only the pages that are still
+ * out. The locked memory charge of the area and of the refill region belongs
+ * to the users, so it goes back now and not when the last pool is gone. The
+ * refill region itself stays until then.
+ */
+static void zcrx_maio_close(struct io_zcrx_ifq *ifq)
+{
+	if (ifq->nr_areas) {
+		struct io_zcrx_area *area = ifq->areas[0];
+
+		scoped_guard(mutex, &ifq->pp_lock)
+			io_zcrx_kmem_close(area);
+		io_unaccount_mem(ifq->user, ifq->mm_account,
+				 area->mem.account_pages);
+		area->mem.account_pages = 0;
+	}
+	if (ifq->user)
+		__io_unaccount_mem(ifq->user,
+				   io_region_nr_accounted(&ifq->rq_region));
+	/* io_zcrx_ifq_free() then gives nothing back again. */
+	free_uid(ifq->user);
+	ifq->user = NULL;
+	if (ifq->mm_account) {
+		mmdrop(ifq->mm_account);
+		ifq->mm_account = NULL;
+	}
+}
+
+/* Drop a user of the area of a MAIO instance, see ->maio_users. */
+void io_zcrx_maio_drop_user(struct io_zcrx_ifq *ifq)
+{
+	if (refcount_dec_and_test(&ifq->maio_users))
+		zcrx_maio_close(ifq);
 }
 
 static void zcrx_unregister_user(struct io_zcrx_ifq *ifq, struct io_ring_ctx *ctx)
@@ -758,6 +903,9 @@ static void zcrx_unregister_user(struct io_zcrx_ifq *ifq, struct io_ring_ctx *ct
 	if (refcount_dec_and_test(&ifq->user_refs)) {
 		io_close_queue(ifq);
 		io_zcrx_scrub(ifq);
+		/* The rings and files were one user of the area. */
+		if (ifq->maio)
+			io_zcrx_maio_drop_user(ifq);
 	}
 }
 
@@ -775,6 +923,16 @@ struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 	lockdep_assert_held(&ctx->mmap_lock);
 
 	return ifq ? &ifq->rq_region : NULL;
+}
+
+struct io_mapped_region *io_zcrx_get_area_region(struct io_ring_ctx *ctx,
+						 unsigned int id)
+{
+	struct io_zcrx_ifq *ifq = xa_load(&ctx->zcrx_ctxs, id);
+
+	lockdep_assert_held(&ctx->mmap_lock);
+
+	return ifq && ifq->maio ? &ifq->area_region : NULL;
 }
 
 static int zcrx_box_release(struct inode *inode, struct file *file)
@@ -842,7 +1000,7 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 		return -EINVAL;
 	if (!(ctx->flags & (IORING_SETUP_CQE32|IORING_SETUP_CQE_MIXED)))
 		return -EINVAL;
-	if (reg->if_rxq || reg->rq_entries || reg->area_ptr || reg->region_ptr)
+	if (reg->if_rxq || reg->rq_entries || reg->region_ptr)
 		return -EINVAL;
 	if (reg->event_desc)
 		return -EINVAL;
@@ -859,6 +1017,9 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 		return -EBADF;
 
 	ifq = file->private_data;
+	/* For a MAIO instance, the area pointer is an output buffer. */
+	if (reg->area_ptr && !ifq->maio)
+		return -EINVAL;
 	refcount_inc(&ifq->refs);
 	refcount_inc(&ifq->user_refs);
 
@@ -873,6 +1034,23 @@ static int import_zcrx(struct io_ring_ctx *ctx,
 	if (copy_to_user(arg, reg, sizeof(*reg))) {
 		ret = -EFAULT;
 		goto err_xa_erase;
+	}
+	if (reg->area_ptr) {
+		/*
+		 * Tell the importer what to map. The mmap offset depends on
+		 * the zcrx id of this ring.
+		 */
+		struct io_uring_zcrx_area_reg area = {
+			.len		= ifq->areas[0]->mem.size,
+			.flags		= IORING_ZCRX_AREA_KERNEL,
+			.mmap_offset	= zcrx_area_mmap_offset(id),
+		};
+
+		if (copy_to_user(u64_to_user_ptr(reg->area_ptr), &area,
+				 sizeof(area))) {
+			ret = -EFAULT;
+			goto err_xa_erase;
+		}
 	}
 
 	scoped_guard(mutex, &ctx->mmap_lock) {
@@ -930,6 +1108,74 @@ static int zcrx_register_netdev(struct io_zcrx_ifq *ifq,
 netdev_put_unlock:
 	netdev_unlock(ifq->netdev);
 	return ret;
+}
+
+/*
+ * Install the provider on every receive queue of the device, in index order.
+ * The core restarts one queue at a time: it allocates new queue memory with
+ * a pool that binds the provider, stops the queue and returns the posted
+ * buffers to the old pool, and starts the queue from the area. If a queue
+ * fails, the core restores that queue, and this function removes the
+ * provider from the queues done before, in reverse order. The device is then
+ * as it was. The caller holds the netdev lock.
+ */
+static int zcrx_open_maio_queues(struct net_device *netdev,
+				 struct io_zcrx_ifq *ifq)
+{
+	struct pp_memory_provider_params mp_param = {
+		.mp_ops = &io_uring_pp_maio_ops,
+		.mp_priv = ifq,
+		.flags = PP_MP_F_READABLE,
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < netdev->real_num_rx_queues; i++) {
+		ret = netif_mp_open_rxq(netdev, i, &mp_param, NULL);
+		if (ret)
+			goto err_undo;
+		ifq->nr_rxq = i + 1;
+	}
+	return 0;
+
+err_undo:
+	while (i--)
+		netif_mp_close_rxq(netdev, i, &mp_param);
+	ifq->nr_rxq = 0;
+	return ret;
+}
+
+static int zcrx_register_maio_netdev(struct io_zcrx_ifq *ifq,
+				     struct io_uring_zcrx_ifq_reg *reg)
+{
+	int ret;
+
+	ifq->netdev = netdev_get_by_index_lock(current->nsproxy->net_ns,
+					       reg->if_idx);
+	if (!ifq->netdev)
+		return -ENODEV;
+
+	netdev_hold(ifq->netdev, &ifq->netdev_tracker, GFP_KERNEL);
+	ret = zcrx_open_maio_queues(ifq->netdev, ifq);
+	netdev_unlock(ifq->netdev);
+	return ret;
+}
+
+static int zcrx_register_maio(struct io_zcrx_ifq *ifq,
+			      struct io_uring_zcrx_ifq_reg *reg,
+			      struct io_uring_zcrx_area_reg *area)
+{
+	int ret;
+
+	/*
+	 * Allocate the area before the netdev lock is taken. The allocation
+	 * can take long for a large area. The area needs no device, because
+	 * the first page pool that maps DMA maps the area.
+	 */
+	ret = io_zcrx_create_area(ifq, area, reg);
+	if (ret)
+		return ret;
+	return zcrx_register_maio_netdev(ifq, reg);
 }
 
 static int zcrx_validate_notif_stats(struct io_zcrx_ifq *ifq,
@@ -996,6 +1242,9 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 		return -EINVAL;
 	if ((reg.if_rxq || reg.if_idx) && (reg.flags & ZCRX_REG_NODEV))
 		return -EINVAL;
+	/* A MAIO instance covers every receive queue, so no queue is named. */
+	if ((reg.flags & ZCRX_REG_MAIO) && reg.if_rxq)
+		return -EINVAL;
 	if (reg.rq_entries > IO_RQ_MAX_ENTRIES) {
 		if (!(ctx->flags & IORING_SETUP_CLAMP))
 			return -EINVAL;
@@ -1027,6 +1276,7 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	if (!ifq)
 		return -ENOMEM;
 
+	ifq->maio = !!(reg.flags & ZCRX_REG_MAIO);
 	ifq->notif_data = notif.user_data;
 	ifq->allowed_notif_mask = notif.type_mask;
 
@@ -1060,7 +1310,10 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	ifq->kern_readable = !(area.flags & IORING_ZCRX_AREA_DMABUF);
 
 	if (!(reg.flags & ZCRX_REG_NODEV)) {
-		ret = zcrx_register_netdev(ifq, &reg, &area);
+		if (ifq->maio)
+			ret = zcrx_register_maio(ifq, &reg, &area);
+		else
+			ret = zcrx_register_netdev(ifq, &reg, &area);
 		if (ret)
 			goto err;
 	} else {
@@ -1072,6 +1325,15 @@ int io_register_zcrx(struct io_ring_ctx *ctx,
 	WARN_ON_ONCE(!ifq->niov_shift);
 
 	reg.zcrx_id = id;
+
+	if (ifq->maio) {
+		struct io_zcrx_area *kern_area = ifq->areas[0];
+
+		/* Filled before the ifq is published, so mmap sees it whole. */
+		ifq->area_region.pages = kern_area->mem.pages;
+		ifq->area_region.nr_pages = kern_area->nia.num_niovs;
+		area.mmap_offset = zcrx_area_mmap_offset(id);
+	}
 
 	scoped_guard(mutex, &ctx->mmap_lock) {
 		/* publish ifq */
@@ -1217,7 +1479,7 @@ static inline bool zcrx_rq_iter_next(struct zcrx_rq_iter *it,
 
 static inline bool io_parse_rqe(struct io_uring_zcrx_rqe *rqe,
 				struct io_zcrx_ifq *ifq,
-				struct net_iov **ret_niov)
+				struct io_zcrx_slot *ret_slot)
 {
 	__u64 off = READ_ONCE(rqe->off);
 	unsigned niov_idx, area_idx;
@@ -1237,35 +1499,41 @@ static inline bool io_parse_rqe(struct io_uring_zcrx_rqe *rqe,
 		return false;
 	niov_idx = array_index_nospec(niov_idx, area->nia.num_niovs);
 
-	*ret_niov = &area->nia.niovs[niov_idx];
+	ret_slot->area = area;
+	ret_slot->idx = niov_idx;
 	return true;
 }
 
-static bool zcrx_put_refill_niov(struct net_iov *niov, struct page_pool *pp,
+static bool zcrx_put_refill_slot(struct io_zcrx_slot slot, struct page_pool *pp,
 				 unsigned refs)
 {
-	netmem_ref netmem = net_iov_to_netmem(niov);
+	netmem_ref netmem = io_zcrx_slot_netmem(slot);
 
-	if (!io_zcrx_put_niov_uref(niov, refs))
+	if (!io_zcrx_put_uref(slot, refs))
 		return false;
 	if (page_pool_unref_netmem(netmem, refs) != 0)
 		return false;
-	if (unlikely(niov->desc.pp != pp)) {
-		io_zcrx_return_niov(niov);
+	if (unlikely(netmem_get_pp(netmem) != pp)) {
+		io_zcrx_return_slot(slot);
+		return false;
+	}
+	/* The page of a kernel area must not reach the device under an outsider. */
+	if (slot.area->mem.is_kernel &&
+	    unlikely(!io_zcrx_page_is_quiet(netmem_to_page(netmem)))) {
+		io_zcrx_kmem_park_slot(pp, slot.area, slot.idx);
 		return false;
 	}
 	return true;
 }
 
-static unsigned io_zcrx_ring_refill(struct page_pool *pp,
-				    struct io_zcrx_ifq *ifq,
-				    netmem_ref *netmems, unsigned to_alloc)
+unsigned int io_zcrx_ring_refill(struct page_pool *pp, struct io_zcrx_ifq *ifq,
+				 netmem_ref *netmems, unsigned int to_alloc)
 {
 	struct zcrx_rq *rq = &ifq->rq;
 	struct io_uring_zcrx_rqe *rqe;
 	struct zcrx_rq_iter it;
-	struct net_iov *niov = NULL;
-	unsigned niov_refs = 0;
+	struct io_zcrx_slot slot = {};
+	unsigned int slot_refs = 0;
 	unsigned allocated = 0;
 
 	guard(spinlock_bh)(&rq->lock);
@@ -1273,24 +1541,24 @@ static unsigned io_zcrx_ring_refill(struct page_pool *pp,
 	zcrx_rq_iter_init(&it, rq);
 
 	while (allocated < to_alloc - 1 && zcrx_rq_iter_next(&it, rq, &rqe)) {
-		struct net_iov *next_niov;
+		struct io_zcrx_slot next_slot;
 
-		if (!io_parse_rqe(rqe, ifq, &next_niov))
+		if (!io_parse_rqe(rqe, ifq, &next_slot))
 			continue;
-		if (niov == next_niov) {
-			niov_refs++;
+		if (slot.area == next_slot.area && slot.idx == next_slot.idx) {
+			slot_refs++;
 			continue;
 		}
-		if (niov && zcrx_put_refill_niov(niov, pp, niov_refs)) {
-			netmems[allocated] = net_iov_to_netmem(niov);
+		if (slot.area && zcrx_put_refill_slot(slot, pp, slot_refs)) {
+			netmems[allocated] = io_zcrx_slot_netmem(slot);
 			allocated++;
 		}
-		niov = next_niov;
-		niov_refs = 1;
+		slot = next_slot;
+		slot_refs = 1;
 	}
 
-	if (niov && zcrx_put_refill_niov(niov, pp, niov_refs)) {
-		netmems[allocated] = net_iov_to_netmem(niov);
+	if (slot.area && zcrx_put_refill_slot(slot, pp, slot_refs)) {
+		netmems[allocated] = io_zcrx_slot_netmem(slot);
 		allocated++;
 	}
 
@@ -1334,12 +1602,7 @@ static void zcrx_notif_tw(struct io_tw_req tw_req, io_tw_token_t tw)
 	kmem_cache_free(req_cachep, req);
 }
 
-static void zcrx_stat_add(__u64 *p, s64 v)
-{
-	WRITE_ONCE(*p, READ_ONCE(*p) + v);
-}
-
-static void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned type)
+void zcrx_send_notif(struct io_zcrx_ifq *ifq, unsigned int type)
 {
 	gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO;
 	u32 type_mask = 1 << type;
@@ -1406,7 +1669,7 @@ static bool io_pp_zc_release_netmem(struct page_pool *pp, netmem_ref netmem)
 
 	niov = netmem_to_net_iov(netmem);
 	net_mp_niov_clear_page_pool(niov);
-	io_zcrx_return_niov_freelist(niov);
+	io_zcrx_return_slot_freelist(io_zcrx_niov_slot(niov));
 	return false;
 }
 
@@ -1463,11 +1726,14 @@ static void io_pp_uninstall(void *mp_priv, struct netdev_rx_queue *rxq)
 	struct io_zcrx_ifq *ifq = mp_priv;
 
 	guard(mutex)(&ifq->pp_lock);
-	io_zcrx_unmap_areas(ifq);
+	/* The pools of a MAIO instance can still have pages in the rings. */
+	if (!ifq->maio)
+		io_zcrx_unmap_areas(ifq);
 	io_zcrx_drop_netdev(ifq);
 
 	p->mp_ops = NULL;
 	p->mp_priv = NULL;
+	p->flags = 0;
 }
 
 static const struct memory_provider_ops io_uring_pp_zc_ops = {
@@ -1479,8 +1745,22 @@ static const struct memory_provider_ops io_uring_pp_zc_ops = {
 	.uninstall		= io_pp_uninstall,
 };
 
-static unsigned zcrx_parse_rq(netmem_ref *netmem_array, unsigned nr,
-			      struct io_zcrx_ifq *zcrx, struct zcrx_rq *rq)
+/*
+ * The provider of a MAIO instance. It hands out the pages of the kernel
+ * area, and ordinary pages when the area has no free page. The pages are
+ * readable, so the page pools of the device need no header split.
+ */
+const struct memory_provider_ops io_uring_pp_maio_ops = {
+	.alloc_netmems		= io_pp_maio_alloc_netmems,
+	.release_netmem		= io_pp_maio_release_netmem,
+	.init			= io_pp_maio_init,
+	.destroy		= io_pp_zc_destroy,
+	.nl_fill		= io_pp_nl_fill,
+	.uninstall		= io_pp_uninstall,
+};
+
+static unsigned int zcrx_parse_rq(struct io_zcrx_slot *slots, unsigned int nr,
+				  struct io_zcrx_ifq *zcrx, struct zcrx_rq *rq)
 {
 	unsigned int mask = rq->nr_entries - 1;
 	unsigned int i;
@@ -1488,11 +1768,9 @@ static unsigned zcrx_parse_rq(netmem_ref *netmem_array, unsigned nr,
 	nr = min(nr, zcrx_rq_entries(rq));
 	for (i = 0; i < nr; i++) {
 		struct io_uring_zcrx_rqe *rqe = zcrx_next_rqe(rq, mask);
-		struct net_iov *niov;
 
-		if (!io_parse_rqe(rqe, zcrx, &niov))
+		if (!io_parse_rqe(rqe, zcrx, &slots[i]))
 			break;
-		netmem_array[i] = net_iov_to_netmem(niov);
 	}
 
 	smp_store_release(&rq->ring->head, rq->cached_head);
@@ -1501,19 +1779,19 @@ static unsigned zcrx_parse_rq(netmem_ref *netmem_array, unsigned nr,
 
 #define ZCRX_FLUSH_BATCH 32
 
-static void zcrx_return_buffers(netmem_ref *netmems, unsigned nr)
+static void zcrx_return_buffers(struct io_zcrx_slot *slots, unsigned int nr)
 {
 	unsigned i;
 
 	for (i = 0; i < nr; i++) {
-		netmem_ref netmem = netmems[i];
-		struct net_iov *niov = netmem_to_net_iov(netmem);
+		struct io_zcrx_slot slot = slots[i];
+		netmem_ref netmem = io_zcrx_slot_netmem(slot);
 
-		if (!io_zcrx_put_niov_uref(niov, 1))
+		if (!io_zcrx_put_uref(slot, 1))
 			continue;
 		if (!page_pool_unref_and_test(netmem))
 			continue;
-		io_zcrx_return_niov(niov);
+		io_zcrx_return_slot(slot);
 	}
 }
 
@@ -1521,7 +1799,7 @@ static int zcrx_flush_rq(struct io_ring_ctx *ctx, struct io_zcrx_ifq *zcrx,
 			 struct zcrx_ctrl *ctrl)
 {
 	struct zcrx_ctrl_flush_rq *frq = &ctrl->zc_flush;
-	netmem_ref netmems[ZCRX_FLUSH_BATCH];
+	struct io_zcrx_slot slots[ZCRX_FLUSH_BATCH];
 	unsigned total = 0;
 	unsigned nr;
 
@@ -1532,8 +1810,8 @@ static int zcrx_flush_rq(struct io_ring_ctx *ctx, struct io_zcrx_ifq *zcrx,
 		struct zcrx_rq *rq = &zcrx->rq;
 
 		scoped_guard(spinlock_bh, &rq->lock) {
-			nr = zcrx_parse_rq(netmems, ZCRX_FLUSH_BATCH, zcrx, rq);
-			zcrx_return_buffers(netmems, nr);
+			nr = zcrx_parse_rq(slots, ZCRX_FLUSH_BATCH, zcrx, rq);
+			zcrx_return_buffers(slots, nr);
 		}
 
 		total += nr;
@@ -1571,6 +1849,10 @@ static int zcrx_ctrl_add_area(struct io_ring_ctx *ctx, struct io_zcrx_ifq *ifq,
 	struct zcrx_ctrl_add_area *ctrl_add = &ctrl->zc_area;
 	struct io_uring_zcrx_area_reg __user *area_uptr;
 	struct io_uring_zcrx_area_reg area_reg;
+
+	/* A MAIO instance has exactly one area. */
+	if (ifq->maio)
+		return -EOPNOTSUPP;
 
 	area_uptr = u64_to_user_ptr(ctrl_add->area_ptr);
 	if (copy_from_user(&area_reg, area_uptr, sizeof(area_reg)))
@@ -1626,14 +1908,12 @@ int io_zcrx_ctrl(struct io_ring_ctx *ctx, void __user *arg, unsigned nr_args)
 	return -EOPNOTSUPP;
 }
 
-static bool io_zcrx_queue_cqe(struct io_kiocb *req, struct net_iov *niov,
+static bool io_zcrx_queue_cqe(struct io_kiocb *req, struct io_zcrx_slot slot,
 			      struct io_zcrx_ifq *ifq, int off, int len)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	struct io_uring_zcrx_cqe *rcqe;
-	struct io_zcrx_area *area;
 	struct io_uring_cqe *cqe;
-	u64 offset;
 
 	if (!io_defer_get_uncommited_cqe(ctx, &cqe))
 		return false;
@@ -1644,10 +1924,8 @@ static bool io_zcrx_queue_cqe(struct io_kiocb *req, struct net_iov *niov,
 	if (ctx->flags & IORING_SETUP_CQE_MIXED)
 		cqe->flags |= IORING_CQE_F_32;
 
-	area = io_zcrx_iov_to_area(niov);
-	offset = off + (net_iov_idx(niov) << ifq->niov_shift);
 	rcqe = (struct io_uring_zcrx_cqe *)(cqe + 1);
-	rcqe->off = offset + zcrx_area_id_to_token(area->area_id);
+	rcqe->off = io_zcrx_slot_off(ifq, slot, off);
 	rcqe->__pad = 0;
 	return true;
 }
@@ -1719,6 +1997,36 @@ static ssize_t io_copy_page(struct io_copy_cache *cc, struct page *src_page,
 	return copied;
 }
 
+/*
+ * Take a free slot of the area for a copy. The slot belongs to no page pool,
+ * and it holds one pool reference. The caller fills the page of the slot,
+ * posts the CQE and takes the user reference. If the caller cannot post the
+ * CQE, it gives the slot back with io_zcrx_return_slot().
+ */
+static bool io_zcrx_alloc_copy_slot(struct io_zcrx_ifq *ifq,
+				    struct io_zcrx_slot *slot)
+{
+	struct net_iov *niov;
+	struct page *page;
+	u64 area_off;
+
+	if (!ifq->maio) {
+		niov = io_alloc_fallback_niov(ifq);
+		if (!niov)
+			return false;
+		*slot = io_zcrx_niov_slot(niov);
+		return true;
+	}
+
+	page = io_zcrx_maio_copy_page(ifq, &area_off);
+	if (!page)
+		return false;
+	/* A MAIO instance has one area, and a slot of it is one page. */
+	slot->area = ifq->areas[0];
+	slot->idx = (area_off & ~IORING_ZCRX_AREA_MASK) >> PAGE_SHIFT;
+	return true;
+}
+
 static ssize_t io_zcrx_copy_chunk(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 				  struct page *src_page, unsigned int src_offset,
 				  size_t len)
@@ -1728,31 +2036,39 @@ static ssize_t io_zcrx_copy_chunk(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 
 	while (len) {
 		struct io_copy_cache cc;
-		struct net_iov *niov;
+		struct io_zcrx_slot slot;
 		size_t n;
 
-		niov = io_alloc_fallback_niov(ifq);
-		if (!niov) {
+		if (!io_zcrx_alloc_copy_slot(ifq, &slot)) {
 			ret = -ENOMEM;
 			break;
 		}
 
-		cc.page = io_zcrx_iov_page(niov);
+		cc.page = io_zcrx_slot_page(slot);
 		cc.offset = 0;
 		cc.size = PAGE_SIZE;
 
 		n = io_copy_page(&cc, src_page, src_offset, len);
 
-		if (!io_zcrx_queue_cqe(req, niov, ifq, 0, n)) {
-			io_zcrx_return_niov(niov);
+		if (!io_zcrx_queue_cqe(req, slot, ifq, 0, n)) {
+			io_zcrx_return_slot(slot);
 			ret = -ENOSPC;
 			break;
 		}
 
-		io_zcrx_get_niov_uref(niov);
+		io_zcrx_get_uref(slot);
 		src_offset += n;
 		len -= n;
 		copied += n;
+	}
+
+	/* One call is one copy for the counters and one event. */
+	if (copied) {
+		if (ifq->notif_stats) {
+			zcrx_stat_add(&ifq->notif_stats->copy_count, 1);
+			zcrx_stat_add(&ifq->notif_stats->copy_bytes, copied);
+		}
+		zcrx_send_notif(ifq, ZCRX_EVENT_COPY);
 	}
 
 	return copied ? copied : ret;
@@ -1762,45 +2078,128 @@ static int io_zcrx_copy_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 			     const skb_frag_t *frag, int off, int len)
 {
 	struct page *page = skb_frag_page(frag);
-	int ret;
 
-	ret = io_zcrx_copy_chunk(req, ifq, page, off + skb_frag_off(frag), len);
-	if (ret > 0) {
-		if (ifq->notif_stats) {
-			zcrx_stat_add(&ifq->notif_stats->copy_count, 1);
-			zcrx_stat_add(&ifq->notif_stats->copy_bytes, ret);
-		}
-		zcrx_send_notif(ifq, ZCRX_EVENT_COPY);
-	}
-
-	return ret;
+	return io_zcrx_copy_chunk(req, ifq, page, off + skb_frag_off(frag), len);
 }
 
-static int io_zcrx_recv_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
-			     const skb_frag_t *frag, int off, int len)
+/**
+ * io_zcrx_maio_page_slot() - find the slot of bytes that can pass by reference
+ * @ifq:	a MAIO instance
+ * @page:	the page that holds the bytes
+ * @page_off:	the offset of the first byte in @page
+ * @len:	the number of bytes
+ * @recycle:	the skb that carries @page is marked for page pool recycling
+ * @slot:	the slot of @page, set if the function returns true
+ *
+ * Tell whether the bytes [@page_off, @page_off + @len) of @page can pass by
+ * reference. They can if a page pool of @ifq owns @page as a slot of the area
+ * and the bytes lie in this one page. A fallback page of such a pool is an
+ * ordinary page and no slot. A page that no pool owns, for example a page of
+ * the area that the process sent with SEND_ZC, is no slot either.
+ *
+ * Only an skb marked for recycling (skb->pp_recycle) holds one pool reference
+ * to each pool page that it carries. The reference pins the pool fields of
+ * the page, so io_zcrx_maio_page_owned() reads them safely, and the pool does
+ * not go away. An skb without the mark holds a pool page by a plain reference
+ * at most, for example after a splice. The pool may release such a page at any
+ * time, so the function does not trust it.
+ *
+ * Return: true if the bytes can pass by reference. Then @slot names the slot.
+ * False if the caller must copy the bytes.
+ */
+static bool io_zcrx_maio_page_slot(struct io_zcrx_ifq *ifq, struct page *page,
+				   unsigned int page_off, size_t len,
+				   bool recycle, struct io_zcrx_slot *slot)
 {
-	struct net_iov *niov;
-	struct page_pool *pp;
+	struct io_zcrx_area *area = ifq->areas[0];
 
-	if (unlikely(!skb_frag_is_net_iov(frag)))
-		return io_zcrx_copy_frag(req, ifq, frag, off, len);
+	if (page_off + len > PAGE_SIZE)
+		return false;
+	if (!recycle || !io_zcrx_maio_page_owned(ifq, page))
+		return false;
+	if (!io_zcrx_kmem_lookup(area, page, &slot->idx))
+		return false;
+	slot->area = area;
+	return true;
+}
 
-	niov = netmem_to_net_iov(frag->netmem);
-	pp = niov->desc.pp;
-
-	if (!pp || pp->mp_ops != &io_uring_pp_zc_ops || io_pp_to_ifq(pp) != ifq)
-		return -EFAULT;
-
-	if (!io_zcrx_queue_cqe(req, niov, ifq, off + skb_frag_off(frag), len))
+/*
+ * Pass a reference to @len bytes at @off in the buffer of a slot. The bytes
+ * stay in the buffer. The process reads them there, and it returns the slot
+ * through the refill ring.
+ */
+static int io_zcrx_ref_slot(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
+			    struct io_zcrx_slot slot, int off, int len)
+{
+	if (!io_zcrx_queue_cqe(req, slot, ifq, off, len))
 		return -ENOSPC;
 
 	/*
 	 * Prevent it from being recycled while user is accessing it.
 	 * It has to be done before grabbing a user reference.
 	 */
-	page_pool_ref_netmem(net_iov_to_netmem(niov));
-	io_zcrx_get_niov_uref(niov);
+	page_pool_ref_netmem(io_zcrx_slot_netmem(slot));
+	io_zcrx_get_uref(slot);
 	return len;
+}
+
+static int io_zcrx_recv_frag(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
+			     const skb_frag_t *frag, int off, int len,
+			     bool recycle)
+{
+	struct io_zcrx_slot slot;
+	struct net_iov *niov;
+	struct page_pool *pp;
+
+	if (unlikely(!skb_frag_is_net_iov(frag))) {
+		/*
+		 * A readable page. A MAIO instance passes a reference to a
+		 * page of its own pools. It copies every other page.
+		 */
+		if (ifq->maio &&
+		    io_zcrx_maio_page_slot(ifq, skb_frag_page(frag),
+					   off + skb_frag_off(frag), len,
+					   recycle, &slot))
+			return io_zcrx_ref_slot(req, ifq, slot,
+						off + skb_frag_off(frag), len);
+		return io_zcrx_copy_frag(req, ifq, frag, off, len);
+	}
+
+	/*
+	 * A net_iov belongs to a provider. It is memory that the CPU may not
+	 * read, so no instance can copy it. An instance accepts the net_iov of
+	 * its own pools only, and a MAIO instance has none.
+	 */
+	niov = netmem_to_net_iov(frag->netmem);
+	pp = niov->desc.pp;
+
+	if (!pp || pp->mp_ops != &io_uring_pp_zc_ops || io_pp_to_ifq(pp) != ifq)
+		return -EFAULT;
+
+	return io_zcrx_ref_slot(req, ifq, io_zcrx_niov_slot(niov),
+				off + skb_frag_off(frag), len);
+}
+
+/*
+ * Receive the bytes of the linear part of an skb. A MAIO instance passes a
+ * reference when the bytes lie in one page that one of its pools owns. A
+ * driver that keeps the headers in a private head puts no payload there, so
+ * this case is rare. The instance copies in every other case, also when the
+ * bytes span two pages.
+ */
+static ssize_t io_zcrx_recv_head(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
+				 struct sk_buff *skb, unsigned int offset,
+				 size_t len)
+{
+	struct page *page = virt_to_page(skb->data);
+	unsigned int page_off = offset_in_page(skb->data) + offset;
+	struct io_zcrx_slot slot;
+
+	if (ifq->maio &&
+	    io_zcrx_maio_page_slot(ifq, page, page_off, len, skb->pp_recycle,
+				   &slot))
+		return io_zcrx_ref_slot(req, ifq, slot, page_off, len);
+	return io_zcrx_copy_chunk(req, ifq, page, page_off, len);
 }
 
 static int
@@ -1832,9 +2231,7 @@ io_zcrx_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 		size_t to_copy;
 
 		to_copy = min_t(size_t, skb_headlen(skb) - offset, len);
-		copied = io_zcrx_copy_chunk(req, ifq, virt_to_page(skb->data),
-					    offset_in_page(skb->data) + offset,
-					    to_copy);
+		copied = io_zcrx_recv_head(req, ifq, skb, offset, to_copy);
 		if (copied < 0) {
 			ret = copied;
 			goto out;
@@ -1861,7 +2258,8 @@ io_zcrx_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 			unsigned copy = min(frag_end - offset, len);
 			unsigned frag_off = offset - start;
 
-			ret = io_zcrx_recv_frag(req, ifq, frag, frag_off, copy);
+			ret = io_zcrx_recv_frag(req, ifq, frag, frag_off, copy,
+						skb->pp_recycle);
 			if (ret < 0)
 				goto out;
 
@@ -1968,3 +2366,7 @@ int io_zcrx_recv(struct io_kiocb *req, struct io_zcrx_ifq *ifq,
 	sock_rps_record_flow(sk);
 	return io_zcrx_tcp_recvmsg(req, ifq, sk, flags, issue_flags, len);
 }
+
+#ifdef CONFIG_IO_URING_ZCRX_KUNIT_TEST
+#include "zcrx_test.c"
+#endif
