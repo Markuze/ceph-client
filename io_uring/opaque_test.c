@@ -7919,6 +7919,309 @@ static void opaque_send_parked_under_socket(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/*
+ * Requests that are prepared, issued and cleaned up by the functions that the core calls, on the
+ * fixture's ring. The ring knows @store as store 1 and keeps the requests that are cleaned up for
+ * the next prep, as a ring does.
+ */
+static void opaque_wire_prep_cleanup(void *arg)
+{
+	struct io_ring_ctx *ctx = arg;
+
+	io_opaque_cache_free(ctx);
+	xa_destroy(&ctx->opaque_stores);
+}
+
+static void opaque_wire_prep_setup(struct kunit *test, struct opaque_wire *w,
+				   struct io_opaque_store *store)
+{
+	unsigned int i;
+
+	xa_init(&w->ctx->opaque_stores);
+	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(w->ctx));
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_wire_prep_cleanup, w->ctx), 0);
+	store->config.max_requests = 8;
+	KUNIT_ASSERT_EQ(test, xa_err(xa_store(&w->ctx->opaque_stores, 1, store, GFP_KERNEL)), 0);
+	for (i = 0; i < ARRAY_SIZE(w->req); i++)
+		w->req[i].opcode = IORING_OP_OPAQUE_OBJ_SEND;
+}
+
+/* Prep request @i as its SQE would: a range, or the vector of @len entries at @addr. */
+static struct io_opaque_req *opaque_wire_prep(struct kunit *test, struct opaque_wire *w, int i,
+					      u16 ioprio, u64 addr, u64 off, u32 len)
+{
+	struct io_uring_sqe sqe = {
+		.opaque_store_id = 1, .ioprio = ioprio, .addr = addr, .off = off, .len = len,
+	};
+
+	w->req[i].flags = 0;
+	w->req[i].async_data = NULL;
+	memset(&w->req[i].cqe, 0, sizeof(w->req[i].cqe));
+	KUNIT_ASSERT_EQ(test, io_opaque_send_prep(&w->req[i], &sqe), 0);
+	KUNIT_ASSERT_NOT_NULL(test, w->req[i].async_data);
+	return w->req[i].async_data;
+}
+
+/* What the core does with a request that has ended or failed: its cleanup, under the ring lock. */
+static void opaque_wire_req_cleanup(struct opaque_wire *w, int i)
+{
+	mutex_lock(&w->ctx->uring_lock);
+	io_opaque_cleanup(&w->req[i]);
+	mutex_unlock(&w->ctx->uring_lock);
+	w->req[i].flags &= ~REQ_F_NEED_CLEANUP;
+}
+
+/* The place of requests in the store's count, as the ones that gave it back saw the socket. */
+static struct {
+	struct sock *sk;
+	unsigned int calls, owned, counted;
+} opaque_uncount_spy;
+
+static void opaque_test_uncount_spy(struct io_opaque_req *op)
+{
+	struct kunit *test = kunit_get_current_test();
+
+	opaque_uncount_spy.calls++;
+	opaque_uncount_spy.owned += sock_owned_by_user_nocheck(opaque_uncount_spy.sk);
+	opaque_uncount_spy.counted += op->counted;
+	kunit_deactivate_static_stub(test, io_opaque_req_uncount);
+	io_opaque_req_uncount(op);
+	kunit_activate_static_stub(test, io_opaque_req_uncount, opaque_test_uncount_spy);
+}
+
+/* How the requests of opaque_life_run() end. */
+enum {
+	OPAQUE_LIFE_DONE,	/* inline, to its end under the socket */
+	OPAQUE_LIFE_DONE_IOWQ,	/* the same, issued as io-wq does */
+	OPAQUE_LIFE_FAILED,	/* to its end with an error, under the socket */
+	OPAQUE_LIFE_ORDINARY,	/* a socket that is not plain: cleanup gives everything back */
+	OPAQUE_LIFE_RETRY,	/* EAGAIN, and the issue that completes it */
+	OPAQUE_LIFE_RETRY_CANCEL, /* EAGAIN, and then it fails without being issued again */
+	OPAQUE_LIFE_PARKED_CANCEL, /* parked behind a head, and canceled there */
+	OPAQUE_LIFE_UNISSUED,	/* prepared, and failed before it was issued */
+	OPAQUE_LIFE_REFUSED,	/* the queue that it joins has failed */
+	OPAQUE_LIFE_NR,
+};
+
+static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, bool last)
+{
+	const bool retry = mode == OPAQUE_LIFE_RETRY || mode == OPAQUE_LIFE_RETRY_CANCEL ||
+			   mode == OPAQUE_LIFE_PARKED_CANCEL || mode == OPAQUE_LIFE_REFUSED;
+	const u64 handle = io_opaque_handle(0, 9);
+	/* Ranges that fit the socket, or too many for it while the peer does not read. */
+	const u32 nr = retry ? 6 : 3, len = retry ? 80000 : 4000;
+	struct io_uring_opaque_send_entry ent[6];
+	u16 flags = (vector ? IORING_OPAQUE_SEND_VECTOR : 0) | (last ? IORING_OPAQUE_SEND_LAST : 0);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *got = kunit_kmalloc(test, 6 * 80000, GFP_KERNEL);
+	struct io_opaque_req *op, *other = NULL;
+	unsigned long user = 0;
+	unsigned int done = 0, tries, nreq = 1;
+	struct sock *sk;
+	int ret, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	for (i = 0; i < ARRAY_SIZE(ent); i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = handle, .off = retry ? 0 : 1000 * i,
+			.len = retry ? 80000 : 1000 + i,
+		};
+	opaque_test_publish(store, 0, 9, data);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_prep_setup(test, w, store);
+	opaque_wire_sndbuf(sk, retry ? SZ_32K : SZ_1M);
+	if (vector) {
+		user = opaque_uvec_map(test);
+		opaque_uvec_put(test, user, ent, nr * sizeof(*ent));
+	}
+	if (mode == OPAQUE_LIFE_FAILED)
+		KUNIT_ASSERT_EQ(test, kernel_sock_shutdown(w->tx, SHUT_WR), 0);
+	if (mode == OPAQUE_LIFE_ORDINARY) {
+		opaque_test_proto = tcp_prot;
+		opaque_test_proto.sendmsg = opaque_test_sendmsg;
+		KUNIT_ASSERT_EQ(test,
+				kunit_add_action_or_reset(test, opaque_test_proto_restore, sk), 0);
+		lock_sock(sk);
+		sk->sk_prot = &opaque_test_proto;
+		release_sock(sk);
+	}
+	memset(&opaque_uncount_spy, 0, sizeof(opaque_uncount_spy));
+	opaque_uncount_spy.sk = sk;
+	kunit_activate_static_stub(test, io_opaque_req_uncount, opaque_test_uncount_spy);
+
+	op = opaque_wire_prep(test, w, 0, flags, vector ? user : handle, 0, vector ? nr : len);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
+	KUNIT_EXPECT_TRUE(test, op->counted);
+
+	switch (mode) {
+	case OPAQUE_LIFE_DONE:
+	case OPAQUE_LIFE_DONE_IOWQ:
+	case OPAQUE_LIFE_FAILED:
+	case OPAQUE_LIFE_ORDINARY:
+		ret = opaque_wire_issue(w, 0, mode == OPAQUE_LIFE_DONE_IOWQ);
+		lockdep_assert_none_held_once();
+		KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+		if (mode == OPAQUE_LIFE_FAILED)
+			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, -EPIPE);
+		/*
+		 * A send that ended with the socket owned has given back its place in the count
+		 * there; any other leaves it to cleanup.
+		 */
+		if (mode == OPAQUE_LIFE_ORDINARY) {
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
+			KUNIT_EXPECT_EQ(test, opaque_uncount_spy.calls, 0U);
+			KUNIT_EXPECT_TRUE(test, op->counted);
+		} else {
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+			KUNIT_EXPECT_EQ(test, opaque_uncount_spy.calls, 1U);
+			KUNIT_EXPECT_EQ(test, opaque_uncount_spy.owned, 1U);
+			KUNIT_EXPECT_FALSE(test, op->counted);
+			/* And so did its place in the queue and its references. */
+			KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
+			if (vector)
+				KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		}
+		break;
+	case OPAQUE_LIFE_RETRY:
+	case OPAQUE_LIFE_RETRY_CANCEL:
+	case OPAQUE_LIFE_PARKED_CANCEL:
+	case OPAQUE_LIFE_REFUSED:
+		ret = opaque_wire_issue(w, 0, false);
+		KUNIT_ASSERT_EQ(test, ret, -EAGAIN);
+		/* Held, with its place at the head and its count. */
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
+		KUNIT_EXPECT_EQ(test, opaque_uncount_spy.calls, 0U);
+		KUNIT_ASSERT_NOT_NULL(test, op->tx);
+		break;
+	case OPAQUE_LIFE_UNISSUED:
+		break;
+	}
+
+	if (mode == OPAQUE_LIFE_PARKED_CANCEL || mode == OPAQUE_LIFE_REFUSED) {
+		other = opaque_wire_prep(test, w, 1, 0, handle, 200, 300);
+		nreq = 2;
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 2);
+		if (mode == OPAQUE_LIFE_REFUSED)
+			op->tx->failed = true;
+		ret = opaque_wire_issue(w, 1, false);
+		if (mode == OPAQUE_LIFE_REFUSED) {
+			/* The failed queue refuses it; that is no completion, the core fails it. */
+			KUNIT_ASSERT_EQ(test, ret, -ECANCELED);
+			op->tx->failed = false;
+			KUNIT_EXPECT_PTR_EQ(test, other->tx, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, other->data, NULL);
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 2);
+			io_opaque_fail(&w->req[1]);
+			opaque_wire_req_cleanup(w, 1);
+		} else {
+			KUNIT_ASSERT_EQ(test, ret, IOU_ISSUE_SKIP_COMPLETE);
+			KUNIT_EXPECT_EQ(test, other->phase, IO_OPAQUE_SEND_WAIT);
+			/* Canceled where it waits: task work wakes it, and cleanup is left. */
+			mutex_lock(&w->ctx->uring_lock);
+			KUNIT_EXPECT_TRUE(test, io_opaque_cancel_all(w->ctx, NULL, true));
+			mutex_unlock(&w->ctx->uring_lock);
+			KUNIT_EXPECT_TRUE(test, other->canceled);
+			KUNIT_EXPECT_EQ(test, other->phase, IO_OPAQUE_QUEUED);
+			KUNIT_EXPECT_EQ(test, other->result, -ECANCELED);
+			KUNIT_EXPECT_PTR_EQ(test, mpscq_pop(&w->ctx->work_list, &w->ctx->work_head),
+					    &w->req[1].io_task_work.node);
+			list_del_init(&other->cancel);
+			other->phase = IO_OPAQUE_IDLE;
+			req_set_fail(&w->req[1]);
+			io_opaque_fail(&w->req[1]);
+			opaque_wire_req_cleanup(w, 1);
+		}
+		/* The head has its place and its own count still; the follower's went with it. */
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
+		KUNIT_EXPECT_EQ(test, opaque_uncount_spy.calls, 1U);
+		KUNIT_EXPECT_PTR_NE(test, op->tx, NULL);
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), last ? 1 : 2);
+	}
+
+	switch (mode) {
+	case OPAQUE_LIFE_RETRY:
+	case OPAQUE_LIFE_PARKED_CANCEL:
+	case OPAQUE_LIFE_REFUSED:
+		/* The peer reads, and each issue goes on from the cursor until all is queued. */
+		for (tries = 0; tries < 4000; tries++) {
+			ret = opaque_wire_issue(w, 0, false);
+			if (ret == IOU_COMPLETE)
+				break;
+			KUNIT_ASSERT_EQ(test, ret, -EAGAIN);
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
+			done += opaque_wire_drain(w, got + done, 6 * 80000 - done);
+			usleep_range(500, 1000);
+		}
+		lockdep_assert_none_held_once();
+		KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)(vector ? nr : 1) * 80000);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+		KUNIT_EXPECT_EQ(test, opaque_uncount_spy.calls, nreq);
+		KUNIT_EXPECT_EQ(test, opaque_uncount_spy.owned, 1U);
+		break;
+	case OPAQUE_LIFE_RETRY_CANCEL:
+	case OPAQUE_LIFE_UNISSUED:
+		/* Canceled, or failed before it ever ran: nothing has given the count back. */
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
+		req_set_fail(&w->req[0]);
+		io_opaque_fail(&w->req[0]);
+		break;
+	default:
+		break;
+	}
+	/* Cleanup runs once for each request, and has nothing to give back that was given. */
+	opaque_wire_req_cleanup(w, 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+	KUNIT_EXPECT_EQ(test, opaque_uncount_spy.calls, nreq);
+	KUNIT_EXPECT_EQ(test, opaque_uncount_spy.counted, nreq);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	/*
+	 * Whatever the send consumed or pinned is back, and the object is the table's again, or
+	 * gone with a LAST send that ran. A LAST send that was canceled before it was admitted
+	 * took nothing, or it ran only as far as the point at which it did.
+	 */
+	if (store->objects[0].data) {
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+		mutex_lock(&store->tables);
+		io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
+		mutex_unlock(&store->tables);
+	}
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	kunit_deactivate_static_stub(test, io_opaque_req_uncount);
+}
+
+/*
+ * A send gives back its place in the store's count of requests exactly once, whichever way it
+ * ends: to its end under the socket, which does it there, before the CQE is posted; to its end
+ * on a socket that is not plain, by an error, after EAGAIN and a retry, canceled where it
+ * waits or where it was left after EAGAIN, refused by a queue that failed, and never issued.
+ * Cleanup does it for every one that has not, and never for one that has: the count goes
+ * negative if it does it twice, and stays if nobody does. A vector and LAST give back their
+ * references as they always did, in the same runs.
+ */
+static void opaque_send_release_once(struct kunit *test)
+{
+	unsigned int mode, vector, last;
+
+	for (mode = 0; mode < OPAQUE_LIFE_NR; mode++)
+		for (vector = 0; vector < 2; vector++)
+			for (last = 0; last < 2; last++) {
+				/* A frame behind a LAST send finds its object gone. */
+				if (last && (mode == OPAQUE_LIFE_PARKED_CANCEL ||
+					     mode == OPAQUE_LIFE_REFUSED))
+					continue;
+				opaque_life_run(test, mode, vector, last);
+			}
+}
+
 /* What the window of an admission that has to grow its block saw, and the frame it lets in. */
 static struct {
 	struct sock *sk;
@@ -10786,6 +11089,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_security_refusal),
 	KUNIT_CASE(opaque_send_join_place),
 	KUNIT_CASE(opaque_send_parked_under_socket),
+	KUNIT_CASE(opaque_send_release_once),
 	KUNIT_CASE(opaque_send_locked_admit_fails),
 	KUNIT_CASE(opaque_send_direct_switch),
 	KUNIT_CASE(opaque_send_locked_blocking),

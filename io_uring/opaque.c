@@ -839,6 +839,23 @@ static void io_opaque_req_free(struct io_ring_ctx *ctx, struct io_opaque_req *op
 	}
 }
 
+/*
+ * Give back a request's place in the store's count of requests, once: the flag
+ * says whether it still has one. A send that ends with its socket owned gives it
+ * back there, where the locked decrement is part of the stretch in which the
+ * socket is not waited for. Cleanup gives it back for every request that has not,
+ * the sends that never got so far among them. Needs neither the ring lock nor the
+ * socket.
+ */
+VISIBLE_IF_KUNIT void io_opaque_req_uncount(struct io_opaque_req *op)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_req_uncount, op);
+	if (op->counted) {
+		op->counted = false;
+		atomic_dec(&op->store->requests);
+	}
+}
+
 /* The ring lock protects enrollment; wait_lock arbitrates remote wakeups. */
 static void io_opaque_enroll(struct io_opaque_req *op)
 {
@@ -2395,11 +2412,14 @@ void io_opaque_cleanup(struct io_kiocb *req)
 		mutex_unlock(&store->tables);
 	}
 	/*
-	 * A send that has run to its end holds no frame, no version and no stream,
-	 * and a call that is made to find that out is a call for nothing.
+	 * A send that ended with its socket owned has given back its place in the
+	 * queue, its references and its place in the count of requests
+	 * (io_opaque_send()), and a call that is made to find that out is a call for
+	 * nothing. Any other has them to give back here, once.
 	 */
 	if (req->opcode == IORING_OP_OPAQUE_OBJ_SEND) {
-		io_opaque_tx_put(op);
+		if (op->tx)
+			io_opaque_tx_put(op);
 		if (op->framing)
 			kfree(op->framing);
 		if (op->frame_charge)
@@ -2418,7 +2438,7 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	if (op->stream)
 		io_opaque_stream_put(op->stream);
 	if (op->counted)
-		atomic_dec(&store->requests);
+		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
@@ -4197,8 +4217,16 @@ finish:
 		ret = op->progress;
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
-	/* The references go with the socket, the last of a version after it. */
-	left = owned && io_opaque_send_unpin_cheap(op);
+	/*
+	 * The references go with the socket, the last of a version after it, and so does
+	 * the request's place in the store's count: what cleanup is left to give back for
+	 * this send is the request itself.
+	 */
+	left = false;
+	if (owned) {
+		left = io_opaque_send_unpin_cheap(op);
+		io_opaque_req_uncount(op);
+	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*
