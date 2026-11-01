@@ -7094,7 +7094,8 @@ static void opaque_send_managed_prefix_fallback(struct kunit *test)
 	opaque_wire_send(test, w, store, &(struct opaque_send_case) {
 			 .prefix = 24, .suffix = 8, .unlocked = true });
 	opaque_managed_read(&after);
-	KUNIT_EXPECT_GE(test, after.fallback - before.fallback, 1ULL);
+	/* Once: the skb the prefix started is full, and the next fill is not let into it. */
+	KUNIT_EXPECT_EQ(test, after.fallback - before.fallback, 1ULL);
 	/* The prefix and 16 extents fill the first skb; the other 5 are managed, 5 references. */
 	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)(21 - (limit - 1)));
 	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 2ULL);
@@ -7986,6 +7987,156 @@ static void opaque_managed_link(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
 }
 
+/*
+ * A skb of ours with all the fragments it may have is a boundary, as another
+ * provider's is: -EEXIST, which TCP takes as the end of that skb, before any fill
+ * is let in. One with room is joined, whatever it holds, and the limit is the
+ * sysctl's, also when it is lower than the ubuf could hold. A skb that has no ubuf
+ * yet gets one even at a limit of one fragment.
+ */
+static void opaque_managed_link_full(struct kunit *test)
+{
+	const int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	struct opaque_managed before, after;
+	struct io_opaque_ubuf *u;
+	struct ubuf_info *uarg;
+	struct bio_vec bv[3];
+	struct opaque_splice f;
+	struct iov_iter iter;
+	unsigned int i;
+
+	opaque_splice_setup(test, &f);
+	for (i = 0; i < ARRAY_SIZE(bv); i++)
+		bvec_set_page(&bv[i], f.units[0], 100, i * 200);
+	iov_iter_bvec(&iter, ITER_SOURCE, bv, ARRAY_SIZE(bv), 300);
+	u = opaque_managed_skb(test, &f);
+	uarg = &u->uarg;
+	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 300), 0);
+	KUNIT_ASSERT_EQ(test, skb_shinfo(f.skb)->nr_frags, 3);
+
+	/* Three fragments, and room for more: joined, with no new ubuf and no new reference. */
+	opaque_managed_read(&before);
+	KUNIT_EXPECT_EQ(test, io_opaque_link_skb(f.skb, NULL), 0);
+	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(f.skb), uarg);
+	/* As many as the limit allows, or fewer: no room, and nothing is made or changed. */
+	opaque_max_frags_set(test, 4);
+	KUNIT_EXPECT_EQ(test, io_opaque_link_skb(f.skb, NULL), 0);
+	opaque_max_frags_set(test, 3);
+	KUNIT_EXPECT_EQ(test, io_opaque_link_skb(f.skb, NULL), -EEXIST);
+	opaque_max_frags_set(test, 2);
+	KUNIT_EXPECT_EQ(test, io_opaque_link_skb(f.skb, NULL), -EEXIST);
+	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(f.skb), uarg);
+	KUNIT_EXPECT_EQ(test, refcount_read(&uarg->refcnt), 1U);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, 3);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.skbs, before.skbs);
+	/* A skb that has no ubuf gets one, however low the limit. */
+	opaque_max_frags_set(test, 1);
+	{
+		struct sk_buff *fresh = alloc_skb(0, GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, fresh);
+		KUNIT_EXPECT_EQ(test, io_opaque_link_skb(fresh, NULL), 0);
+		KUNIT_EXPECT_NOT_NULL(test, skb_zcopy(fresh));
+		KUNIT_EXPECT_PTR_NE(test, skb_zcopy(fresh), uarg);
+		/* ... and it is full once it has the one fragment, which the fill gave it. */
+		iov_iter_bvec(&iter, ITER_SOURCE, bv, 1, 100);
+		KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(fresh, &iter, 100), 0);
+		KUNIT_EXPECT_EQ(test, io_opaque_link_skb(fresh, NULL), -EEXIST);
+		kfree_skb(fresh);
+	}
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
+	KUNIT_EXPECT_GE(test, limit, 1);
+	kfree_skb(f.skb);
+	opaque_splice_done(&f);
+}
+
+/* What TCP sees of the fill when a test drives tcp_sendmsg_locked() itself. */
+static struct {
+	unsigned int calls;
+	/* Fills that said -EMSGSIZE having added nothing: each one is reverted by TCP's helper. */
+	unsigned int empty;
+} opaque_fill_spy;
+
+static int opaque_test_spy_fill(struct sk_buff *skb, struct iov_iter *from, size_t length)
+{
+	unsigned int len = skb->len;
+	int ret = io_opaque_sg_from_iter(skb, from, length);
+
+	opaque_fill_spy.calls++;
+	if (ret == -EMSGSIZE && skb->len == len)
+		opaque_fill_spy.empty++;
+	return ret;
+}
+
+/*
+ * A send of 1000 bytes of each of 40 pages, to TCP itself: an skb gets as many
+ * fragments as it may, which is well below what its size would allow, and the next
+ * fill is not let into it. The skb after it has a ubuf of its own. No fill ever finds
+ * its skb full: link_skb() has said so before it.
+ */
+static void opaque_managed_boundary(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	const unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	const unsigned int skbs = DIV_ROUND_UP(40, limit);
+	struct ubuf_info cursor = { .ops = &io_opaque_ubuf_ops };
+	struct bio_vec *bv = kunit_kcalloc(test, 40, sizeof(*bv), GFP_KERNEL);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 40000, GFP_KERNEL);
+	u8 *want = kunit_kmalloc(test, 40000, GFP_KERNEL);
+	struct opaque_page_refs *pages;
+	struct opaque_managed before, after;
+	struct msghdr msg = {};
+	struct sock *sk;
+	unsigned int i;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, bv);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	opaque_test_copy(data, source);
+	pages = opaque_page_refs_take(test, data);
+	for (i = 0; i < 40; i++) {
+		bvec_set_page(&bv[i], data->bvec[i].bv_page, 1000, 0);
+		memcpy(want + i * 1000, source + i * 2000, 1000);
+	}
+	sk = w->tx->sk;
+	msg.msg_flags = MSG_ZEROCOPY;
+	msg.msg_ubuf = &cursor;
+	msg.sg_from_iter = opaque_test_spy_fill;
+	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bv, 40, 40000);
+	memset(&opaque_fill_spy, 0, sizeof(opaque_fill_spy));
+
+	opaque_managed_read(&before);
+	lock_sock(sk);
+	ret = tcp_sendmsg_locked(sk, &msg, 40000);
+	release_sock(sk);
+	opaque_managed_read(&after);
+	KUNIT_EXPECT_EQ(test, ret, 40000);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&msg.msg_iter), 0UL);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, (u64)skbs);
+	KUNIT_EXPECT_EQ(test, after.refs - before.refs, 40ULL);
+	KUNIT_EXPECT_EQ(test, after.fallback, before.fallback);
+	KUNIT_EXPECT_EQ(test, opaque_fill_spy.calls, skbs);
+	KUNIT_EXPECT_EQ(test, opaque_fill_spy.empty, 0U);
+	opaque_wire_read(test, w, got, 0, 40000);
+	KUNIT_EXPECT_MEMEQ(test, got, want, 40000);
+	opaque_wire_acked(sk);
+	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, true));
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, false));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
 struct opaque_atomic {
 	struct tasklet_struct tasklet;
 	struct completion done;
@@ -8375,6 +8526,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_managed_fill_captured),
 	KUNIT_CASE(opaque_managed_fill_fallback),
 	KUNIT_CASE(opaque_managed_link),
+	KUNIT_CASE(opaque_managed_link_full),
+	KUNIT_CASE(opaque_managed_boundary),
 	KUNIT_CASE(opaque_ubuf_complete_atomic),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),

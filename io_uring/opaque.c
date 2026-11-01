@@ -3427,6 +3427,14 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * boundary, as io_uring's own link_skb() makes it for the provider it does not
  * mix with: TCP pushes it and starts a new one.
  *
+ * So is a skb of ours that has all the fragments it may have. -EEXIST makes
+ * TCP push it and start another, which is what is wanted of a skb that is
+ * full, and it does so before the fill: a fill that is let in finds no room,
+ * adds nothing and says -EMSGSIZE, and skb_zerocopy_iter_stream() then takes
+ * back what it did, ___pskb_trim() walking every fragment of the skb, for TCP
+ * to do the same. A range that would have extended the last fragment starts
+ * the next skb instead.
+ *
  * TCP does not set skb->sk on a skb of its write queue, so the allocation has
  * no socket to take its mask from. GFP_KERNEL is what a user's socket
  * allocates its skbs with.
@@ -3436,8 +3444,12 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 	struct ubuf_info *cur = skb_zcopy(skb);
 	struct io_opaque_ubuf *u;
 
-	if (cur)
-		return cur->ops == &io_opaque_ubuf_ops ? 0 : -EEXIST;
+	if (cur) {
+		if (cur->ops != &io_opaque_ubuf_ops ||
+		    skb_shinfo(skb)->nr_frags >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
+			return -EEXIST;
+		return 0;
+	}
 	u = kmem_cache_alloc(io_opaque_ubuf_cache, GFP_KERNEL);
 	if (!u)
 		return -ENOMEM;
