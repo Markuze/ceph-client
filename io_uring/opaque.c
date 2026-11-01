@@ -796,9 +796,15 @@ void io_opaque_put(struct io_opaque_store *store)
 		io_opaque_free(store);
 }
 
-static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
-						 struct io_opaque_store *store,
-						 bool control)
+/*
+ * A request from the ring's cache, or a new one, that counts against the store's
+ * limit unless it is a control request, and has nothing set but the flag that
+ * the core cleans it up: a recycled one is what the last request left. The caller
+ * sets what it reads, all of the request but its block of a vector in
+ * io_opaque_req_alloc(), only what the opcode reads in io_opaque_send_prep().
+ */
+static struct io_opaque_req *io_opaque_req_get(struct io_kiocb *req,
+					       struct io_opaque_store *store, bool control)
 {
 	struct io_opaque_req *op;
 
@@ -814,6 +820,18 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 			atomic_dec(&store->requests);
 		return ERR_PTR(-ENOMEM);
 	}
+	req->flags |= REQ_F_NEED_CLEANUP;
+	return op;
+}
+
+static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
+						 struct io_opaque_store *store,
+						 bool control)
+{
+	struct io_opaque_req *op = io_opaque_req_get(req, store, control);
+
+	if (IS_ERR(op))
+		return op;
 	/* Not the vector block, which a recycled request brings along. */
 	memset(op, 0, offsetof(struct io_opaque_req, vec));
 	op->op = U16_MAX;
@@ -823,7 +841,6 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 	op->retry_at = jiffies;
 	INIT_LIST_HEAD(&op->wait);
 	INIT_LIST_HEAD(&op->cancel);
-	req->flags |= REQ_F_NEED_CLEANUP;
 	return op;
 }
 
@@ -857,7 +874,7 @@ VISIBLE_IF_KUNIT void io_opaque_req_uncount(struct io_opaque_req *op)
 }
 
 /* The ring lock protects enrollment; wait_lock arbitrates remote wakeups. */
-static void io_opaque_enroll(struct io_opaque_req *op)
+static __always_inline void io_opaque_enroll(struct io_opaque_req *op)
 {
 	lockdep_assert_held(&op->req->ctx->uring_lock);
 	if (list_empty(&op->cancel))
@@ -2374,16 +2391,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	/*
 	 * Taking wait_lock is how cleanup waits out a waker that is still in
 	 * its hold: budget_waits and copies are walked under it, using the
-	 * request's file and stream after its entry has been unlinked. A send
-	 * is on neither list. What reaches one from outside comes through its
-	 * TX queue, which io_opaque_tx_put() below waits for, or from
-	 * cancellation, which holds the ring lock as cleanup does. It has no
-	 * waker to wait out, and takes the lock only if its entry is linked.
+	 * request's file and stream after its entry has been unlinked.
 	 */
-	if (req->opcode != IORING_OP_OPAQUE_OBJ_SEND || !list_empty(&op->wait)) {
-		scoped_guard(spinlock, &store->wait_lock)
-			list_del_init(&op->wait);
-	}
+	scoped_guard(spinlock, &store->wait_lock)
+		list_del_init(&op->wait);
 	/* Waiters have stopped accessing this request before cleanup. */
 	if (op->stream) {
 		mutex_lock(&op->stream->lock);
@@ -2411,20 +2422,6 @@ void io_opaque_cleanup(struct io_kiocb *req)
 				       store->objects[op->slot].generation);
 		mutex_unlock(&store->tables);
 	}
-	/*
-	 * A send that ended with its socket owned has given back its place in the
-	 * queue, its references and its place in the count of requests
-	 * (io_opaque_send()), and a call that is made to find that out is a call for
-	 * nothing. Any other has them to give back here, once.
-	 */
-	if (req->opcode == IORING_OP_OPAQUE_OBJ_SEND) {
-		if (op->tx)
-			io_opaque_tx_put(op);
-		if (op->framing)
-			kfree(op->framing);
-		if (op->frame_charge)
-			io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
-	}
 	if (unlikely(op->vec))
 		io_opaque_vec_cleanup(op);
 	if (op->op == IORING_OPAQUE_CREATE)
@@ -2437,6 +2434,52 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	}
 	if (op->stream)
 		io_opaque_stream_put(op->stream);
+	if (op->counted)
+		io_opaque_req_uncount(op);
+	lockdep_assert_held(&req->ctx->uring_lock);
+	io_opaque_req_free(req->ctx, op);
+	io_req_async_data_clear(req, 0);
+}
+
+/*
+ * Request cleanup of a send, which holds only what a send can hold: a place in
+ * a queue, a frame and its charge, references (a version, and those of a vector in
+ * its block), a place in the count of requests, and the block. A send that ended
+ * with its socket owned has given back all but the frame and the decision about
+ * the block (io_opaque_send()); any other has all of them to give back here, once,
+ * and each is given back only if it is there: a call that is made to find that
+ * out is a call for nothing.
+ *
+ * A send is on neither list that a waker walks under wait_lock, budget_waits and
+ * copies, so it has no waker to wait out, and takes the lock only if its entry is
+ * linked. What reaches a send from outside comes through its TX queue, which
+ * io_opaque_tx_put() waits for, or from cancellation, which holds the ring lock as
+ * cleanup does. Its stream is none, and it reserves no slot.
+ */
+void io_opaque_send_cleanup(struct io_kiocb *req)
+{
+	struct io_opaque_req *op = req->async_data;
+	struct io_opaque_store *store;
+
+	if (!op)
+		return;
+	store = op->store;
+	if (!list_empty(&op->cancel))
+		list_del_init(&op->cancel);
+	if (!list_empty(&op->wait)) {
+		scoped_guard(spinlock, &store->wait_lock)
+			list_del_init(&op->wait);
+	}
+	if (op->tx)
+		io_opaque_tx_put(op);
+	if (op->framing)
+		kfree(op->framing);
+	if (op->frame_charge)
+		io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
+	if (unlikely(op->vec))
+		io_opaque_vec_cleanup(op);
+	if (op->data)
+		io_opaque_data_put(store, op->data);
 	if (op->counted)
 		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
@@ -3078,6 +3121,35 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 	return io_opaque_vec_copy_in(op, u64_to_user_ptr(op->handle), nr);
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Fill the request of a send with the poison of the test (io_opaque_send_poison)
+ * before the send sets what it reads, as the message and the cursor are filled
+ * in io_opaque_send(), so that a field that is read before it is written does not
+ * get away with what the last request left, or with zero. Not the block of a
+ * vector, which a request brings along.
+ */
+#define IO_OPAQUE_SEND_POISON_REQ(op)					\
+	do {								\
+		if (io_opaque_send_poison >= 0)				\
+			memset((op), io_opaque_send_poison,		\
+			       offsetof(struct io_opaque_req, vec));	\
+	} while (0)
+#else
+#define IO_OPAQUE_SEND_POISON_REQ(op)	((void)(op))
+#endif
+
+/*
+ * A send sets the members of its request that it reads before it writes them,
+ * and no more: the request is shared with the receives and the control operations,
+ * whose members it never looks at, and a recycled one is what the last request
+ * left, apart from the block of a vector that it keeps. What a send writes
+ * before it reads is left alone: iter (admission), send (the join, which links
+ * it into the queue), frame_reserved (the charge that sets frame_charge) and
+ * result (the wakeup that sets it). The stream is none because cancellation looks
+ * at it for every request that waits, and the total is none until the request is
+ * resolved, by this prep or by the import of its frame.
+ */
 int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_opaque_store *store = io_opaque_get_store(req, READ_ONCE(sqe->opaque_store_id));
@@ -3094,11 +3166,30 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
 	    (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
 		return -EINVAL;
-	op = io_opaque_req_alloc(req, store, false);
+	op = io_opaque_req_get(req, store, false);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
+	IO_OPAQUE_SEND_POISON_REQ(op);
+	op->req = req;
+	op->store = store;
+	op->stream = NULL;
+	op->data = NULL;
+	INIT_LIST_HEAD(&op->wait);
+	INIT_LIST_HEAD(&op->cancel);
+	op->progress = 0;
 	op->op = U16_MAX;
-	INIT_LIST_HEAD(&op->send);
+	op->phase = IO_OPAQUE_IDLE;
+	op->canceled = false;
+	op->counted = true;
+	op->consumed = false;
+	op->resolved = false;
+	op->tx = NULL;
+	op->framing = NULL;
+	op->frame_charge = 0;
+	op->prefix_length = 0;
+	op->suffix_length = 0;
+	op->total_length = 0;
+	op->tx_started = false;
 	op->send_flags = send_flags;
 	op->handle = READ_ONCE(sqe->addr);
 	op->offset = READ_ONCE(sqe->off);
@@ -3241,6 +3332,17 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
 }
 
 /*
+ * io_opaque_send() joins in two places, for an io-wq issue and for an inline one. The join
+ * is part of it, not a call, as it was when it had one place: both are inlined, except
+ * in a test, which calls the join and has it as a function.
+ */
+#if IS_ENABLED(CONFIG_KUNIT)
+#define IO_OPAQUE_JOIN_INLINE
+#else
+#define IO_OPAQUE_JOIN_INLINE	__always_inline
+#endif
+
+/*
  * Queue @op behind the frames already admitted for @sk. Returns
  * IO_OPAQUE_TX_WAIT when it waits for one (its phase is set before tx_lock is
  * dropped, so a release cannot miss it), IO_OPAQUE_TX_HEAD when it is the head
@@ -3263,7 +3365,8 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
  *
  * @op->req is not used; the caller enrolls a waiting request for cancellation.
  */
-VISIBLE_IF_KUNIT int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk)
+VISIBLE_IF_KUNIT IO_OPAQUE_JOIN_INLINE int
+io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_tx *tx, *spare = NULL;

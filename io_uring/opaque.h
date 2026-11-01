@@ -105,6 +105,7 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags);
 int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
 int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags);
 void io_opaque_cleanup(struct io_kiocb *req);
+void io_opaque_send_cleanup(struct io_kiocb *req);
 void io_opaque_fail(struct io_kiocb *req);
 int io_opaque_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 		     unsigned int issue_flags);
@@ -134,6 +135,10 @@ static inline void io_unregister_opaque(struct io_ring_ctx *ctx)
 }
 
 static inline void io_opaque_cleanup(struct io_kiocb *req)
+{
+}
+
+static inline void io_opaque_send_cleanup(struct io_kiocb *req)
 {
 }
 

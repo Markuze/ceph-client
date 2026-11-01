@@ -2788,7 +2788,7 @@ static void opaque_prep_done(struct opaque_prep *p)
 {
 	if (p->req.async_data) {
 		mutex_lock(&p->ctx->uring_lock);
-		io_opaque_cleanup(&p->req);
+		io_opaque_send_cleanup(&p->req);
 		mutex_unlock(&p->ctx->uring_lock);
 	}
 	p->req.flags = 0;
@@ -2883,6 +2883,7 @@ struct opaque_wire {
 	struct io_kiocb req[2];
 	struct socket *listener, *tx, *rx;
 	struct file *file;
+	bool prepped;
 };
 
 static void opaque_wire_cleanup(void *arg)
@@ -2952,6 +2953,65 @@ static bool opaque_wire_unit_free(struct page *unit)
 	for (i = 0; i < 100 && page_count(unit) != 1; i++)
 		msleep(20);
 	return page_count(unit) == 1;
+}
+
+/*
+ * Requests that are prepared, issued and cleaned up by the functions that the core calls, on the
+ * fixture's ring. The ring knows @store as store 1 and keeps the requests that are cleaned up for
+ * the next prep, as a ring does.
+ */
+static void opaque_wire_prep_cleanup(void *arg)
+{
+	struct io_ring_ctx *ctx = arg;
+
+	io_opaque_cache_free(ctx);
+	xa_destroy(&ctx->opaque_stores);
+}
+
+static void opaque_wire_prep_setup(struct kunit *test, struct opaque_wire *w,
+				   struct io_opaque_store *store)
+{
+	unsigned int i;
+
+	if (w->prepped)
+		return;
+	w->prepped = true;
+	xa_init(&w->ctx->opaque_stores);
+	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(w->ctx));
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_wire_prep_cleanup, w->ctx), 0);
+	store->config.max_requests = 8;
+	KUNIT_ASSERT_EQ(test, xa_err(xa_store(&w->ctx->opaque_stores, 1, store, GFP_KERNEL)), 0);
+	for (i = 0; i < ARRAY_SIZE(w->req); i++)
+		w->req[i].opcode = IORING_OP_OPAQUE_OBJ_SEND;
+}
+
+/*
+ * Prep request @i as its SQE would: a range, or the vector of @len entries at @addr, with
+ * a frame at @addr3 if there is one.
+ */
+static struct io_opaque_req *opaque_wire_prep(struct kunit *test, struct opaque_wire *w, int i,
+					      u16 ioprio, u64 addr, u64 off, u32 len, u64 addr3)
+{
+	struct io_uring_sqe sqe = {
+		.opaque_store_id = 1, .ioprio = ioprio, .addr = addr, .off = off, .len = len,
+		.addr3 = addr3,
+	};
+
+	w->req[i].flags = 0;
+	w->req[i].async_data = NULL;
+	memset(&w->req[i].cqe, 0, sizeof(w->req[i].cqe));
+	KUNIT_ASSERT_EQ(test, io_opaque_send_prep(&w->req[i], &sqe), 0);
+	KUNIT_ASSERT_NOT_NULL(test, w->req[i].async_data);
+	return w->req[i].async_data;
+}
+
+/* What the core does with a request that has ended or failed: its cleanup, under the ring lock. */
+static void opaque_wire_req_cleanup(struct opaque_wire *w, int i)
+{
+	mutex_lock(&w->ctx->uring_lock);
+	io_opaque_send_cleanup(&w->req[i]);
+	mutex_unlock(&w->ctx->uring_lock);
+	w->req[i].flags &= ~REQ_F_NEED_CLEANUP;
 }
 
 /*
@@ -3494,6 +3554,7 @@ struct opaque_send_case {
 	bool frame_only;	/* a reply made of the frame alone */
 	bool unmanaged;		/* send_managed is N: a body that is not copied is spliced */
 	bool prepay;		/* send_prepay is Y */
+	bool prep;		/* the request is made by prep, from an SQE, and cleaned up after */
 	u32 prefix, suffix;
 };
 
@@ -3671,34 +3732,55 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	}
 	memcpy(want + at, frame + c->prefix, c->suffix);
 
-	if (c->vector) {
-		op = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent),
-				    c->last ? IORING_OPAQUE_SEND_LAST : 0);
+	if (c->prep) {
+		/* The request as prep makes it from the SQE: all that a send reads is set there. */
+		u16 ioprio = (c->vector ? IORING_OPAQUE_SEND_VECTOR : 0) |
+			     (c->last ? IORING_OPAQUE_SEND_LAST : 0);
+		unsigned long user = 0;
+
+		opaque_wire_prep_setup(test, w, store);
+		if (c->vector) {
+			user = opaque_uvec_map(test);
+			opaque_uvec_put(test, user, ent, sizeof(ent));
+		}
+		/* A frame is a pointer that prep does not follow: the first issue imports it. */
+		op = opaque_wire_prep(test, w, 0, ioprio,
+				      c->vector ? user : c->frame_only ? 0 : handle,
+				      c->vector || c->frame_only ? 0 : 4196,
+				      c->vector ? ARRAY_SIZE(ent) : body,
+				      c->prefix || c->suffix ? 0x1000 : 0);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
 	} else {
-		op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
-		KUNIT_ASSERT_NOT_NULL(test, op);
-		op->store = store;
-		op->send_flags = c->last ? IORING_OPAQUE_SEND_LAST : 0;
-		op->handle = c->frame_only ? 0 : handle;
-		op->offset = c->frame_only ? 0 : 4196;
-		op->length = body;
+		if (c->vector) {
+			op = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent),
+					    c->last ? IORING_OPAQUE_SEND_LAST : 0);
+		} else {
+			op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
+			KUNIT_ASSERT_NOT_NULL(test, op);
+			op->store = store;
+			op->send_flags = c->last ? IORING_OPAQUE_SEND_LAST : 0;
+			op->handle = c->frame_only ? 0 : handle;
+			op->offset = c->frame_only ? 0 : 4196;
+			op->length = body;
+		}
+		op->req = &w->req[0];
+		op->op = U16_MAX;
+		INIT_LIST_HEAD(&op->wait);
+		INIT_LIST_HEAD(&op->cancel);
+		INIT_LIST_HEAD(&op->send);
+		w->req[0].async_data = op;
+		w->req[0].flags = 0;
+		memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
 	}
-	op->req = &w->req[0];
-	op->op = U16_MAX;
-	INIT_LIST_HEAD(&op->wait);
-	INIT_LIST_HEAD(&op->cancel);
-	INIT_LIST_HEAD(&op->send);
-	w->req[0].async_data = op;
-	w->req[0].flags = 0;
-	memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
 	if (c->prefix || c->suffix) {
 		/* As the first issue leaves a request that has imported its frame. */
-		op->framing = frame;
+		op->framing = c->prep ? kmemdup(frame, c->prefix + c->suffix, GFP_KERNEL) : frame;
+		KUNIT_ASSERT_NOT_NULL(test, op->framing);
 		op->prefix_length = c->prefix;
 		op->suffix_length = c->suffix;
 		op->total_length = total;
 		op->resolved = true;
-	} else {
+	} else if (!c->prep) {
 		io_opaque_send_resolve(op);
 	}
 	KUNIT_ASSERT_TRUE(test, op->resolved);
@@ -3736,7 +3818,7 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	opaque_parts_expect(test, want_part, nwant, mode, true);
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED) - copied,
 			c->copy ? (u64)body : 0);
-	/* What the send held it has given back itself: there is no cleanup in this test. */
+	/* What the send held it has given back itself: there is no cleanup before this. */
 	KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
 	if (c->vector)
@@ -3744,6 +3826,12 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
+	if (c->prep) {
+		/* The count went with the socket; cleanup has the frame and the request. */
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+		opaque_wire_req_cleanup(w, 0);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
+	}
 
 	opaque_wire_read(test, w, got, 0, total);
 	KUNIT_EXPECT_MEMEQ(test, got, want, total);
@@ -3839,6 +3927,17 @@ static void opaque_send_msghdr_parts(struct kunit *test)
 		{ .prefix = 16, .frame_only = true, .unlocked = true },
 		{ .prefix = 24, .unlocked = true },
 		{ .prefix = 24, .suffix = 8, .unlocked = true, .vector = true, .last = true },
+		/* The request as prep makes it, poisoned as the stack of the send is. */
+		{ .prep = true },
+		{ .prep = true, .last = true, .unlocked = true },
+		{ .prep = true, .prefix = 24, .suffix = 8 },
+		{ .prep = true, .prefix = 24, .suffix = 8, .unmanaged = true },
+		{ .prep = true, .prefix = 24, .suffix = 8, .copy = true, .unlocked = true },
+		{ .prep = true, .prefix = 24, .suffix = 8, .prepay = true },
+		{ .prep = true, .prefix = 16, .frame_only = true },
+		{ .prep = true, .vector = true },
+		{ .prep = true, .vector = true, .last = true, .unlocked = true },
+		{ .prep = true, .vector = true, .prefix = 24, .suffix = 8, .prepay = true },
 	};
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
@@ -7066,6 +7165,121 @@ static void opaque_send_vec_prep_grows(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 0);
 }
 
+/* The member checks of opaque_send_prep_fields(), which say which byte and which shape. */
+#define OPAQUE_FIELD_EQ(got, want) \
+	KUNIT_EXPECT_EQ_MSG(test, got, want, "byte %02x, shape %u", byte, shape)
+#define OPAQUE_FIELD_PTR_EQ(got, want) \
+	KUNIT_EXPECT_PTR_EQ_MSG(test, got, want, "byte %02x, shape %u", byte, shape)
+#define OPAQUE_FIELD_TRUE(got) \
+	KUNIT_EXPECT_TRUE_MSG(test, got, "byte %02x, shape %u", byte, shape)
+#define OPAQUE_FIELD_FALSE(got) \
+	KUNIT_EXPECT_FALSE_MSG(test, got, "byte %02x, shape %u", byte, shape)
+
+/*
+ * The request of a send as prep leaves it, whatever the request held before: every member that
+ * the send reads before it writes it has its value, and the members that the SQE gives have what
+ * it gave. The request is filled with a byte first (io_opaque_send_poison, with three of them,
+ * since a member that should be zero or all ones is told from the byte only by one that is
+ * neither), so that one that prep leaves alone is what the byte made it. Five shapes: a range,
+ * LAST, a send with a frame to import, a reply of a frame alone, and a vector, whose block is
+ * the one member that the byte does not touch.
+ */
+static void opaque_send_prep_fields(struct kunit *test)
+{
+	static const u8 bytes[] = { 0x00, 0xa5, 0x5a };
+	static const struct {
+		u16 ioprio;
+		u64 off, addr3;
+		u32 msg_flags, len;
+		bool resolved;
+	} shapes[] = {
+		{ 0, 5, 0, 0, 100, true },
+		{ IORING_OPAQUE_SEND_LAST, 0, 0, MSG_MORE, 1, true },
+		{ 0, 9, 0x1000, MSG_DONTWAIT, 100, false },
+		{ IORING_OPAQUE_SEND_LAST, 0, 0x1000, 0, 0, false },
+		{ IORING_OPAQUE_SEND_VECTOR, 0, 0, 0, 3, true },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_prep *p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	const u64 h = io_opaque_handle(0, 9);
+	struct io_uring_opaque_send_entry ent[3] = {
+		{ .handle = h, .off = 0, .len = 10 }, { .handle = h, .off = 10, .len = 20 },
+		{ .handle = h, .off = 30, .len = 30 },
+	};
+	unsigned long addr;
+	unsigned int shape, j;
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	opaque_test_params_save(test);
+	opaque_prep_init(test, p, store);
+	addr = opaque_uvec_map(test);
+	opaque_uvec_put(test, addr, ent, sizeof(ent));
+	for (j = 0; j < ARRAY_SIZE(bytes); j++) {
+		u8 byte = bytes[j];
+
+		io_opaque_send_poison = byte;
+		for (shape = 0; shape < ARRAY_SIZE(shapes); shape++) {
+			bool vector = shapes[shape].ioprio & IORING_OPAQUE_SEND_VECTOR;
+			bool resolved = shapes[shape].resolved;
+			u32 len = vector ? 60 : shapes[shape].len;
+			struct io_opaque_req *op;
+
+			opaque_prep_sqe(p, shapes[shape].ioprio, vector ? addr : h,
+					shapes[shape].off, shapes[shape].len);
+			p->sqe.addr3 = shapes[shape].addr3;
+			p->sqe.msg_flags = shapes[shape].msg_flags;
+			KUNIT_ASSERT_EQ(test, opaque_prep_send(p, &op), 0);
+			KUNIT_ASSERT_NOT_NULL(test, op);
+			OPAQUE_FIELD_TRUE(p->req.flags & REQ_F_NEED_CLEANUP);
+			OPAQUE_FIELD_EQ(atomic_read(&store->requests), 1);
+			OPAQUE_FIELD_PTR_EQ(op->req, &p->req);
+			OPAQUE_FIELD_PTR_EQ(op->store, store);
+			/* Cancellation looks at the stream, lists and phase of what waits. */
+			OPAQUE_FIELD_PTR_EQ(op->stream, NULL);
+			OPAQUE_FIELD_PTR_EQ(op->data, NULL);
+			OPAQUE_FIELD_TRUE(list_empty(&op->wait));
+			OPAQUE_FIELD_TRUE(list_empty(&op->cancel));
+			OPAQUE_FIELD_EQ(op->phase, IO_OPAQUE_IDLE);
+			OPAQUE_FIELD_FALSE(op->canceled);
+			OPAQUE_FIELD_EQ(op->op, (u16)U16_MAX);
+			OPAQUE_FIELD_TRUE(op->counted);
+			OPAQUE_FIELD_FALSE(op->consumed);
+			OPAQUE_FIELD_EQ(op->progress, 0ULL);
+			/* The place in a queue, the frame and its charge. */
+			OPAQUE_FIELD_PTR_EQ(op->tx, NULL);
+			OPAQUE_FIELD_FALSE(op->tx_started);
+			OPAQUE_FIELD_PTR_EQ(op->framing, NULL);
+			OPAQUE_FIELD_EQ(op->frame_charge, 0U);
+			OPAQUE_FIELD_EQ(op->prefix_length, 0U);
+			OPAQUE_FIELD_EQ(op->suffix_length, 0U);
+			/* Resolved at once, or left to the first issue, which imports the frame. */
+			OPAQUE_FIELD_EQ(op->resolved, resolved);
+			OPAQUE_FIELD_EQ(op->total_length, resolved ? len : 0U);
+			/* And what the SQE says. */
+			OPAQUE_FIELD_EQ(op->send_flags, shapes[shape].ioprio);
+			OPAQUE_FIELD_EQ(op->msg_flags, shapes[shape].msg_flags);
+			OPAQUE_FIELD_EQ(op->length, len);
+			OPAQUE_FIELD_PTR_EQ(op->addr, u64_to_user_ptr(shapes[shape].addr3));
+			OPAQUE_FIELD_EQ(op->handle, vector ? 0 : h);
+			OPAQUE_FIELD_EQ(op->offset, vector ? 0 : shapes[shape].off);
+			OPAQUE_FIELD_EQ(!!(p->req.flags & REQ_F_NOWAIT),
+					!!(shapes[shape].msg_flags & MSG_DONTWAIT));
+			if (vector) {
+				KUNIT_ASSERT_NOT_NULL(test, op->vec);
+				OPAQUE_FIELD_EQ(op->vec->nr, 3U);
+				OPAQUE_FIELD_EQ(op->vec->pinned, 0U);
+			}
+			opaque_prep_done(p);
+			OPAQUE_FIELD_EQ(atomic_read(&store->requests), 0);
+		}
+	}
+}
+
+#undef OPAQUE_FIELD_EQ
+#undef OPAQUE_FIELD_PTR_EQ
+#undef OPAQUE_FIELD_TRUE
+#undef OPAQUE_FIELD_FALSE
+
 static void opaque_test_noop_work(struct work_struct *work)
 {
 }
@@ -7919,58 +8133,6 @@ static void opaque_send_parked_under_socket(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
-/*
- * Requests that are prepared, issued and cleaned up by the functions that the core calls, on the
- * fixture's ring. The ring knows @store as store 1 and keeps the requests that are cleaned up for
- * the next prep, as a ring does.
- */
-static void opaque_wire_prep_cleanup(void *arg)
-{
-	struct io_ring_ctx *ctx = arg;
-
-	io_opaque_cache_free(ctx);
-	xa_destroy(&ctx->opaque_stores);
-}
-
-static void opaque_wire_prep_setup(struct kunit *test, struct opaque_wire *w,
-				   struct io_opaque_store *store)
-{
-	unsigned int i;
-
-	xa_init(&w->ctx->opaque_stores);
-	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(w->ctx));
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_wire_prep_cleanup, w->ctx), 0);
-	store->config.max_requests = 8;
-	KUNIT_ASSERT_EQ(test, xa_err(xa_store(&w->ctx->opaque_stores, 1, store, GFP_KERNEL)), 0);
-	for (i = 0; i < ARRAY_SIZE(w->req); i++)
-		w->req[i].opcode = IORING_OP_OPAQUE_OBJ_SEND;
-}
-
-/* Prep request @i as its SQE would: a range, or the vector of @len entries at @addr. */
-static struct io_opaque_req *opaque_wire_prep(struct kunit *test, struct opaque_wire *w, int i,
-					      u16 ioprio, u64 addr, u64 off, u32 len)
-{
-	struct io_uring_sqe sqe = {
-		.opaque_store_id = 1, .ioprio = ioprio, .addr = addr, .off = off, .len = len,
-	};
-
-	w->req[i].flags = 0;
-	w->req[i].async_data = NULL;
-	memset(&w->req[i].cqe, 0, sizeof(w->req[i].cqe));
-	KUNIT_ASSERT_EQ(test, io_opaque_send_prep(&w->req[i], &sqe), 0);
-	KUNIT_ASSERT_NOT_NULL(test, w->req[i].async_data);
-	return w->req[i].async_data;
-}
-
-/* What the core does with a request that has ended or failed: its cleanup, under the ring lock. */
-static void opaque_wire_req_cleanup(struct opaque_wire *w, int i)
-{
-	mutex_lock(&w->ctx->uring_lock);
-	io_opaque_cleanup(&w->req[i]);
-	mutex_unlock(&w->ctx->uring_lock);
-	w->req[i].flags &= ~REQ_F_NEED_CLEANUP;
-}
-
 /* The place of requests in the store's count, as the ones that gave it back saw the socket. */
 static struct {
 	struct sock *sk;
@@ -8053,7 +8215,8 @@ static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, 
 	opaque_uncount_spy.sk = sk;
 	kunit_activate_static_stub(test, io_opaque_req_uncount, opaque_test_uncount_spy);
 
-	op = opaque_wire_prep(test, w, 0, flags, vector ? user : handle, 0, vector ? nr : len);
+	op = opaque_wire_prep(test, w, 0, flags, vector ? user : handle, 0, vector ? nr : len,
+			      0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 1);
 	KUNIT_EXPECT_TRUE(test, op->counted);
 
@@ -8103,7 +8266,7 @@ static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, 
 	}
 
 	if (mode == OPAQUE_LIFE_PARKED_CANCEL || mode == OPAQUE_LIFE_REFUSED) {
-		other = opaque_wire_prep(test, w, 1, 0, handle, 200, 300);
+		other = opaque_wire_prep(test, w, 1, 0, handle, 200, 300, 0);
 		nreq = 2;
 		KUNIT_EXPECT_EQ(test, atomic_read(&store->requests), 2);
 		if (mode == OPAQUE_LIFE_REFUSED)
@@ -8209,17 +8372,22 @@ static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, 
  */
 static void opaque_send_release_once(struct kunit *test)
 {
-	unsigned int mode, vector, last;
+	unsigned int mode, vector, last, poison;
 
-	for (mode = 0; mode < OPAQUE_LIFE_NR; mode++)
-		for (vector = 0; vector < 2; vector++)
-			for (last = 0; last < 2; last++) {
-				/* A frame behind a LAST send finds its object gone. */
-				if (last && (mode == OPAQUE_LIFE_PARKED_CANCEL ||
-					     mode == OPAQUE_LIFE_REFUSED))
-					continue;
-				opaque_life_run(test, mode, vector, last);
-			}
+	opaque_test_params_save(test);
+	/* Once with the request of each send filled with a byte first, for prep to write over. */
+	for (poison = 0; poison < 2; poison++) {
+		io_opaque_send_poison = poison ? 0xa5 : -1;
+		for (mode = 0; mode < OPAQUE_LIFE_NR; mode++)
+			for (vector = 0; vector < 2; vector++)
+				for (last = 0; last < 2; last++) {
+					/* A frame behind a LAST send finds its object gone. */
+					if (last && (mode == OPAQUE_LIFE_PARKED_CANCEL ||
+						     mode == OPAQUE_LIFE_REFUSED))
+						continue;
+					opaque_life_run(test, mode, vector, last);
+				}
+	}
 }
 
 /* What the window of an admission that has to grow its block saw, and the frame it lets in. */
@@ -11077,6 +11245,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_uses_cache),
 	KUNIT_CASE(opaque_compact_inline),
 	KUNIT_CASE(opaque_send_resolve),
+	KUNIT_CASE(opaque_send_prep_fields),
 	KUNIT_CASE(opaque_send_copy_policy),
 	KUNIT_CASE(opaque_send_loopback),
 	KUNIT_CASE(opaque_send_locked_path),
