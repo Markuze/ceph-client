@@ -536,6 +536,14 @@ static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opa
 		charge = backing->charge;
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
+		/*
+		 * A call of the actor has not settled a pending backing yet, and it
+		 * will. Nobody else may release one. If it happens, leak the chunk and
+		 * the page reference that the call will give it, rather than free the
+		 * chunk under the call.
+		 */
+		if (WARN_ON_ONCE(backing->ref == IO_OPAQUE_REF_PENDING))
+			return charge;
 		io_opaque_backing_put(store, backing);
 		chunk = container_of(backing, struct io_opaque_chunk, backing);
 		io_opaque_block_put(chunk->block, 1);
@@ -1902,7 +1910,9 @@ VISIBLE_IF_KUNIT int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *sk
 				     unsigned int offset, size_t length)
 {
 	struct io_opaque_stream *stream = desc->arg.data;
+	struct io_opaque_req *ready, *next;
 	unsigned int entry = offset;
+	LIST_HEAD(done);
 	u32 consumed = 0;
 	int ret = 0;
 
@@ -1955,10 +1965,22 @@ consumed:
 		if (op && op->progress == op->length) {
 			rb_erase_cached(&op->decision, &stream->decisions);
 			RB_CLEAR_NODE(&op->decision);
-			io_opaque_queue_ready(op, op->length);
+			/* Reported below, when nothing the range holds is pending. */
+			list_add_tail(&op->read, &done);
 		}
 	}
 	io_opaque_settle_call(stream, skb, entry, consumed);
+	/*
+	 * The completion of a range is task work of the ring of its request. That
+	 * can be another ring than the one that runs the pass, if the store is
+	 * shared, and then it runs at once, on another CPU, and does not take the
+	 * lock of the stream: it publishes the object, and the application may
+	 * free it. The backings of the range must have their references by then.
+	 */
+	list_for_each_entry_safe(ready, next, &done, read) {
+		list_del_init(&ready->read);
+		io_opaque_queue_ready(ready, ready->length);
+	}
 	if (!length && stream->next == U64_MAX)
 		stream->error = -EOVERFLOW;
 	return consumed ?: ret;

@@ -610,6 +610,38 @@ static void opaque_block_lifetime(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
+/*
+ * Nobody but its call may release a pending backing: the call settles it. If it
+ * happens, the chunk stays for the call to find, and is not freed under it.
+ */
+static void opaque_release_pending(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_extent *extent;
+	struct io_opaque_block *block;
+	struct page *page = alloc_page(GFP_KERNEL);
+	LIST_HEAD(list);
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	extent = io_opaque_extent_new(store, page, 0, 128, 0, 0);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	list_add(&extent->list, &list);
+	block = opaque_block_of(extent);
+	extent->backing->ref = IO_OPAQUE_REF_PENDING;
+	extent->backing->want = IO_OPAQUE_REF_PAGE;
+	extent->backing->units = 0;
+	kunit_warning_suppress(test) {
+		io_opaque_extent_free(store, extent);
+	}
+	/* The chunk is there, and so is the page. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&block->live), 1);
+	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	kfree(block);
+	put_page(page);
+}
+
 static void opaque_keep_restore(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
@@ -8618,6 +8650,75 @@ static void opaque_steal_soft_batch(struct kunit *test)
 }
 
 /*
+ * The task work that completes a range is the ring's of its request, and the
+ * store can be shared with another ring. It runs at once, on another CPU, and
+ * does not take the lock of the stream: it publishes the object, and the
+ * application frees it. This does that. Every backing of the range must hold
+ * its references by then, and the free must give them back to the pool.
+ */
+static void opaque_remote_free(struct io_opaque_req *op, int result)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct io_opaque_extent *extent;
+
+	if (op->op != IORING_OPAQUE_RECV_OBJECT || !op->data)
+		return;
+	list_for_each_entry(extent, &op->data->extents, list)
+		KUNIT_EXPECT_NE(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PENDING);
+	io_opaque_data_put(op->store, op->data);
+	op->data = NULL;
+}
+
+static void opaque_remote_completion_run(struct kunit *test, unsigned int pages)
+{
+	struct page_pool *pp = opaque_sized_pool(test, 128);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	struct io_opaque_req op = {
+		.store = store, .stream = &stream, .data = data,
+		.op = IORING_OPAQUE_RECV_OBJECT, .offset = 0, .length = pages * 100,
+	};
+	read_descriptor_t desc = { .count = SZ_1M, .arg.data = &stream };
+	struct page *all[IO_OPAQUE_BLOCK_CHUNKS];
+	struct sk_buff *top = NULL, *tail = NULL;
+	unsigned int made = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_LE(test, pages, (unsigned int)ARRAY_SIZE(all));
+	/* One skb, and children on its frag_list for what it cannot hold. */
+	while (made < pages) {
+		unsigned int n = min_t(unsigned int, pages - made, 17);
+		struct sk_buff *skb = opaque_pp_frags(test, pp, all + made, n, 100);
+
+		if (top)
+			opaque_pp_child(top, &tail, skb);
+		else
+			top = skb;
+		made += n;
+	}
+	opaque_test_stream(&stream, store);
+	kunit_activate_static_stub(test, io_opaque_queue_ready, opaque_remote_free);
+	KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&op), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, top, 0, top->len), (int)top->len);
+	/* The object was published and freed, and the call settled what it had left. */
+	KUNIT_EXPECT_NULL(test, op.data);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	kfree_skb(top);
+	KUNIT_EXPECT_EQ(test, opaque_ring_pages(pp), pages);
+	KUNIT_EXPECT_EQ(test, atomic_read(&pp->pages_state_release_cnt), 0);
+	io_opaque_capture_release(&stream);
+}
+
+/* A few fragments, and as many as fill and retire a block of chunks. */
+static void opaque_steal_remote_completion(struct kunit *test)
+{
+	opaque_remote_completion_run(test, 4);
+	opaque_remote_completion_run(test, IO_OPAQUE_BLOCK_CHUNKS);
+}
+
+/*
  * More fragments than the stream remembers settle in order: the oldest take
  * references of their own, and the skb keeps their fragments. The rest are
  * passed on. Every page has the references it needs at the end.
@@ -8699,6 +8800,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_private_budget),
 	KUNIT_CASE(opaque_split_shared_charge),
 	KUNIT_CASE(opaque_block_lifetime),
+	KUNIT_CASE(opaque_release_pending),
 	KUNIT_CASE(opaque_hold_flags),
 #if IS_ENABLED(CONFIG_PAGE_POOL)
 	KUNIT_CASE(opaque_capture_pool_page),
@@ -8717,6 +8819,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_steal_split_fragment),
 	KUNIT_CASE(opaque_steal_soft_batch),
 	KUNIT_CASE(opaque_steal_overflow),
+	KUNIT_CASE(opaque_steal_remote_completion),
 #endif
 	KUNIT_CASE(opaque_release_units),
 	KUNIT_CASE(opaque_capture_page_stats),
