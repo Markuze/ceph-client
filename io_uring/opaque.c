@@ -1419,6 +1419,11 @@ static bool io_opaque_pp_page(const struct sk_buff *skb, struct page *page)
  * then. A page reference would make the pool give the page up when the skb is
  * freed before the store lets go.
  *
+ * A reference of the pool keeps the pool alive for as long as an object holds
+ * it. After the device is removed, or when its driver creates its pools again,
+ * the old pool stays until the objects that hold its pages are freed, and the
+ * page pool code warns of a stalled shutdown every minute meanwhile.
+ *
  * A store with an instance keeps all the bytes that it captures in the area, so
  * that the process sees them through its mapping:
  *

@@ -514,6 +514,11 @@ original network allocation's accounting is independent. A page that a page
 pool owns, in a socket buffer marked for page pool recycling, is held by a page
 pool fragment reference, as the socket buffer holds it, and goes back to its
 pool when the last holder lets go. Any other page is held by a page reference.
+A page pool page that an object holds keeps its pool alive until the object is
+freed. After the device is removed, or when its driver creates its pools again,
+for example after a change of the ring sizes, the old pool stays until the
+objects that hold its pages are freed, and the kernel warns of a stalled pool
+shutdown every minute meanwhile. Free the objects of a device that goes away.
 When a pass consumes a receive buffer to its end, and nothing shares or clones
 the buffer, the backings take over the references that the buffer holds to its
 fragments from the offset at which the pass began, instead of taking new ones,
