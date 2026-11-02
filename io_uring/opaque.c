@@ -1511,7 +1511,8 @@ static void io_opaque_ref_take(struct io_opaque_store *store, struct io_opaque_b
  * that reference passes to the backing, and nothing is taken. Otherwise the
  * backing takes a reference of its own, unless it holds one already: the page
  * is pinned then, and its units do not depend on the fragment. Return whether
- * the reference of the skb passed.
+ * the reference of the skb passed. The counters count pages: a backing counts
+ * once, however many fragments of its page it holds.
  */
 static bool io_opaque_settle_ref(struct io_opaque_store *store, struct io_opaque_backing *backing,
 				 bool move)
@@ -1524,13 +1525,14 @@ static bool io_opaque_settle_ref(struct io_opaque_store *store, struct io_opaque
 			io_opaque_count(IO_OPAQUE_STAT_PAGES_HELD, 1);
 			return false;
 		}
-	} else if (move && backing->units < U16_MAX) {
-		backing->units++;
-	} else {
-		return false;
+		io_opaque_count(IO_OPAQUE_STAT_PAGES_STOLEN, 1);
+		return true;
 	}
-	io_opaque_count(IO_OPAQUE_STAT_PAGES_STOLEN, 1);
-	return true;
+	if (move && backing->units < U16_MAX) {
+		backing->units++;
+		return true;
+	}
+	return false;
 }
 
 /*
