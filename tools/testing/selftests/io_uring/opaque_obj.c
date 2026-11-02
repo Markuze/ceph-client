@@ -6045,6 +6045,108 @@ static void test_maio_device_small(struct io_uring_opaque_config cfg)
 	ksft_test_result_pass("store on a port: a full area makes an object wait for a free\n");
 }
 
+/*
+ * The collector of a stream runs in the ring that attached the socket, and with
+ * DEFER_TASKRUN its work waits until that ring is entered. Keep the ring of the
+ * collector going while another ring of the store waits for a completion.
+ */
+static struct event wait_tag_pumped(struct ring *collector, struct ring *r, uint64_t tag)
+{
+	struct timespec start, now;
+	struct event event;
+	unsigned int i;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		enter(collector, 0);
+		enter(r, 0);
+		for (i = 0; i < r->nr_saved; i++) {
+			if (r->saved[i].tag == tag) {
+				event = r->saved[i];
+				r->saved[i] = r->saved[--r->nr_saved];
+				return event;
+			}
+		}
+		while (peek(r, &event)) {
+			if (event.tag == tag)
+				return event;
+			require(r->nr_saved < 64, "pumped completion stash");
+			r->saved[r->nr_saved++] = event;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		require((now.tv_sec - start.tv_sec) * 1000 +
+			(now.tv_nsec - start.tv_nsec) / 1000000 < 10000, "pumped CQ wait deadline");
+		usleep(1000);
+	}
+}
+
+/*
+ * A store that two rings share. The collector runs in the first ring, and the
+ * second names the stream in a RECV_OBJECT, so the completion is task work of the
+ * second ring: it publishes the object there, and the application reads and
+ * frees it there. Rounds alternate between a range that waits for the bytes and
+ * bytes that wait for the range. The captured pages have to be the object's by
+ * the time the second ring completes it, and come back to the store when it is
+ * freed, whichever ring completes the range.
+ */
+static void test_shared_stream(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 3 * 4096 + 100;
+	unsigned char *data = malloc(2 * length), *got = data + length;
+	struct io_uring_opaque_stat stat;
+	uint64_t stream, tag, handle, cursor = 0;
+	uint32_t first, second;
+	struct ring a, b;
+	struct event event;
+	int pair[2], fd;
+	unsigned int round, j;
+
+	require(data && !ring_init(&a, IORING_SETUP_CQE32) && !register_store(&a, &cfg, &first),
+		"shared stream store");
+	tcp_pair(pair);
+	stream = attach(&a, first, pair[1], next_tag++);
+	fd = export_store(&a, first);
+	require(fd >= 0 && !ring_init(&b, IORING_SETUP_CQE32) && !import_store(&b, fd, &second),
+		"second ring of the shared store");
+	close(fd);
+	for (round = 0; round < 16; round++) {
+		for (j = 0; j < length; j++)
+			data[j] = (round * 31 + j) % 251;
+		tag = cmd_stage(&b, second, IORING_OPAQUE_RECV_OBJECT, stream, cursor,
+				length, NULL);
+		if (round & 1) {
+			/* The bytes are captured first; the second ring starts the range. */
+			write_all(pair[0], data, length);
+			enter(&a, 0);
+		} else {
+			/* The range waits in the stream; the collector completes it. */
+			enter(&b, 0);
+			write_all(pair[0], data, length);
+		}
+		event = wait_tag_pumped(&a, &b, tag);
+		require(event.res == (int)length && event.extra[0],
+			"object completed in the second ring");
+		handle = event.extra[0];
+		cursor += length;
+		require(command(&b, second, IORING_OPAQUE_READ_OBJECT, handle, 0, length,
+				got).res == (int)length && !memcmp(got, data, length),
+			"bytes of the object in the second ring");
+		require(!command(&b, second, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"free in the second ring");
+	}
+	ring_exit(&b);
+	require(!command(&a, first, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"shared stream close");
+	require(!command(&a, first, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.extents && !stat.objects,
+		"the objects of the second ring are gone, with their backing");
+	ring_exit(&a);
+	close(pair[0]);
+	close(pair[1]);
+	free(data);
+	ksft_test_result_pass("a range completed in the second ring of a shared store\n");
+}
+
 /* A counter of the module, which the kernel exports read-only; -1 if there is none. */
 static long long module_stat(const char *name)
 {
@@ -6244,7 +6346,7 @@ int main(void)
 		maio_ok = !maio_err;
 		ring_exit(&probe);
 	}
-	ksft_set_plan(123);
+	ksft_set_plan(124);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	test_create(cfg);
 	test_create_quota(cfg);
@@ -6531,5 +6633,6 @@ int main(void)
 	test_maio_device_small(cfg);
 	test_capture_cloned(cfg);
 	test_maio_device_stolen(cfg);
+	test_shared_stream(cfg);
 	ksft_finished();
 }
