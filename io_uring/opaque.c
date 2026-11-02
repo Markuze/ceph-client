@@ -5,6 +5,7 @@
 #include <linux/bvec.h>
 #include <linux/file.h>
 #include <linux/highmem.h>
+#include <linux/kasan.h>
 #include <linux/memcontrol.h>
 #include <linux/overflow.h>
 #include <linux/rbtree.h>
@@ -3627,8 +3628,36 @@ atomic_long_t io_opaque_ubuf_pools_live = ATOMIC_LONG_INIT(0);
  * at that moment may be on the list and not counted. A pool therefore holds at most
  * twice IO_OPAQUE_UBUF_POOL_MAX ubufs and a few more, in done and in stock, and no
  * more than the skbs of the store ever had in flight.
+ *
+ * KASAN. A ubuf in the pool is poisoned, as an entry of io_alloc_cache is, so that an
+ * access through a pointer that an skb kept to a ubuf that has completed is reported
+ * where it happens. It is poisoned before it is pushed, which is when the send side
+ * may take it, and unpoisoned when it is taken out or freed. The link is not: it
+ * shares its storage with the cursor, and the lists are read and written while the
+ * ubufs on them are poisoned. KASAN keeps the track of the free in the first bytes of
+ * the object, where the count is: a ubuf in the pool has a count of zero only in a
+ * build without KASAN, and with it the access that would have read the count is
+ * reported first. Without KASAN none of this is code.
  */
 #define IO_OPAQUE_UBUF_POOL_CLOSED	((struct llist_node *)1UL)
+
+/*
+ * A ubuf goes into the pool poisoned, but for its link. False is KASAN's word that it
+ * was freed already, which it has reported; the ubuf is not the pool's.
+ */
+static __always_inline bool io_opaque_ubuf_poison(struct io_opaque_ubuf *u)
+{
+	if (!kasan_mempool_poison_object(u))
+		return false;
+	kasan_unpoison_range(&u->node, sizeof(u->node));
+	return true;
+}
+
+/* It comes out of the pool, to be used by a skb or freed to the cache. */
+static __always_inline void io_opaque_ubuf_unpoison(struct io_opaque_ubuf *u)
+{
+	kasan_mempool_unpoison_object(u, sizeof(*u));
+}
 
 VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void)
 {
@@ -3666,8 +3695,10 @@ static void io_opaque_ubuf_free_chain(struct llist_node *node)
 {
 	while (node) {
 		struct llist_node *next = node->next;
+		struct io_opaque_ubuf *u = llist_entry(node, struct io_opaque_ubuf, node);
 
-		io_opaque_ubuf_free(llist_entry(node, struct io_opaque_ubuf, node));
+		io_opaque_ubuf_unpoison(u);
+		io_opaque_ubuf_free(u);
 		node = next;
 	}
 }
@@ -3683,10 +3714,15 @@ static bool io_opaque_ubuf_pool_push(struct io_opaque_ubuf_pool *pool, struct io
 
 	if (atomic_inc_return(&pool->nr) > IO_OPAQUE_UBUF_POOL_MAX)
 		goto refused;
+	/* Before the exchange that lets the send side have it, not after. */
+	if (!io_opaque_ubuf_poison(u))
+		goto refused;
 	first = READ_ONCE(pool->done.first);
 	do {
-		if (first == IO_OPAQUE_UBUF_POOL_CLOSED)
+		if (first == IO_OPAQUE_UBUF_POOL_CLOSED) {
+			io_opaque_ubuf_unpoison(u);
 			goto refused;
+		}
 		u->node.next = first;
 	} while (!try_cmpxchg(&pool->done.first, &first, &u->node));
 	return true;
@@ -3703,6 +3739,7 @@ refused:
  */
 VISIBLE_IF_KUNIT struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool)
 {
+	struct io_opaque_ubuf *u;
 	struct llist_node *node;
 
 	spin_lock(&pool->lock);
@@ -3720,7 +3757,12 @@ VISIBLE_IF_KUNIT struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque
 	if (node)
 		pool->stock = node->next;
 	spin_unlock(&pool->lock);
-	return node ? llist_entry(node, struct io_opaque_ubuf, node) : NULL;
+	if (!node)
+		return NULL;
+	/* After the link is read, and out of the lock: KASAN has a stack to save. */
+	u = llist_entry(node, struct io_opaque_ubuf, node);
+	io_opaque_ubuf_unpoison(u);
+	return u;
 }
 
 /*
@@ -4305,9 +4347,14 @@ VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, struct msghdr 
  * for each part, with the ring lock dropped around it.
  *
  * An inline issue that finds a frame ahead of it, or its own place not at the
- * front, has asked the hook and taken the socket for nothing, and parks as
- * soon as it has let the socket go. That is the rare case, and the hook's
- * verdict is dropped.
+ * front, has asked the hook and taken the socket for nothing, and parks. The
+ * join has set its phase under tx_lock (io_opaque_tx_join()), the request is
+ * then listed for cancellation (io_opaque_enroll()), and only then is the
+ * socket released. The head may hand the queue on, and queue the wakeup of the
+ * request, as soon as tx_lock is dropped. The wakeup is task work, which runs
+ * with the ring lock held, and an inline issue holds that throughout, so it
+ * cannot run until the request is listed and the issue has returned. That is
+ * the rare case, and the hook's verdict is dropped.
  *
  * Under IO_URING_F_UNLOCKED the ring lock is dropped before the socket is
  * taken, and an issue that owned the socket returns without taking it again,
@@ -4390,8 +4437,8 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	if (!joined) {
 		/*
 		 * A head finds its queue free under the socket, and goes on. One that finds a
-		 * frame ahead, or its own place not at the front, lets the socket go and parks,
-		 * in the ring lock it still holds.
+		 * frame ahead, or its own place not at the front, is parked and listed by the
+		 * join, and then lets the socket go with the ring lock still held.
 		 */
 		ret = io_opaque_send_join(op, sk, &fresh);
 		if (ret) {

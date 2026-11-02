@@ -259,7 +259,10 @@ struct io_opaque_ubuf {
 		 * so that it never outlives the call.
 		 */
 		struct io_opaque_send_cursor *cursor;
-		/* Link in the pool of a ubuf that has completed and is waiting for a skb. */
+		/*
+		 * Link in the pool of a ubuf that has completed and is waiting for a skb.
+		 * KASAN poisons a ubuf in the pool but for this (io_opaque_ubuf_poison()).
+		 */
 		struct llist_node node;
 	};
 	/* Where the ubuf goes when its last skb is freed; none for one that is only freed. */

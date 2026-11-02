@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
+#include <linux/delay.h>
 #include <linux/file.h>
 #include <linux/highmem.h>
 #include <linux/inet.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
+#include <linux/kthread.h>
 #include <linux/mman.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
@@ -15,6 +17,7 @@
 #include <linux/sched/user.h>
 #include <linux/skbuff.h>
 #include <linux/uaccess.h>
+#include <linux/xarray.h>
 #include <net/hotdata.h>
 #include <net/tcp.h>
 
@@ -11104,7 +11107,9 @@ static void opaque_ubuf_pool_reuse(struct kunit *test)
 	kfree_skb(skb);
 	/* It let go of its folio and went to the pool, not to the cache. */
 	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
-	KUNIT_EXPECT_EQ(test, refcount_read(&first->uarg.refcnt), 0U);
+	/* Under KASAN it is poisoned there, and the track of the free is where the count was. */
+	if (!IS_ENABLED(CONFIG_KASAN))
+		KUNIT_EXPECT_EQ(test, refcount_read(&first->uarg.refcnt), 0U);
 	OPAQUE_POOL_HELD(test, p, 1, 0);
 	opaque_pool_read(&after);
 	KUNIT_EXPECT_EQ(test, after.live - before.live, 1L);
@@ -11210,7 +11215,9 @@ static void opaque_ubuf_pool_share_one(struct kunit *test, unsigned int how)
 
 	/* The device's skb goes. The twin still holds the ubuf and its folios, unless it copied. */
 	kfree_skb(skb);
-	KUNIT_EXPECT_EQ(test, u->nr, 3);
+	/* The ubuf of a tap that copied is the pool's by now, and poisoned under KASAN. */
+	if (!copied || !IS_ENABLED(CONFIG_KASAN))
+		KUNIT_EXPECT_EQ(test, u->nr, 3);
 	if (copied) {
 		OPAQUE_POOL_HELD(test, p, 1, 0);
 		KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
@@ -11224,7 +11231,8 @@ static void opaque_ubuf_pool_share_one(struct kunit *test, unsigned int how)
 	/* The last one goes and the ubuf is the pool's, once, with every page given back. */
 	kfree_skb(twin);
 	OPAQUE_POOL_HELD(test, p, 1, 0);
-	KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 0U);
+	if (!IS_ENABLED(CONFIG_KASAN))
+		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 0U);
 	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
 	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
 	KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 1);
@@ -11549,6 +11557,259 @@ static void opaque_send_managed_pool(struct kunit *test)
 	opaque_pool_read(&after);
 	KUNIT_EXPECT_EQ(test, after.live, before.live);
 	KUNIT_EXPECT_EQ(test, after.pools, before.pools - 1);
+}
+
+/*
+ * The pool on several CPUs. OPAQUE_RACE_TAKERS tasks make skbs with ubufs through
+ * io_opaque_link_skb(), as sends do, and OPAQUE_RACE_FREERS tasks free them in the order they were
+ * made, every other one with bottom halves off as an ACK frees a skb, so that a ubuf completes on
+ * one CPU and is taken on another: the takers have the lock of the pool between them, the
+ * completions a compare-and-exchange. Each skb in use is entered under the address of its ubuf, and
+ * a second entry for one address is a ubuf that two skbs have at once: a duplicate. A ubuf comes
+ * out whole, as a new one is, whichever skb had it before.
+ */
+#define OPAQUE_RACE_TAKERS	3
+#define OPAQUE_RACE_FREERS	3
+#define OPAQUE_RACE_TASKS	(OPAQUE_RACE_TAKERS + OPAQUE_RACE_FREERS)
+/* The takers wait while this many skbs are in use, so that they do not run away from the freers. */
+#define OPAQUE_RACE_QUEUE	512
+
+struct opaque_race;
+
+struct opaque_race_task {
+	struct opaque_race *r;
+	struct completion done;
+};
+
+struct opaque_race {
+	struct opaque_pool *p;
+	/* The skbs in use, in the order they were made, and by the address of their ubuf. */
+	struct sk_buff_head queue;
+	struct xarray inuse;
+	/* The takers stop first, the freers when the queue is empty; they wait while held. */
+	atomic_t stop_take, stop_free, hold;
+	atomic_long_t taken, freed, dup, bad;
+	struct opaque_race_task task[OPAQUE_RACE_TASKS];
+};
+
+static int opaque_race_taker(void *data)
+{
+	struct opaque_race_task *t = data;
+	struct opaque_race *r = t->r;
+	unsigned long n = 0;
+
+	while (!atomic_read(&r->stop_take)) {
+		struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+		struct io_opaque_ubuf *u;
+
+		if (!skb) {
+			cond_resched();
+			continue;
+		}
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		if (io_opaque_link_skb(skb, &r->p->cursor.uarg)) {
+			kfree_skb(skb);
+			atomic_long_inc(&r->bad);
+			continue;
+		}
+		u = opaque_skb_ubuf(skb);
+		if (u->nr || u->cursor || u->pool != r->p->pool ||
+		    u->uarg.ops != &io_opaque_ubuf_ops || refcount_read(&u->uarg.refcnt) != 1)
+			atomic_long_inc(&r->bad);
+		switch (xa_insert(&r->inuse, (unsigned long)u >> 3, skb, GFP_KERNEL)) {
+		case 0:
+			break;
+		case -EBUSY:
+			atomic_long_inc(&r->dup);
+			break;
+		default:
+			atomic_long_inc(&r->bad);
+		}
+		while (skb_queue_len(&r->queue) > OPAQUE_RACE_QUEUE && !atomic_read(&r->stop_take))
+			cond_resched();
+		skb_queue_tail(&r->queue, skb);
+		atomic_long_inc(&r->taken);
+		if (!(++n & 31))
+			cond_resched();
+	}
+	complete(&t->done);
+	return 0;
+}
+
+static int opaque_race_freer(void *data)
+{
+	struct opaque_race_task *t = data;
+	struct opaque_race *r = t->r;
+	unsigned long n = 0;
+
+	for (;;) {
+		struct sk_buff *skb;
+
+		if (atomic_read(&r->hold)) {
+			cond_resched();
+			continue;
+		}
+		skb = skb_dequeue(&r->queue);
+		if (!skb) {
+			if (atomic_read(&r->stop_free))
+				break;
+			cond_resched();
+			continue;
+		}
+		xa_erase(&r->inuse, (unsigned long)opaque_skb_ubuf(skb) >> 3);
+		if (n++ & 1) {
+			local_bh_disable();
+			kfree_skb(skb);
+			local_bh_enable();
+		} else {
+			kfree_skb(skb);
+		}
+		atomic_long_inc(&r->freed);
+		if (!(n & 31))
+			cond_resched();
+	}
+	complete(&t->done);
+	return 0;
+}
+
+/*
+ * Make a pool and start the takers and the freers on it. The tasks are made before any is woken, so
+ * that one that cannot be made takes the others down before they have run, as they use what is made
+ * here. The freers wait while @hold.
+ */
+static struct opaque_race *opaque_race_start(struct kunit *test, bool hold)
+{
+	struct opaque_race *r = kunit_kzalloc(test, sizeof(*r), GFP_KERNEL);
+	struct task_struct *task[OPAQUE_RACE_TASKS];
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	r->p = opaque_pool_new(test);
+	skb_queue_head_init(&r->queue);
+	xa_init(&r->inuse);
+	atomic_set(&r->hold, hold);
+	for (i = 0; i < OPAQUE_RACE_TASKS; i++) {
+		r->task[i].r = r;
+		init_completion(&r->task[i].done);
+		task[i] = kthread_create(i < OPAQUE_RACE_TAKERS ? opaque_race_taker :
+					 opaque_race_freer, &r->task[i], "opaque_race%u", i);
+		if (IS_ERR(task[i])) {
+			while (i--)
+				kthread_stop(task[i]);
+			return NULL;
+		}
+	}
+	for (i = 0; i < OPAQUE_RACE_TASKS; i++)
+		wake_up_process(task[i]);
+	return r;
+}
+
+/* The takers stop and are waited for: every skb they made is queued. */
+static void opaque_race_stop_taking(struct opaque_race *r)
+{
+	unsigned int i;
+
+	atomic_set(&r->stop_take, 1);
+	for (i = 0; i < OPAQUE_RACE_TAKERS; i++)
+		wait_for_completion(&r->task[i].done);
+}
+
+/* The freers stop when the queue is empty, and are waited for: every skb is freed. */
+static void opaque_race_finish(struct opaque_race *r)
+{
+	unsigned int i;
+
+	atomic_set(&r->stop_free, 1);
+	for (i = OPAQUE_RACE_TAKERS; i < OPAQUE_RACE_TASKS; i++)
+		wait_for_completion(&r->task[i].done);
+}
+
+/*
+ * Takers and freers for a few seconds, and then the freers drain what is queued. Nobody gets a
+ * ubuf that another skb has, every ubuf comes whole, and every skb made is freed. What the cache
+ * made and has not got back is what the pool holds, on its list and in its stock, within its bound,
+ * give or take the ubufs of the freers that were in the middle of a push when the list was taken:
+ * each can leave one on the new list uncounted, and have one refused that was counted before the
+ * count was reset. The references of the pool are the store's and one for each ubuf it holds, and
+ * closing it gives them all back. It needs two CPUs to race on.
+ */
+static void opaque_ubuf_pool_smp_stress(struct kunit *test)
+{
+	struct opaque_pool_snap before, after;
+	unsigned int done, stocked;
+	struct opaque_race *r;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	opaque_pool_read(&before);
+	r = opaque_race_start(test, false);
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	/* The pool that the race made. */
+	before.pools++;
+	msleep(4000);
+	opaque_race_stop_taking(r);
+	opaque_race_finish(r);
+	done = opaque_pool_held(r->p->pool, &stocked);
+	opaque_pool_read(&after);
+	kunit_info(test, "cpus %u taken %ld freed %ld reused %llu live %ld done %u stock %u",
+		   num_online_cpus(), atomic_long_read(&r->taken), atomic_long_read(&r->freed),
+		   after.reused - before.reused, after.live - before.live, done, stocked);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->dup), 0L);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->bad), 0L);
+	KUNIT_EXPECT_EQ(test, skb_queue_len(&r->queue), 0U);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->taken), atomic_long_read(&r->freed));
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, (u64)atomic_long_read(&r->taken));
+	KUNIT_EXPECT_GT(test, after.reused - before.reused, 0ULL);
+	KUNIT_EXPECT_EQ(test, after.live - before.live, (long)(done + stocked));
+	KUNIT_EXPECT_LE(test, done, IO_OPAQUE_UBUF_POOL_MAX + 2 * OPAQUE_RACE_FREERS);
+	KUNIT_EXPECT_LE(test, done + stocked, 2 * IO_OPAQUE_UBUF_POOL_MAX + 4 * OPAQUE_RACE_FREERS);
+	KUNIT_EXPECT_EQ(test, refcount_read(&r->p->pool->refs), 1 + done + stocked);
+	xa_destroy(&r->inuse);
+	opaque_pool_close(r->p);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live, before.live);
+	KUNIT_EXPECT_EQ(test, after.pools, before.pools - 1);
+}
+
+/*
+ * The store goes while ubufs of its pool complete on other CPUs. In each round the takers fill the
+ * queue with skbs whose ubufs the pool made and stop, the freers are let go, and the pool is closed
+ * a little later than that, from not at all to nearly a millisecond: before the first completion,
+ * among them and after the last. Whatever the order, no ubuf is freed twice or left on a list that
+ * nobody takes, every one is back with the cache, and the pool is freed with the last of them.
+ */
+static void opaque_ubuf_pool_smp_close(struct kunit *test)
+{
+	unsigned int round;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	for (round = 0; round < 20; round++) {
+		struct opaque_pool_snap before, after;
+		unsigned long wait_until;
+		struct opaque_race *r;
+
+		opaque_pool_read(&before);
+		r = opaque_race_start(test, true);
+		KUNIT_ASSERT_NOT_NULL(test, r);
+		before.pools++;
+		wait_until = jiffies + 10 * HZ;
+		while (skb_queue_len(&r->queue) < 400 && time_before(jiffies, wait_until))
+			msleep(1);
+		KUNIT_EXPECT_GE(test, skb_queue_len(&r->queue), 400U);
+		opaque_race_stop_taking(r);
+		atomic_set(&r->hold, 0);
+		udelay(50 * round);
+		opaque_pool_close(r->p);
+		opaque_race_finish(r);
+		opaque_pool_read(&after);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&r->dup), 0L);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&r->bad), 0L);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&r->taken), atomic_long_read(&r->freed));
+		KUNIT_EXPECT_EQ(test, after.live, before.live);
+		KUNIT_EXPECT_EQ(test, after.pools, before.pools - 1);
+		xa_destroy(&r->inuse);
+	}
 }
 
 /*
@@ -11909,6 +12170,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_ubuf_pool_store),
 	KUNIT_CASE(opaque_ubuf_pool_atomic),
 	KUNIT_CASE(opaque_send_managed_pool),
+	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_stress),
+	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_close),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}

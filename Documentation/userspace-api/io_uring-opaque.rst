@@ -928,6 +928,24 @@ framed and mixed sends, and the completion in a softirq.
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.
 
+A UML kernel runs the tests with ``tools/testing/kunit/kunit.py run``, using a
+``--kunitconfig`` fragment that sets ``CONFIG_KUNIT``, ``CONFIG_IO_URING``,
+``CONFIG_NET``, ``CONFIG_INET``, ``CONFIG_IO_URING_OPAQUE_OBJ`` and
+``CONFIG_IO_URING_OPAQUE_OBJ_KUNIT_TEST``, and the lockdep and atomic-sleep
+options if wanted. Two cases race the ubuf pool of a store on several CPUs:
+three tasks take ubufs as sends do and three free the skbs that hold them, and
+in the second case the store goes meanwhile. They are skipped with fewer than
+two CPUs online, as on a UML kernel without ``CONFIG_SMP``. To run them, build
+with ``CONFIG_SMP=y`` and ``CONFIG_NR_CPUS=4`` and start UML with ``ncpus=4``,
+which it accepts only with ``seccomp=on``::
+
+  tools/testing/kunit/kunit.py run --build_dir="$build" \
+      --kunitconfig="$fragment" --kconfig_add CONFIG_SMP=y \
+      --kconfig_add CONFIG_NR_CPUS=4 --kernel_args ncpus=4 \
+      --kernel_args seccomp=on 'io_uring-opaque*'
+
+The VM below has two CPUs, so these cases run there.
+
 To test without replacing the host kernel, build ``bzImage`` with loopback,
 initramfs and serial-console support, build a static test, and use the optional
 QEMU helper. It requires QEMU x86_64, cpio and static BusyBox::
