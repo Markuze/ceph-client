@@ -8067,6 +8067,9 @@ static void opaque_capture_pool_other(struct kunit *test)
 	io_opaque_capture_release(&stream);
 }
 
+/* Fragments of a test skb: MAX_SKB_FRAGS is 17 to 45, depending on the configuration. */
+#define OPAQUE_TEST_FRAGS	17
+
 /* The skb of a driver: @nr pool pages in as many fragments of @size bytes, and their references. */
 static struct sk_buff *opaque_pp_frags(struct kunit *test, struct page_pool *pp,
 				       struct page **pages, unsigned int nr, unsigned int size)
@@ -8074,7 +8077,9 @@ static struct sk_buff *opaque_pp_frags(struct kunit *test, struct page_pool *pp,
 	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
 	unsigned int i;
 
+	BUILD_BUG_ON(OPAQUE_TEST_FRAGS > MAX_SKB_FRAGS);
 	KUNIT_ASSERT_NOT_NULL(test, skb);
+	KUNIT_ASSERT_LE(test, nr, (unsigned int)MAX_SKB_FRAGS);
 	for (i = 0; i < nr; i++) {
 		pages[i] = page_pool_dev_alloc_pages(pp);
 		KUNIT_ASSERT_NOT_NULL(test, pages[i]);
@@ -8744,12 +8749,12 @@ static void opaque_steal_head_frag_same_page(struct kunit *test)
  */
 static void opaque_steal_overflow_same_backing(struct kunit *test)
 {
-	const unsigned int per = 17, kids = 3, total = (kids + 1) * per;
+	const unsigned int per = OPAQUE_TEST_FRAGS, kids = 3, total = (kids + 1) * per;
 	struct page_pool *pp = opaque_sized_pool(test, 128);
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_stream stream;
 	read_descriptor_t desc = { .count = SZ_1M, .arg.data = &stream };
-	struct page *pages[(3 + 1) * 17];
+	struct page *pages[(3 + 1) * OPAQUE_TEST_FRAGS];
 	struct sk_buff *top, *kid[3], *tail = NULL;
 	struct page *shared;
 	skb_frag_t *frag;
@@ -8757,7 +8762,6 @@ static void opaque_steal_overflow_same_backing(struct kunit *test)
 	u64 held = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD);
 	unsigned int i, ring;
 
-	BUILD_BUG_ON(17 > MAX_SKB_FRAGS);
 	top = opaque_pp_frags(test, pp, pages, per, 100);
 	for (i = 0; i < kids; i++) {
 		kid[i] = opaque_pp_frags(test, pp, pages + (i + 1) * per, per, 100);
@@ -8835,7 +8839,7 @@ static void opaque_remote_completion_run(struct kunit *test, unsigned int pages)
 	KUNIT_ASSERT_LE(test, pages, (unsigned int)ARRAY_SIZE(all));
 	/* One skb, and children on its frag_list for what it cannot hold. */
 	while (made < pages) {
-		unsigned int n = min_t(unsigned int, pages - made, 17);
+		unsigned int n = min_t(unsigned int, pages - made, OPAQUE_TEST_FRAGS);
 		struct sk_buff *skb = opaque_pp_frags(test, pp, all + made, n, 100);
 
 		if (top)
@@ -8908,18 +8912,19 @@ static void opaque_steal_overflow(struct kunit *test)
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_stream stream;
 	read_descriptor_t desc = { .count = SZ_1M, .arg.data = &stream };
-	struct page *pages[5 * MAX_SKB_FRAGS];
+	const unsigned int per = OPAQUE_TEST_FRAGS, kids = 5, total = 5 * OPAQUE_TEST_FRAGS;
+	struct page *pages[5 * OPAQUE_TEST_FRAGS];
 	struct sk_buff *top = alloc_skb(0, GFP_KERNEL), *tail = NULL, *kid[5];
 	u64 stolen = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN);
 	u64 held = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD);
-	unsigned int i, early = IO_OPAQUE_PENDING_MAX / 2, total = 5 * MAX_SKB_FRAGS;
+	unsigned int i, early = IO_OPAQUE_PENDING_MAX / 2;
 
 	KUNIT_ASSERT_NOT_NULL(test, top);
 	KUNIT_ASSERT_GT(test, total, (unsigned int)IO_OPAQUE_PENDING_MAX);
 	opaque_test_stream(&stream, store);
 	opaque_test_scratch(test, &stream);
-	for (i = 0; i < 5; i++) {
-		kid[i] = opaque_pp_frags(test, pp, pages + i * MAX_SKB_FRAGS, MAX_SKB_FRAGS, 100);
+	for (i = 0; i < kids; i++) {
+		kid[i] = opaque_pp_frags(test, pp, pages + i * per, per, 100);
 		opaque_pp_child(top, &tail, kid[i]);
 	}
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, top, 0, top->len), (int)top->len);
@@ -8930,10 +8935,11 @@ static void opaque_steal_overflow(struct kunit *test)
 	for (i = 0; i < total; i++)
 		KUNIT_EXPECT_EQ(test, opaque_pp_refs(pages[i]), i < early ? 2L : 1L);
 	/* The skb keeps what the oldest settled, up to the first fragment that was passed on. */
-	KUNIT_EXPECT_EQ(test, skb_shinfo(kid[0])->nr_frags, (u8)MAX_SKB_FRAGS);
-	KUNIT_EXPECT_EQ(test, skb_shinfo(kid[1])->nr_frags, (u8)(early - MAX_SKB_FRAGS));
-	for (i = 2; i < 5; i++)
-		KUNIT_EXPECT_EQ(test, skb_shinfo(kid[i])->nr_frags, (u8)0);
+	for (i = 0; i < kids; i++) {
+		unsigned int kept = early > i * per ? min(early - i * per, per) : 0;
+
+		KUNIT_EXPECT_EQ(test, skb_shinfo(kid[i])->nr_frags, (u8)kept);
+	}
 	kfree_skb(top);
 	for (i = 0; i < total; i++)
 		KUNIT_EXPECT_EQ(test, opaque_pp_refs(pages[i]), 1L);
