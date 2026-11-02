@@ -271,9 +271,9 @@ struct io_opaque_stream {
 	bool hold_undecided;
 	/*
 	 * The call of the actor that is under way, if any: the references that
-	 * its captures have still to settle. The first call allocates the room
-	 * for IO_OPAQUE_PENDING_MAX of them, and the last put of the stream frees
-	 * it. Under lock, as everything else of the capture.
+	 * its captures have still to settle. Attaching the stream allocates the
+	 * room for IO_OPAQUE_PENDING_MAX of them, and the last put frees it. Under
+	 * lock, as everything else of the capture.
 	 */
 	bool in_call;
 	/* The offset in the skb at which the call began. */

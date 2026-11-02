@@ -71,6 +71,16 @@ static void opaque_test_stream(struct io_opaque_stream *stream,
 	stream->decisions = RB_ROOT_CACHED;
 }
 
+/*
+ * The room that attaching gives a stream for the references of a call.
+ * io_opaque_capture_release() frees it.
+ */
+static void opaque_test_scratch(struct kunit *test, struct io_opaque_stream *stream)
+{
+	stream->pending = kmalloc_objs(*stream->pending, IO_OPAQUE_PENDING_MAX, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, stream->pending);
+}
+
 static struct sk_buff *opaque_test_frag(struct kunit *test, struct page *page,
 					unsigned int offset, unsigned int length)
 {
@@ -334,6 +344,7 @@ static void opaque_capture_partial_pressure(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, skb);
 	store->config.hard_limit = PAGE_SIZE;
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	get_page(first);
 	get_page(second);
 	skb_add_rx_frag(skb, 0, first, 0, 512, PAGE_SIZE);
@@ -1738,6 +1749,7 @@ static void opaque_collect_gate(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, page);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	mutex_init(&stream.lock);
 	/* Open gate: undecided bytes are retained, not copied. */
 	skb = opaque_test_frag(test, page, 0, PAGE_SIZE);
@@ -4252,6 +4264,7 @@ static void opaque_attach_lock_order(struct kunit *test)
 	lockdep_assert_none_held_once();
 	stream = op[0]->stream;
 	KUNIT_ASSERT_NOT_NULL(test, stream);
+	KUNIT_EXPECT_NOT_NULL(test, stream->pending);
 	KUNIT_EXPECT_PTR_EQ(test, sk->sk_rx_owner, &stream->owner);
 	KUNIT_EXPECT_PTR_EQ(test, store->streams[0].stream, stream);
 	KUNIT_EXPECT_EQ(test, store->nr_streams, 1U);
@@ -7286,6 +7299,7 @@ static void opaque_maio_steal(struct kunit *test)
 	skb = opaque_pool_skb(test, page, 0, 1000);
 	skb_add_rx_frag(skb, 1, plain, 0, 1000, PAGE_SIZE);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, skb->len), 2000);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)0);
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN), stolen + 2);
@@ -7671,6 +7685,7 @@ static void opaque_maio_exhausted(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, io_zcrx_maio_copy_page(ifq, &off));
 	memset(skb_put(skb, 100), 0x51, 100);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 
 	/* No free page: nothing is charged and nothing is kept. */
 	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 100, false), -ENOMEM);
@@ -8108,6 +8123,7 @@ static void opaque_steal_whole_skb(struct kunit *test)
 	unsigned int i = 0;
 
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, len), (int)len);
 	KUNIT_EXPECT_EQ(test, desc.error, 0);
 	KUNIT_EXPECT_EQ(test, stream.next, (u64)len);
@@ -8161,6 +8177,7 @@ static void opaque_steal_partial_call(struct kunit *test)
 	unsigned int i;
 
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	/* The budget lets one page in: the call stops at the second fragment. */
 	store->config.hard_limit = PAGE_SIZE;
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, len), 1000);
@@ -8216,6 +8233,7 @@ static void opaque_steal_straddle(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	opaque_test_wakeups(test);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	/* The object takes the first 1500 bytes, and the gate holds the rest on the socket. */
 	stream.hold_undecided = true;
 	KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&op), 0);
@@ -8265,6 +8283,7 @@ static void opaque_steal_cloned_copies(struct kunit *test)
 	clone = skb_clone(skb, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, clone);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, len), (int)len);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)4);
 	for (i = 0; i < 4; i++)
@@ -8307,6 +8326,7 @@ static void opaque_steal_mixed_discard(struct kunit *test)
 
 	opaque_test_wakeups(test);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&discard), 0);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, len), (int)len);
 	KUNIT_EXPECT_EQ(test, discard.progress, 2000ULL);
@@ -8349,6 +8369,7 @@ static void opaque_steal_fraglist(struct kunit *test)
 	unsigned int i;
 
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	for (i = 0; i < 2; i++) {
 		kid[i] = opaque_pp_frags(test, pp, pages + 2 + 2 * i, 2, 1000);
 		opaque_pp_child(top, &tail, kid[i]);
@@ -8399,6 +8420,7 @@ static void opaque_steal_fraglist_whole(struct kunit *test)
 	unsigned int i;
 
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	for (i = 0; i < 2; i++) {
 		kid[i] = opaque_pp_frags(test, pp, pages + 2 + 2 * i, 2, 1000);
 		opaque_pp_child(top, &tail, kid[i]);
@@ -8448,6 +8470,7 @@ static void opaque_steal_head_pool_ref(struct kunit *test)
 	}
 	skb_mark_for_recycle(skb);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, skb->len), 2600);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)0);
 	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
@@ -8497,6 +8520,7 @@ static void opaque_steal_same_page_two_skbs(struct kunit *test)
 	skb_mark_for_recycle(b);
 	KUNIT_EXPECT_EQ(test, opaque_pp_refs(page), 2L);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, a, 0, 1000), 1000);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, b, 0, 1000), 1000);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(a)->nr_frags, (u8)0);
@@ -8549,6 +8573,7 @@ static void opaque_steal_kind_mismatch(struct kunit *test)
 	get_page(page);
 	skb_add_rx_frag(b, 0, page, 2000, 1000, PAGE_SIZE);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, a, 0, 1000), 1000);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, b, 0, 1000), 1000);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(a)->nr_frags, (u8)0);
@@ -8599,6 +8624,7 @@ static void opaque_steal_split_fragment(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	opaque_test_wakeups(test);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&op), 0);
 	/* The middle third goes to an object: a backing of its own on the same page. */
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, 3000), 3000);
@@ -8639,6 +8665,7 @@ static void opaque_steal_soft_batch(struct kunit *test)
 	struct sk_buff *next = opaque_pp_frags(test, pp, pages, 4, 1000);
 
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, skb->len), 4000);
 	KUNIT_EXPECT_EQ(test, desc.count, (size_t)0);
 	KUNIT_EXPECT_EQ(test, stream.next, 4000ULL);
@@ -8684,6 +8711,7 @@ static void opaque_steal_head_frag_same_page(struct kunit *test)
 	skb_mark_for_recycle(skb);
 	KUNIT_EXPECT_EQ(test, opaque_pp_refs(page), 2L);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, skb->len), 1600);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)0);
 	list_for_each_entry(extent, &stream.extents, list) {
@@ -8748,6 +8776,7 @@ static void opaque_steal_overflow_same_backing(struct kunit *test)
 	ring = opaque_ring_pages(pp);
 	KUNIT_EXPECT_EQ(test, opaque_pp_refs(shared), 2L);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, top, 0, top->len), (int)top->len);
 	/* The fragment of the skb, the backing's own, and the one passed on. */
 	KUNIT_EXPECT_EQ(test, opaque_pp_refs(shared), 3L);
@@ -8816,6 +8845,7 @@ static void opaque_remote_completion_run(struct kunit *test, unsigned int pages)
 		made += n;
 	}
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	kunit_activate_static_stub(test, io_opaque_queue_ready, opaque_remote_free);
 	KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&op), 0);
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, top, 0, top->len), (int)top->len);
@@ -8834,6 +8864,37 @@ static void opaque_steal_remote_completion(struct kunit *test)
 {
 	opaque_remote_completion_run(test, 4);
 	opaque_remote_completion_run(test, IO_OPAQUE_BLOCK_CHUNKS);
+}
+
+/*
+ * A stream without the room for a call, which only a test makes, takes its
+ * references at once and leaves the skb as it is.
+ */
+static void opaque_steal_no_room(struct kunit *test)
+{
+	struct page_pool *pp = opaque_plain_pool(test);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	read_descriptor_t desc = { .count = SZ_1M, .arg.data = &stream };
+	struct page *pages[4];
+	struct sk_buff *skb = opaque_pp_frags(test, pp, pages, 4, 1000);
+	u64 stolen = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN);
+	u64 held = io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD);
+	unsigned int i;
+
+	opaque_test_stream(&stream, store);
+	KUNIT_EXPECT_NULL(test, stream.pending);
+	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, skb->len), 4000);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)4);
+	for (i = 0; i < 4; i++)
+		KUNIT_EXPECT_EQ(test, opaque_pp_refs(pages[i]), 2L);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD), held + 4);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN), stolen);
+	kfree_skb(skb);
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, opaque_ring_pages(pp), 4U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&pp->pages_state_release_cnt), 0);
+	io_opaque_capture_release(&stream);
 }
 
 /*
@@ -8856,6 +8917,7 @@ static void opaque_steal_overflow(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, top);
 	KUNIT_ASSERT_GT(test, total, (unsigned int)IO_OPAQUE_PENDING_MAX);
 	opaque_test_stream(&stream, store);
+	opaque_test_scratch(test, &stream);
 	for (i = 0; i < 5; i++) {
 		kid[i] = opaque_pp_frags(test, pp, pages + i * MAX_SKB_FRAGS, MAX_SKB_FRAGS, 100);
 		opaque_pp_child(top, &tail, kid[i]);
@@ -8937,6 +8999,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_steal_split_fragment),
 	KUNIT_CASE(opaque_steal_soft_batch),
 	KUNIT_CASE(opaque_steal_overflow),
+	KUNIT_CASE(opaque_steal_no_room),
 	KUNIT_CASE(opaque_steal_head_frag_same_page),
 	KUNIT_CASE(opaque_steal_overflow_same_backing),
 	KUNIT_CASE(opaque_steal_remote_completion),

@@ -1922,12 +1922,9 @@ VISIBLE_IF_KUNIT int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *sk
 	if (!desc->count)
 		length = 0;
 	/*
-	 * Without the room for the call, which is only a failed allocation, the
-	 * backings take their references at once.
+	 * A stream that attached has the room for the call. One without it, which
+	 * only a test makes, takes the references at once.
 	 */
-	if (!stream->pending)
-		stream->pending = kmalloc_objs(*stream->pending, IO_OPAQUE_PENDING_MAX,
-					       GFP_KERNEL_ACCOUNT);
 	stream->in_call = !!stream->pending;
 	stream->call_entry = entry;
 	stream->nr_pending = 0;
@@ -2053,6 +2050,13 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	stream = kzalloc_obj(*stream, GFP_KERNEL_ACCOUNT);
 	if (!stream)
 		return -ENOMEM;
+	/* The room that a call of the actor remembers its backings in, see io_opaque_actor(). */
+	stream->pending = kmalloc_objs(*stream->pending, IO_OPAQUE_PENDING_MAX,
+				       GFP_KERNEL_ACCOUNT);
+	if (!stream->pending) {
+		kfree(stream);
+		return -ENOMEM;
+	}
 	refcount_set(&stream->refs, 1);
 	mutex_init(&stream->lock);
 	INIT_LIST_HEAD(&stream->extents);
