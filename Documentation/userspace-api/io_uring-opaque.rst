@@ -93,7 +93,8 @@ compact backing or cancel pending work to make capacity available; eligible
 collectors resume automatically after release. No replacement COLLECT is needed.
 Collection follows the application's capture policy. When collection is
 permitted, one pass may take everything that has arrived, bounded by the
-256 KiB batch and the store quota. Undecided bytes stay in their original
+256 KiB batch, which a pass exceeds by the rest of the receive buffer it is in,
+and the store quota. Undecided bytes stay in their original
 receive buffers: the policy never copies them, and only INSPECT copies the
 requested header bytes to userspace. The copy fallback described under
 "Backing and memory management" still applies. While a stream holds
@@ -513,6 +514,12 @@ original network allocation's accounting is independent. A page that a page
 pool owns, in a socket buffer marked for page pool recycling, is held by a page
 pool fragment reference, as the socket buffer holds it, and goes back to its
 pool when the last holder lets go. Any other page is held by a page reference.
+When a pass consumes a receive buffer to its end, and nothing shares or clones
+the buffer, the backings take over the references that the buffer holds to its
+fragments from the offset at which the pass began, instead of taking new ones,
+and TCP frees the buffer without them. The head of the buffer, the fragment in
+which the pass began, and every buffer that a pass leaves before its end are
+held by references of the backings' own.
 Owned copy and
 compaction pages already use accounted allocation and are not charged twice.
 Copy fallback appends into unused space in the previous owned page;
@@ -552,8 +559,8 @@ The protected allowance permits bounded framed and generated-only replies
 even when payload capacity is full. A stream that holds undecided bytes
 cannot refill capacity freed by the application; it stays held until the
 application decides those bytes. Any stream whose collection is permitted
-can still take one pass of up to 256 KiB, which can fill a small store
-before a reply is admitted; that is what ``reply_reserve`` is for.
+can still take one pass of up to 256 KiB, and the rest of the receive buffer it
+is in, which can fill a small store before a reply is admitted; that is what ``reply_reserve`` is for.
 Concurrent snapshots can still exhaust the reply reserve once capture capacity
 is full, and allocation or request admission can fail independently. Framing
 cannot consume compaction headroom. With a zero reply reserve, snapshots share

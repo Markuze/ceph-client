@@ -42,6 +42,8 @@
 #define IO_OPAQUE_POLICY_CHUNK	256
 /* Chunks, and so backings, that a stream allocates at a time. */
 #define IO_OPAQUE_BLOCK_CHUNKS	32
+/* Backings that one call of the actor leaves undecided; more settle at once. */
+#define IO_OPAQUE_PENDING_MAX	64
 
 /* What io_opaque_tx_join() returns besides an error. */
 /* Queued behind another frame and parked, with its references taken. */
@@ -89,6 +91,8 @@ struct io_opaque_backing {
 	u16 units;
 	/* An enum io_opaque_ref. */
 	u8 ref;
+	/* While @ref is pending, the kind of reference that settles it. */
+	u8 want;
 	bool copied;
 	bool accounted;
 	/* The page is in the area of the MAIO instance that the store binds. */
@@ -218,6 +222,31 @@ struct io_opaque_vec {
 	struct bio_vec *bv;
 };
 
+/*
+ * Where the bytes of a capture come from, when the pass that captures them may
+ * take over the reference of the skb to the page: the skb, which is the one
+ * that TCP handed to the actor or a child on its frag_list, the index of the
+ * fragment in it, or -1 for its head, and whether the fragment lies wholly at or
+ * after the offset at which the pass began.
+ */
+struct io_opaque_src {
+	struct sk_buff *skb;
+	s16 frag;
+	bool from_entry;
+};
+
+/*
+ * A backing that a pass created or joined, and the fragment it did so for. The
+ * pass settles them when it has consumed what it came for, see
+ * io_opaque_actor().
+ */
+struct io_opaque_pending {
+	struct io_opaque_backing *backing;
+	struct io_opaque_src src;
+	/* Settled: the reference of the skb to the fragment passed to the backing. */
+	bool moved;
+};
+
 struct io_opaque_stream {
 	refcount_t refs;
 	/* Extents, range decisions and collector state. */
@@ -240,6 +269,17 @@ struct io_opaque_stream {
 	bool closed;
 	/* Collection pass may not take undecided bytes off the socket. */
 	bool hold_undecided;
+	/*
+	 * The call of the actor that is under way, if any: the references that
+	 * its captures have still to settle. The first call allocates the room
+	 * for IO_OPAQUE_PENDING_MAX of them, and the last put of the stream frees
+	 * it. Under lock, as everything else of the capture.
+	 */
+	bool in_call;
+	/* The offset in the skb at which the call began. */
+	u32 call_entry;
+	u32 nr_pending;
+	struct io_opaque_pending *pending;
 };
 
 /*
@@ -489,6 +529,7 @@ struct io_opaque_extent *io_opaque_stream_extent_new(struct io_opaque_stream *st
 						     u32 length, u64 start,
 						     unsigned int flags);
 void io_opaque_block_retire(struct io_opaque_stream *stream);
+void io_opaque_capture_release(struct io_opaque_stream *stream);
 void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation);
 void io_opaque_extent_free(struct io_opaque_store *store,
 			   struct io_opaque_extent *extent);
@@ -513,9 +554,8 @@ void io_opaque_budget_wait(struct io_opaque_req *op, int error);
 void io_opaque_stream_close(struct io_opaque_stream *stream);
 void io_opaque_stream_put(struct io_opaque_stream *stream);
 int io_opaque_attach(struct io_opaque_req *op);
-int io_opaque_capture(struct io_opaque_stream *stream,
-		      const struct sk_buff *skb, u32 offset, u32 len,
-		      bool shared);
+int io_opaque_capture(struct io_opaque_stream *stream, struct sk_buff *skb,
+		      u32 offset, u32 len, bool shared);
 int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 		    unsigned int offset, size_t length);
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);

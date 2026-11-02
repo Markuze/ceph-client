@@ -1659,6 +1659,13 @@ EXPORT_SYMBOL(tcp_recv_skb);
  *	- At present, there is no support for reading OOB data
  *	  or for 'peeking' the socket using this routine
  *	  (although both would be easy to implement).
+ *	- An actor that consumes the rest of an skb that is neither shared nor
+ *	  cloned may take over the references to the fragments of that skb from
+ *	  the consumed offset on, and set skb_shinfo(skb)->nr_frags to what it
+ *	  leaves, as skb_gro_receive() does for a merged skb. len, data_len and
+ *	  truesize must stay as they are: this routine looks at len again, and
+ *	  tcp_eat_recv_skb() uncharges truesize and frees the skb as soon as the
+ *	  actor returns.
  */
 static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 			   sk_read_actor_t recv_actor, bool noack,

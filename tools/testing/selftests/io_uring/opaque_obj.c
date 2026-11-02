@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/ethtool.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/opaque.h>
 #include <linux/sockios.h>
@@ -6043,6 +6045,161 @@ static void test_maio_device_small(struct io_uring_opaque_config cfg)
 	ksft_test_result_pass("store on a port: a full area makes an object wait for a free\n");
 }
 
+/* A counter of the module, which the kernel exports read-only; -1 if there is none. */
+static long long module_stat(const char *name)
+{
+	char path[128], text[32];
+	ssize_t n;
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/module/io_uring_opaque/parameters/stat_%s", name);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	text[n] = 0;
+	return strtoll(text, NULL, 10);
+}
+
+/*
+ * An skb that anyone else shares or clones is not the collector's to take apart.
+ * A packet socket on the loopback device keeps a clone of every segment until
+ * it is read, so the segments that reach the collector are cloned. It copies
+ * their bytes, takes none of their references, and leaves the skbs as they are:
+ * no page is taken over, and the stream arrives intact.
+ */
+static void test_capture_cloned(struct io_uring_opaque_config cfg)
+{
+	struct sockaddr_ll ll = { .sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_ALL) };
+	const size_t length = 32768;
+	struct io_uring_opaque_stat stat;
+	unsigned char *data = malloc(2 * length), *got = data + length;
+	long long stolen = module_stat("pages_stolen"), copied = module_stat("pages_copied");
+	uint64_t stream, handle, tag, cursor = 0;
+	int pair[2], pkt, big = 64 << 20, i;
+	struct event event;
+	struct ring r;
+	uint32_t context;
+
+	if (stolen < 0 || copied < 0) {
+		ksft_test_result_skip("the module exports no page counters\n");
+		free(data);
+		return;
+	}
+	pkt = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+	if (pkt < 0) {
+		ksft_test_result_skip("no packet socket: %s\n", strerror(errno));
+		free(data);
+		return;
+	}
+	ll.sll_ifindex = if_nametoindex("lo");
+	require(data && ll.sll_ifindex && !bind(pkt, (void *)&ll, sizeof(ll)),
+		"packet socket on the loopback device");
+	/* The clones stay queued while the test runs: the socket never reads. */
+	if (setsockopt(pkt, SOL_SOCKET, SO_RCVBUFFORCE, &big, sizeof(big)))
+		setsockopt(pkt, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+	require(!ring_init(&r, IORING_SETUP_CQE32) && !register_store(&r, &cfg, &context),
+		"cloned segments store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], next_tag++);
+	for (i = 0; i < 3; i++) {
+		memset(data, 'p' + i, length);
+		tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, cursor, length,
+				NULL);
+		write_all(pair[0], data, length);
+		event = wait_tag(&r, tag);
+		require(event.res == (int)length && event.extra[0], "object of cloned segments");
+		handle = event.extra[0];
+		cursor += length;
+		require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handle, 0, length,
+				got).res == (int)length && !memcmp(got, data, length),
+			"bytes of cloned segments");
+		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"free the object of cloned segments");
+	}
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
+		"cloned segments store stat");
+	require(stat.copied_bytes == 3 * length, "every byte of a cloned segment is copied");
+	require(module_stat("pages_stolen") == stolen, "no page of a cloned segment is taken over");
+	require(module_stat("pages_copied") > copied, "the bytes are copied into pages");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"cloned segments stream close");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	close(pkt);
+	free(data);
+	ksft_test_result_pass("cloned segments are copied, and no page is taken over\n");
+}
+
+/*
+ * The skbs of a port with an instance are the driver's own: not shared, not cloned,
+ * and the pool pages in them are held by the pool references of the skbs. The
+ * collector takes those references over when it consumes an skb to its end, so
+ * the counter of pages taken over grows, and not a byte is copied.
+ */
+static void test_maio_device_stolen(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 16384;
+	struct io_uring_opaque_extent vec[64];
+	struct io_uring_opaque_stat stat;
+	long long stolen = module_stat("pages_stolen"), copied = module_stat("pages_copied");
+	unsigned char *data, *got;
+	uint64_t stream, handle, cursor = 0;
+	unsigned int round;
+	struct event event;
+	uint16_t port;
+	uint32_t bound;
+	struct maio z;
+	struct ring r;
+	struct pair pr;
+	int sock, listener;
+
+	if (stolen < 0 || copied < 0) {
+		ksft_test_result_skip("the module exports no page counters\n");
+		return;
+	}
+	if (!maio_port(&pr, &r, &z, 128, cfg, &bound))
+		return;
+	data = malloc(2 * length);
+	require(data, "buffers");
+	got = data + length;
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	stream = attach(&r, bound, sock, next_tag++);
+	for (round = 0; round < 32; round++) {
+		uint64_t tag;
+
+		maio_pattern(data, length, 700 + round);
+		tag = cmd_stage(&r, bound, IORING_OPAQUE_RECV_OBJECT, stream, cursor, length, NULL);
+		submit_only(&r);
+		write_all(pr.peer.socks[0], data, length);
+		require(maio_poll(&r, tag, 20000, &event) && event.res == (int)length,
+			"object from the port");
+		cursor += length;
+		handle = event.extra[0];
+		maio_gather(&r, bound, &z, handle, length, got, vec, ARRAY_SIZE(vec));
+		require(!memcmp(got, data, length), "bytes through the mapping");
+		maio_end(&r, bound, IORING_OPAQUE_FREE, handle);
+	}
+	require(!cmd_res(&r, bound, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat), "store stat");
+	require(!stat.copied_bytes, "no byte is copied");
+	require(module_stat("pages_stolen") > stolen, "the references of the skbs are taken over");
+	require(module_stat("pages_copied") == copied, "no page is copied");
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_drained(&r, bound);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(sock);
+	close(listener);
+	pair_destroy(&pr);
+	free(data);
+	ksft_test_result_pass("store on a port: the references of the skbs are taken over\n");
+}
+
 int main(void)
 {
 	struct ring r, imported;
@@ -6087,7 +6244,7 @@ int main(void)
 		maio_ok = !maio_err;
 		ring_exit(&probe);
 	}
-	ksft_set_plan(121);
+	ksft_set_plan(123);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	test_create(cfg);
 	test_create_quota(cfg);
@@ -6372,5 +6529,7 @@ int main(void)
 	test_maio_store_first(cfg);
 	test_maio_device(cfg);
 	test_maio_device_small(cfg);
+	test_capture_cloned(cfg);
+	test_maio_device_stolen(cfg);
 	ksft_finished();
 }
