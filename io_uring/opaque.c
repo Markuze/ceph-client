@@ -1379,42 +1379,31 @@ static struct io_opaque_extent *io_opaque_capture_tail(struct io_opaque_stream *
 }
 
 /*
- * How the capture holds the page of a new backing. The last two kinds exist
- * only for a store that binds a MAIO instance.
+ * Whether the reference that @skb holds to @page is a page pool fragment
+ * reference. That is what the stack drops for a page pool page of an skb that is
+ * marked for recycling, see skb_page_unref(). It takes any other page of the
+ * skb by a page reference.
  */
-enum io_opaque_hold {
-	/* A page reference, taken here. */
-	IO_OPAQUE_HOLD_PAGE,
-	/*
-	 * A page reference to an area page, taken here, when no pool reference
-	 * is possible. Either no pool of the instance owns the page, or the skb
-	 * holds only a page reference to it. The page is an outsider page for
-	 * the area. For example, the process may have passed it to a send as
-	 * user memory, and the send came back over loopback. The bytes are
-	 * visible through the mapping, so the backing counts as in the area.
-	 * If a pool owns the page when it returns, the instance parks the page
-	 * in limbo until this reference ends.
-	 */
-	IO_OPAQUE_HOLD_AREA,
-	/*
-	 * A pool reference to an area page, taken here. A pool of the instance
-	 * owns the page.
-	 */
-	IO_OPAQUE_HOLD_POOL,
-	/*
-	 * A copy page. The reference of the caller passes to the backing. The
-	 * page is a page of the area if the store binds an instance.
-	 */
-	IO_OPAQUE_HOLD_COPY,
-};
+static bool io_opaque_pp_page(const struct sk_buff *skb, struct page *page)
+{
+	return IS_ENABLED(CONFIG_PAGE_POOL) && skb->pp_recycle &&
+	       page_pool_page_is_pp(compound_head(page));
+}
 
 /*
  * Decide how a store holds a page that an skb carries. Return false if the
  * capture must copy the bytes.
  *
- * A store without an instance holds every page by a page reference. A store
- * with an instance keeps all the bytes that it captures in the area, so that
- * the process sees them through its mapping:
+ * A store without an instance holds a page pool page of an skb that is marked
+ * for recycling by a page pool fragment reference, and every other page by a
+ * page reference. The skb holds a reference of the same kind, and its pool
+ * reference keeps the pool fields of the page stable while the store takes its
+ * own. The last release hands the page back to its pool, wherever the skb is by
+ * then. A page reference would make the pool give the page up when the skb is
+ * freed before the store lets go.
+ *
+ * A store with an instance keeps all the bytes that it captures in the area, so
+ * that the process sees them through its mapping:
  *
  * - A page outside the area is copied. This includes a fallback page, which
  *   a pool of the instance got from the page allocator.
@@ -1439,7 +1428,7 @@ static bool io_opaque_retain(struct io_opaque_store *store,
 	u64 off;
 
 	if (!store->maio) {
-		*hold = IO_OPAQUE_HOLD_PAGE;
+		*hold = io_opaque_pp_page(skb, page) ? IO_OPAQUE_HOLD_PP : IO_OPAQUE_HOLD_PAGE;
 		return true;
 	}
 	if (!io_zcrx_maio_page_off(store->maio, page, &off))
@@ -1455,10 +1444,27 @@ static bool io_opaque_retain(struct io_opaque_store *store,
 static enum io_opaque_ref io_opaque_hold_ref(const struct io_opaque_store *store,
 					     enum io_opaque_hold hold)
 {
+	if (hold == IO_OPAQUE_HOLD_PP)
+		return IO_OPAQUE_REF_PP;
 	/* A copy page of a bound store has a pool reference, of the area. */
 	if (hold == IO_OPAQUE_HOLD_POOL || (hold == IO_OPAQUE_HOLD_COPY && store->maio))
 		return IO_OPAQUE_REF_MAIO;
 	return IO_OPAQUE_REF_PAGE;
+}
+
+/*
+ * What the memory cgroup of the store pays for. The caller charged a copy page.
+ * The memory cgroup does not pay for an area page, because the area was
+ * allocated and accounted when the instance was registered. It pays for every
+ * other page the store holds.
+ */
+VISIBLE_IF_KUNIT unsigned int io_opaque_hold_flags(enum io_opaque_hold hold)
+{
+	if (hold == IO_OPAQUE_HOLD_COPY)
+		return IO_OPAQUE_EXT_RESERVED;
+	if (hold == IO_OPAQUE_HOLD_AREA || hold == IO_OPAQUE_HOLD_POOL)
+		return IO_OPAQUE_EXT_NO_MEMCG;
+	return 0;
 }
 
 /*
@@ -1528,26 +1534,19 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
 		bool bound = !!stream->store->maio;
-		unsigned int flags = 0;
+		unsigned int flags = io_opaque_hold_flags(hold);
 
 		/* Leave room for dense copies of a private KEEP's remaining bytes. */
 		if (!copied && op && op->data->charge + stream->need_bytes + left >
 		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
-		/*
-		 * The caller charged a copy page. The memory cgroup of the
-		 * store does not pay for an area page, because the area was
-		 * allocated and accounted when the instance was registered.
-		 */
-		if (copied)
-			flags = IO_OPAQUE_EXT_RESERVED;
-		else if (hold != IO_OPAQUE_HOLD_PAGE)
-			flags = IO_OPAQUE_EXT_NO_MEMCG;
 		extent = io_opaque_stream_extent_new(stream, page, offset, length, start, flags);
 		if (IS_ERR(extent))
 			return PTR_ERR(extent);
 		if (hold == IO_OPAQUE_HOLD_POOL)
 			io_zcrx_maio_page_get(stream->store->maio, page);
+		else if (hold == IO_OPAQUE_HOLD_PP)
+			page_pool_ref_netmem(page_to_netmem(page));
 		else if (!copied)
 			get_page(page);
 		extent->backing->copied = copied;

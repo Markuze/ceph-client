@@ -509,7 +509,11 @@ and charge. Independent captures can still conservatively charge the same
 physical allocation more than once. A retained compound allocation is charged
 in full. Retained RX allocations also carry an explicit charge to the store
 owner's memory cgroup until the final backing reference is released; the
-original network allocation's accounting is independent. Owned copy and
+original network allocation's accounting is independent. A page that a page
+pool owns, in a socket buffer marked for page pool recycling, is held by a page
+pool fragment reference, as the socket buffer holds it, and goes back to its
+pool when the last holder lets go. Any other page is held by a page reference.
+Owned copy and
 compaction pages already use accounted allocation and are not charged twice.
 Copy fallback appends into unused space in the previous owned page;
 it does not allocate a whole page for every small fragment.

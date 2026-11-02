@@ -420,6 +420,41 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 #define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store already */
 #define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
 
+/*
+ * How the capture holds the page of a new backing. AREA and POOL exist only for
+ * a store that binds a MAIO instance, and PP only for one that does not.
+ */
+enum io_opaque_hold {
+	/* A page reference, taken here. */
+	IO_OPAQUE_HOLD_PAGE,
+	/*
+	 * A page pool fragment reference, taken here, to a page that a page
+	 * pool owns, in an skb that is marked for recycling.
+	 */
+	IO_OPAQUE_HOLD_PP,
+	/*
+	 * A page reference to an area page, taken here, when no pool reference
+	 * is possible. Either no pool of the instance owns the page, or the skb
+	 * holds only a page reference to it. The page is an outsider page for
+	 * the area. For example, the process may have passed it to a send as
+	 * user memory, and the send came back over loopback. The bytes are
+	 * visible through the mapping, so the backing counts as in the area.
+	 * If a pool owns the page when it returns, the instance parks the page
+	 * in limbo until this reference ends.
+	 */
+	IO_OPAQUE_HOLD_AREA,
+	/*
+	 * A pool reference to an area page, taken here. A pool of the instance
+	 * owns the page.
+	 */
+	IO_OPAQUE_HOLD_POOL,
+	/*
+	 * A copy page. The reference of the caller passes to the backing. The
+	 * page is a page of the area if the store binds an instance.
+	 */
+	IO_OPAQUE_HOLD_COPY,
+};
+
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
@@ -448,6 +483,7 @@ int io_opaque_compact_start(struct io_opaque_req *op);
 int io_opaque_set_policy(struct io_opaque_req *op);
 
 #if IS_ENABLED(CONFIG_KUNIT)
+unsigned int io_opaque_hold_flags(enum io_opaque_hold hold);
 struct io_opaque_extent *io_opaque_stream_extent_new(struct io_opaque_stream *stream,
 						     struct page *page, u32 offset,
 						     u32 length, u64 start,
