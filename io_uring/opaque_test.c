@@ -2,6 +2,7 @@
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <linux/file.h>
+#include <linux/gcd.h>
 #include <linux/highmem.h>
 #include <linux/inet.h>
 #include <linux/kobject.h>
@@ -514,11 +515,19 @@ static void opaque_block_lifetime(struct kunit *test)
 	struct io_opaque_stream stream;
 	struct io_opaque_extent *ext[IO_OPAQUE_BLOCK_CHUNKS + 8];
 	struct io_opaque_block *first, *second, *third;
-	unsigned int i, n = ARRAY_SIZE(ext);
+	unsigned int i, n = ARRAY_SIZE(ext), stride = 7;
 	u64 blocks = io_opaque_stat_read(IO_OPAQUE_STAT_CHUNK_BLOCKS);
 
 	opaque_test_stream(&stream, store);
 	KUNIT_EXPECT_NULL(test, stream.block);
+	/* A block fills the slab object it gets, and holds no fewer chunks than 32 of them. */
+	KUNIT_EXPECT_GE(test, IO_OPAQUE_BLOCK_CHUNKS, 32);
+	KUNIT_EXPECT_LE(test, struct_size_t(struct io_opaque_block, chunk, IO_OPAQUE_BLOCK_CHUNKS),
+			(size_t)SZ_4K);
+	KUNIT_EXPECT_GT(test, struct_size_t(struct io_opaque_block, chunk,
+					    IO_OPAQUE_BLOCK_CHUNKS + 1), (size_t)SZ_4K);
+	kunit_info(test, "a block of %d chunks, %zu bytes", IO_OPAQUE_BLOCK_CHUNKS,
+		   struct_size_t(struct io_opaque_block, chunk, IO_OPAQUE_BLOCK_CHUNKS));
 
 	/* The first chunk makes a block: every chunk and the stream hold it. */
 	ext[0] = opaque_block_extent(test, &stream, 0);
@@ -551,8 +560,10 @@ static void opaque_block_lifetime(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_CHUNK_BLOCKS), blocks + 2);
 
 	/* Free the first block's chunks out of order: each takes one hold off the block. */
+	while (gcd(stride, IO_OPAQUE_BLOCK_CHUNKS) != 1)
+		stride++;
 	for (i = 0; i < IO_OPAQUE_BLOCK_CHUNKS; i++) {
-		io_opaque_extent_free(store, ext[(i * 7) % IO_OPAQUE_BLOCK_CHUNKS]);
+		io_opaque_extent_free(store, ext[(i * stride) % IO_OPAQUE_BLOCK_CHUNKS]);
 		KUNIT_EXPECT_EQ(test, refcount_read(&first->live),
 				IO_OPAQUE_BLOCK_CHUNKS + 1 - (int)i - 1);
 	}

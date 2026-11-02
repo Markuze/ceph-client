@@ -501,8 +501,9 @@ version. FREE drops the table reference; SEND_LAST transfers it into the send;
 compaction replaces that reference. Old versions remain charged until their
 store references disappear.
 
-Capture allocates the backing and initial extent metadata of 32 pages at a
-time, in one block that lives until the last of those backings is released,
+Capture allocates the backing and initial extent metadata of a few dozen
+pages at a time, in one block of 4 KiB that lives until the last of those
+backings is released,
 and coalesces adjacent compatible extents. Successive captures from the same
 compound allocation share its backing and charge even when another socket's
 data separates their physical offsets. Splits also share the backing reference
@@ -802,9 +803,9 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     copying the bytes into a page of its own. A page that more bytes join
     counts once.
 ``stat_chunk_blocks``
-    Blocks of 32 extent records that streams allocated. A stream allocates one
-    block for every 32 pages it keeps by reference or by copy, and not one
-    record per page.
+    Blocks of extent records that streams allocated. A stream allocates a block
+    of 4 KiB for every few dozen pages it keeps by reference or by copy, and not
+    one record per page.
 
 Stores in the area of a MAIO instance
 =====================================

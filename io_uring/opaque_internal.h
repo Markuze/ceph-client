@@ -40,8 +40,6 @@
 #define IO_OPAQUE_SEEK_STRIDE	16
 /* Slots of the table of handles that a policy change walks while it holds tables. */
 #define IO_OPAQUE_POLICY_CHUNK	256
-/* Chunks, and so backings, that a stream allocates at a time. */
-#define IO_OPAQUE_BLOCK_CHUNKS	32
 /* Backings that one call of the actor leaves undecided; more settle at once. */
 #define IO_OPAQUE_PENDING_MAX	64
 
@@ -132,6 +130,14 @@ struct io_opaque_block {
 	u32 used;
 	struct io_opaque_chunk chunk[];
 };
+
+/*
+ * Chunks, and so backings, that a stream allocates at a time: as many as fit in
+ * an object of 4 KiB with the header of the block. A smaller block leaves part of
+ * the object unused, and the next size class is twice as large.
+ */
+#define IO_OPAQUE_BLOCK_CHUNKS \
+	((int)((SZ_4K - sizeof(struct io_opaque_block)) / sizeof(struct io_opaque_chunk)))
 
 struct io_opaque_data {
 	refcount_t refs;
