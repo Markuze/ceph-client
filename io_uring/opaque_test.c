@@ -22,6 +22,7 @@
 #include <net/hotdata.h>
 #include <net/tcp.h>
 
+#include "cancel.h"
 #include "io_uring.h"
 #include "mpscq.h"
 #include "notif.h"
@@ -1422,6 +1423,480 @@ static void opaque_tx_failed_head(struct kunit *test)
 	opaque_test_tx_done(&a, false);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&a), NULL);
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+}
+
+/*
+ * A head that fails a long queue. The followers are the requests of a fake ring, each listed for
+ * cancellation as a parked send is and freed when it is cleaned up, so that a walk that touches
+ * one after it was woken, which a request need not survive, is caught by KASAN. The walk looks at
+ * IO_OPAQUE_WAKE_BATCH of them in a hold of tx_lock and wakes them after it.
+ */
+struct opaque_fol {
+	struct io_opaque_req op;
+	struct io_kiocb req;
+};
+
+struct opaque_fail {
+	struct io_opaque_store *store;
+	struct io_ring_ctx *ctx;
+	struct sock *sk;
+	struct io_opaque_tx *tx;
+	struct io_opaque_req head;
+	/* The followers not cleaned up yet, and how often each was woken, by whoever did it. */
+	struct opaque_fol **fol;
+	atomic_t *woken;
+	unsigned int nr;
+};
+
+static void opaque_fail_free(void *arg)
+{
+	struct opaque_fail *fx = arg;
+	unsigned int i;
+
+	for (i = 0; i < fx->nr; i++)
+		kfree(fx->fol[i]);
+}
+
+static struct opaque_fail *opaque_fail_new(struct kunit *test, unsigned int nr)
+{
+	struct opaque_fail *fx = kunit_kzalloc(test, sizeof(*fx), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, fx);
+	fx->store = opaque_test_store(test);
+	fx->ctx = kunit_kzalloc(test, sizeof(*fx->ctx), GFP_KERNEL);
+	fx->sk = kunit_kzalloc(test, sizeof(*fx->sk), GFP_KERNEL);
+	fx->fol = kunit_kcalloc(test, nr, sizeof(*fx->fol), GFP_KERNEL);
+	fx->woken = kunit_kcalloc(test, nr, sizeof(*fx->woken), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fx->ctx);
+	KUNIT_ASSERT_NOT_NULL(test, fx->sk);
+	KUNIT_ASSERT_NOT_NULL(test, fx->fol);
+	KUNIT_ASSERT_NOT_NULL(test, fx->woken);
+	fx->nr = nr;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_fail_free, fx), 0);
+	mutex_init(&fx->ctx->uring_lock);
+	fx->ctx->flags = IORING_SETUP_DEFER_TASKRUN;
+	return fx;
+}
+
+/* The queue of the socket with its head admitted and all the followers parked behind it. */
+static void opaque_fail_fill(struct kunit *test, struct opaque_fail *fx)
+{
+	unsigned int i;
+
+	mpscq_init(&fx->ctx->work_list, &fx->ctx->work_head);
+	INIT_LIST_HEAD(&fx->ctx->opaque_waits);
+	opaque_test_tx_op(&fx->head, fx->store);
+	KUNIT_ASSERT_EQ(test, io_opaque_tx_admit(&fx->head, fx->sk), 1);
+	fx->tx = fx->head.tx;
+	for (i = 0; i < fx->nr; i++) {
+		struct opaque_fol *f = kzalloc(sizeof(*f), GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		fx->fol[i] = f;
+		atomic_set(&fx->woken[i], 0);
+		opaque_test_tx_op(&f->op, fx->store);
+		f->op.req = &f->req;
+		f->req.ctx = fx->ctx;
+		f->req.async_data = &f->op;
+		f->req.cqe.user_data = i + 1;
+		KUNIT_ASSERT_EQ(test, io_opaque_tx_admit(&f->op, fx->sk), 0);
+		KUNIT_ASSERT_EQ(test, f->op.phase, IO_OPAQUE_SEND_WAIT);
+		mutex_lock(&fx->ctx->uring_lock);
+		list_add_tail(&f->op.cancel, &fx->ctx->opaque_waits);
+		mutex_unlock(&fx->ctx->uring_lock);
+	}
+}
+
+/*
+ * The cleanup of follower @i once it has been woken: off the ring's list, out of its queue, and
+ * freed. Says whom the release handed the queue to, which for a canceled follower is nobody.
+ */
+static struct io_opaque_req *opaque_fail_end(struct opaque_fail *fx, unsigned int i)
+{
+	struct opaque_fol *f = fx->fol[i];
+	struct io_opaque_req *next;
+
+	mutex_lock(&fx->ctx->uring_lock);
+	list_del_init(&f->op.cancel);
+	f->op.phase = IO_OPAQUE_IDLE;
+	mutex_unlock(&fx->ctx->uring_lock);
+	next = io_opaque_tx_release(&f->op);
+	WRITE_ONCE(fx->fol[i], NULL);
+	kfree(f);
+	return next;
+}
+
+#define OPAQUE_FAIL_NR		(3 * IO_OPAQUE_WAKE_BATCH + 5)
+/* A follower of the second batch, which the hook cancels before the walk gets to it. */
+#define OPAQUE_FAIL_CUT		(IO_OPAQUE_WAKE_BATCH + 8)
+
+static struct {
+	struct kunit *test;
+	struct opaque_fail *fx;
+	/* Wakeups by the walk, and by the cancellation that the hook starts. */
+	unsigned int walk, cancel;
+	/* The most followers canceled and not woken yet at a wakeup; wakeups with tx_lock held. */
+	unsigned int queued, locked;
+	/* Cleanups that handed the queue to a follower. */
+	unsigned int promoted;
+	bool inside, drain;
+} opaque_fail_hook;
+
+static void opaque_fail_ready(struct io_opaque_req *op, int result)
+{
+	struct opaque_fail *fx = opaque_fail_hook.fx;
+	struct kunit *test = opaque_fail_hook.test;
+	struct io_cancel_data cd = { .ctx = fx->ctx };
+	unsigned int i = op->req->cqe.user_data - 1, k, queued = 0, walk;
+	struct io_opaque_req j;
+
+	KUNIT_EXPECT_EQ(test, result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, atomic_inc_return(&fx->woken[i]), 1);
+#ifdef CONFIG_LOCKDEP
+	/*
+	 * What follows takes tx_lock, so with it held it is a deadlock and not a failure. Only
+	 * lockdep can say who holds a spinlock on every configuration; without it this is not checked.
+	 */
+	if (lockdep_is_held(&fx->store->tx_lock) == LOCK_STATE_HELD) {
+		opaque_fail_hook.locked++;
+		return;
+	}
+#endif
+	if (opaque_fail_hook.inside) {
+		opaque_fail_hook.cancel++;
+		return;
+	}
+	walk = opaque_fail_hook.walk++;
+	for (k = 0; k < fx->nr; k++)
+		if (fx->fol[k] && fx->fol[k]->op.canceled && !atomic_read(&fx->woken[k]))
+			queued++;
+	opaque_fail_hook.queued = max(opaque_fail_hook.queued, queued);
+
+	if (walk == IO_OPAQUE_WAKE_BATCH - 1) {
+		/* The first batch is woken and the second not looked at: the walk is out of tx_lock. */
+		opaque_fail_hook.inside = true;
+		KUNIT_EXPECT_TRUE(test, fx->tx->failed);
+		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 1U);
+		/* A frame that comes now is refused, as it is for the whole walk. */
+		opaque_test_tx_op(&j, fx->store);
+		KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&j, fx->sk), -ECANCELED);
+		KUNIT_EXPECT_PTR_EQ(test, j.tx, NULL);
+		/* A cancellation finds a follower that the walk has not got to, and wakes it itself. */
+		cd.data = OPAQUE_FAIL_CUT + 1;
+		KUNIT_EXPECT_EQ(test, io_opaque_cancel(fx->ctx, &cd, IO_URING_F_UNLOCKED), 0);
+		KUNIT_EXPECT_EQ(test, atomic_read(&fx->woken[OPAQUE_FAIL_CUT]), 1);
+		/* And nothing in one that the walk has made queued: it is left to the walk. */
+		cd.data = 1;
+		KUNIT_EXPECT_EQ(test, io_opaque_cancel(fx->ctx, &cd, IO_URING_F_UNLOCKED), -ENOENT);
+		KUNIT_EXPECT_EQ(test, atomic_read(&fx->woken[0]), 1);
+		/*
+		 * The batch is cleaned up, each as the first of the queue. The last has the walk next
+		 * to it, and the followers it has not looked at behind that: none may be promoted.
+		 */
+		for (k = 0; k < IO_OPAQUE_WAKE_BATCH; k++)
+			if (opaque_fail_end(fx, k))
+				opaque_fail_hook.promoted++;
+		/* And the one that was canceled out of turn, which was not the first. */
+		if (opaque_fail_end(fx, OPAQUE_FAIL_CUT))
+			opaque_fail_hook.promoted++;
+		opaque_fail_hook.inside = false;
+	} else if (walk == IO_OPAQUE_WAKE_BATCH) {
+		KUNIT_EXPECT_TRUE(test, fx->tx->failed);
+		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 1U);
+	} else if (opaque_fail_hook.drain && walk == OPAQUE_FAIL_NR - 2) {
+		/*
+		 * The last wakeup: all the followers are woken, and they all go before the walk is
+		 * back. The queue is theirs to forget once the walk leaves it, and the walk has to
+		 * see that. @op is gone with its follower.
+		 */
+		for (k = 0; k < fx->nr; k++)
+			if (fx->fol[k] && opaque_fail_end(fx, k))
+				opaque_fail_hook.promoted++;
+	}
+}
+
+/*
+ * A head ends short, and the frames queued behind it are many more than a batch. Each is woken
+ * once; a batch is made queued before any of it is woken, and no more than a batch is; tx_lock is
+ * free for the wakeups. The queue stays failed, and in place, until the last follower has gone,
+ * be that one of them or the walk. In between, a frame that comes is refused; a cancellation
+ * takes a follower that the walk has not got to and finds nothing in one that it has; and the
+ * followers that are cleaned up first do not hand the queue to those that are not canceled yet.
+ */
+static void opaque_tx_failed_long(struct kunit *test)
+{
+	struct opaque_fail *fx = opaque_fail_new(test, OPAQUE_FAIL_NR);
+	struct io_opaque_req next;
+	unsigned int drain, i, wrong, left;
+
+	for (drain = 0; drain < 2; drain++) {
+		opaque_fail_fill(test, fx);
+		memset(&opaque_fail_hook, 0, sizeof(opaque_fail_hook));
+		opaque_fail_hook.test = test;
+		opaque_fail_hook.fx = fx;
+		opaque_fail_hook.drain = drain;
+		kunit_activate_static_stub(test, io_opaque_queue_ready, opaque_fail_ready);
+		opaque_test_tx_done(&fx->head, false);
+		KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&fx->head), NULL);
+		kunit_deactivate_static_stub(test, io_opaque_queue_ready);
+
+		KUNIT_EXPECT_PTR_EQ(test, fx->head.tx, NULL);
+		KUNIT_EXPECT_TRUE(test, list_empty(&fx->head.send));
+		/* Every follower once: the walk woke all but the one the cancellation woke. */
+		KUNIT_EXPECT_EQ(test, opaque_fail_hook.walk, (unsigned int)OPAQUE_FAIL_NR - 1);
+		KUNIT_EXPECT_EQ(test, opaque_fail_hook.cancel, 1U);
+		for (i = 0, wrong = 0; i < fx->nr; i++)
+			wrong += atomic_read(&fx->woken[i]) != 1;
+		KUNIT_EXPECT_EQ(test, wrong, 0U);
+		/* A batch is made queued before it is woken, and not more. */
+		KUNIT_EXPECT_GT(test, opaque_fail_hook.queued, 0U);
+		KUNIT_EXPECT_LE(test, opaque_fail_hook.queued, (unsigned int)IO_OPAQUE_WAKE_BATCH);
+		KUNIT_EXPECT_EQ(test, opaque_fail_hook.locked, 0U);
+		KUNIT_EXPECT_EQ(test, opaque_fail_hook.promoted, 0U);
+
+		if (drain) {
+			/* The walk was the last one out: the queue is idle and forgets the failure. */
+			KUNIT_EXPECT_FALSE(test, fx->tx->failed);
+			KUNIT_EXPECT_TRUE(test, list_empty(&fx->tx->requests));
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 0U);
+			KUNIT_EXPECT_EQ(test, fx->store->nr_txs_idle, 1U);
+		} else {
+			/* The followers that are still queued keep the queue failed, in the tree. */
+			left = OPAQUE_FAIL_NR - IO_OPAQUE_WAKE_BATCH - 1;
+			KUNIT_EXPECT_TRUE(test, fx->tx->failed);
+			KUNIT_EXPECT_EQ(test, list_count_nodes(&fx->tx->requests), left);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 1U);
+			opaque_test_tx_op(&next, fx->store);
+			KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&next, fx->sk), -ECANCELED);
+			for (i = 0; i < fx->nr; i++)
+				if (fx->fol[i])
+					KUNIT_EXPECT_PTR_EQ(test, opaque_fail_end(fx, i), NULL);
+			KUNIT_EXPECT_FALSE(test, fx->tx->failed);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 0U);
+		}
+		/* The queue takes a frame again. */
+		opaque_test_tx_op(&next, fx->store);
+		KUNIT_ASSERT_EQ(test, io_opaque_tx_admit(&next, fx->sk), 1);
+		opaque_test_tx_done(&next, true);
+		KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&next), NULL);
+		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 0U);
+	}
+}
+
+#define OPAQUE_FAIL_TASKS	3
+#define OPAQUE_FAIL_SMP_NR	1024
+#define OPAQUE_FAIL_SMP_ROUNDS	100
+
+struct opaque_fail_smp {
+	struct opaque_fail *fx;
+	atomic_t ready, go, stop;
+	/* Cleanups begun, and those that handed the queue to a follower. */
+	atomic_t done, promoted;
+	/* Followers that a cancellation woke; frames refused by the queue, and let in too soon. */
+	atomic_t canceled, refused, early;
+	/* Followers woken twice, and anything else that is not as it should be. */
+	atomic_t bad;
+	struct completion fin[OPAQUE_FAIL_TASKS];
+	u32 seed;
+};
+
+static void opaque_fail_start(struct opaque_fail_smp *s)
+{
+	atomic_inc(&s->ready);
+	while (!atomic_read(&s->go))
+		cond_resched();
+}
+
+/*
+ * The walk's wakeup, made a little slower than the cleanups that follow the wakeups: they have
+ * the time to run in the windows that the walk leaves between batches, which they otherwise
+ * seldom do. The wakeup itself is the real one.
+ */
+static void opaque_fail_slow_ready(struct io_opaque_req *op, int result)
+{
+	struct kunit *test = opaque_fail_hook.test;
+
+	kunit_deactivate_static_stub(test, io_opaque_queue_ready);
+	io_opaque_queue_ready(op, result);
+	kunit_activate_static_stub(test, io_opaque_queue_ready, opaque_fail_slow_ready);
+	if (!(++opaque_fail_hook.walk & 7))
+		udelay(10);
+}
+
+/* The task of the ring: what wakes a follower reaches it, and it cleans the follower up. */
+static int opaque_fail_completer(void *data)
+{
+	struct opaque_fail_smp *s = data;
+	struct opaque_fail *fx = s->fx;
+
+	opaque_fail_start(s);
+	while (atomic_read(&s->done) < fx->nr && !atomic_read(&s->stop)) {
+		struct llist_node *node = mpscq_pop(&fx->ctx->work_list, &fx->ctx->work_head);
+		struct io_kiocb *req;
+		unsigned int i;
+
+		if (!node) {
+			cond_resched();
+			continue;
+		}
+		req = container_of(node, struct io_kiocb, io_task_work.node);
+		i = req->cqe.user_data - 1;
+		if (atomic_inc_return(&fx->woken[i]) != 1) {
+			atomic_inc(&s->bad);
+			break;
+		}
+		atomic_inc(&s->done);
+		if (opaque_fail_end(fx, i))
+			atomic_inc(&s->promoted);
+	}
+	complete(&s->fin[0]);
+	return 0;
+}
+
+/* Cancellations of followers picked at random, from some time into the walk. */
+static int opaque_fail_canceler(void *data)
+{
+	struct opaque_fail_smp *s = data;
+	struct opaque_fail *fx = s->fx;
+	struct io_cancel_data cd = { .ctx = fx->ctx };
+	struct rnd_state rs;
+	unsigned int n;
+
+	prandom_seed_state(&rs, s->seed);
+	opaque_fail_start(s);
+	udelay(prandom_u32_state(&rs) % 64);
+	for (n = 0; n < fx->nr && !atomic_read(&s->stop); n++) {
+		cd.data = 1 + prandom_u32_state(&rs) % fx->nr;
+		if (!io_opaque_cancel(fx->ctx, &cd, IO_URING_F_UNLOCKED))
+			atomic_inc(&s->canceled);
+	}
+	complete(&s->fin[1]);
+	return 0;
+}
+
+/*
+ * Frames that come while the queue is failed, which refuses them; one that comes when it is
+ * empty goes in, and no follower may be left by then.
+ */
+static int opaque_fail_joiner(void *data)
+{
+	struct opaque_fail_smp *s = data;
+	struct opaque_fail *fx = s->fx;
+
+	opaque_fail_start(s);
+	/* A frame that came before the queue failed would be a follower, with nobody to wake it. */
+	while (!READ_ONCE(fx->tx->failed) && !atomic_read(&s->stop))
+		cond_resched();
+	while (!atomic_read(&s->stop)) {
+		struct io_opaque_req j;
+		int ret;
+
+		opaque_test_tx_op(&j, fx->store);
+		ret = io_opaque_tx_join(&j, fx->sk);
+		if (ret == -ECANCELED) {
+			atomic_inc(&s->refused);
+			cond_resched();
+			continue;
+		}
+		if (ret < 0 || j.tx != fx->tx)
+			atomic_inc(&s->bad);
+		else if (atomic_read(&s->done) != fx->nr)
+			atomic_inc(&s->early);
+		if (ret >= 0 && io_opaque_tx_release(&j))
+			atomic_inc(&s->bad);
+		break;
+	}
+	complete(&s->fin[2]);
+	return 0;
+}
+
+/*
+ * The same on several CPUs, with the real wakeups: the walk, the cancellations of a ring
+ * and the cleanups that follow them, and frames that join, all at once. No follower is woken
+ * twice or lost, no cleanup hands the queue to a follower, and a frame is not let in while
+ * one is left. It needs two CPUs to race on.
+ */
+static void opaque_tx_failed_smp(struct kunit *test)
+{
+	static int (*const fn[OPAQUE_FAIL_TASKS])(void *) = {
+		opaque_fail_completer, opaque_fail_canceler, opaque_fail_joiner,
+	};
+	struct opaque_fail *fx;
+	struct opaque_fail_smp *s;
+	unsigned int round, canceled = 0, refused = 0;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	fx = opaque_fail_new(test, OPAQUE_FAIL_SMP_NR);
+	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	s->fx = fx;
+	memset(&opaque_fail_hook, 0, sizeof(opaque_fail_hook));
+	opaque_fail_hook.test = test;
+	for (round = 0; round < OPAQUE_FAIL_SMP_ROUNDS; round++) {
+		struct task_struct *task[OPAQUE_FAIL_TASKS];
+		unsigned int i, wrong;
+
+		opaque_fail_fill(test, fx);
+		atomic_set(&s->ready, 0);
+		atomic_set(&s->go, 0);
+		atomic_set(&s->stop, 0);
+		atomic_set(&s->done, 0);
+		atomic_set(&s->promoted, 0);
+		atomic_set(&s->canceled, 0);
+		atomic_set(&s->refused, 0);
+		atomic_set(&s->early, 0);
+		atomic_set(&s->bad, 0);
+		s->seed = 0x9e3779b1 * (round + 1);
+		for (i = 0; i < OPAQUE_FAIL_TASKS; i++) {
+			init_completion(&s->fin[i]);
+			task[i] = kthread_create(fn[i], s, "opaque_fail%u", i);
+			if (IS_ERR(task[i])) {
+				while (i--)
+					kthread_stop(task[i]);
+				KUNIT_FAIL(test, "no task for the race");
+				return;
+			}
+		}
+		for (i = 0; i < OPAQUE_FAIL_TASKS; i++)
+			wake_up_process(task[i]);
+		/* The others run when the walk starts, not some time after it has ended. */
+		while (atomic_read(&s->ready) < OPAQUE_FAIL_TASKS)
+			cond_resched();
+		atomic_set(&s->go, 1);
+		opaque_test_tx_done(&fx->head, false);
+		kunit_activate_static_stub(test, io_opaque_queue_ready, opaque_fail_slow_ready);
+		if (io_opaque_tx_release(&fx->head))
+			atomic_inc(&s->bad);
+		kunit_deactivate_static_stub(test, io_opaque_queue_ready);
+		if (!wait_for_completion_timeout(&s->fin[0], 10 * HZ)) {
+			KUNIT_FAIL(test, "round %u: %d of %u followers cleaned up", round,
+				   atomic_read(&s->done), fx->nr);
+			atomic_set(&s->stop, 1);
+			wait_for_completion(&s->fin[0]);
+		}
+		atomic_set(&s->stop, 1);
+		wait_for_completion(&s->fin[1]);
+		wait_for_completion(&s->fin[2]);
+
+		for (i = 0, wrong = 0; i < fx->nr; i++)
+			wrong += atomic_read(&fx->woken[i]) != 1 || fx->fol[i];
+		canceled += atomic_read(&s->canceled);
+		refused += atomic_read(&s->refused);
+		if (wrong || atomic_read(&s->promoted) || atomic_read(&s->bad) ||
+		    atomic_read(&s->early) || !mpscq_empty(&fx->ctx->work_list) ||
+		    fx->tx->failed || opaque_test_txs_busy(fx->store)) {
+			KUNIT_FAIL(test,
+				   "round %u: %u followers woken other than once or left, %d promoted, %d bad, %d early, queue %s",
+				   round, wrong, atomic_read(&s->promoted), atomic_read(&s->bad),
+				   atomic_read(&s->early),
+				   fx->tx->failed ? "failed" : "not drained");
+			return;
+		}
+	}
+	kunit_info(test, "%u rounds of %u followers on %u CPUs: %u woken by a cancellation, %u frames refused",
+		   OPAQUE_FAIL_SMP_ROUNDS, OPAQUE_FAIL_SMP_NR, num_online_cpus(), canceled, refused);
+	KUNIT_EXPECT_GT(test, canceled, 0U);
 }
 
 /* A drained queue stays for the next frame on its socket, up to a cap. */
@@ -13519,6 +13994,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_tx_order),
 	KUNIT_CASE(opaque_tx_inline_admission),
 	KUNIT_CASE(opaque_tx_failed_head),
+	KUNIT_CASE(opaque_tx_failed_long),
+	KUNIT_CASE_SLOW(opaque_tx_failed_smp),
 	KUNIT_CASE(opaque_tx_idle_cache),
 	KUNIT_CASE(opaque_tx_lock_order),
 	KUNIT_CASE(opaque_send_head_admit_fails),

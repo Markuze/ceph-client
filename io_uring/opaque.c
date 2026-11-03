@@ -4037,10 +4037,72 @@ VISIBLE_IF_KUNIT int io_opaque_tx_settle_head(struct io_opaque_req *op)
 }
 
 /*
+ * Cancel and wake the frames admitted behind @op, a head that attempted TCP and
+ * ended short. @op has left @tx, which has failed already, and goes back in for
+ * the walk. At most IO_OPAQUE_WAKE_BATCH followers are looked at in a hold of
+ * tx_lock, and they are woken after it: how many there are is up to the process,
+ * and every socket and ring of the store takes tx_lock.
+ *
+ * The followers stay in the queue and leave it as they always did, each when its
+ * request is cleaned up, so the queue stays failed until the last has gone. @op
+ * is where the walk has got to. It moves behind each batch and leaves with the
+ * last, and nobody else moves it: the followers after it have not been looked at,
+ * whoever leaves meanwhile. It is not parked, and a release hands the queue only
+ * to a parked follower, so a canceled follower that is released as the first of
+ * the queue cannot promote one that is not canceled yet.
+ *
+ * A follower is touched in a hold of tx_lock, where it cannot be cleaned up, for
+ * its cleanup leaves the queue first. After the hold the walk touches only those
+ * it made queued: nobody else will wake them, and a request ends only once it is
+ * woken. A follower that was queued before is a cancellation's to wake. It is
+ * marked here, as it always was, and left alone.
+ */
+static noinline_for_stack void io_opaque_tx_fail(struct io_opaque_store *store,
+						 struct io_opaque_tx *tx,
+						 struct io_opaque_req *op)
+{
+	struct io_opaque_req *woken[IO_OPAQUE_WAKE_BATCH];
+
+	lockdep_assert_held(&store->tx_lock);
+	op->tx = tx;
+	list_add(&op->send, &tx->requests);
+	while (op->send.next != &tx->requests) {
+		struct list_head *pos = op->send.next;
+		unsigned int seen, nr = 0, i;
+
+		for (seen = 0; seen < IO_OPAQUE_WAKE_BATCH && pos != &tx->requests; seen++) {
+			struct io_opaque_req *next = list_entry(pos, struct io_opaque_req, send);
+			bool queue;
+
+			scoped_guard(spinlock, &store->wait_lock) {
+				WRITE_ONCE(next->canceled, true);
+				queue = next->phase == IO_OPAQUE_SEND_WAIT;
+				if (queue)
+					next->phase = IO_OPAQUE_QUEUED;
+			}
+			if (queue)
+				woken[nr++] = next;
+			pos = pos->next;
+		}
+		/* Behind the ones looked at: what follows is what is left to do. */
+		list_move(&op->send, pos->prev);
+		spin_unlock(&store->tx_lock);
+		for (i = 0; i < nr; i++)
+			io_opaque_queue_ready(woken[i], -ECANCELED);
+		spin_lock(&store->tx_lock);
+	}
+	list_del_init(&op->send);
+	op->tx = NULL;
+	/* The followers may all have gone while the walk was out of the lock. */
+	io_opaque_tx_unused(store, tx);
+}
+
+/*
  * Remove @op from its queue. A head that attempted TCP and ended short fails
- * the queue: every follower is canceled and woken, and nothing is returned.
- * Otherwise the follower that becomes head is returned with its phase already
- * queued, for the caller to wake. Only the failure wakeups reach an io_kiocb.
+ * the queue: every follower is canceled and woken (io_opaque_tx_fail()), and
+ * nothing is returned. Otherwise the follower that becomes head is returned with
+ * its phase already queued, for the caller to wake. Only the failure wakeups
+ * reach an io_kiocb.
  */
 VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op)
 {
@@ -4062,18 +4124,7 @@ VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req
 	/* Only a send that attempted TCP can break the following frames. */
 	if (op->tx_started && op->progress != op->total_length) {
 		tx->failed = true;
-		list_for_each_entry(next, &tx->requests, send) {
-			bool queue;
-
-			scoped_guard(spinlock, &store->wait_lock) {
-				WRITE_ONCE(next->canceled, true);
-				queue = next->phase == IO_OPAQUE_SEND_WAIT;
-				if (queue)
-					next->phase = IO_OPAQUE_QUEUED;
-			}
-			if (queue)
-				io_opaque_queue_ready(next, -ECANCELED);
-		}
+		io_opaque_tx_fail(store, tx, op);
 		return NULL;
 	}
 	next = io_opaque_tx_head(tx);
