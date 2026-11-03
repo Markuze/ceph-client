@@ -94,6 +94,46 @@ static void opaque_test_free(struct io_opaque_store *store, u32 index)
 	io_opaque_data_put(store, data);
 }
 
+/*
+ * What a test can say about a spinlock: that this context holds it, that it does not, or that
+ * nothing can be told. Lockdep knows who holds a lock. Without it spin_is_locked() says whether
+ * anyone does, which means something on SMP and with CONFIG_DEBUG_SPINLOCK, and nothing on a
+ * uniprocessor kernel without it, where it is always 0 (spinlock_up.h).
+ */
+#define OPAQUE_LOCK_UNKNOWN	(-1)
+
+static int opaque_test_lock_state(spinlock_t *lock)
+{
+#ifdef CONFIG_LOCKDEP
+	switch (lockdep_is_held(lock)) {
+	case LOCK_STATE_HELD:
+		return 1;
+	case LOCK_STATE_NOT_HELD:
+		return 0;
+	}
+	/* Lockdep has turned itself off, after a report. */
+	return OPAQUE_LOCK_UNKNOWN;
+#elif defined(CONFIG_SMP) || defined(CONFIG_DEBUG_SPINLOCK)
+	return spin_is_locked(lock);
+#else
+	return OPAQUE_LOCK_UNKNOWN;
+#endif
+}
+
+/*
+ * Whether @lock is held, for the expectations that it is not. A lock that cannot be told counts
+ * as free, so those expectations are not checked there, and the console says so once;
+ * opaque_lock_held_check() skips on such a kernel, which shows in the results.
+ */
+static bool opaque_test_held(spinlock_t *lock)
+{
+	int state = opaque_test_lock_state(lock);
+
+	if (state == OPAQUE_LOCK_UNKNOWN)
+		pr_info_once("opaque_test: neither lockdep nor the lock can say whether a spinlock is held: the expectations that one is free are not checked\n");
+	return state == 1;
+}
+
 /* Fragments of a test skb: MAX_SKB_FRAGS is 17 to 45, depending on the configuration. */
 #define OPAQUE_TEST_FRAGS	17
 static_assert(OPAQUE_TEST_FRAGS <= MAX_SKB_FRAGS);
@@ -1552,16 +1592,14 @@ static void opaque_fail_ready(struct io_opaque_req *op, int result)
 
 	KUNIT_EXPECT_EQ(test, result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, atomic_inc_return(&fx->woken[i]), 1);
-#ifdef CONFIG_LOCKDEP
 	/*
-	 * What follows takes tx_lock, so with it held it is a deadlock and not a failure. Only
-	 * lockdep can say who holds a spinlock on every configuration; without it this is not checked.
+	 * What follows takes tx_lock, so with it held it is a deadlock and not a failure. Where a
+	 * spinlock cannot be told held, opaque_test_held() says it is not, and this is not checked.
 	 */
-	if (lockdep_is_held(&fx->store->tx_lock) == LOCK_STATE_HELD) {
+	if (opaque_test_held(&fx->store->tx_lock)) {
 		opaque_fail_hook.locked++;
 		return;
 	}
-#endif
 	if (opaque_fail_hook.inside) {
 		opaque_fail_hook.cancel++;
 		return;
@@ -1957,6 +1995,26 @@ static void opaque_tx_idle_cache(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&store->txs));
 	KUNIT_EXPECT_EQ(test, store->nr_txs_idle, 0U);
 	KUNIT_EXPECT_TRUE(test, list_empty(&store->txs_idle));
+}
+
+/*
+ * The helper sees a hold of a spinlock and the end of it. If it cannot, the expectations that
+ * rest on it prove nothing here, and this is where that shows.
+ */
+static void opaque_lock_held_check(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	bool held;
+
+	if (opaque_test_lock_state(&store->tables) == OPAQUE_LOCK_UNKNOWN)
+		kunit_skip(test, "no lockdep, and a spinlock has no state to read: uniprocessor without CONFIG_DEBUG_SPINLOCK");
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+	spin_lock(&store->tables);
+	/* A failed expectation allocates, which a spinlock does not allow: look after the hold. */
+	held = opaque_test_held(&store->tables);
+	spin_unlock(&store->tables);
+	KUNIT_EXPECT_TRUE(test, held);
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 }
 
 static void opaque_test_sock_release(void *sock)
@@ -4638,7 +4696,7 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	if (c->vector)
 		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 	/* Cleanup has the frame and the request. */
 	if (c->prep)
@@ -4867,7 +4925,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 	KUNIT_EXPECT_EQ(test, op->consumed, last);
 	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, last ? NULL : data);
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), last ? (int)nr : 2);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 
 	/* The handle goes while the send is held, with nobody to put the version but the send. */
@@ -5030,7 +5088,7 @@ static void opaque_send_locked_short(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, follower->tx, tx);
 	KUNIT_EXPECT_PTR_EQ(test, follower->data, data);
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 3);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 
 	/* MSG_DONTWAIT is in force when the head is retried: it ends short, and must say so. */
@@ -5055,7 +5113,7 @@ static void opaque_send_locked_short(struct kunit *test)
 			    &w->req[1].io_task_work.node);
 	/* Only the follower's pin is left on the object besides the table's. */
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 	/* A frame that comes now is refused, until the canceled follower has gone. */
 	opaque_test_tx_op(&third, store);
@@ -5132,7 +5190,7 @@ static void opaque_send_locked_error(struct kunit *test)
 			if (vector)
 				KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
 			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
-			KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 			if (last) {
 				KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
@@ -5375,7 +5433,7 @@ static void opaque_attach_lock_order(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, sk->sk_rx_owner, &stream->owner);
 	KUNIT_EXPECT_PTR_EQ(test, store->streams[0].stream, stream);
 	KUNIT_EXPECT_EQ(test, store->nr_streams, 1U);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 	/* The token went to the request in a 32-byte CQE, with MORE. */
 	KUNIT_EXPECT_EQ(test, rings->cqes[0].user_data, 0xa0ULL);
@@ -5390,7 +5448,7 @@ static void opaque_attach_lock_order(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, op[1]->stream, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, sk->sk_rx_owner, &stream->owner);
 	KUNIT_EXPECT_EQ(test, store->nr_streams, 1U);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 
 	/*
@@ -6790,7 +6848,7 @@ static int opaque_test_grow_window(struct io_opaque_req *op, u32 nr, u32 segs, u
 	kunit_deactivate_static_stub(test, io_opaque_vec_grow);
 	opaque_window.grow_hook = false;
 	opaque_window.calls++;
-	opaque_window.grow_locked = spin_is_locked(&op->store->tables);
+	opaque_window.grow_locked = opaque_test_held(&op->store->tables);
 	opaque_window.pinned = op->vec->pinned;
 	opaque_window.consumed = op->consumed;
 	opaque_window.segs = segs;
@@ -6944,7 +7002,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	opaque_window_close(test);
 	lockdep_assert_none_held_once();
 	KUNIT_EXPECT_EQ(test, opaque_window.calls, 0U);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 2U);
 	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 5U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
@@ -8179,7 +8237,7 @@ static void opaque_policy_between(struct io_opaque_store *store)
 	if (opaque_policy_hook.inside)
 		return;
 	opaque_policy_hook.inside = true;
-	opaque_policy_hook.tables_free &= !spin_is_locked(&store->tables);
+	opaque_policy_hook.tables_free &= !opaque_test_held(&store->tables);
 	if (opaque_policy_hook.at < ARRAY_SIZE(opaque_policy_hook.candidates))
 		opaque_policy_hook.candidates[opaque_policy_hook.at] = opaque_policy_count(store);
 	opaque_policy_hook.at++;
@@ -8505,7 +8563,7 @@ static void opaque_security_run(struct kunit *test, bool direct, int err, bool l
 	mutex_unlock(&w->ctx->uring_lock);
 	lockdep_assert_none_held_once();
 	KUNIT_ASSERT_FALSE(test, opaque_refuse.armed);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 	KUNIT_EXPECT_EQ(test, head->consumed, last);
 	/* The hook is asked once per issue on the direct path, by sock_sendmsg() on the other. */
@@ -8797,7 +8855,7 @@ static void opaque_send_parked_under_socket(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_join_spy.hooks, 2U);
 	KUNIT_EXPECT_EQ(test, opaque_hook_calls, 2U);
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&w->ctx->uring_lock));
 	KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_SEND_WAIT);
 	KUNIT_EXPECT_PTR_EQ(test, follower->tx, tx);
@@ -9034,7 +9092,7 @@ static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, 
 	/* Cleanup runs once for each request, and has nothing to give back that was given. */
 	opaque_wire_req_cleanup(w, 0);
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
-	KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 	/*
 	 * Whatever the send consumed or pinned is back, and the object is the table's again, or
@@ -9144,7 +9202,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
 			KUNIT_EXPECT_PTR_EQ(test, head->data, NULL);
 			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
-			KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
 					calls);
@@ -9165,7 +9223,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			/* It was the owner of the socket that needed the block, and let it go. */
 			KUNIT_EXPECT_TRUE(test, opaque_admit_hook.owned);
 			KUNIT_EXPECT_EQ(test, opaque_window.calls, 1U);
-			KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 			KUNIT_EXPECT_FALSE(test, head->consumed);
 			KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
@@ -9218,7 +9276,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
 			KUNIT_EXPECT_TRUE(test, opaque_admit_hook.owned);
 			KUNIT_EXPECT_EQ(test, opaque_window.calls, 1U);
-			KUNIT_EXPECT_FALSE(test, spin_is_locked(&store->tables));
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 			/* The head consumed and holds nothing; the queue is not failed. */
 			KUNIT_EXPECT_FALSE(test, head->consumed);
@@ -13997,6 +14055,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_tx_failed_long),
 	KUNIT_CASE_SLOW(opaque_tx_failed_smp),
 	KUNIT_CASE(opaque_tx_idle_cache),
+	KUNIT_CASE(opaque_lock_held_check),
 	KUNIT_CASE(opaque_tx_lock_order),
 	KUNIT_CASE(opaque_send_head_admit_fails),
 	KUNIT_CASE(opaque_send_head_races_follower),
