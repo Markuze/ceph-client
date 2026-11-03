@@ -7,6 +7,7 @@
 #include <linux/llist.h>
 #include <linux/net.h>
 #include <linux/percpu.h>
+#include <linux/rcupdate.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
@@ -19,7 +20,7 @@
 #define IO_OPAQUE_RX_BATCH	SZ_256K
 #define IO_OPAQUE_MAX_ORDER	(PAGE_SHIFT < 16 ? 16 - PAGE_SHIFT : 0)
 #define IO_OPAQUE_ALLOC_RETRY_MS	50
-/* Waiters looked at in one hold of wait_lock, or the followers of a failed queue in one of tx_lock. */
+/* Waiters looked at in one hold of wait_lock, or followers of a failed queue in one of tx_lock. */
 #define IO_OPAQUE_WAKE_BATCH	32
 #define IO_OPAQUE_INDEX_BITS	14
 #define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
@@ -144,6 +145,19 @@ struct io_opaque_block {
 
 struct io_opaque_data {
 	refcount_t refs;
+	/*
+	 * The handle that names this version. Set before the version is published and
+	 * never changed, so that a lookup that holds neither tables nor a reference can
+	 * tell whether the slot it read the version from still holds what the handle
+	 * names. The lookup (io_opaque_pin()) reads it, and the length, in an RCU
+	 * read-side section before it takes a reference. Neither changes after
+	 * publication, and the struct outlives its last reference by a grace period
+	 * (@rcu), so what it reads is what the version was, even if it was put by
+	 * everyone since.
+	 */
+	u64 handle;
+	/* The struct outlives its last reference by a grace period, see io_opaque_data_put(). */
+	struct rcu_head rcu;
 	struct list_head extents;
 	struct bio_vec *bvec;
 	/*
@@ -166,7 +180,12 @@ struct io_opaque_data {
 };
 
 struct io_opaque_slot {
-	struct io_opaque_data *data;
+	/*
+	 * The version that the handle names. It is changed with tables held, and read with
+	 * it, or in RCU by the lookup of a send that does not consume the object
+	 * (io_opaque_pin()).
+	 */
+	struct io_opaque_data __rcu *data;
 	u64 generation;
 	bool reserved;
 	bool compacting;
@@ -207,9 +226,12 @@ struct io_opaque_vec {
 	 * Entries of pin[] that admission has set. The version of each is kept
 	 * alive by the send, by a reference of the entry's own or, unless the
 	 * vector is LAST, by that of the entry before it when both name the
-	 * same handle.
+	 * same handle. They stay set when admission fails, for the cleanup of the
+	 * request, and when it needs a bigger block, which takes them over.
 	 */
 	u32 pinned;
+	/* Entries of pin[] that are borrowed from the ring, see borrowed[]. */
+	u32 nr_borrowed;
 	u32 cap_nr;
 	u32 cap_segs;
 	/* The largest entry; the copy threshold applies to it. */
@@ -217,6 +239,12 @@ struct io_opaque_vec {
 	struct io_uring_opaque_send_entry *ent;
 	struct io_opaque_data **pin;
 	struct bio_vec *bv;
+	/*
+	 * Whether the version of an entry that owns its pin (io_opaque_vec_owns()), among the
+	 * first @pinned, is held by a borrow from the ring (io_opaque_pin()) and not by a
+	 * reference of the send's own. Read only while @nr_borrowed is not zero.
+	 */
+	u8 *borrowed;
 };
 
 /*
@@ -340,6 +368,13 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
 	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
 	IO_OPAQUE_STAT_SEND_UBUF_REUSED,
+	/*
+	 * Versions that sends hold, counted when they are acquired: a reference that the send
+	 * took on the version, or the table's own that a send with LAST took over.
+	 */
+	IO_OPAQUE_STAT_SEND_REFS_TAKEN,
+	/* Versions that a send borrowed from its ring, taking no reference (io_opaque_pin()). */
+	IO_OPAQUE_STAT_SEND_REFS_BORROWED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -431,12 +466,15 @@ struct io_opaque_store {
 	/*
 	 * Handles and candidates. A spinlock: nothing under it sleeps or allocates, and
 	 * a version is put, a copy made and a socket locked only after it is dropped. It
-	 * is held for a time that the request bounds: what admission does under it is a
-	 * lookup per entry, the segments its ranges span up to the limit, which it counts
-	 * and stores in the request's block, and for each range a walk that the version's
-	 * anchors keep to about two strides and a binary search. Attach and the admission
-	 * of a send take it with the socket owned, so a socket lock is never taken while
-	 * holding it.
+	 * is held for a time that the request bounds: what the admission of a send that
+	 * consumes its object does under it is a lookup per entry, the segments its
+	 * ranges span up to the limit, which it counts and stores in the request's
+	 * block, and for each range a walk that the version's anchors keep to about two
+	 * strides and a binary search. Attach and that admission take it with the socket
+	 * owned, so a socket lock is never taken while holding it. Every change of a
+	 * slot's version is made with it held, and a send that does not consume its
+	 * object does not take it to read one (see io_opaque_pin()), but for the lookup
+	 * that finds no version to take.
 	 */
 	spinlock_t tables;
 	struct io_opaque_slot *objects;
@@ -592,6 +630,14 @@ struct page *io_opaque_dest_page(struct io_opaque_store *store, u64 pages_left,
 u64 io_opaque_handle(u32 index, u64 generation);
 struct io_opaque_slot *io_opaque_lookup(struct io_opaque_store *store,
 					u64 handle);
+
+/* The version that @slot holds, for a caller that holds tables, which is what changes it. */
+static inline struct io_opaque_data *io_opaque_slot_data(struct io_opaque_store *store,
+							 const struct io_opaque_slot *slot)
+{
+	return rcu_dereference_protected(slot->data, lockdep_is_held(&store->tables));
+}
+
 void io_opaque_wait(struct io_opaque_req *op, enum io_opaque_phase phase);
 void io_opaque_queue_ready(struct io_opaque_req *op, int result);
 int io_opaque_compact_build(struct io_opaque_req *op);
@@ -640,6 +686,7 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 void io_opaque_send_resolve(struct io_opaque_req *op);
 int io_opaque_send_acquire(struct io_opaque_req *op);
+void io_opaque_send_return(struct io_opaque_req *op);
 int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
 void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total, u32 longest);
 int io_opaque_vec_copy_in(struct io_opaque_req *op,
@@ -650,6 +697,11 @@ int io_opaque_apply_policy(struct io_opaque_store *store,
 			   const struct io_uring_opaque_policy *policy);
 extern unsigned int io_opaque_policy_chunk;
 extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
+extern void (*io_opaque_lookup_before)(struct io_opaque_store *store);
+extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
+extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
+extern atomic_long_t io_opaque_pin_slow;
+extern void (*io_opaque_borrows_exit_hook)(struct io_ring_ctx *ctx);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;

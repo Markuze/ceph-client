@@ -52,6 +52,9 @@ void io_opaque_cache_free(struct io_ring_ctx *ctx)
 static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_vec_cleanup(struct io_opaque_req *op);
+static bool io_opaque_send_borrows(const struct io_opaque_req *op);
+static void io_opaque_vec_return(struct io_opaque_req *op);
+VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream);
 static void io_opaque_tx_put(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
@@ -609,7 +612,17 @@ void io_opaque_data_put(struct io_opaque_store *store,
 	if (data && refcount_dec_and_test(&data->refs)) {
 		io_opaque_extents_free(store, &data->extents);
 		kvfree(data->bvec);
-		kfree(data);
+		/*
+		 * The extents and the segments go now, as they always did. Only the struct
+		 * waits for the grace period: a lookup that read the version from its slot
+		 * in RCU may still be about to look at it (io_opaque_pin()). It reads the
+		 * count, which may be zero by now, and the handle and the length, before it
+		 * holds a reference. Those two are set before the version is published and
+		 * never change, so they are what they were whenever the lookup reads them,
+		 * and the struct is there for it to read. It reads nothing else until it
+		 * holds a reference, and the segments are gone.
+		 */
+		kfree_rcu(data, rcu);
 	}
 }
 
@@ -711,10 +724,12 @@ VISIBLE_IF_KUNIT struct io_opaque_data *io_opaque_detach(struct io_opaque_store 
 	struct io_opaque_data *data;
 
 	lockdep_assert_held(&store->tables);
-	if (!slot || !slot->data)
+	if (!slot)
 		return NULL;
-	data = slot->data;
-	slot->data = NULL;
+	data = io_opaque_slot_data(store, slot);
+	if (!data)
+		return NULL;
+	RCU_INIT_POINTER(slot->data, NULL);
 	store->nr_objects--;
 	io_opaque_release_slot(store->object_used, slot - store->objects, slot->generation);
 	slot->compacting = false;
@@ -2379,6 +2394,7 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_slot *slot = &store->objects[op->slot];
+	struct io_opaque_data *data = op->data;
 
 	guard(spinlock)(&store->tables);
 	if (store->dead || READ_ONCE(op->canceled))
@@ -2386,10 +2402,12 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	if (!slot->reserved ||
 	    slot->generation != op->handle >> IO_OPAQUE_INDEX_BITS)
 		return -ESTALE;
-	slot->data = op->data;
-	if (op->data->forward_only)
+	/* The handle is set before the version is seen, and not changed again. */
+	data->handle = op->handle;
+	rcu_assign_pointer(slot->data, data);
+	if (data->forward_only)
 		*object_flags = IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
-	if (op->data->mapped)
+	if (data->mapped)
 		*object_flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
 	store->nr_objects++;
 	op->data = NULL;
@@ -2397,7 +2415,7 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	op->slot_reserved = false;
 	slot->born = jiffies;
 	slot->retry = jiffies;
-	if (!slot->data->dense && !slot->data->forward_only && !slot->data->mapped &&
+	if (!data->dense && !data->forward_only && !data->mapped &&
 	    (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT)) {
 		list_add_tail(&slot->candidate, &store->candidates);
 		queue_delayed_work(system_dfl_wq, &store->compact_work,
@@ -2551,6 +2569,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 static int io_opaque_resolve(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
+	struct io_opaque_data *data;
 	struct io_opaque_slot *slot;
 	u16 cmd = op->op;
 	int ret = 0;
@@ -2573,14 +2592,14 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 	} else if (cmd == IORING_OPAQUE_READ_OBJECT || cmd == IORING_OPAQUE_OBJECT_STAT ||
 		   cmd == IORING_OPAQUE_OBJECT_EXTENTS) {
 		slot = io_opaque_lookup(store, op->handle);
-		if (!slot || !slot->data) {
+		data = slot ? io_opaque_slot_data(store, slot) : NULL;
+		if (!data) {
 			ret = -ESTALE;
 		} else {
-			op->data = slot->data;
-			refcount_inc(&op->data->refs);
+			op->data = data;
+			refcount_inc(&data->refs);
 			if (cmd == IORING_OPAQUE_READ_OBJECT &&
-			    (op->offset > op->data->length ||
-			     op->length > op->data->length - op->offset))
+			    (op->offset > data->length || op->length > data->length - op->offset))
 				ret = -ERANGE;
 		}
 	}
@@ -3082,7 +3101,13 @@ void io_opaque_cleanup(struct io_kiocb *req)
  * its block), and the block. A send that ended with its socket owned has given
  * back all but the frame and the decision about the block (io_opaque_send()); any
  * other has all of them to give back here, once, and each is given back only if it
- * is there: a call that is made to find that out is a call for nothing.
+ * is there: a call that is made to find that out is a call for nothing. A vector
+ * whose admission failed, with the socket owned or not, is one of those: it left the
+ * references it had taken for this (io_opaque_vec_acquire()). So is a frame that a queue
+ * which failed refused after it had taken its references (io_opaque_tx_settle()). So is
+ * a send that borrowed a version from its ring and ended in an issue that did not hold the
+ * ring lock, which cleanup does: it gives the borrow back (io_opaque_send_return()), and
+ * puts the ring's reference if that was the last borrow of the version.
  *
  * A send is on neither list that a waker walks under wait_lock, budget_waits and
  * copies, so it has no waker to wait out, and takes the lock only if its entry is
@@ -3110,11 +3135,13 @@ void io_opaque_send_cleanup(struct io_kiocb *req)
 		kfree(op->framing);
 	if (op->frame_charge)
 		io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
+	lockdep_assert_held(&req->ctx->uring_lock);
+	if (unlikely(io_opaque_send_borrows(op)))
+		io_opaque_send_return(op);
 	if (unlikely(op->vec))
 		io_opaque_vec_cleanup(op);
 	if (op->data)
 		io_opaque_data_put(store, op->data);
-	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
 }
@@ -3225,40 +3252,37 @@ atomic_long_t io_opaque_vec_counted = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_VEC_COUNTED(n)	((void)(n))
 #endif
 
-/*
- * Whether the request's block, if it has one, holds @nr entries and @segs
- * segments already. A request that is made ready for a vector holds no
- * reference in its block, which is what the warning says.
- */
+/* Whether the request's block, if it has one, holds @nr entries and @segs segments already. */
 static inline bool io_opaque_vec_fits(const struct io_opaque_vec *vec, u32 nr, u32 segs)
 {
-	if (!vec)
-		return false;
-	WARN_ON_ONCE(vec->pinned);
-	return vec->cap_nr >= nr && vec->cap_segs >= segs;
+	return vec && vec->cap_nr >= nr && vec->cap_segs >= segs;
 }
 
 /*
- * Make room in the request's block for @nr entries and @segs segments, keeping
- * its first @keep entries. A block that is big enough stays as it is, and a
- * caller that can tell (io_opaque_vec_fits()) does not call. This allocates, so
- * tables must not be held, and the send must hold no reference yet: what
- * admission recorded about the versions is not carried over.
+ * Make room in the request's block for @nr entries and @segs segments, keeping its first @keep
+ * entries and the references that admission took on them, and the borrows: the new block holds
+ * the versions that the old one did, and admission walks the entries again over them (see
+ * io_opaque_vec_acquire()). A reference on an entry that is not kept would be lost, which is
+ * what the warning says. A block that is big enough stays as it is, and a caller that can tell
+ * (io_opaque_vec_fits()) does not call. This allocates, so tables must not be held.
  */
 VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep)
 {
 	struct io_opaque_vec *old = op->vec, *vec;
+	u32 i;
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_vec_grow, op, nr, segs, keep);
 	lockdep_assert_not_held(&op->store->tables);
 	if (io_opaque_vec_fits(old, nr, segs))
 		return 0;
+	WARN_ON_ONCE(old && old->pinned > keep);
 	if (old) {
 		nr = max(nr, old->cap_nr);
 		segs = max(segs, old->cap_segs);
 	}
 	vec = kvmalloc(size_add(sizeof(*vec),
-				size_add(array_size(nr, sizeof(*vec->ent) + sizeof(*vec->pin)),
+				size_add(array_size(nr, sizeof(*vec->ent) + sizeof(*vec->pin) +
+						       sizeof(*vec->borrowed)),
 					 array_size(segs, sizeof(*vec->bv)))),
 		       GFP_KERNEL_ACCOUNT);
 	if (!vec)
@@ -3268,12 +3292,24 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 	vec->ent = (void *)(vec + 1);
 	vec->pin = (void *)(vec->ent + nr);
 	vec->bv = (void *)(vec->pin + nr);
+	vec->borrowed = (void *)(vec->bv + segs);
 	vec->nr_segs = 0;
 	vec->pinned = 0;
+	vec->nr_borrowed = 0;
 	if (old) {
 		vec->nr = old->nr;
 		vec->max_len = old->max_len;
 		memcpy(vec->ent, old->ent, array_size(keep, sizeof(*vec->ent)));
+		vec->pinned = min(old->pinned, keep);
+		memcpy(vec->pin, old->pin, array_size(vec->pinned, sizeof(*vec->pin)));
+		/*
+		 * The borrows of the pins that are kept go with them. The flags are copied
+		 * whether or not any is set, and the count is made from them: the new block
+		 * is not cleared, and a flag that was not copied is what the allocation held.
+		 */
+		memcpy(vec->borrowed, old->borrowed, vec->pinned);
+		for (i = 0; i < vec->pinned; i++)
+			vec->nr_borrowed += vec->borrowed[i];
 		kvfree(old);
 	} else {
 		vec->nr = 0;
@@ -3296,6 +3332,7 @@ VISIBLE_IF_KUNIT void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32
 	vec->nr = nr;
 	vec->nr_segs = 0;
 	vec->pinned = 0;
+	vec->nr_borrowed = 0;
 	vec->max_len = longest;
 	op->handle = 0;
 	op->offset = 0;
@@ -3354,10 +3391,11 @@ efault:
 /*
  * Whether entry @i of an admitted vector holds a reference of its own. A LAST
  * vector takes one per entry. Any other takes one per run of entries that name
- * the same handle: within one hold of tables the same handle is the same
- * version, so the rest of the run shares the first entry's pin. This looks at
- * the entries, which never change, and not at the pins, which may be freed by
- * the time the run's owner has been released.
+ * the same handle: a run is one version, the one that its first entry pinned,
+ * and the rest of it uses that pin and does not look the handle up again, for
+ * the slot may hold another version by then. This looks at the entries, which
+ * never change, and not at the pins, which may be freed by the time the run's
+ * owner has been released.
  */
 static bool io_opaque_vec_owns(const struct io_opaque_req *op, u32 i)
 {
@@ -3367,12 +3405,21 @@ static bool io_opaque_vec_owns(const struct io_opaque_req *op, u32 i)
 	       vec->ent[i].handle != vec->ent[i - 1].handle;
 }
 
-/* Drop every version reference the send holds; one that took none drops none. */
+/*
+ * Drop every version reference the send holds; one that took none drops none. This puts the
+ * last reference of a version if it is the send's, and it is for a context that does not own the
+ * socket: the end of a send, after the socket is released, and request cleanup. That includes
+ * the references that a failed admission leaves in the block (io_opaque_vec_acquire()). What the
+ * vector borrowed from its ring is given back first, which needs the ring lock
+ * (io_opaque_send_return()).
+ */
 VISIBLE_IF_KUNIT void io_opaque_vec_release(struct io_opaque_req *op)
 {
 	struct io_opaque_vec *vec = op->vec;
 	u32 i;
 
+	if (unlikely(vec->nr_borrowed))
+		io_opaque_vec_return(op);
 	for (i = 0; i < vec->pinned; i++)
 		if (io_opaque_vec_owns(op, i))
 			io_opaque_data_put(op->store, vec->pin[i]);
@@ -3484,33 +3531,344 @@ static u32 io_opaque_vec_span(const struct io_opaque_data *data, u32 seg, u32 sk
 	return n;
 }
 
-/* The handle must hold a version, and the range must lie within it. */
-static int io_opaque_send_range(const struct io_opaque_slot *slot, u64 off, u32 len)
+/* The range must lie within the version. */
+static int io_opaque_send_range(const struct io_opaque_data *data, u64 off, u32 len)
 {
-	if (!slot || !slot->data)
-		return -ESTALE;
-	if (off > slot->data->length || len > slot->data->length - off)
+	if (off > data->length || len > data->length - off)
 		return -ERANGE;
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
 /*
- * Take a send's reference on the version @slot holds: the table reference when
- * the send is LAST, which also removes the handle, else an extra one. Under
- * tables, after io_opaque_send_range().
+ * Run by io_opaque_pin() before it reads the slot, with no lock held and not in RCU, which is
+ * after its caller has looked at store->dead: for a test to stop the store, or to hold the
+ * lookup until it is stopped. It may sleep.
  */
-static struct io_opaque_data *io_opaque_send_pin(struct io_opaque_store *store,
-						 struct io_opaque_slot *slot, bool last)
+void (*io_opaque_lookup_before)(struct io_opaque_store *store);
+#define IO_OPAQUE_LOOKUP_BEFORE(store)				\
+	do {							\
+		if (io_opaque_lookup_before)			\
+			io_opaque_lookup_before(store);		\
+	} while (0)
+/*
+ * Run by io_opaque_pin() in the RCU section, after it has read the version from its slot and
+ * before it takes a reference, for a test to change what the slot holds there.
+ */
+void (*io_opaque_lookup_between)(struct io_opaque_store *store);
+#define IO_OPAQUE_LOOKUP_BETWEEN(store)				\
+	do {							\
+		if (io_opaque_lookup_between)			\
+			io_opaque_lookup_between(store);	\
+	} while (0)
+/*
+ * Run by io_opaque_pin() when it has the reference and returns it, with no lock held and not
+ * in RCU: a lookup that returns an error has not got here. For a test to change what the
+ * other holders of the version do, and to see that a lookup that fails never held it.
+ */
+void (*io_opaque_lookup_after)(struct io_opaque_store *store);
+#define IO_OPAQUE_LOOKUP_AFTER(store)				\
+	do {							\
+		if (io_opaque_lookup_after)			\
+			io_opaque_lookup_after(store);		\
+	} while (0)
+/* Lookups that the table settled, with tables held: those that found nothing to take in RCU. */
+atomic_long_t io_opaque_pin_slow = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_PIN_SLOW()		atomic_long_inc(&io_opaque_pin_slow)
+#else
+#define IO_OPAQUE_LOOKUP_BEFORE(store)	((void)(store))
+#define IO_OPAQUE_LOOKUP_BETWEEN(store)	((void)(store))
+#define IO_OPAQUE_LOOKUP_AFTER(store)	((void)(store))
+#define IO_OPAQUE_PIN_SLOW()		((void)0)
+#endif
+
+/*
+ * The lookup of io_opaque_pin() that is settled with tables held, where nothing changes
+ * meanwhile: the slot was empty, or held a version of another handle, or a version that
+ * everyone has put since it was read. The handle names another version now, a replacement of the
+ * one that was read for example, or none. A store that has stopped is looked at first. It stops
+ * by setting dead with tables held and detaching its objects afterwards, so that a handle that
+ * was there when the send began can be gone by now, and is not stale: the send is ordered after
+ * the stop, and the answer it gets is the store's, as it is for a send that begins after it.
+ * Like the lookup in RCU, this takes a reference or returns an error and holds none.
+ */
+static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store, u64 handle,
+						   u64 off, u32 len)
 {
-	if (last)
-		return io_opaque_detach(store, slot);
-	refcount_inc(&slot->data->refs);
-	return slot->data;
+	struct io_opaque_slot *slot;
+	struct io_opaque_data *data;
+	int ret;
+
+	IO_OPAQUE_PIN_SLOW();
+	guard(spinlock)(&store->tables);
+	if (store->dead)
+		return ERR_PTR(-ESHUTDOWN);
+	slot = io_opaque_lookup(store, handle);
+	data = slot ? io_opaque_slot_data(store, slot) : NULL;
+	if (!data)
+		return ERR_PTR(-ESTALE);
+	ret = io_opaque_send_range(data, off, len);
+	if (ret)
+		return ERR_PTR(ret);
+	refcount_inc(&data->refs);
+	return data;
 }
 
-/* Drop the references a send took at admission; a no-op when it took none. */
+/*
+ * The borrows of a ring. A send that keeps its object holds the version it sends until it ends.
+ * The sends of one ring that are in flight on one version at the same time, as the evaluation's
+ * senders have eight of the same objects, each took a reference on it and gave one back: two
+ * atomic operations a send, for a hold that the ring can keep once for all of them.
+ * ctx->opaque_borrow is that hold: an entry for each version the ring has a reference on, with
+ * the number of its sends that borrow it.
+ *
+ * The first send of a version that finds the ring without an entry for it takes a reference as
+ * a send always did, and the ring keeps it in an entry with a count of one: the send borrows it.
+ * A send that comes while the entry is there raises the count and takes nothing. A send that ends
+ * gives its borrow back, and the one that gives back the last drops the ring's reference, and the
+ * entry goes. Nothing is kept for a send that has not come: the entries are the versions that
+ * sends of the ring are in flight on, and a version is held for as long as one is, as it was when
+ * every send held a reference of its own. Nothing that userspace can see differs.
+ *
+ * A version is looked for by its address. The version that a slot holds is the one the ring has
+ * an entry for if the two are the same, since a version that the ring holds a reference on is not
+ * freed, and so its address is not another version's.
+ *
+ * The table is under the ring lock. An inline issue holds that from end to end, and an io-wq
+ * issue does not: it drops the lock for the socket, and does not take it again before it ends.
+ * So only an inline issue borrows (op->may_borrow), and a borrow is given back where the ring
+ * lock is held, which is the end of an inline issue and the cleanup of the request. A send that
+ * holds a borrow and ends in an issue that does not hold the lock leaves it for its cleanup, as
+ * does a frame that joins a queue that has failed: it is refused with its borrow
+ * (io_opaque_tx_settle()), since it may join with the socket owned, where no version is put. A
+ * send with LAST takes the table's reference, a send of a version that finds the table full takes
+ * one of its own, and so does one that is not inline, as they all did.
+ */
+
+/* The entry of the ring for @data, or NULL. */
+static struct io_opaque_borrow *io_opaque_borrow_find(struct io_ring_ctx *ctx,
+						      const struct io_opaque_data *data)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&ctx->uring_lock);
+	for (i = 0; i < ctx->opaque_borrow_nr; i++)
+		if (ctx->opaque_borrow[i].data == data)
+			return &ctx->opaque_borrow[i];
+	return NULL;
+}
+
+/* Borrow @data if the ring has an entry for it, taking and putting nothing. */
+static bool io_opaque_borrow_take(struct io_ring_ctx *ctx, const struct io_opaque_data *data)
+{
+	struct io_opaque_borrow *b = io_opaque_borrow_find(ctx, data);
+
+	if (!b)
+		return false;
+	b->borrows++;
+	return true;
+}
+
+/*
+ * The ring keeps the reference that a send has taken on @data in an entry of its own, and the
+ * send borrows it. False if the table is full: the reference stays the send's.
+ */
+static bool io_opaque_borrow_add(struct io_ring_ctx *ctx, struct io_opaque_data *data)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	if (ctx->opaque_borrow_nr >= IO_OPAQUE_BORROW_MAX)
+		return false;
+	ctx->opaque_borrow[ctx->opaque_borrow_nr++] = (struct io_opaque_borrow) {
+		.data = data, .borrows = 1,
+	};
+	return true;
+}
+
+/*
+ * Give back a borrow of @data. True if it was the last: the entry is gone, and the ring's
+ * reference is the caller's to put, as the send's own would be.
+ */
+static bool io_opaque_borrow_return(struct io_ring_ctx *ctx, const struct io_opaque_data *data)
+{
+	struct io_opaque_borrow *b = io_opaque_borrow_find(ctx, data);
+
+	/* A borrow with no entry is a bug, and a reference left is better than one put twice. */
+	if (WARN_ON_ONCE(!b))
+		return false;
+	if (--b->borrows)
+		return false;
+	*b = ctx->opaque_borrow[--ctx->opaque_borrow_nr];
+	return true;
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Run by io_opaque_borrows_exit() before it looks, for a test to read what the ring holds when
+ * its registrations are undone.
+ */
+void (*io_opaque_borrows_exit_hook)(struct io_ring_ctx *ctx);
+#define IO_OPAQUE_BORROWS_EXIT(ctx)					\
+	do {								\
+		if (io_opaque_borrows_exit_hook)			\
+			io_opaque_borrows_exit_hook(ctx);		\
+	} while (0)
+#else
+#define IO_OPAQUE_BORROWS_EXIT(ctx)	((void)(ctx))
+#endif
+
+/*
+ * The ring is going. Every send has been cleaned up, and gave back what it borrowed in its
+ * cleanup, so no version is borrowed: the references of the entries would be left with the store.
+ */
+void io_opaque_borrows_exit(struct io_ring_ctx *ctx)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	IO_OPAQUE_BORROWS_EXIT(ctx);
+	WARN_ON(ctx->opaque_borrow_nr);
+}
+
+/*
+ * Take a reference on the version that @handle names, for a send that does not consume it and
+ * wants @len bytes of it from @off, without taking tables. The slot is read in RCU, and the
+ * count raised if it is not zero. What is read is the version that the slot held. A FREE, a LAST
+ * send or a compaction that runs at the same time has either not changed it yet, and then the
+ * send is ordered before it, or has: the version has left the table by then, but it is still the
+ * one that the handle named when it was read, and sending it is what a send that came first
+ * would have done.
+ *
+ * The version must be the handle's, and have the range, and both are settled in the RCU
+ * section, before the reference is taken. The version knows the handle it was published for and
+ * its length, both set before it was and never changed, and its struct is there until a grace
+ * period after the last put (io_opaque_data_put()). So a lookup returns a version with a
+ * reference that the send keeps, or an error and no reference at all, and a send never has to
+ * give back what it took. That matters for the last reference of a version, which a send that
+ * owns the socket must not put (a free is not for the socket lock to wait out, see
+ * io_opaque_send_unpin_cheap()): admission runs with the socket, and the version may have left
+ * the table since the reference was taken, so that giving it back would be the last put.
+ *
+ * Whatever does not give a version to take is asked of the table with tables held, where the
+ * answer is the one it always was (io_opaque_pin_locked()): an empty slot, a version of another
+ * handle (the slot was freed and taken by another object), and a count of zero, which says that
+ * the version has left the table and that everyone has put it. Its extents and segments are
+ * freed and only the struct is left, so that the count, the handle and the length can still be
+ * read. A store that has
+ * stopped is answered there too. The caller has looked at store->dead, and the store may stop
+ * after that and before the slot is read: it sets dead under tables and detaches its objects
+ * later, and the lookup that finds one detached is told so. A range outside the version that is
+ * the handle's is the answer without tables.
+ *
+ * A send that may borrow (@borrowed is not NULL, and the issue holds the ring lock throughout)
+ * takes no reference when the ring has an entry for the version the slot holds: it borrows that,
+ * and sets *@borrowed. The version is then held by the reference of the entry, which is not the
+ * send's to put, and which the entry keeps for as long as it has a borrow. Without an entry it
+ * takes a reference as above, and the ring keeps it in one if the table has room for it, and
+ * the send borrows it. A reference that the table settled is the send's own.
+ */
+static struct io_opaque_data *io_opaque_pin(struct io_opaque_req *op, u64 handle, u64 off,
+					    u32 len, bool *borrowed)
+{
+	struct io_opaque_store *store = op->store;
+	struct io_ring_ctx *ctx = borrowed && op->may_borrow ? op->req->ctx : NULL;
+	u32 index = io_opaque_index(handle);
+	struct io_opaque_data *data;
+	bool taken = false, hit = false;
+	int ret = 0;
+
+	if (!handle || index >= store->config.max_objects)
+		return ERR_PTR(-ESTALE);
+	IO_OPAQUE_LOOKUP_BEFORE(store);
+	rcu_read_lock();
+	data = rcu_dereference(store->objects[index].data);
+	IO_OPAQUE_LOOKUP_BETWEEN(store);
+	if (data && data->handle == handle) {
+		ret = io_opaque_send_range(data, off, len);
+		if (!ret) {
+			hit = ctx && io_opaque_borrow_take(ctx, data);
+			taken = hit || refcount_inc_not_zero(&data->refs);
+		}
+	}
+	rcu_read_unlock();
+	if (ret)
+		return ERR_PTR(ret);
+	if (unlikely(!taken)) {
+		data = io_opaque_pin_locked(store, handle, off, len);
+		if (IS_ERR(data))
+			return data;
+	} else if (ctx && !hit) {
+		*borrowed = io_opaque_borrow_add(ctx, data);
+	}
+	if (hit) {
+		*borrowed = true;
+		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_BORROWED, 1);
+	} else {
+		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
+	}
+	IO_OPAQUE_LOOKUP_AFTER(store);
+	return data;
+}
+
+/* Whether the send holds a version by a borrow, which only the ring lock lets it give back. */
+static bool io_opaque_send_borrows(const struct io_opaque_req *op)
+{
+	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
+		return op->vec && op->vec->nr_borrowed;
+	return op->borrowed;
+}
+
+/* The borrows of a vector, as io_opaque_send_return() gives them back. */
+static void io_opaque_vec_return(struct io_opaque_req *op)
+{
+	struct io_ring_ctx *ctx = op->req->ctx;
+	struct io_opaque_vec *vec = op->vec;
+	u32 i;
+
+	lockdep_assert_held(&ctx->uring_lock);
+	for (i = 0; i < vec->pinned && vec->nr_borrowed; i++) {
+		if (!vec->borrowed[i] || !io_opaque_vec_owns(op, i))
+			continue;
+		vec->borrowed[i] = false;
+		vec->nr_borrowed--;
+		if (!io_opaque_borrow_return(ctx, vec->pin[i]))
+			vec->pin[i] = NULL;
+	}
+	WARN_ON_ONCE(vec->nr_borrowed);
+	vec->nr_borrowed = 0;
+}
+
+/*
+ * Give back the borrows of the send, with the ring lock held. A borrow that is not the last of
+ * its version leaves the send with nothing to put. The last leaves it with the ring's reference,
+ * as its own: the send puts that as it would one it took, which for a send that owns its socket is
+ * after the socket is released (io_opaque_send_unpin_cheap()).
+ */
+VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op)
+{
+	struct io_ring_ctx *ctx;
+
+	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR)) {
+		if (op->vec && op->vec->nr_borrowed)
+			io_opaque_vec_return(op);
+		return;
+	}
+	if (!op->borrowed)
+		return;
+	ctx = op->req->ctx;
+	lockdep_assert_held(&ctx->uring_lock);
+	op->borrowed = false;
+	if (!io_opaque_borrow_return(ctx, op->data))
+		op->data = NULL;
+}
+
+/*
+ * Drop the references a send took at admission, giving back what it borrowed first (with the
+ * ring lock held, see io_opaque_send_return()); a no-op when it took none. The last of a version
+ * is put here, so this is for the end of a send once its socket is released, and nothing that
+ * has the socket calls it.
+ */
 static void io_opaque_send_unpin(struct io_opaque_req *op)
 {
+	if (unlikely(io_opaque_send_borrows(op)))
+		io_opaque_send_return(op);
 	if (op->send_flags & IORING_OPAQUE_SEND_VECTOR)
 		io_opaque_vec_release(op);
 	io_opaque_data_put(op->store, op->data);
@@ -3523,16 +3881,31 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
  * decrement and cannot free anything, and say whether any is left. What is
  * left is for io_opaque_send_unpin() once the socket is released, since the
  * last reference frees the version, every extent of it, and that is not for
- * the lock to wait out. Nobody can take a reference on a version whose count
- * is one, which is not in the table, so the last one is still the last then.
- * A vector's entries that were put are cleared, so that the rest cannot put
- * them again. A send that consumed its object does not call it (see
- * io_opaque_send()).
+ * the lock to wait out. A version whose count is one has left the table, but
+ * a lookup in RCU that read it before it did can still take a reference on it
+ * (io_opaque_pin()). Then the one put after the socket is not the last. The
+ * last is put by the send of that lookup, when it gives its references back:
+ * after it has released its socket, if it ends owning it as this one does, or
+ * in its cleanup, since a lookup puts nothing, a single range that fails holds
+ * no reference, and a vector that fails leaves what it pinned for its cleanup
+ * (io_opaque_vec_acquire()). So does a frame that joins a queue which fails
+ * meanwhile: it is refused with its references (io_opaque_tx_settle()), and
+ * its cleanup puts them. A decrement never takes a count from one to zero. A
+ * vector's entries that were put are cleared, so that the rest cannot put them
+ * again. A send that consumed its object does not call it (see io_opaque_send()).
+ *
+ * A borrow is given back first, with the ring lock held (io_opaque_send_return()), and a borrow
+ * that is not the last of its version leaves nothing to drop. The last leaves the reference of
+ * the ring, which is dropped as the send's own would be: by a decrement here, if the version has
+ * other holders, and else after the socket. So a send that borrows puts nothing with the socket
+ * owned either.
  */
 static bool io_opaque_send_unpin_cheap(struct io_opaque_req *op)
 {
 	bool left = false;
 
+	if (unlikely(io_opaque_send_borrows(op)))
+		io_opaque_send_return(op);
 	if (op->send_flags & IORING_OPAQUE_SEND_VECTOR) {
 		struct io_opaque_vec *vec = op->vec;
 		u32 i;
@@ -3572,32 +3945,45 @@ static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *
 }
 
 /*
- * Admission of a vectored send, under tables; every entry sees the versions
- * as they are in this one hold, and nothing in here sleeps. Pass one resolves,
- * stores and counts, and fails without having pinned or detached anything, so a
- * vector that cannot go consumes nothing. It finds where each range starts by
- * walking the segments of its version, and an entry that follows another in
- * the same version, not before the segment that one started in, walks on from
- * there instead of from the first: ranges in ascending order walk each object
- * once, and a range that starts in the segment the walk is at, as every range
- * of an object of one segment does, is found without a call. One that is more
- * than a stride from where the walk is jumps to the version's anchors (see
- * io_opaque_vec_seek()), so that ranges that go back or alternate between large
- * objects cost a few dozen steps each, not an object. The segments of each
- * range go to the block as the range is found, in the order of the ranges,
- * which is the cursor over the bytes of the send, and are counted whether the
- * block has room for them or not. Counting stops as soon as the limit is
- * passed. What tables is held for is therefore bounded by the entries and the
- * limit, whatever the ranges. A block with too few segments is not grown here,
- * as that allocates; the number needed is returned, and io_opaque_vec_finish()
- * grows the block and asks again. Otherwise the cursor is made, and pass two
- * takes the references and looks nothing up: pass one recorded every version
- * in pin[], and tables has been held since. A LAST vector detaches each handle
- * at its first entry, and an entry that repeats the handle takes one more
- * reference on the version it found. Any other vector takes one reference for
- * each run of entries that name the same handle (see io_opaque_vec_owns()), so
- * eight ranges of one object cost one reference, and a handle that returns
- * after another one pins again. Nothing can fail from there on.
+ * Admission of a vectored send. Pass one resolves the entries, stores the segments of their
+ * ranges and counts them, and fails having removed nothing from the table, so a vector that
+ * cannot go consumes nothing. It finds where each range starts by walking the segments of its
+ * version, and an entry that follows another in the same version, not before the segment that
+ * one started in, walks on from there instead of from the first: ranges in ascending order walk
+ * each object once, and a range that starts in the segment the walk is at, as every range of an
+ * object of one segment does, is found without a call. One that is more than a stride from where
+ * the walk is jumps to the version's anchors (see io_opaque_vec_seek()), so that ranges that go
+ * back or alternate between large objects cost a few dozen steps each, not an object. The
+ * segments of each range go to the block as the range is found, in the order of the ranges,
+ * which is the cursor over the bytes of the send, and are counted whether the block has room for
+ * them or not. Counting stops as soon as the limit is passed. What admission does is therefore
+ * bounded by the entries and the limit, whatever the ranges. A block with too few segments is
+ * not grown here, as that allocates; the number needed is returned, and io_opaque_vec_finish()
+ * grows the block and asks again.
+ *
+ * A vector that consumes what it names (LAST) runs under tables, which
+ * io_opaque_send_acquire() takes for it. Pass one pins nothing there, so every entry sees the
+ * versions as they are in that one hold, and pass two, which nothing can fail, detaches each
+ * handle at its first entry; an entry that repeats the handle takes one more reference on the
+ * version it found. Nothing is held when it returns an error or asks for a bigger block.
+ *
+ * Any other vector does not take tables and has no second pass. It pins each version as pass
+ * one comes to it (io_opaque_pin()), for the walk reads the segments of the version and they
+ * must not be freed under it, and it pins once for each run of entries that name the same
+ * handle (see io_opaque_vec_owns()): eight ranges of one object cost one reference, or one
+ * borrow from the ring, which the entry that owns the pin records (@vec->borrowed). The
+ * entries after the first of a run use its pin and do not look at the table. A handle that
+ * returns after another one pins again, and may then find a replacement that a compaction has
+ * published meanwhile, which has the same bytes.
+ *
+ * What it pinned stays in the block, whatever it returns, and is not given back here: admission
+ * may own the socket, where the last reference of a version is not to be put, and a version
+ * that is freed meanwhile makes the pin of an entry the last. A vector that fails is left with
+ * its references for the cleanup of the request, which gives them back with the socket
+ * released and the ring locked (io_opaque_vec_release()). One that needs a bigger block keeps
+ * them across io_opaque_vec_grow(), and pass one is made again over the same versions: an entry
+ * that is pinned already (@vec->pinned) is not looked up again, so the vector goes on with the
+ * versions it began with, and the block is the only thing that is made again.
  */
 static int io_opaque_vec_acquire(struct io_opaque_req *op)
 {
@@ -3605,22 +3991,45 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 	bool last = op->send_flags & IORING_OPAQUE_SEND_LAST;
 	struct io_opaque_vec *vec = op->vec;
 	const struct io_opaque_data *prev = NULL;
+	struct io_opaque_data *data = NULL;
 	u64 segs = 0, pos = 0;
 	u32 i, seg = 0;
 	int ret;
 
-	if (store->dead)
+	if (READ_ONCE(store->dead))
 		return -ESHUTDOWN;
 	for (i = 0; i < vec->nr; i++) {
 		const struct io_uring_opaque_send_entry *ent = &vec->ent[i];
-		struct io_opaque_slot *slot = io_opaque_lookup(store, ent->handle);
-		struct io_opaque_data *data;
 		u32 skip, n, stored;
 
-		ret = io_opaque_send_range(slot, ent->off, ent->len);
+		if (last) {
+			struct io_opaque_slot *slot = io_opaque_lookup(store, ent->handle);
+
+			data = slot ? io_opaque_slot_data(store, slot) : NULL;
+			if (!data)
+				return -ESTALE;
+		} else if (i < vec->pinned) {
+			/* Pinned before the block grew. */
+			data = vec->pin[i];
+		} else if (io_opaque_vec_owns(op, i)) {
+			bool borrowed = false;
+
+			data = io_opaque_pin(op, ent->handle, ent->off, ent->len, &borrowed);
+			if (IS_ERR(data))
+				return PTR_ERR(data);
+			vec->borrowed[i] = borrowed;
+			vec->nr_borrowed += borrowed;
+		} else {
+			/* An entry of a run uses the first's pin, which is not its to give back. */
+			vec->borrowed[i] = false;
+		}
+		/* A LAST vector takes the reference in pass two, and a repeated handle needs it. */
+		vec->pin[i] = data;
+		if (!last)
+			vec->pinned = max(vec->pinned, i + 1);
+		ret = io_opaque_send_range(data, ent->off, ent->len);
 		if (ret)
 			return ret;
-		data = slot->data;
 		if (data != prev || ent->off < pos) {
 			prev = data;
 			seg = 0;
@@ -3639,81 +4048,125 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 		segs += n;
 		if (segs > IO_OPAQUE_VEC_SEGS_LIMIT)
 			return -EMSGSIZE;
-		/* Not yet a reference: pass two takes it, and a repeated handle needs it. */
-		vec->pin[i] = data;
 	}
 	/* Within the limit, so it fits an int. */
 	if (segs > vec->cap_segs)
 		return segs;
 	vec->nr_segs = segs;
 	iov_iter_bvec(&op->iter, ITER_SOURCE, vec->bv, segs, op->length);
+	if (!last)
+		return 0;
 	for (i = 0; i < vec->nr; i++) {
-		struct io_opaque_slot *slot;
+		struct io_opaque_slot *slot = io_opaque_lookup(store, vec->ent[i].handle);
 
-		if (!last) {
-			if (io_opaque_vec_owns(op, i))
-				refcount_inc(&vec->pin[i]->refs);
-			continue;
-		}
-		slot = io_opaque_lookup(store, vec->ent[i].handle);
-		if (!slot->data)
+		if (!io_opaque_slot_data(store, slot))
 			refcount_inc(&vec->pin[i]->refs);
 		else
-			vec->pin[i] = io_opaque_send_pin(store, slot, true);
+			vec->pin[i] = io_opaque_detach(store, slot);
 	}
 	vec->pinned = vec->nr;
-	if (last)
-		op->consumed = true;
+	op->consumed = true;
+	io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, vec->nr);
 	return 0;
 }
 
 /*
- * Resolve what a send names and take its references, under tables. A send gets
- * its cursor too: one range gets it over the segments of its version, a vector
- * over the block's. A vector returns 0 with its references taken, a negative
- * errno with none taken and nothing removed, or the number of segments its
- * ranges span when its block holds fewer, to be settled by
- * io_opaque_vec_finish() once tables is dropped.
+ * The cursor of a single send over the range it names in its version, which it holds a
+ * reference on, found as a vector's ranges are.
  */
-VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
+static void io_opaque_send_cursor(struct io_opaque_req *op)
 {
-	struct io_opaque_store *store = op->store;
-	bool last = op->send_flags & IORING_OPAQUE_SEND_LAST;
-	struct io_opaque_slot *slot;
+	const struct io_opaque_data *data = op->data;
 	u64 pos = 0;
 	u32 seg = 0, skip;
+
+	skip = io_opaque_vec_seek(data, op->offset, &seg, &pos);
+	io_opaque_send_iter(op, data->bvec + seg, data->nr - seg, data->length - pos, skip);
+}
+
+/*
+ * A send of one range. A LAST send takes the table's reference, which also removes the handle,
+ * under tables; any other sends the version that the handle names now, and takes a reference
+ * of its own without tables, or borrows one of its ring's (io_opaque_pin()), which has checked
+ * the range by then and holds nothing if it refuses it. The cursor is made once the version is
+ * held.
+ */
+static int io_opaque_send_acquire_one(struct io_opaque_req *op)
+{
+	struct io_opaque_store *store = op->store;
+	struct io_opaque_data *data;
 	int ret;
 
-	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_acquire, op);
-	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
-		return io_opaque_vec_acquire(op);
-	slot = io_opaque_lookup(store, op->handle);
-
-	if (store->dead)
+	/*
+	 * A send that consumes what it names looks under tables, and has the answer. Any other
+	 * is told again by its lookup, if it finds no version to take (io_opaque_pin()).
+	 */
+	if (READ_ONCE(store->dead))
 		return -ESHUTDOWN;
 	if (!op->length)
 		return 0;
-	ret = io_opaque_send_range(slot, op->offset, op->length);
-	if (ret)
-		return ret;
-	op->data = io_opaque_send_pin(store, slot, last);
-	if (last)
+	if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
+		struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
+
+		data = slot ? io_opaque_slot_data(store, slot) : NULL;
+		if (!data)
+			return -ESTALE;
+		ret = io_opaque_send_range(data, op->offset, op->length);
+		if (ret)
+			return ret;
+		op->data = io_opaque_detach(store, slot);
 		op->consumed = true;
-	/* The cursor starts at the segment that holds the range, found as a vector's are. */
-	skip = io_opaque_vec_seek(op->data, op->offset, &seg, &pos);
-	io_opaque_send_iter(op, op->data->bvec + seg, op->data->nr - seg, op->data->length - pos,
-			    skip);
+		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
+	} else {
+		bool borrowed = false;
+
+		data = io_opaque_pin(op, op->handle, op->offset, op->length, &borrowed);
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+		op->data = data;
+		op->borrowed = borrowed;
+	}
+	io_opaque_send_cursor(op);
 	return 0;
 }
 
+/* The references of a send, as io_opaque_send_acquire() takes them, with tables if it needs it. */
+static int io_opaque_acquire(struct io_opaque_req *op)
+{
+	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
+		return io_opaque_vec_acquire(op);
+	return io_opaque_send_acquire_one(op);
+}
+
 /*
- * What admission of a vector does without tables, after the hold in which
- * io_opaque_send_acquire() returned @ret. A block with too few segments (@ret
- * of them are needed) is grown here, where allocating is fine, and the vector
- * is resolved again in a new hold: nothing was pinned, and the versions may
- * have changed meanwhile, so every entry is looked at again, and the block may
- * still be short. A vector that goes in the first hold is counted as a fast
- * admission, and one that needed the block grown, however often, as a slow one.
+ * Resolve what a send names and take its references, and make its cursor: one range gets it
+ * over the segments of its version, a vector over the block's. A send that consumes what it
+ * names (LAST) does that under tables, which is taken here, as removing the handle is a write
+ * of the table; any other does not take tables (io_opaque_pin()). A single range returns 0 with
+ * its reference taken, or a negative errno with none. A vector returns 0 with its references
+ * taken, a negative errno with nothing removed, or the number of segments its ranges span when
+ * its block holds fewer, to be settled by io_opaque_vec_finish(). It keeps the references that it
+ * has taken in the last two cases and does not give them back (io_opaque_vec_acquire()): this
+ * may run with the socket owned, and the request gives them back when it is cleaned up.
+ */
+VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_acquire, op);
+	if (!(op->send_flags & IORING_OPAQUE_SEND_LAST))
+		return io_opaque_acquire(op);
+	guard(spinlock)(&op->store->tables);
+	return io_opaque_acquire(op);
+}
+
+/*
+ * What admission of a vector does after io_opaque_send_acquire() has returned @ret. A block with
+ * too few segments (@ret of them are needed) is grown here, where allocating is fine, and the
+ * vector is resolved again. A vector that consumes what it names holds nothing between the
+ * attempts, the versions may have changed meanwhile, so every entry is looked at again, and the
+ * block may still be short. Any other keeps the references of the first attempt, and the second
+ * walks the entries over the versions they pinned, in a block that holds all the segments they
+ * span. A vector that goes at the first attempt is counted as a fast admission, and one that
+ * needed the block grown, however often, as a slow one.
  */
 VISIBLE_IF_KUNIT int io_opaque_vec_finish(struct io_opaque_req *op, int ret)
 {
@@ -3723,8 +4176,7 @@ VISIBLE_IF_KUNIT int io_opaque_vec_finish(struct io_opaque_req *op, int ret)
 		ret = io_opaque_vec_grow(op, op->vec->nr, ret, op->vec->nr);
 		if (ret)
 			return ret;
-		scoped_guard(spinlock, &op->store->tables)
-			ret = io_opaque_send_acquire(op);
+		ret = io_opaque_send_acquire(op);
 	}
 	if (!ret)
 		io_opaque_count(slow ? IO_OPAQUE_STAT_SEND_ADMIT_SLOW :
@@ -3745,6 +4197,8 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 
 	if (op->offset || !nr || nr > IORING_OPAQUE_SEND_VEC_MAX)
 		return -EINVAL;
+	/* A request that is made ready for a vector holds no reference in its block. */
+	WARN_ON_ONCE(op->vec && op->vec->pinned);
 	/* Every entry spans a segment; admission grows the block if some span more. */
 	if (!io_opaque_vec_fits(op->vec, nr, nr)) {
 		ret = io_opaque_vec_grow(op, nr, nr, 0);
@@ -3822,6 +4276,8 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	op->suffix_length = 0;
 	op->total_length = 0;
 	op->tx_started = false;
+	op->may_borrow = false;
+	op->borrowed = false;
 	op->send_flags = send_flags;
 	op->handle = READ_ONCE(sqe->addr);
 	op->offset = READ_ONCE(sqe->off);
@@ -3914,16 +4370,16 @@ static void io_opaque_tx_claim(struct io_opaque_store *store, struct io_opaque_t
 }
 
 /*
- * Resolve what @op names and take its references, and make its cursor, under
- * tables. A vector leaves tables once its references are taken; one whose block
- * is too small leaves it earlier, to grow the block, and is resolved again.
+ * Resolve what @op names and take its references, and make its cursor. A send that consumes
+ * what it names does it under tables, which io_opaque_send_acquire() takes; any other takes no
+ * lock. A vector whose block is too small grows it and is resolved again. A send that fails
+ * gives nothing back here, and the socket may be owned: what a vector took before it failed is
+ * left to the cleanup of the request.
  */
 static int io_opaque_tx_acquire(struct io_opaque_req *op)
 {
-	int ret;
+	int ret = io_opaque_send_acquire(op);
 
-	scoped_guard(spinlock, &op->store->tables)
-		ret = io_opaque_send_acquire(op);
 	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
 		ret = io_opaque_vec_finish(op, ret);
 	return ret;
@@ -3933,8 +4389,16 @@ static int io_opaque_tx_acquire(struct io_opaque_req *op)
  * The admission of a request that found frames ahead of it. It takes its
  * references before it waits, so that a LAST send parked behind another has
  * consumed its object, and joins the queue afterwards, in a second tx_lock
- * hold: a queue that fails in between cancels it. It holds tables alone, and the
- * socket if its caller owns it. Returns as io_opaque_tx_join() does.
+ * hold: a queue that fails in between cancels it. It holds no lock but the one that
+ * a LAST send takes for its references (tables, alone), and the socket if its caller
+ * owns it. Returns as io_opaque_tx_join() does.
+ *
+ * A request that is refused, because admission failed or the queue did, keeps the
+ * references it took, and a LAST send stays consumed: the socket may be owned, where a
+ * send puts no version, and a reference of the request may be the last one on its version
+ * (another ring frees the object once the request has it). The cleanup of the request gives
+ * them back, with the socket released and the ring locked, as it does for any send that ends
+ * without having the socket (io_opaque_vec_acquire()).
  */
 static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx)
 {
@@ -3944,15 +4408,9 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
 	spin_lock(&store->tx_lock);
 	tx->admitting--;
 	if (ret || tx->failed) {
-		bool pinned = !ret;
-
 		io_opaque_tx_unused(store, tx);
 		spin_unlock(&store->tx_lock);
-		if (!pinned)
-			return ret;
-		/* The head failed after the check: the pin goes, LAST stays consumed. */
-		io_opaque_send_unpin(op);
-		return -ECANCELED;
+		return ret ?: -ECANCELED;
 	}
 	op->tx = tx;
 	list_add_tail(&op->send, &tx->requests);
@@ -3979,7 +4437,8 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
  * IO_OPAQUE_TX_WAIT when it waits for one (its phase is set before tx_lock is
  * dropped, so a release cannot miss it), IO_OPAQUE_TX_HEAD when it is the head
  * and holds its references, IO_OPAQUE_TX_SETTLE when it is the head and has
- * not taken them yet, or a negative errno.
+ * not taken them yet, or a negative errno, with the references that the request took
+ * before it was refused still its own, for its cleanup to give back.
  *
  * A request that finds its queue empty links itself as the head in the one
  * tx_lock hold that finds out, and takes its references later, from
@@ -4056,10 +4515,12 @@ io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk)
 
 /*
  * Take the references of a head that io_opaque_tx_join() left to settle, with
- * the socket owned where it can be. Nothing is taken and nothing removed when
- * this fails, and the request is still the head: it leaves the queue through
- * io_opaque_tx_put(), which hands the queue to whoever waits behind it and does
- * not fail it, since nothing of this frame was sent.
+ * the socket owned where it can be. Nothing is removed when this fails, and
+ * the request is still the head: it leaves the queue through io_opaque_tx_put(),
+ * which hands the queue to whoever waits behind it and does not fail it, since
+ * nothing of this frame was sent. A vector that pinned versions before it failed
+ * still holds them, for the cleanup of the request: nothing is put with the socket
+ * owned (io_opaque_vec_acquire()).
  */
 VISIBLE_IF_KUNIT int io_opaque_tx_settle_head(struct io_opaque_req *op)
 {
@@ -4990,6 +5451,8 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	IO_OPAQUE_SEND_POISON(&mub);
 	IO_OPAQUE_SEND_POISON(&msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
+	/* An issue borrows from the ring only if it keeps the ring lock to its end. */
+	op->may_borrow = !(issue_flags & IO_URING_F_UNLOCKED);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
 		ret = -EOPNOTSUPP;
 		goto finish;
@@ -5056,7 +5519,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	if (fresh) {
 		ret = io_opaque_tx_settle_head(op);
 		if (ret) {
-			/* Nothing was taken or sent: the frame behind this one goes now. */
+			/* Nothing was sent or removed: the frame behind this one goes now. */
 			io_opaque_tx_put(op);
 			goto leave;
 		}
@@ -5167,10 +5630,20 @@ finish:
 	 * frees nothing and is as good after the socket. All of them are for
 	 * io_opaque_send_unpin(), and the call that would find the count at one and drop
 	 * nothing is not made.
+	 *
+	 * What the send borrowed from its ring is given back where the ring lock is held, which
+	 * an inline issue does and an io-wq issue that owns the socket does not: it leaves its
+	 * borrows, and with them all it holds, for the cleanup of the request. The borrow that
+	 * is the last of its version leaves the send with the ring's reference, and that is
+	 * dropped as any is, the last after the socket.
 	 */
 	left = false;
-	if (owned)
-		left = op->consumed || io_opaque_send_unpin_cheap(op);
+	if (owned) {
+		if (op->consumed)
+			left = true;
+		else if (op->may_borrow || !io_opaque_send_borrows(op))
+			left = io_opaque_send_unpin_cheap(op);
+	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*

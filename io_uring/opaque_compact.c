@@ -131,6 +131,8 @@ IO_OPAQUE_STAT_PARAM(stat_send_ubuf_copied, IO_OPAQUE_STAT_SEND_UBUF_COPIED);
 IO_OPAQUE_STAT_PARAM(stat_send_admit_fast, IO_OPAQUE_STAT_SEND_ADMIT_FAST);
 IO_OPAQUE_STAT_PARAM(stat_send_admit_slow, IO_OPAQUE_STAT_SEND_ADMIT_SLOW);
 IO_OPAQUE_STAT_PARAM(stat_send_ubuf_reused, IO_OPAQUE_STAT_SEND_UBUF_REUSED);
+IO_OPAQUE_STAT_PARAM(stat_send_refs_taken, IO_OPAQUE_STAT_SEND_REFS_TAKEN);
+IO_OPAQUE_STAT_PARAM(stat_send_refs_borrowed, IO_OPAQUE_STAT_SEND_REFS_BORROWED);
 
 static void io_opaque_auto_compact(struct io_opaque_store *store);
 
@@ -499,10 +501,12 @@ int io_opaque_compact_publish(struct io_opaque_req *op)
 
 	spin_lock(&store->tables);
 	slot = io_opaque_lookup(store, op->handle);
-	if (slot && slot->data == op->data && !store->dead &&
+	if (slot && io_opaque_slot_data(store, slot) == op->data && !store->dead &&
 	    !READ_ONCE(op->canceled)) {
-		old = slot->data;
-		slot->data = op->replacement;
+		old = op->data;
+		/* The handle is set before the replacement is seen, and not changed again. */
+		op->replacement->handle = op->handle;
+		rcu_assign_pointer(slot->data, op->replacement);
 		op->replacement = NULL;
 		slot->compacting = false;
 		list_del_init(&slot->candidate);
@@ -572,7 +576,7 @@ static int io_opaque_compact_inline(struct io_opaque_req *op)
 		ret = io_opaque_compact_publish(op);
 	scoped_guard(spinlock, &store->tables) {
 		slot = io_opaque_lookup(store, op->handle);
-		if (slot && slot->data == op->data)
+		if (slot && io_opaque_slot_data(store, slot) == op->data)
 			slot->compacting = false;
 	}
 	io_opaque_data_put(store, op->data);
@@ -587,23 +591,25 @@ int io_opaque_compact_start(struct io_opaque_req *op)
 {
 	u32 inline_max = READ_ONCE(io_opaque_inline_compact_max);
 	struct io_opaque_store *store = op->store;
+	struct io_opaque_data *data;
 	struct io_opaque_slot *slot;
 
 	scoped_guard(spinlock, &store->tables) {
 		if (store->dead)
 			return -ESHUTDOWN;
 		slot = io_opaque_lookup(store, op->handle);
-		if (!slot || !slot->data)
+		data = slot ? io_opaque_slot_data(store, slot) : NULL;
+		if (!data)
 			return -ESTALE;
 		/* A dense copy would move the bytes out of the area. */
-		if (slot->data->mapped)
+		if (data->mapped)
 			return -EOPNOTSUPP;
 		if (slot->compacting)
 			return -EBUSY;
-		if (slot->data->dense)
+		if (data->dense)
 			return 0;
-		op->data = slot->data;
-		refcount_inc(&op->data->refs);
+		op->data = data;
+		refcount_inc(&data->refs);
 		slot->compacting = true;
 		if (!inline_max || op->data->length > inline_max) {
 			io_opaque_wait(op, IO_OPAQUE_COPY_WORK);
@@ -662,9 +668,10 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 	seq = ++store->policy_seq;
 	for (i = 0; i < store->config.max_objects; i++) {
 		struct io_opaque_slot *slot = &store->objects[i];
+		struct io_opaque_data *data = io_opaque_slot_data(store, slot);
 
-		if (automatic && slot->data && !slot->data->dense && !slot->data->forward_only &&
-		    !slot->data->mapped && list_empty(&slot->candidate)) {
+		if (automatic && data && !data->dense && !data->forward_only &&
+		    !data->mapped && list_empty(&slot->candidate)) {
 			list_add_tail(&slot->candidate, &store->candidates);
 			slot->retry = jiffies;
 		} else if (!automatic) {
@@ -745,33 +752,35 @@ static void io_opaque_auto_compact(struct io_opaque_store *store)
 	store->tokens = min(policy.burst_bytes, store->tokens + min(minted, policy.burst_bytes));
 	store->token_time = jiffies;
 	while (!list_empty(&store->candidates) && scanned++ < 32) {
+		struct io_opaque_data *data;
 		u64 dense, saving;
 
 		slot = list_first_entry(&store->candidates, struct io_opaque_slot, candidate);
 		list_move_tail(&slot->candidate, &store->candidates);
-		if (!slot->data || slot->data->dense) {
+		data = io_opaque_slot_data(store, slot);
+		if (!data || data->dense) {
 			list_del_init(&slot->candidate);
 			continue;
 		}
 		if (slot->compacting || time_before(jiffies, slot->retry) ||
 		    time_before(jiffies, slot->born + msecs_to_jiffies(100)))
 			continue;
-		dense = ALIGN(slot->data->length, PAGE_SIZE);
-		saving = slot->data->charge > dense ? slot->data->charge - dense : 0;
+		dense = ALIGN(data->length, PAGE_SIZE);
+		saving = data->charge > dense ? data->charge - dense : 0;
 		/* Selection heuristics are implementation details, not UAPI. */
-		if ((!saving && slot->data->nr == 1) ||
-		    (saving && saving * 100 < slot->data->charge * 25) ||
-		    dense > policy.max_temporary_bytes || slot->data->length > policy.burst_bytes) {
+		if ((!saving && data->nr == 1) ||
+		    (saving && saving * 100 < data->charge * 25) ||
+		    dense > policy.max_temporary_bytes || data->length > policy.burst_bytes) {
 			/* Immutable backing cannot become eligible without a new policy. */
 			list_del_init(&slot->candidate);
 			continue;
 		}
-		if (slot->data->length > store->tokens)
+		if (data->length > store->tokens)
 			continue;
 		slot->compacting = true;
-		store->tokens -= slot->data->length;
-		op.data = slot->data;
-		refcount_inc(&op.data->refs);
+		store->tokens -= data->length;
+		op.data = data;
+		refcount_inc(&data->refs);
 		op.handle = io_opaque_handle(slot - store->objects, slot->generation);
 		break;
 	}
@@ -784,7 +793,7 @@ unlock:
 			ret = io_opaque_compact_publish(&op);
 		spin_lock(&store->tables);
 		slot = io_opaque_lookup(store, op.handle);
-		if (slot && slot->data == op.data) {
+		if (slot && io_opaque_slot_data(store, slot) == op.data) {
 			slot->compacting = false;
 			if (ret)
 				slot->retry = jiffies + HZ;
