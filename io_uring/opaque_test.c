@@ -3577,6 +3577,7 @@ static void opaque_params_sysfs(struct kunit *test)
 		"io_uring_opaque.stat_send_admit_fast",
 		"io_uring_opaque.stat_send_admit_slow",
 		"io_uring_opaque.stat_send_ubuf_reused",
+		"io_uring_opaque.stat_send_refs_taken",
 	};
 	const struct kernel_param *framing_copied =
 		opaque_test_param("io_uring_opaque.stat_framing_copied");
@@ -6165,6 +6166,99 @@ static void opaque_send_vec_pin_once(struct kunit *test)
 	opaque_test_free(store, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+}
+
+/*
+ * What the counter of the references that sends take has seen so far (stat_send_refs_taken):
+ * a send counts each version it holds when it acquires it.
+ */
+static u64 opaque_refs_taken(void)
+{
+	return io_opaque_stat_read(IO_OPAQUE_STAT_SEND_REFS_TAKEN);
+}
+
+/*
+ * A send of one range counts one; a vector one for each run of entries that name the same
+ * handle, as it takes one; a send with LAST counts the table's reference that it takes over,
+ * one for a range and one for every entry of a vector. A send that is refused counts none, and a
+ * vector that fails counts the references that it had taken, which it still holds.
+ */
+static void opaque_send_refs_taken(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *a = opaque_sparse_data(test, store);
+	struct io_opaque_data *b = opaque_sparse_data(test, store);
+	const u64 ha = io_opaque_handle(0, 9), hb = io_opaque_handle(1, 7);
+	struct io_opaque_req send = { .store = store, .handle = ha, .offset = 100, .length = 1000 };
+	struct io_uring_opaque_send_entry ent[4] = {
+		{ .handle = ha, .off = 0, .len = 100 }, { .handle = ha, .off = 100, .len = 100 },
+		{ .handle = hb, .off = 0, .len = 100 }, { .handle = ha, .off = 200, .len = 100 },
+	};
+	struct io_opaque_req *op;
+	u64 taken;
+
+	opaque_test_publish(store, 0, 9, a);
+	opaque_test_publish(store, 1, 7, b);
+
+	taken = opaque_refs_taken();
+	KUNIT_ASSERT_EQ(test, opaque_test_acquire(store, &send), 0);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 1ULL);
+	io_opaque_data_put(store, send.data);
+
+	/* A handle that names nothing, and a range outside the version, take no reference. */
+	taken = opaque_refs_taken();
+	send.data = NULL;
+	send.handle = io_opaque_handle(2, 0);
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ESTALE);
+	send.handle = ha;
+	send.offset = a->length - 10;
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ERANGE);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 0ULL);
+
+	/* A, A, B, A: three runs, three references. */
+	op = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent), 0);
+	taken = opaque_refs_taken();
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 3ULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 3);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+	io_opaque_vec_release(op);
+
+	/* The third entry is out of range: the run of A before it was counted, and is held. */
+	ent[2].off = b->length;
+	op = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent), 0);
+	taken = opaque_refs_taken();
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), -ERANGE);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 1ULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+	opaque_vec_failed(test, op, 2);
+	ent[2].off = 0;
+
+	/* A vector with LAST counts every entry, the repeats of B being references of their own. */
+	op = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent), IORING_OPAQUE_SEND_LAST);
+	op->vec->ent[0].handle = hb;
+	op->vec->ent[1].handle = hb;
+	op->vec->ent[3].handle = hb;
+	taken = opaque_refs_taken();
+	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+	KUNIT_EXPECT_TRUE(test, op->consumed);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 4ULL);
+	io_opaque_vec_release(op);
+
+	/* A send of a range with LAST takes the table's reference over: one. */
+	send.handle = ha;
+	send.offset = 100;
+	send.send_flags = IORING_OPAQUE_SEND_LAST;
+	taken = opaque_refs_taken();
+	KUNIT_ASSERT_EQ(test, opaque_test_acquire(store, &send), 0);
+	KUNIT_EXPECT_TRUE(test, send.consumed);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 1ULL);
+	io_opaque_data_put(store, send.data);
+
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
 }
 
 /* The combined cursor reads the ranges in order; TCP sees adjacent ones as one fragment. */
@@ -15962,6 +16056,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_vec_copy_in_model),
 	KUNIT_CASE(opaque_send_vec_acquire),
 	KUNIT_CASE(opaque_send_vec_pin_once),
+	KUNIT_CASE(opaque_send_refs_taken),
 	KUNIT_CASE(opaque_send_vec_iter),
 	KUNIT_CASE(opaque_send_vec_loopback),
 	KUNIT_CASE(opaque_send_vec_admit_fail),

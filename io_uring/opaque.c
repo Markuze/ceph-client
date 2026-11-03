@@ -3611,6 +3611,7 @@ static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 h
 		if (IS_ERR(data))
 			return data;
 	}
+	io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
 	IO_OPAQUE_LOOKUP_AFTER(store);
 	return data;
 }
@@ -3799,6 +3800,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 	}
 	vec->pinned = vec->nr;
 	op->consumed = true;
+	io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, vec->nr);
 	return 0;
 }
 
@@ -3847,6 +3849,7 @@ static int io_opaque_send_acquire_one(struct io_opaque_req *op)
 			return ret;
 		op->data = io_opaque_detach(store, slot);
 		op->consumed = true;
+		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
 	} else {
 		data = io_opaque_pin(store, op->handle, op->offset, op->length);
 		if (IS_ERR(data))

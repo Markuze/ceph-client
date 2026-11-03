@@ -857,6 +857,12 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     block of a request is kept for the next, so a send is slow when its
     request is new or its ranges span more segments than any before it did. A
     send of one range is neither, and neither is a vector that fails.
+``stat_send_refs_taken``
+    Versions that sends have acquired, one for each version a send holds: the
+    reference that a send of one range takes on the version, one for each run
+    of entries of a vector that name the same handle, and, for SEND_LAST, the
+    table's reference that the send takes over, one for each entry of a
+    vector. A send that is refused takes none.
 
 Stores in the area of a MAIO instance
 =====================================

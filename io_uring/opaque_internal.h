@@ -355,6 +355,11 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
 	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
 	IO_OPAQUE_STAT_SEND_UBUF_REUSED,
+	/*
+	 * Versions that sends hold, counted when they are acquired: a reference that the send
+	 * took on the version, or the table's own that a send with LAST took over.
+	 */
+	IO_OPAQUE_STAT_SEND_REFS_TAKEN,
 	IO_OPAQUE_STAT_NR,
 };
 
