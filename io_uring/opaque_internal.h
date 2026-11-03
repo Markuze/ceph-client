@@ -410,8 +410,8 @@ struct io_opaque_msg_ubuf {
 	struct io_opaque_ubuf_pool *pool;
 	/*
 	 * What the store adds to the flags of every ubuf (io_opaque_ubuf_flags()):
-	 * SKBFL_SHARED_FRAG if it binds a MAIO instance, else none. It is not the pool's,
-	 * because a store may have no pool.
+	 * SKBFL_SHARED_FRAG if it binds a MAIO instance or holds a page of one, else none.
+	 * It is not the pool's, because a store may have no pool.
 	 */
 	u8 flags;
 };
@@ -461,6 +461,15 @@ struct io_opaque_store {
 	 * gone, so the area outlives all pages that a backing holds.
 	 */
 	struct io_zcrx_ifq *maio;
+	/*
+	 * Set once and never cleared: this store, which binds no instance, has kept a page
+	 * of the area of a MAIO instance (io_opaque_retain()), because it captured from a
+	 * queue that an instance owns. The process that maps the area can write that page,
+	 * as it can write the pages of a bound store, so the managed sends of this store
+	 * are marked as theirs are (io_opaque_send_ubuf_flags()). The mark is the store's,
+	 * not the object's, as the binding is. Set by the capture, read by the sends.
+	 */
+	bool maio_pages;
 	atomic64_t bytes;
 	atomic64_t copied;
 	atomic64_t compacted;

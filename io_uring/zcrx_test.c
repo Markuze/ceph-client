@@ -683,6 +683,73 @@ static void zcrx_maio_owned(struct kunit *test)
 }
 
 /*
+ * io_zcrx_maio_pool_area_page() names no instance, so an area page that a pool
+ * of any instance owns qualifies. A fallback page does not: it is not in the
+ * area, and nobody maps it. Nor does a copy page, which no pool owns, a page
+ * that no pool owns, or a page of a pool without the provider.
+ */
+static void zcrx_maio_pool_area_page(struct kunit *test)
+{
+	struct page *held[ZT_BATCH], *own, *theirs, *copy, *fallback, *plain, *pooled;
+	struct page_pool *ordinary;
+	struct zt_env env, other;
+	unsigned int n;
+	u64 off;
+
+	/* One batch for the pool and one page for a copy page; the other instance has four. */
+	zt_env_init(test, &env, ZT_BATCH + 1, 1);
+	zt_env_init(test, &other, 4, 1);
+	own = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, own);
+	theirs = zt_alloc(other.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, theirs);
+	copy = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	n = zt_drain_cache(test, env.pp[0], held, ARRAY_SIZE(held));
+
+	/* An area page of a pool, whichever instance's it is. */
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_pool_area_page(own));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_pool_area_page(theirs));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_owned(other.ifq, own));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(other.ifq, theirs, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(other.ifq, own, &off));
+
+	/* A copy page is in the area and has no pool. */
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(env.ifq, copy, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(copy));
+
+	/* The area is empty, so the pool gets a page that is not in the area. */
+	fallback = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, fallback);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_owned(env.ifq, fallback));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(env.ifq, fallback, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(fallback));
+
+	/* A page that no pool owns, and a page of a pool without the provider. */
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(plain));
+	ordinary = zt_pool(test, env.dev, 1, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_EXPECT_NULL(test, ordinary->mp_ops);
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	KUNIT_EXPECT_TRUE(test, page_pool_page_is_pp(pooled));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(pooled));
+
+	zt_free(ordinary, pooled);
+	page_pool_destroy(ordinary);
+	__free_page(plain);
+	zt_free(env.pp[0], fallback);
+	io_zcrx_maio_page_put(env.ifq, copy);
+	while (n--)
+		zt_free(env.pp[0], held[n]);
+	zt_free(env.pp[0], own);
+	zt_free(other.pp[0], theirs);
+	zt_env_exit(test, &other);
+	zt_env_exit(test, &env);
+}
+
+/*
  * A PTE of a user mapping holds one page reference and one map count. The
  * test imitates a PTE by hand. A page with only PTE references is ready, and
  * a page with an outsider on top of them is not.
@@ -2032,6 +2099,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_refill_outsider),
 	KUNIT_CASE(zcrx_maio_copy_page),
 	KUNIT_CASE(zcrx_maio_owned),
+	KUNIT_CASE(zcrx_maio_pool_area_page),
 	KUNIT_CASE(zcrx_maio_mapped),
 	KUNIT_CASE(zcrx_maio_teardown),
 #ifdef CONFIG_MMU

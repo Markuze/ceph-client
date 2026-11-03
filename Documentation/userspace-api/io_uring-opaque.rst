@@ -10,7 +10,9 @@ those ranges through generation handles. The payload is not mapped into the
 application's address space, and the application cannot change it. One
 exception exists. A privileged process can bind a store to the area of a MAIO
 zcrx instance. It maps the area, and it reads and writes the payload in place.
-See "Stores in the area of a MAIO instance". Eligible ordinary RX pages are
+A store that is not bound can hold pages of the area too, if it captures from a
+queue that the instance owns. See "Stores in the area of a MAIO instance" and
+"Writes". Eligible ordinary RX pages are
 retained; unsafe backing is copied into independently owned pages. An
 allocation larger than the entire capture limit also uses this fallback so
 that small stores can make progress.
@@ -463,8 +465,9 @@ An error/short result counts the prefix of the complete response, including
 cases where no body byte was queued. The consumed flag is independent of that
 total. No user-buffer reuse notification is
 needed: userspace cannot overwrite the payload of a store that binds no MAIO
-instance, and TCP, or the completion of its skbs, owns the page references. A
-process can overwrite the payload of a bound store, see "Writes". FREE after
+instance and holds no page of one, and TCP, or the completion of its skbs, owns
+the page references. A process can overwrite the payload of a bound store, and of
+a store that holds pages of an instance, see "Writes". FREE after
 queued sends can invalidate the handle while TCP still retains those pages.
 SEND_LAST does this without a separate FREE SQE or CQE and transfers a
 reference rather than adding and dropping a send pin.
@@ -845,10 +848,11 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     (``skb_copy_ubufs()``, or the stack pulling its last fragment into the
     head) instead of holding it. A consumer on the receive path that holds a
     clone, such as a packet socket or a socket of this host, does not copy it.
-    Neither does the transmit path, but for the skb of a bound store that the
-    stack sums in software, on a device without checksum offload: it copies the
-    fragments first (see "Writes"). Otherwise it stays at zero; a count means
-    that something copied the data of a managed send.
+    Neither does the transmit path, but for the skb of a bound store, or of a
+    store that holds pages of an instance, that the stack sums in software, on a
+    device without checksum offload: it copies the fragments first (see
+    "Writes"). Otherwise it stays at zero; a count means that something copied
+    the data of a managed send.
 ``stat_send_ubuf_reused``
     Skbs of ``stat_send_managed_skbs`` that were given a ubuf which an earlier
     skb had finished with and the store had kept, instead of one allocated for
@@ -873,7 +877,8 @@ of such an object in place. The object interface does not change. The bytes of
 an object that ``IORING_OPAQUE_CREATE`` made are the exception: the process
 supplied them, and the kernel keeps them outside the area (see Create below).
 The binding is optional and needs ``CONFIG_IO_URING_ZCRX``. A store that is not
-bound behaves as the rest of this document describes.
+bound behaves as the rest of this document describes, except for what it holds
+of the area of an instance that owns the queue it captures from, see "Writes".
 
 The word "immutable" in this document names the list of pages of a backing
 version. It does not name the bytes of a bound store. The kernel never relies
@@ -1032,6 +1037,16 @@ them. On a device without checksum offload, the stack copies the bytes of such
 an skb before it sums them, so that the sum is that of the bytes it sends. A
 device that sums them needs no copy. This race does not affect the safety of
 the kernel.
+
+A store that binds no instance can hold pages of the area as well. An instance
+installs its provider on every receive queue of its device, and a store that
+captures from a socket whose segments arrive on one of them holds the pages of
+the pool by reference, as it does for any pool. The process that maps the area
+can write them. From the first such page on, the skbs of the store are marked
+like those of a bound store, for all of its sends and not only for the objects
+that hold such a page, and the mark stays for as long as the store lives. A
+page that is outside the area, such as a fallback page of the pool, does not
+mark the store.
 
 Compaction
 ----------

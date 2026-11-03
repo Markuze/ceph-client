@@ -13525,15 +13525,25 @@ static void opaque_send_managed_pool(struct kunit *test)
  * Which skbs say that their fragments may change. The stack takes SKBFL_SHARED_FRAG to mean
  * that someone else may write them while the skb is queued, and copies them before it sums
  * them in software or changes them in place. The pages of a store that binds a MAIO instance
- * are the area's, which the process that maps it can write, and a body that was spliced from
- * them was marked by TCP. So the skbs of a managed send of such a store are marked, and so is
- * every skb that is made from one. The pages of an ordinary store cannot change, and its skbs
- * are not marked. The receive path copies nothing for either: the holder of a clone, as a tap
- * is, is left with it.
+ * are the area's, which the process that maps it can write, and so are those that a store
+ * without an instance has kept from a queue that an instance owns. A body that was spliced
+ * from them was marked by TCP. So the skbs of a managed send of such a store are marked, and
+ * so is every skb that is made from one. The pages of an ordinary store cannot change, and
+ * its skbs are not marked. The receive path copies nothing for either: the holder of a clone,
+ * as a tap is, is left with it.
  */
 #define OPAQUE_SHARED_HDR	8
 #define OPAQUE_SHARED_PAGES	6
 #define OPAQUE_SHARED_MSS	3000
+
+/*
+ * Whether the skbs of the managed sends of @store are to be marked: it binds an instance, or holds
+ * a page of one. Not asked of io_opaque_send_ubuf_flags(), which the tests are to hold to it.
+ */
+static bool opaque_store_marked(const struct io_opaque_store *store)
+{
+	return store->maio || store->maio_pages;
+}
 
 /*
  * An skb of a managed send of @store, as TCP has the send's fill leave it. The msg_ubuf is set
@@ -13578,9 +13588,9 @@ static struct sk_buff *opaque_shared_skb(struct kunit *test, struct io_opaque_st
  */
 static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *store)
 {
-	const bool bound = !!store->maio;
+	const bool marked = opaque_store_marked(store);
 	const u8 flags = SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX |
-			 (bound ? SKBFL_SHARED_FRAG : 0);
+			 (marked ? SKBFL_SHARED_FRAG : 0);
 	struct opaque_segs *segs = opaque_segs_new(test, OPAQUE_SHARED_PAGES, 2000);
 	struct sk_buff *skb, *clone, *copy, *twin, *ext, *list, *seg;
 	struct opaque_pool_snap before, mid, after;
@@ -13598,20 +13608,20 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	KUNIT_EXPECT_EQ(test, skb_zcopy(skb)->flags, flags);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->flags & SKBFL_ALL_ZEROCOPY,
 			flags | SKBFL_MANAGED_FRAG_REFS);
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), marked);
 
 	/* A clone shares the shinfo. The receive path leaves it to its holder, copying nothing. */
 	clone = skb_clone(skb, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, clone);
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(clone), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(clone), marked);
 	KUNIT_EXPECT_EQ(test, skb_orphan_frags_rx(clone, GFP_KERNEL), 0);
 	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(clone), skb_zcopy(skb));
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(clone), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(clone), marked);
 
 	/* A copy of the head has a shinfo of its own, with references of its own on the pages. */
 	copy = pskb_copy(skb, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, copy);
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(copy), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(copy), marked);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(copy)->flags & SKBFL_ALL_ZEROCOPY, flags);
 	consume_skb(copy);
 	consume_skb(clone);
@@ -13626,8 +13636,8 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	KUNIT_EXPECT_EQ(test, skb->len, 7000U);
 	KUNIT_EXPECT_EQ(test, twin->len, 5000U);
 	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(twin), skb_zcopy(skb));
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), bound);
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(twin), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), marked);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(twin), marked);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(twin)->flags & SKBFL_ALL_ZEROCOPY, flags);
 	kfree_skb(twin);
 	kfree_skb(skb);
@@ -13638,7 +13648,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	KUNIT_ASSERT_NOT_NULL(test, ext);
 	KUNIT_EXPECT_EQ(test, ext->len, 5000U);
 	KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(ext), skb_zcopy(skb));
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(ext), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(ext), marked);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(ext)->flags & SKBFL_ALL_ZEROCOPY, flags);
 	kfree_skb(ext);
 	kfree_skb(skb);
@@ -13650,7 +13660,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	for (seg = list, n = 0; seg; seg = seg->next, n++) {
 		KUNIT_EXPECT_TRUE(test, skb_is_nonlinear(seg));
 		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(seg), skb_zcopy(skb));
-		KUNIT_EXPECT_EQ(test, skb_has_shared_frag(seg), bound);
+		KUNIT_EXPECT_EQ(test, skb_has_shared_frag(seg), marked);
 		KUNIT_EXPECT_EQ(test, skb_shinfo(seg)->flags & SKBFL_ALL_ZEROCOPY, flags);
 	}
 	KUNIT_EXPECT_EQ(test, n, 4U);
@@ -13662,7 +13672,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 
 	/*
 	 * Where the stack sums in software it copies the fragments of a marked skb first: the
-	 * segments of a bound store's skb are linear, and an ordinary store's keep the pages.
+	 * segments of a marked store's skb are linear, and an ordinary store's keep the pages.
 	 * A segment with no bytes left in fragments lets go of its ubuf as a copy
 	 * (__pskb_pull_tail() says so), which is what the counter of copies sees.
 	 */
@@ -13670,7 +13680,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	list = skb_segment(skb, NETIF_F_SG);
 	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(list));
 	for (seg = list, n = 0; seg; seg = seg->next, n++) {
-		KUNIT_EXPECT_EQ(test, skb_is_nonlinear(seg), !bound);
+		KUNIT_EXPECT_EQ(test, skb_is_nonlinear(seg), !marked);
 		KUNIT_EXPECT_EQ(test, seg->len, OPAQUE_SHARED_HDR + 3000U);
 	}
 	KUNIT_EXPECT_EQ(test, n, 4U);
@@ -13678,7 +13688,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	kfree_skb(skb);
 	opaque_pool_read(&after);
 	copies = after.copied - mid.copied;
-	KUNIT_EXPECT_EQ(test, copies, bound ? (u64)n : 0ULL);
+	KUNIT_EXPECT_EQ(test, copies, marked ? (u64)n : 0ULL);
 
 	/*
 	 * The skb that has fragments of its own, a framed send's prefix, takes the body as a splice
@@ -13693,7 +13703,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(skb, &iter, 2 * 2000), 0);
 	KUNIT_EXPECT_FALSE(test, skb_zcopy_managed(skb));
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 3);
-	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), bound);
+	KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), marked);
 	KUNIT_EXPECT_EQ(test, page_count(segs->bv[0].bv_page), 2);
 	kfree_skb(skb);
 
@@ -13798,13 +13808,13 @@ static void opaque_wire_queue_frags(struct opaque_wire *w, unsigned int *skbs,
 /*
  * Over TCP on loopback, sends of @store through the owned path: four with managed fragments, so
  * that the store's pool has ubufs to give to the later ones, and one spliced. The peer's queue
- * holds the skbs, as a tap on the way would: those of a bound store are marked, and those of an
- * ordinary store are not. A spliced body is marked by TCP whichever store it is from. The receive
- * path copies nothing, and the bytes are the object's.
+ * holds the skbs, as a tap on the way would: those of a marked store, bound or not, are marked,
+ * and those of an ordinary store are not. A spliced body is marked by TCP whichever store it is
+ * from. The receive path copies nothing, and the bytes are the object's.
  */
 static void opaque_wire_shared_frag(struct kunit *test, struct io_opaque_store *store)
 {
-	const bool bound = !!store->maio;
+	const bool marked = opaque_store_marked(store);
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
 	struct opaque_pool *p = opaque_pool_new(test);
@@ -13836,7 +13846,7 @@ static void opaque_wire_shared_frag(struct kunit *test, struct io_opaque_store *
 		KUNIT_EXPECT_GE_MSG(test, skbs, 1U, "round %u", round);
 		if (managed) {
 			KUNIT_EXPECT_EQ_MSG(test, ours, skbs, "round %u", round);
-			KUNIT_EXPECT_EQ_MSG(test, shared, bound ? skbs : 0U, "round %u", round);
+			KUNIT_EXPECT_EQ_MSG(test, shared, marked ? skbs : 0U, "round %u", round);
 		} else {
 			KUNIT_EXPECT_EQ_MSG(test, ours, 0U, "round %u", round);
 			KUNIT_EXPECT_EQ_MSG(test, shared, skbs, "round %u", round);
@@ -13928,6 +13938,224 @@ static void opaque_maio_send_managed_two_stores(struct kunit *test)
 		opaque_test_free(store[i], 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store[i]->bytes), 0LL);
 	}
+}
+
+/*
+ * @len bytes of @fill in a page of the area that the pool owns, as the driver of a queue of the
+ * instance gets it, in the skb that carries them, which the store of @stream captures. The skb is
+ * gone and the store holds the page by a pool reference.
+ */
+static struct page *opaque_pool_capture(struct kunit *test, struct io_opaque_stream *stream,
+					struct page_pool *pp, u32 len, u8 fill)
+{
+	struct page *page = opaque_pool_page(test, pp);
+	struct sk_buff *skb;
+	void *mapped = kmap_local_page(page);
+
+	memset(mapped, fill, len);
+	kunmap_local(mapped);
+	skb = opaque_pool_page_skb(test, page, 0, len);
+	opaque_maio_take(test, stream, skb, len);
+	kfree_skb(skb);
+	return page;
+}
+
+/*
+ * A store that binds no instance and holds a page of one: it captures an skb from a queue that
+ * the instance owns, as a store does that captures on the device of an instance, and then lets the
+ * object go. The mark stays.
+ */
+static struct io_opaque_store *opaque_maio_unbound_store(struct kunit *test,
+							 struct io_zcrx_ifq *ifq)
+{
+	struct page_pool *pp = io_zcrx_maio_test_pool(test, ifq);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+
+	opaque_test_stream(&stream, store);
+	opaque_pool_capture(test, &stream, pp, 1000, 0x5c);
+	io_opaque_extents_free(store, &stream.extents);
+	io_opaque_capture_release(&stream);
+	KUNIT_ASSERT_TRUE(test, store->maio_pages);
+	KUNIT_ASSERT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)SKBFL_SHARED_FRAG);
+	KUNIT_ASSERT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	return store;
+}
+
+/*
+ * A store that binds no instance notes that it holds a page of one when it keeps, by a pool
+ * reference, a page in the area that a pool of an instance owns, and not otherwise. A plain page
+ * does not mark it, nor a page of an ordinary pool, nor a fallback page of the pool of the
+ * instance: it is not in the area, and nobody maps it. The mark stays when the page is let go.
+ */
+static void opaque_maio_unbound_flag(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, OPAQUE_BATCH + 1);
+	struct page_pool *pp = io_zcrx_maio_test_pool(test, ifq);
+	struct page_pool *ordinary = opaque_plain_pool(test);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct page *held[OPAQUE_BATCH], *copy, *fallback, *plain, *pooled;
+	struct sk_buff *skb[4];
+	struct io_opaque_stream stream;
+	struct io_opaque_extent *extent;
+	unsigned int i;
+	u64 off;
+
+	/* One page for a copy, a batch for the pool, and then nothing: the pool falls back. */
+	copy = io_zcrx_maio_copy_page(ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	for (i = 0; i < OPAQUE_BATCH; i++)
+		held[i] = opaque_pool_page(test, pp);
+	fallback = opaque_pool_page(test, pp);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_owned(ifq, fallback));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(ifq, fallback, &off));
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	pooled = page_pool_dev_alloc_pages(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+
+	KUNIT_EXPECT_FALSE(test, store->maio_pages);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)0);
+	opaque_test_stream(&stream, store);
+
+	/* A plain page, a page of an ordinary pool, and a fallback page of the instance's pool. */
+	skb[0] = opaque_test_frag(test, plain, 0, 300);
+	opaque_maio_take(test, &stream, skb[0], 300);
+	KUNIT_EXPECT_FALSE(test, store->maio_pages);
+	skb[1] = opaque_pp_skb(test, pooled, 0, 400);
+	opaque_maio_take(test, &stream, skb[1], 400);
+	extent = list_last_entry(&stream.extents, struct io_opaque_extent, list);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PP);
+	KUNIT_EXPECT_FALSE(test, store->maio_pages);
+	skb[2] = opaque_pool_page_skb(test, fallback, 0, 500);
+	opaque_maio_take(test, &stream, skb[2], 500);
+	extent = list_last_entry(&stream.extents, struct io_opaque_extent, list);
+	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, fallback);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PP);
+	KUNIT_EXPECT_FALSE(test, store->maio_pages);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)0);
+
+	/* A page of the area: held the same way, and the store holds a page of the instance. */
+	skb[3] = opaque_pool_page_skb(test, held[0], 0, 600);
+	opaque_maio_take(test, &stream, skb[3], 600);
+	extent = list_last_entry(&stream.extents, struct io_opaque_extent, list);
+	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, held[0]);
+	KUNIT_EXPECT_EQ(test, extent->backing->ref, (u8)IO_OPAQUE_REF_PP);
+	KUNIT_EXPECT_FALSE(test, extent->backing->area);
+	KUNIT_EXPECT_TRUE(test, store->maio_pages);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)SKBFL_SHARED_FRAG);
+
+	/* The pages go back, and the mark stays. */
+	for (i = 0; i < ARRAY_SIZE(skb); i++)
+		kfree_skb(skb[i]);
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_TRUE(test, store->maio_pages);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)SKBFL_SHARED_FRAG);
+	for (i = 1; i < OPAQUE_BATCH; i++)
+		opaque_pool_free(pp, held[i]);
+	io_zcrx_maio_page_put(ifq, copy);
+	__free_page(plain);
+	io_opaque_capture_release(&stream);
+}
+
+/* The skbs that a store with a page of an instance makes are marked, and so are theirs. */
+static void opaque_maio_unbound_managed_shared_frag(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+
+	opaque_shared_frag_one(test, opaque_maio_unbound_store(test, ifq));
+}
+
+static void opaque_maio_unbound_send_managed_shared_frag(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+
+	opaque_wire_shared_frag(test, opaque_maio_unbound_store(test, ifq));
+}
+
+/*
+ * A store that binds no instance sends on one socket before it holds a page of an instance and
+ * after. The socket is corked, so that what TCP has not sent stays at the tail of the queue. The
+ * first send makes an skb that is not marked. The store then captures three pages of the area,
+ * from a queue that the instance owns, and publishes them as an object. The sends of that object
+ * are marked, and so would be the sends of any other. The first of them finds the unmarked skb at
+ * the tail of the queue and starts another, and the second joins the one that is marked. The
+ * peer's queue has two skbs, one of them marked, and the bytes are those of the first object and
+ * then those of the area pages, which the skbs carry without a copy.
+ */
+static void opaque_maio_unbound_send_managed_flip(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+	struct page_pool *pp = io_zcrx_maio_test_pool(test, ifq);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_pool *ubufs = opaque_pool_new(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *area = kunit_kmalloc(test, 3 * 2000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 16000, GFP_KERNEL);
+	unsigned int i, skbs, shared, ours;
+	struct opaque_managed before, after;
+	struct io_opaque_stream stream;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, area);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	io_opaque_send_managed = true;
+	io_opaque_send_copy_max = 0;
+	store->ubuf_pool = ubufs->pool;
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	tcp_sock_set_cork(w->tx->sk, true);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	KUNIT_ASSERT_FALSE(test, store->maio_pages);
+	opaque_managed_read(&before);
+
+	/* Before: an ordinary object, and an skb that is not marked and not sent. */
+	opaque_managed_send(test, w, store, 0, 6000, 0);
+	KUNIT_EXPECT_EQ(test, (int)(tcp_sk(w->tx->sk)->write_seq - tcp_sk(w->tx->sk)->snd_nxt),
+			6000);
+
+	/* The store captures three pages of the area. Their object takes the slot of the first. */
+	opaque_test_stream(&stream, store);
+	for (i = 0; i < 3; i++) {
+		opaque_pool_capture(test, &stream, pp, 2000, 0x41 + i);
+		memset(area + i * 2000, 0x41 + i, 2000);
+	}
+	KUNIT_ASSERT_TRUE(test, store->maio_pages);
+	opaque_test_free(store, 0);
+	data = opaque_maio_object(test, &stream);
+	KUNIT_EXPECT_FALSE(test, data->mapped);
+	opaque_test_publish(store, 0, 9, data);
+	io_opaque_capture_release(&stream);
+
+	/* After: the first send of it starts a skb, and the second joins that skb. */
+	opaque_managed_send(test, w, store, 0, 6000, 0);
+	opaque_managed_send(test, w, store, 2000, 4000, 0);
+	tcp_sock_set_cork(w->tx->sk, false);
+	opaque_wire_acked(w->tx->sk);
+	opaque_managed_read(&after);
+	opaque_wire_queue_frags(w, &skbs, &shared, &ours);
+	KUNIT_EXPECT_EQ(test, skbs, 2U);
+	KUNIT_EXPECT_EQ(test, ours, 2U);
+	KUNIT_EXPECT_EQ(test, shared, 1U);
+	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 2ULL);
+	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
+	opaque_wire_read(test, w, got, 0, 16000);
+	KUNIT_EXPECT_MEMEQ(test, got, source, 6000);
+	KUNIT_EXPECT_MEMEQ(test, got + 6000, area, 6000);
+	KUNIT_EXPECT_MEMEQ(test, got + 12000, area + 2000, 4000);
+
+	/* The reader has let go of every skb, and the pages of the area go back to the pool. */
+	opaque_wire_acked(w->tx->sk);
+	opaque_test_free(store, 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	store->ubuf_pool = NULL;
 }
 #endif
 
@@ -14552,6 +14780,10 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_maio_managed_shared_frag),
 	KUNIT_CASE(opaque_maio_send_managed_shared_frag),
 	KUNIT_CASE(opaque_maio_send_managed_two_stores),
+	KUNIT_CASE(opaque_maio_unbound_flag),
+	KUNIT_CASE(opaque_maio_unbound_managed_shared_frag),
+	KUNIT_CASE(opaque_maio_unbound_send_managed_shared_frag),
+	KUNIT_CASE(opaque_maio_unbound_send_managed_flip),
 #endif
 	KUNIT_CASE(opaque_send_managed_loopback),
 	KUNIT_CASE(opaque_send_managed_holds_unit),

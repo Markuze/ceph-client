@@ -1423,6 +1423,28 @@ static bool io_opaque_pp_page(const struct sk_buff *skb, struct page *page)
 }
 
 /*
+ * Note that a store without an instance holds a page of the area of one. The
+ * instance opens every receive queue of its device, so the page pool of a queue
+ * gives the pages of the area to the driver, and an skb from the queue carries them.
+ * The store holds such a page by a pool reference, as it holds the page of any pool
+ * (io_opaque_retain()), and the process that maps the area can write it. The managed
+ * sends of the store are marked from then on, as those of a bound store are
+ * (io_opaque_send_ubuf_flags()). Set once: the mark is the store's, not the object's,
+ * and a store does not go back.
+ *
+ * The caller's skb holds a pool reference to @page. That keeps its pool, and with it
+ * the instance and its area, for the look. A page that an unmarked skb holds by a
+ * plain reference is not looked at, because the pool can let go of it at any time.
+ */
+static void io_opaque_note_area_page(struct io_opaque_store *store, struct page *page)
+{
+	/* The key is off until a pool binds a provider, so a host that has none pays a branch. */
+	if (IS_ENABLED(CONFIG_PAGE_POOL) && static_branch_unlikely(&page_pool_mem_providers) &&
+	    !READ_ONCE(store->maio_pages) && io_zcrx_maio_pool_area_page(page))
+		WRITE_ONCE(store->maio_pages, true);
+}
+
+/*
  * Decide how a store holds a page that an skb carries. Return false if the
  * capture must copy the bytes.
  *
@@ -1432,7 +1454,8 @@ static bool io_opaque_pp_page(const struct sk_buff *skb, struct page *page)
  * reference keeps the pool fields of the page stable while the store takes its
  * own. The last release hands the page back to its pool, wherever the skb is by
  * then. A page reference would make the pool give the page up when the skb is
- * freed before the store lets go.
+ * freed before the store lets go. If the pool is that of a MAIO instance, the page
+ * is one that the process that maps the area can write, and the store notes it.
  *
  * A reference of the pool keeps the pool alive for as long as an object holds
  * it. After the device is removed, or when its driver creates its pools again,
@@ -1465,7 +1488,12 @@ static bool io_opaque_retain(struct io_opaque_store *store,
 	u64 off;
 
 	if (!store->maio) {
-		*hold = io_opaque_pp_page(skb, page) ? IO_OPAQUE_HOLD_PP : IO_OPAQUE_HOLD_PAGE;
+		if (io_opaque_pp_page(skb, page)) {
+			*hold = IO_OPAQUE_HOLD_PP;
+			io_opaque_note_area_page(store, page);
+		} else {
+			*hold = IO_OPAQUE_HOLD_PAGE;
+		}
 		return true;
 	}
 	if (!io_zcrx_maio_page_off(store->maio, page, &off))
@@ -4194,14 +4222,16 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
  * cooling until it completes. What the store has charged, the handles and the
  * lifetime of the request do not depend on it.
  *
- * Nor can a consumer be left with a page that is recycled or rewritten: a
- * clone shares the shinfo, the shinfo holds the ubuf, and the ubuf holds the
- * folios. An skb that gets a shinfo of its own, by a split, a segmentation or
- * the copy of a clone, takes references on the pages for itself first and one
- * on the ubuf. The completion is not a notification that anyone waits for, so
- * the ubuf asks not to be copied on the receive path (SKBFL_DONT_ORPHAN_RX):
- * a packet socket, or a socket of this host, may hold the skb for as long as
- * it likes, as it may hold a spliced page.
+ * Nor can a consumer be left with a page that is recycled: a clone shares the
+ * shinfo, the shinfo holds the ubuf, and the ubuf holds the folios. An skb that
+ * gets a shinfo of its own, by a split, a segmentation or the copy of a clone,
+ * takes references on the pages for itself first and one on the ubuf. The
+ * completion is not a notification that anyone waits for, so the ubuf asks not to
+ * be copied on the receive path (SKBFL_DONT_ORPHAN_RX): a packet socket, or a
+ * socket of this host, may hold the skb for as long as it likes, as it may hold a
+ * spliced page. What the page holds can change meanwhile for a store that binds an
+ * instance or holds a page of one, as it can for a spliced page, and those skbs
+ * say so (see the flags below).
  */
 
 /*
@@ -4213,14 +4243,22 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
  * write the fragments while the skb is queued, as after vmsplice() or sendfile(),
  * and so copies them before it sums them in software or changes them in place
  * (skb_checksum_help(), skb_segment(), ESP). The pages of an ordinary store cannot
- * change once their object is published, and no process maps them. The pages of a
- * store that binds a MAIO instance are the area's, which a process maps read-write
- * and may write at any time, and the splice path that took them before managed
- * fragments (tcp_sendmsg_locked()) marked every page it took. So the skbs of such
- * a store get the flag as well, io_opaque_send_ubuf_flags(): a copy where the
- * stack sums in software, and nothing where the device does. It is the store's
- * and not the object's: an object that CREATE or compaction made in a bound store
+ * change once their object is published, and no process maps them. An ordinary
+ * store is one that binds no MAIO instance and holds no page of one. The pages of
+ * a store that binds an instance are the area's, which a process maps read-write
+ * and may write at any time, and so are the area pages that a store without an
+ * instance keeps when it captures from a queue that the instance owns
+ * (io_opaque_note_area_page()). The splice path that took such pages before
+ * managed fragments (tcp_sendmsg_locked()) marked every page it took. So the skbs
+ * of these stores get the flag as well, io_opaque_send_ubuf_flags(): a copy where
+ * the stack sums in software, and nothing where the device does. It is the store's
+ * and not the object's: an object that CREATE or compaction made in such a store
  * is in ordinary pages, and is marked too.
+ *
+ * A store without an instance gets the mark from a flag that the capture sets when
+ * it keeps an area page. Copying such a page at the capture instead would cost a
+ * copy per page on the path that exists to avoid one, where the mark costs a copy
+ * only when the stack must sum in software.
  */
 #define IO_OPAQUE_UBUF_FLAGS \
 	(SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX)
@@ -4238,12 +4276,15 @@ VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
 
 /*
  * What a store adds to those flags for the ubufs of its sends. The binding is set
- * when the store is made and never changes, so every ubuf of a store gets the same,
- * whether it is made new or is one that the store's pool kept.
+ * when the store is made and never changes. The flag of a store without an instance
+ * goes from off to on, once, when the capture keeps a page of an area, and never
+ * back. A ubuf that the store's pool kept is made whole again by link_skb() with
+ * the flags of the send that has it now, so the ubufs of a send all have the same,
+ * whether they are new or were kept, and whenever they were made.
  */
 VISIBLE_IF_KUNIT u8 io_opaque_send_ubuf_flags(const struct io_opaque_store *store)
 {
-	return store->maio ? SKBFL_SHARED_FRAG : 0;
+	return store->maio || READ_ONCE(store->maio_pages) ? SKBFL_SHARED_FRAG : 0;
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
@@ -4502,13 +4543,14 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
  * the msg_ubuf names the pool and has one, else the cache's. Its flags are set here
  * whichever way it was got: those of every ubuf, and what the msg_ubuf adds, which
- * is SKBFL_SHARED_FRAG for a bound store. A skb of ours is joined only by a send
- * that adds the same, so that the fragments of a bound store are never in a skb
- * that is not marked, nor those of another store in one that is: when a bound
- * store and another store send on one socket, the skb is a boundary, as another
- * provider's is. TCP does not set skb->sk on a skb of its write queue, so the
- * allocation has no socket to take its mask from. GFP_KERNEL is what a user's
- * socket allocates its skbs with.
+ * is SKBFL_SHARED_FRAG for a store that binds an instance or holds a page of one. A
+ * skb of ours is joined only by a send that adds the same, so that the fragments of
+ * such a store are never in a skb that is not marked, nor those of another store in
+ * one that is: when a bound store and another store send on one socket, the skb is
+ * a boundary, as another provider's is. So it is for a store whose flag turned on
+ * behind its own skbs in the queue. TCP does not set skb->sk on a skb of its write
+ * queue, so the allocation has no socket to take its mask from. GFP_KERNEL is what
+ * a user's socket allocates its skbs with.
  */
 VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 {
