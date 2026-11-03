@@ -5581,6 +5581,31 @@ static void test_timeout(int signal_number)
 	_exit(KSFT_FAIL);
 }
 
+/*
+ * One alarm serves the binary, for OPAQUE_TEST_TIMEOUT seconds in all. A step
+ * that has to end sooner arms it for itself with test_alarm(seconds), and when
+ * it is done, arms it again for what is left of the overall time with
+ * test_alarm(0). A step never outlasts the overall timeout.
+ */
+static time_t test_deadline;	/* the CLOCK_MONOTONIC second of the overall timeout */
+
+static time_t monotonic_second(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec;
+}
+
+static void test_alarm(unsigned int seconds)
+{
+	time_t left = test_deadline - monotonic_second();
+
+	if (left < 1)
+		left = 1;
+	alarm(seconds && seconds < left ? seconds : left);
+}
+
 static void set_test_timeout(void)
 {
 	const char *value = getenv("OPAQUE_TEST_TIMEOUT");
@@ -5595,7 +5620,8 @@ static void set_test_timeout(void)
 			"OPAQUE_TEST_TIMEOUT must be a positive number of seconds");
 	}
 	signal(SIGALRM, test_timeout);
-	alarm(seconds);
+	test_deadline = monotonic_second() + seconds;
+	test_alarm(0);
 }
 
 /*
@@ -5867,12 +5893,12 @@ static int connect_peer(struct pair *pr, int idx, int listener, uint16_t port)
 	int fd;
 
 	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
-	alarm(120);
+	test_alarm(120);
 	require(!connect(pr->peer.socks[idx], (void *)&addr, sizeof(addr)),
 		"connect the peer to port A");
 	fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
 	require(fd >= 0, "accept the connection of the peer");
-	alarm(0);
+	test_alarm(0);
 	return fd;
 }
 

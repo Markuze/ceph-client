@@ -97,6 +97,49 @@ static void require(bool ok, const char *what)
 		ksft_exit_fail_msg("%s: errno=%d (%s)\n", what, errno, strerror(errno));
 }
 
+/* The seconds that one wait for the network may take. */
+#define WAIT_LIMIT	120
+#define STR_(x)		#x
+#define STR(x)		STR_(x)
+
+static const char *volatile test_name;	/* the test that main() runs */
+static const char *volatile wait_name;	/* the wait that the alarm watches */
+
+static void say(const char *text)
+{
+	ssize_t n = write(STDOUT_FILENO, text, strlen(text));
+
+	(void)n;
+}
+
+/*
+ * The default action of SIGALRM kills the process without a word. Name the
+ * test that waited too long, and the wait, in the words that TAP has for a
+ * test that cannot go on, and end the run.
+ */
+static void wait_timeout(int signal_number)
+{
+	(void)signal_number;
+	say("Bail out! ");
+	say(test_name ? test_name : "?");
+	say(": ");
+	say(wait_name ? wait_name : "?");
+	say(" took more than " STR(WAIT_LIMIT) " s\n");
+	_exit(KSFT_FAIL);
+}
+
+/* Let the alarm watch a wait for the network. @what names the wait. */
+static void wait_begin(const char *what)
+{
+	wait_name = what;
+	alarm(WAIT_LIMIT);
+}
+
+static void wait_end(void)
+{
+	alarm(0);
+}
+
 static int ring_init(struct ring *r, unsigned int flags)
 {
 	memset(r, 0, sizeof(*r));
@@ -717,14 +760,14 @@ static void recv_stream(int fd, uint64_t pos, size_t len, unsigned int seed)
 	size_t done = 0;
 
 	require(buf, "buffer for the stream");
-	alarm(120);
+	wait_begin(__func__);
 	while (done < len) {
 		ssize_t n = recv(fd, buf + done, len - done, 0);
 
 		require(n > 0, "receive the stream with recv");
 		done += n;
 	}
-	alarm(0);
+	wait_end();
 	require(check_stream(buf, pos, len, seed), "recv gets the bytes that the peer sent");
 	free(buf);
 }
@@ -790,7 +833,7 @@ static void rx_drain(struct ring *r, struct rx *rx)
 /* Run the ring until @bytes bytes arrived or the request ended. */
 static void rx_wait(struct ring *r, struct rx *rx, uint64_t bytes)
 {
-	alarm(120);
+	wait_begin(__func__);
 	for (;;) {
 		rx_drain(r, rx);
 		if (rx->bytes >= bytes || rx->done)
@@ -800,7 +843,7 @@ static void rx_wait(struct ring *r, struct rx *rx, uint64_t bytes)
 	/* Run the deferred work that is left, so that the event CQEs are in. */
 	enter(r, 0);
 	rx_drain(r, rx);
-	alarm(0);
+	wait_end();
 }
 
 /* Close the sending side and wait for the CQE that ends the request. */
@@ -1463,12 +1506,12 @@ static int connect_peer(struct pair *pr, int idx, int listener, uint16_t port)
 	int fd;
 
 	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
-	alarm(120);
+	wait_begin(__func__);
 	require(!connect(pr->peer.socks[idx], (void *)&addr, sizeof(addr)),
 		"connect the peer to port A");
 	fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
 	require(fd >= 0, "accept the connection of the peer");
-	alarm(0);
+	wait_end();
 	return fd;
 }
 
@@ -1568,10 +1611,10 @@ static void test_netdevsim_rx(void)
 	require(!rx.nr_event[ZCRX_EVENT_ALLOC_FAIL], "no allocation failure event");
 	/*
 	 * The frames pass by reference, so no fragment is copied. The counters
-	 * and the event see the copy of a fragment only. A copy from the linear
-	 * part of an skb is not counted. The check of the reuse below and the
-	 * check of the offset in the page, for the second ring, tell a copy
-	 * from a reference too.
+	 * and the event see every copy, also the copy from the linear part of
+	 * an skb: io_zcrx_copy_chunk() counts both. The check of the reuse
+	 * below and the check of the offset in the page, for the second ring,
+	 * tell a copy from a reference too.
 	 */
 	require(!stat_read(&st->copy_count) && !stat_read(&st->copy_bytes),
 		"no fragment is copied");
@@ -2103,6 +2146,13 @@ static void test_memlock(void)
 	ksft_test_result_pass("the area counts against the memory limit, a failure releases it\n");
 }
 
+/* Run a test, and keep its name for the message of the alarm. */
+#define RUN(test, ...)						\
+	do {							\
+		test_name = #test;				\
+		test(__VA_ARGS__);				\
+	} while (0)
+
 int main(void)
 {
 	struct rlimit lim = { RLIM_INFINITY, RLIM_INFINITY };
@@ -2117,6 +2167,7 @@ int main(void)
 
 	page_size = sysconf(_SC_PAGESIZE);
 	ksft_print_header();
+	signal(SIGALRM, wait_timeout);
 	setrlimit(RLIMIT_MEMLOCK, &lim);
 	own_netns();
 	ret = ring_init(&r, IORING_SETUP_CQE32);
@@ -2128,26 +2179,26 @@ int main(void)
 		ksft_exit_skip("MAIO mode is unavailable\n");
 	ksft_set_plan(PLAN);
 
-	test_register_map(&r);
-	test_two_instances(&r);
-	test_flag_validation(&r);
-	test_refill_ring(&r);
-	test_add_area(&r);
-	test_capability();
-	test_recv_copy(&r);
-	test_recv_exhaust(&r);
-	test_loopback(&r);
-	test_large_area(&r);
-	test_memlock();
-	test_device();
-	test_device_removal();
-	test_netdevsim_rx();
-	test_netdevsim_foreign();
-	test_netdevsim_exhaust();
-	test_netdevsim_head();
-	test_charge_last_user();
+	RUN(test_register_map, &r);
+	RUN(test_two_instances, &r);
+	RUN(test_flag_validation, &r);
+	RUN(test_refill_ring, &r);
+	RUN(test_add_area, &r);
+	RUN(test_capability);
+	RUN(test_recv_copy, &r);
+	RUN(test_recv_exhaust, &r);
+	RUN(test_loopback, &r);
+	RUN(test_large_area, &r);
+	RUN(test_memlock);
+	RUN(test_device);
+	RUN(test_device_removal);
+	RUN(test_netdevsim_rx);
+	RUN(test_netdevsim_foreign);
+	RUN(test_netdevsim_exhaust);
+	RUN(test_netdevsim_head);
+	RUN(test_charge_last_user);
 	/* The last test closes the first ring. */
-	test_export_import(&r);
+	RUN(test_export_import, &r);
 
 	ksft_finished();
 }
