@@ -17389,10 +17389,14 @@ static void opaque_borrow_vec_send(struct kunit *test)
 			opaque_wire_hold(test, w, &hold, store, a->handle);
 		op = opaque_wire_prep(test, w, 0, IORING_OPAQUE_SEND_VECTOR, user, 0, 3, 0);
 		memset(&opaque_probe.seen, 0, sizeof(opaque_probe.seen));
+		opaque_put_spy_start(test, sk);
 		ret = opaque_wire_issue(w, 0, unlocked);
+		opaque_put_spy_stop(test);
 		lockdep_assert_none_held_once();
 		KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
 		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3000);
+		/* The table's references are there, so the ends are decrements and put nothing. */
+		opaque_put_spy_expect(test, 0, 0);
 		KUNIT_ASSERT_EQ(test, opaque_probe.seen.calls, 1U);
 		KUNIT_EXPECT_TRUE(test, opaque_probe.seen.owned[0]);
 		/* Two runs, two borrows of two versions; the send held by hand borrows A too. */
@@ -17489,7 +17493,29 @@ static void opaque_borrow_vec_send(struct kunit *test)
 		while (opaque_wire_drain(w, got, 80000))
 			;
 	}
-	opaque_test_free(store, 0);
+
+	/*
+	 * Another ring frees the first version once the vector has pinned it: the ring's reference
+	 * is the last on it, and the vector puts it after the socket, once, and not under it. The
+	 * other version has the table's, and its borrow ends in a decrement.
+	 */
+	op = opaque_wire_prep(test, w, 0, IORING_OPAQUE_SEND_VECTOR, user, 0, 3, 0);
+	opaque_lk_open_at(test, store, OPAQUE_LK_AFTER, opaque_lk_free_other, 0);
+	opaque_lk.sk = sk;
+	opaque_put_spy_start(test, sk);
+	ret = opaque_wire_issue(w, 0, false);
+	opaque_put_spy_stop(test);
+	opaque_lk_close();
+	lockdep_assert_none_held_once();
+	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3000);
+	KUNIT_EXPECT_TRUE(test, opaque_lk.owned);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	opaque_put_spy_expect(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+	opaque_wire_read(test, w, got, 0, 3000);
+	opaque_wire_req_cleanup(w, 0);
 	opaque_test_free(store, 1);
 	opaque_store_empty(test, store);
 	kvfree_rcu_barrier();
