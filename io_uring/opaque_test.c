@@ -14259,22 +14259,40 @@ static void opaque_pin_retired_send(struct kunit *test)
  * A store stops by setting dead under tables and detaching its objects afterwards, and a send
  * that has looked at dead, found the store alive and not yet read its slot may meet the stop
  * anywhere in that. It is told that the store has stopped, as a send that came after is, and not
- * that its handle is stale: no handle was freed. That holds wherever the stop lands: after the
- * slot was read and the version put by all (the lookup finds a count of zero), and before the
- * slot was read (it finds nothing), for a single range and for the second entry of a vector,
- * whose first has pinned already. A send that took its reference before the stop was ordered
- * before it, and takes the version: here an earlier send holds the version, so the count is
- * not zero when the lookup raises it.
+ * that its handle is stale: no handle was freed. That holds wherever the stop lands, and for
+ * each of the three ways that a lookup in RCU finds nothing to take, which are all asked of the
+ * table: after the slot was read and the version put by all (the lookup finds a count of zero);
+ * after the slot was read and found to hold an object of the next generation (another handle);
+ * and before the slot was read (it finds nothing); for a single range and for the second entry
+ * of a vector, whose first has pinned already. A send that took its reference before the stop
+ * was ordered before it, and takes the version: here an earlier send holds the version, so the
+ * count is not zero when the lookup raises it.
  */
 static void opaque_pin_stop_window(struct kunit *test)
 {
-	static const int errs[] = { -ESHUTDOWN, 0, -ESHUTDOWN, -ESHUTDOWN };
+	static const struct {
+		unsigned int where, at;
+		void (*act)(void);
+		int ret;
+	} cases[] = {
+		/* 0: the version is put by all of its holders while the lookup has it. */
+		{ OPAQUE_LK_BETWEEN, 0, opaque_lk_stop_like, -ESHUTDOWN },
+		/* 1: an earlier send holds it, and the lookup takes it. */
+		{ OPAQUE_LK_BETWEEN, 0, opaque_lk_stop_like, 0 },
+		/* 2: the store is stopped before the slot is read. */
+		{ OPAQUE_LK_BEFORE, 0, opaque_lk_stop, -ESHUTDOWN },
+		/* 3: the same, in the lookup of the second entry of a vector. */
+		{ OPAQUE_LK_BEFORE, 1, opaque_lk_stop, -ESHUTDOWN },
+		/* 4: the slot holds the object of the next generation when the lookup reads it. */
+		{ OPAQUE_LK_BETWEEN, 0, opaque_lk_stop_like, -ESHUTDOWN },
+	};
 	unsigned int kind;
 
-	for (kind = 0; kind < ARRAY_SIZE(errs); kind++) {
+	for (kind = 0; kind < ARRAY_SIZE(cases); kind++) {
 		struct io_opaque_store *store = opaque_test_store(test);
 		struct io_opaque_data *a = opaque_sparse_data(test, store);
 		struct io_opaque_data *b = opaque_sparse_data(test, store);
+		struct io_opaque_data *c = kind == 4 ? opaque_sparse_data(test, store) : NULL;
 		struct io_uring_opaque_send_entry ent[2] = {
 			{ .handle = io_opaque_handle(0, 9), .off = 100, .len = 1000 },
 			{ .handle = io_opaque_handle(1, 7), .off = 100, .len = 1000 },
@@ -14293,16 +14311,25 @@ static void opaque_pin_stop_window(struct kunit *test)
 			op = opaque_vec_new(test, store, ent, 2, 0);
 		if (kind == 1)
 			refcount_inc(&a->refs); /* an earlier send */
-		if (kind < 2)
-			opaque_lk_open(test, store, opaque_lk_stop_like, 0);
-		else
-			opaque_lk_open_at(test, store, OPAQUE_LK_BEFORE, opaque_lk_stop, kind - 2);
+		if (kind == 4) {
+			struct io_opaque_req next = {
+				.store = store, .data = c, .length = c->length,
+			};
+			u64 flags = 0;
+
+			/* The slot is C's, under the next generation, and the send asks for A's. */
+			opaque_test_free(store, 0);
+			store->object_cursor = 0;
+			KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&next), 0);
+			KUNIT_ASSERT_EQ(test, io_opaque_publish(&next, &flags), (int)c->length);
+		}
+		opaque_lk_open_at(test, store, cases[kind].where, cases[kind].act, cases[kind].at);
 		ret = op ? opaque_vec_admit(op) : opaque_test_acquire(store, &send);
 		opaque_lk_close();
-		KUNIT_EXPECT_EQ(test, ret, errs[kind]);
+		KUNIT_EXPECT_EQ(test, ret, cases[kind].ret);
 		KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
 		KUNIT_EXPECT_EQ(test, opaque_lk.calls, kind == 3 ? 2U : 1U);
-		KUNIT_EXPECT_EQ(test, opaque_lk.rcu, kind < 2);
+		KUNIT_EXPECT_EQ(test, opaque_lk.rcu, cases[kind].where == OPAQUE_LK_BETWEEN);
 		KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 		/* One that meets the stop is settled by the table; one with its reference, not. */
 		slow = atomic_long_read(&io_opaque_pin_slow) - slow;
@@ -15539,8 +15566,8 @@ static void opaque_pin_smp_stop(struct kunit *test)
  * the one before the newest freed a moment after the newest is published, and the vectors name
  * both. A vector whose entries are all there is whole, with the version that each handle names
  * and a reference that its cleanup gives back, never a version of the object that took a slot
- * over; any other is told ESTALE and gives back what it had taken. At the end nothing is
- * charged. It needs two CPUs to race on.
+ * over; any other is told ESTALE and leaves what it had taken for its cleanup. At the end
+ * nothing is charged. It needs two CPUs to race on.
  */
 static void opaque_pin_smp_vec_free(struct kunit *test)
 {

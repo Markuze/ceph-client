@@ -3513,7 +3513,7 @@ void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 		if (io_opaque_lookup_after)			\
 			io_opaque_lookup_after(store);		\
 	} while (0)
-/* Lookups whose reference did not take and that looked the handle up under tables. */
+/* Lookups that the table settled, with tables held: those that found nothing to take in RCU. */
 atomic_long_t io_opaque_pin_slow = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_PIN_SLOW()		atomic_long_inc(&io_opaque_pin_slow)
 #else
