@@ -93,6 +93,58 @@ static void opaque_test_free(struct io_opaque_store *store, u32 index)
 	io_opaque_data_put(store, data);
 }
 
+/* Fragments of a test skb: MAX_SKB_FRAGS is 17 to 45, depending on the configuration. */
+#define OPAQUE_TEST_FRAGS	17
+static_assert(OPAQUE_TEST_FRAGS <= MAX_SKB_FRAGS);
+
+/* Set the fragment limit for the rest of the test. */
+static void opaque_max_frags_restore(void *arg)
+{
+	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, (int)(long)arg);
+}
+
+static void opaque_max_frags_set(struct kunit *test, int frags)
+{
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_max_frags_restore,
+				(void *)(long)READ_ONCE(net_hotdata.sysctl_max_skb_frags)), 0);
+	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, frags);
+}
+
+/*
+ * Segments for a fill to run past the fragment limit of any configuration, each in a page of
+ * its own: the 40 extents of a fixture's object are fewer than the 45 fragments that an skb
+ * may have.
+ */
+struct opaque_segs {
+	struct bio_vec bv[MAX_SKB_FRAGS + 4];
+	u32 nr;
+};
+
+static void opaque_segs_put(void *arg)
+{
+	struct opaque_segs *s = arg;
+
+	while (s->nr)
+		put_page(s->bv[--s->nr].bv_page);
+}
+
+/* @nr segments of @len bytes at the start of a page each, which the test lets go of at its end. */
+static struct opaque_segs *opaque_segs_new(struct kunit *test, u32 nr, u32 len)
+{
+	struct opaque_segs *segs = kunit_kzalloc(test, sizeof(*segs), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, segs);
+	KUNIT_ASSERT_LE(test, nr, (u32)ARRAY_SIZE(segs->bv));
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_segs_put, segs), 0);
+	while (segs->nr < nr) {
+		struct page *page = alloc_page(GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		bvec_set_page(&segs->bv[segs->nr++], page, len, 0);
+	}
+	return segs;
+}
+
 static void opaque_test_stream(struct io_opaque_stream *stream,
 			       struct io_opaque_store *store)
 {
@@ -10086,58 +10138,6 @@ static void opaque_capture_pool_other(struct kunit *test)
 	page_pool_put_unrefed_netmem(pp, page_to_netmem(pooled), -1, true);
 	put_page(plain);
 	io_opaque_capture_release(&stream);
-}
-
-/* Fragments of a test skb: MAX_SKB_FRAGS is 17 to 45, depending on the configuration. */
-#define OPAQUE_TEST_FRAGS	17
-static_assert(OPAQUE_TEST_FRAGS <= MAX_SKB_FRAGS);
-
-/* Set the fragment limit for the rest of the test. */
-static void opaque_max_frags_restore(void *arg)
-{
-	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, (int)(long)arg);
-}
-
-static void opaque_max_frags_set(struct kunit *test, int frags)
-{
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_max_frags_restore,
-				(void *)(long)READ_ONCE(net_hotdata.sysctl_max_skb_frags)), 0);
-	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, frags);
-}
-
-/*
- * Segments for a fill to run past the fragment limit of any configuration, each in a page of
- * its own: the 40 extents of a fixture's object are fewer than the 45 fragments that an skb
- * may have.
- */
-struct opaque_segs {
-	struct bio_vec bv[MAX_SKB_FRAGS + 4];
-	u32 nr;
-};
-
-static void opaque_segs_put(void *arg)
-{
-	struct opaque_segs *s = arg;
-
-	while (s->nr)
-		put_page(s->bv[--s->nr].bv_page);
-}
-
-/* @nr segments of @len bytes at the start of a page each, which the test lets go of at its end. */
-static struct opaque_segs *opaque_segs_new(struct kunit *test, u32 nr, u32 len)
-{
-	struct opaque_segs *segs = kunit_kzalloc(test, sizeof(*segs), GFP_KERNEL);
-
-	KUNIT_ASSERT_NOT_NULL(test, segs);
-	KUNIT_ASSERT_LE(test, nr, (u32)ARRAY_SIZE(segs->bv));
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_segs_put, segs), 0);
-	while (segs->nr < nr) {
-		struct page *page = alloc_page(GFP_KERNEL);
-
-		KUNIT_ASSERT_NOT_NULL(test, page);
-		bvec_set_page(&segs->bv[segs->nr++], page, len, 0);
-	}
-	return segs;
 }
 
 /* The skb of a driver: @nr pool pages in as many fragments of @size bytes, and their references. */
