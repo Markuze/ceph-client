@@ -10090,6 +10090,55 @@ static void opaque_capture_pool_other(struct kunit *test)
 
 /* Fragments of a test skb: MAX_SKB_FRAGS is 17 to 45, depending on the configuration. */
 #define OPAQUE_TEST_FRAGS	17
+static_assert(OPAQUE_TEST_FRAGS <= MAX_SKB_FRAGS);
+
+/* Set the fragment limit for the rest of the test. */
+static void opaque_max_frags_restore(void *arg)
+{
+	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, (int)(long)arg);
+}
+
+static void opaque_max_frags_set(struct kunit *test, int frags)
+{
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_max_frags_restore,
+				(void *)(long)READ_ONCE(net_hotdata.sysctl_max_skb_frags)), 0);
+	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, frags);
+}
+
+/*
+ * Segments for a fill to run past the fragment limit of any configuration, each in a page of
+ * its own: the 40 extents of a fixture's object are fewer than the 45 fragments that an skb
+ * may have.
+ */
+struct opaque_segs {
+	struct bio_vec bv[MAX_SKB_FRAGS + 4];
+	u32 nr;
+};
+
+static void opaque_segs_put(void *arg)
+{
+	struct opaque_segs *s = arg;
+
+	while (s->nr)
+		put_page(s->bv[--s->nr].bv_page);
+}
+
+/* @nr segments of @len bytes at the start of a page each, which the test lets go of at its end. */
+static struct opaque_segs *opaque_segs_new(struct kunit *test, u32 nr, u32 len)
+{
+	struct opaque_segs *segs = kunit_kzalloc(test, sizeof(*segs), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, segs);
+	KUNIT_ASSERT_LE(test, nr, (u32)ARRAY_SIZE(segs->bv));
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_segs_put, segs), 0);
+	while (segs->nr < nr) {
+		struct page *page = alloc_page(GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		bvec_set_page(&segs->bv[segs->nr++], page, len, 0);
+	}
+	return segs;
+}
 
 /* The skb of a driver: @nr pool pages in as many fragments of @size bytes, and their references. */
 static struct sk_buff *opaque_pp_frags(struct kunit *test, struct page_pool *pp,
@@ -11216,14 +11265,21 @@ static void opaque_send_managed_prefix_fallback(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
 	struct opaque_managed before, after;
+	unsigned int limit;
 
 	KUNIT_ASSERT_NOT_NULL(test, w);
 	opaque_test_params_save(test);
 	io_opaque_send_managed = true;
 	opaque_wire_init(test, w);
 	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	/*
+	 * The body is 21 extents of 2000 bytes, and TCP ends an skb at its size goal as well as at
+	 * the fragment limit: some 32 KB on this connection, which 45 fragments of these pass. The
+	 * limit is to end the first skb here, so it is set to what the object can fill.
+	 */
+	opaque_max_frags_set(test, OPAQUE_TEST_FRAGS);
+	limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
 
 	opaque_managed_read(&before);
 	opaque_wire_send(test, w, store, &(struct opaque_send_case) {
@@ -11231,7 +11287,7 @@ static void opaque_send_managed_prefix_fallback(struct kunit *test)
 	opaque_managed_read(&after);
 	/* Once: the skb the prefix started is full, and the next fill is not let into it. */
 	KUNIT_EXPECT_EQ(test, after.fallback - before.fallback, 1ULL);
-	/* The prefix and 16 extents fill the first skb; the other 5 are managed, 5 references. */
+	/* The prefix and limit - 1 extents fill the first skb; the other 21 - (limit - 1) are managed. */
 	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)(21 - (limit - 1)));
 	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 2ULL);
 	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
@@ -11572,30 +11628,33 @@ static void opaque_managed_fill_limits(struct kunit *test)
 {
 	const unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
 	struct sk_buff *shared = alloc_skb(0, GFP_KERNEL), *next = alloc_skb(0, GFP_KERNEL);
-	size_t room = 2000 * limit;
+	size_t room = 2000 * limit, total;
 	struct opaque_managed before, after;
 	struct io_opaque_ubuf *u, *v;
+	struct opaque_segs *segs;
 	struct opaque_splice f;
 	struct iov_iter iter;
 
 	KUNIT_ASSERT_NOT_NULL(test, shared);
 	KUNIT_ASSERT_NOT_NULL(test, next);
 	opaque_splice_setup(test, &f);
-	/* One extent, one page, 2000 bytes each: a fragment each. */
-	iov_iter_bvec(&iter, ITER_SOURCE, f.data->bvec, f.data->nr, 80000);
+	/* One page, 2000 bytes each: a fragment each, four more than the limit lets one skb have. */
+	segs = opaque_segs_new(test, limit + 4, 2000);
+	total = 2000 * segs->nr;
+	iov_iter_bvec(&iter, ITER_SOURCE, segs->bv, segs->nr, total);
 	opaque_managed_read(&before);
 	u = opaque_managed_skb(test, &f);
-	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 80000), -EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, total), -EMSGSIZE);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(f.skb)->nr_frags, (int)limit);
 	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)room);
-	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 80000 - room);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), total - room);
 	KUNIT_EXPECT_EQ(test, u->nr, limit);
 	opaque_managed_read(&after);
 	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)limit);
 	/* A full skb takes nothing more, and takes no reference for it. */
-	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 80000), -EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, total), -EMSGSIZE);
 	KUNIT_EXPECT_EQ(test, f.skb->len, (unsigned int)room);
-	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 80000 - room);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), total - room);
 	opaque_managed_read(&after);
 	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)limit);
 
@@ -11808,19 +11867,6 @@ static void opaque_managed_fill_cursor(struct kunit *test)
 	}
 	kfree_skb(f.skb);
 	opaque_splice_done(&f);
-}
-
-/* Set the fragment limit for the rest of the test. */
-static void opaque_max_frags_restore(void *arg)
-{
-	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, (int)(long)arg);
-}
-
-static void opaque_max_frags_set(struct kunit *test, int frags)
-{
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_max_frags_restore,
-				(void *)(long)READ_ONCE(net_hotdata.sysctl_max_skb_frags)), 0);
-	WRITE_ONCE(net_hotdata.sysctl_max_skb_frags, frags);
 }
 
 /*
@@ -12037,7 +12083,9 @@ static void opaque_managed_fill_fallback(struct kunit *test)
 {
 	struct page *prefix = alloc_page(GFP_KERNEL);
 	struct opaque_managed before, after;
+	const unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
 	struct io_opaque_ubuf *u;
+	struct opaque_segs *segs;
 	struct opaque_splice f;
 	struct iov_iter iter;
 	unsigned int i;
@@ -12046,7 +12094,9 @@ static void opaque_managed_fill_fallback(struct kunit *test)
 	opaque_splice_setup(test, &f);
 	skb_add_rx_frag(f.skb, 0, prefix, 0, 24, 24);
 	u = opaque_managed_skb(test, &f);
-	iov_iter_bvec(&iter, ITER_SOURCE, f.data->bvec, f.data->nr, 80000);
+	/* Pages for the fragments that fill the skb to its limit, and four more. */
+	segs = opaque_segs_new(test, limit + 4, 2000);
+	iov_iter_bvec(&iter, ITER_SOURCE, segs->bv, segs->nr, 2000 * segs->nr);
 	opaque_managed_read(&before);
 	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 6000), 0);
 	opaque_managed_read(&after);
@@ -12059,9 +12109,16 @@ static void opaque_managed_fill_fallback(struct kunit *test)
 	/* A reference of the skb's own on each page. */
 	for (i = 1; i < 4; i++)
 		KUNIT_EXPECT_EQ(test, page_count(skb_frag_page(&skb_shinfo(f.skb)->frags[i])), 2);
-	/* The skb is full when its fragments are, and then TCP starts another. */
-	while (skb_shinfo(f.skb)->nr_frags < READ_ONCE(net_hotdata.sysctl_max_skb_frags))
+	/*
+	 * The skb is full when its fragments are, and then TCP starts another. Each fill adds a
+	 * fragment: one that adds nothing, or an iterator that is spent, fails the test and does
+	 * not leave it looping.
+	 */
+	for (i = 0; skb_shinfo(f.skb)->nr_frags < limit; i++) {
+		KUNIT_ASSERT_LT(test, i, limit);
+		KUNIT_ASSERT_GT(test, iov_iter_count(&iter), 0UL);
 		KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 2000), 0);
+	}
 	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 2000), -EMSGSIZE);
 	kfree_skb(f.skb);
 	opaque_splice_done(&f);
@@ -12210,8 +12267,6 @@ static void opaque_managed_boundary(struct kunit *test)
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
-	const unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
-	const unsigned int skbs = DIV_ROUND_UP(40, limit);
 	struct ubuf_info cursor = { .ops = &io_opaque_ubuf_ops };
 	struct bio_vec *bv = kunit_kcalloc(test, 40, sizeof(*bv), GFP_KERNEL);
 	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
@@ -12220,8 +12275,8 @@ static void opaque_managed_boundary(struct kunit *test)
 	struct opaque_page_refs *pages;
 	struct opaque_managed before, after;
 	struct msghdr msg = {};
+	unsigned int limit, skbs, i;
 	struct sock *sk;
-	unsigned int i;
 	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, w);
@@ -12231,6 +12286,14 @@ static void opaque_managed_boundary(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, want);
 	opaque_wire_init(test, w);
 	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	/*
+	 * 40 pages of 1000 bytes are 40 KB, and TCP ends an skb at its size goal as well as at the
+	 * fragment limit: some 32 KB on this connection. The limit is what ends an skb here, at the
+	 * number of pages that the object has to fill the skbs with, not 45 of them.
+	 */
+	opaque_max_frags_set(test, OPAQUE_TEST_FRAGS);
+	limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	skbs = DIV_ROUND_UP(40, limit);
 	opaque_test_copy(data, source);
 	pages = opaque_page_refs_take(test, data);
 	for (i = 0; i < 40; i++) {
