@@ -13372,7 +13372,7 @@ static void opaque_ubuf_pool_store(struct kunit *test)
 		.hard_limit = 64 * PAGE_SIZE, .compact_headroom = 4 * OPAQUE_TEST_UNIT,
 		.max_object_size = SZ_64K, .max_objects = 4, .max_streams = 1,
 		.max_extents = 64,
-		/* Ignored: any value registers, which kernels before this change refused. */
+		/* Ignored: any value registers, which earlier versions of this interface refused. */
 		.max_requests = U32_MAX,
 	};
 	struct io_opaque_msg_ubuf mub = opaque_new_msg_ubuf();
