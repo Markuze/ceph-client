@@ -728,7 +728,7 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 	struct io_opaque_slot *slot;
 	u32 index;
 
-	guard(mutex)(&store->tables);
+	guard(spinlock)(&store->tables);
 	for (;;) {
 		index = io_opaque_find_slot(store->object_used, store->config.max_objects,
 					    &store->object_cursor);
@@ -844,7 +844,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 		set_active_memcg(old);
 	}
 #endif
-	mutex_init(&store->tables);
+	spin_lock_init(&store->tables);
 	spin_lock_init(&store->wait_lock);
 	spin_lock_init(&store->tx_lock);
 	spin_lock_init(&store->transient_lock);
@@ -880,7 +880,7 @@ void io_opaque_stop(struct io_opaque_store *store)
 	if (!store)
 		return;
 	/* Close enrollment before draining the compaction dispatcher. */
-	scoped_guard(mutex, &store->tables) {
+	scoped_guard(spinlock, &store->tables) {
 		guard(spinlock)(&store->wait_lock);
 
 		if (store->dead)
@@ -894,14 +894,14 @@ void io_opaque_stop(struct io_opaque_store *store)
 	for (i = 0; i < store->config.max_streams; i++) {
 		struct io_opaque_stream *stream;
 
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		stream = store->streams[i].stream;
 		store->streams[i].stream = NULL;
 		if (stream) {
 			store->nr_streams--;
 			io_opaque_release_slot(store->stream_used, i, store->streams[i].generation);
 		}
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		if (stream) {
 			io_opaque_stream_close(stream);
 			io_opaque_stream_put(stream);
@@ -910,9 +910,9 @@ void io_opaque_stop(struct io_opaque_store *store)
 	for (i = 0; i < store->config.max_objects; i++) {
 		struct io_opaque_data *data;
 
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		data = io_opaque_detach(store, &store->objects[i]);
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		io_opaque_data_put(store, data);
 	}
 	io_opaque_wake_budget(store);
@@ -961,7 +961,6 @@ void io_opaque_free(struct io_opaque_store *store)
 	bitmap_free(store->stream_used);
 	kvfree(store->objects);
 	kvfree(store->streams);
-	mutex_destroy(&store->tables);
 	kfree(store);
 }
 
@@ -2087,7 +2086,7 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	stream->owner.data = stream;
 	stream->collector = op;
 	lock_sock(sock->sk);
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	if (sock->sk->sk_rx_owner || sock->sk->sk_prot != sock->sk->sk_prot_creator ||
 	    tcp_sk(sock->sk)->repair || tcp_sk(sock->sk)->urg_data) {
 		ret = -EBUSY;
@@ -2136,7 +2135,7 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 		break;
 	}
 unlock:
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	release_sock(sock->sk);
 	if (!ret)
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
@@ -2350,7 +2349,7 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_slot *slot = &store->objects[op->slot];
 
-	guard(mutex)(&store->tables);
+	guard(spinlock)(&store->tables);
 	if (store->dead || READ_ONCE(op->canceled))
 		return -ECANCELED;
 	if (!slot->reserved ||
@@ -2400,14 +2399,14 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (op->op == IORING_OPAQUE_COMPACT) {
 		if (ret >= 0)
 			ret = io_opaque_compact_publish(op);
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		{
 			struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
 
 			if (slot)
 				slot->compacting = false;
 		}
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 	}
 	if (ret < 0 && op->op == IORING_OPAQUE_RECV_OBJECT) {
 		mutex_lock(&op->stream->lock);
@@ -2527,7 +2526,7 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 
 	if (op->resolved)
 		return 0;
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	if (io_opaque_stream_op(cmd)) {
 		u32 index = io_opaque_index(op->handle);
 
@@ -2554,7 +2553,7 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 				ret = -ERANGE;
 		}
 	}
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	if (ret)
 		return ret;
 	if (cmd == IORING_OPAQUE_INSPECT || cmd == IORING_OPAQUE_RECV_OBJECT) {
@@ -2679,10 +2678,10 @@ static int io_opaque_stat(struct io_opaque_req *op)
 
 	/* Framing in the reply reserve is charged outside bytes. */
 	stat.backing_bytes += atomic64_read(&store->reserve_framing);
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	stat.objects = store->nr_objects;
 	stat.streams = store->nr_streams;
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	return io_opaque_stat_copy(op, &stat, sizeof(stat));
 }
 
@@ -2812,13 +2811,13 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		ret = io_opaque_copy(op->data, op->offset, op->length, op->addr);
 		break;
 	case IORING_OPAQUE_FREE:
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		{
 			struct io_opaque_data *data = io_opaque_detach(store,
 						io_opaque_lookup(store, op->handle));
 
 			ret = data ? 0 : -ESTALE;
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			io_opaque_data_put(store, data);
 		}
 		break;
@@ -2840,11 +2839,11 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
 			if (op->data->mapped)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
-			mutex_lock(&store->tables);
+			spin_lock(&store->tables);
 			slot = io_opaque_lookup(store, op->handle);
 			if (slot && slot->compacting)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_COMPACTING;
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			ret = io_opaque_stat_copy(op, &stat, sizeof(stat));
 		}
 		break;
@@ -2865,18 +2864,18 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		}
 		break;
 	case IORING_OPAQUE_STREAM_CLOSE:
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		if (store->streams[io_opaque_index(op->handle)].stream == op->stream) {
 			store->streams[io_opaque_index(op->handle)].stream = NULL;
 			store->nr_streams--;
 			io_opaque_release_slot(store->stream_used, io_opaque_index(op->handle),
 					       op->handle >> IO_OPAQUE_INDEX_BITS);
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			io_opaque_stream_close(op->stream);
 			io_opaque_stream_put(op->stream);
 			ret = 0;
 		} else {
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			ret = -ESTALE;
 		}
 		break;
@@ -3023,11 +3022,11 @@ void io_opaque_cleanup(struct io_kiocb *req)
 			io_opaque_stream_close(op->stream);
 	}
 	if (op->slot_reserved) {
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		store->objects[op->slot].reserved = false;
 		io_opaque_release_slot(store->object_used, op->slot,
 				       store->objects[op->slot].generation);
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 	}
 	if (unlikely(op->vec))
 		io_opaque_vec_cleanup(op);
@@ -3692,7 +3691,7 @@ VISIBLE_IF_KUNIT int io_opaque_vec_finish(struct io_opaque_req *op, int ret)
 		ret = io_opaque_vec_grow(op, op->vec->nr, ret, op->vec->nr);
 		if (ret)
 			return ret;
-		scoped_guard(mutex, &op->store->tables)
+		scoped_guard(spinlock, &op->store->tables)
 			ret = io_opaque_send_acquire(op);
 	}
 	if (!ret)
@@ -3891,7 +3890,7 @@ static int io_opaque_tx_acquire(struct io_opaque_req *op)
 {
 	int ret;
 
-	scoped_guard(mutex, &op->store->tables)
+	scoped_guard(spinlock, &op->store->tables)
 		ret = io_opaque_send_acquire(op);
 	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
 		ret = io_opaque_vec_finish(op, ret);

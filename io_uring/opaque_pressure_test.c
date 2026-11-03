@@ -506,7 +506,7 @@ static void pressure_available_prep(struct kunit *test)
 
 	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(f->ctx));
 	xa_init(&f->ctx->opaque_stores);
-	mutex_init(&f->store.tables);
+	spin_lock_init(&f->store.tables);
 	ret = xa_err(xa_store(&f->ctx->opaque_stores, 1, &f->store, GFP_KERNEL));
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {

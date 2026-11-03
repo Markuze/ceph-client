@@ -420,16 +420,16 @@ struct io_opaque_store {
 	refcount_t users;
 	struct io_uring_opaque_config config;
 	/*
-	 * Handles and candidates; never held during copies or I/O, and for a time
-	 * that the request bounds: what admission does under it is a lookup per
-	 * entry, the segments its ranges span up to the limit, which it counts and
-	 * stores in the request's block, and for each range a walk that the
-	 * version's anchors keep to about two strides and a binary search. Attach
-	 * and the admission of a send take it with the socket owned, so nothing
-	 * may take a socket lock while holding it, or wait for anything that holds
-	 * one for long.
+	 * Handles and candidates. A spinlock: nothing under it sleeps or allocates, and
+	 * a version is put, a copy made and a socket locked only after it is dropped. It
+	 * is held for a time that the request bounds: what admission does under it is a
+	 * lookup per entry, the segments its ranges span up to the limit, which it counts
+	 * and stores in the request's block, and for each range a walk that the version's
+	 * anchors keep to about two strides and a binary search. Attach and the admission
+	 * of a send take it with the socket owned, so a socket lock is never taken while
+	 * holding it.
 	 */
-	struct mutex tables;
+	spinlock_t tables;
 	struct io_opaque_slot *objects;
 	struct io_opaque_stream_slot *streams;
 	unsigned long *object_used;
