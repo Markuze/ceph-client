@@ -4166,6 +4166,20 @@ static int opaque_vec_admit(struct io_opaque_req *op)
 }
 
 /*
+ * A vector whose admission failed (or that did not get so far as to be admitted) has not given back
+ * what it pinned: @pinned entries of its block are set, each run of entries that name one handle
+ * holding a reference, and no cursor was made (io_opaque_vec_acquire()). The cleanup of the request
+ * gives them back, without the socket; this does what it does.
+ */
+static void opaque_vec_failed(struct kunit *test, struct io_opaque_req *op, u32 pinned)
+{
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, pinned);
+	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
+	io_opaque_vec_release(op);
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+}
+
+/*
  * The segments of a range as the first version of the vectored send found
  * them: its object walked from the first segment for every range. Counted when
  * @bv is NULL, else stored there.
@@ -5886,6 +5900,8 @@ static void opaque_send_vec_acquire(struct kunit *test)
 	};
 	struct io_uring_opaque_send_entry bad[4][3];
 	static const int errs[4] = { -ERANGE, -ESTALE, -ESTALE, -EMSGSIZE };
+	/* Entries set at each failure: one past the limit is set, one out of range is not. */
+	static const u32 held[4] = { 2, 1, 1, 3 };
 	struct io_opaque_req *op, *other;
 	unsigned long limit;
 	struct bio_vec *bv;
@@ -5958,7 +5974,8 @@ static void opaque_send_vec_acquire(struct kunit *test)
 					       last ? IORING_OPAQUE_SEND_LAST : 0);
 			KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, other), errs[i]);
 			KUNIT_EXPECT_FALSE(test, other->consumed);
-			KUNIT_EXPECT_EQ(test, other->vec->pinned, 0U);
+			/* A LAST vector pins nothing; any other leaves its pins to the cleanup. */
+			opaque_vec_failed(test, other, last ? 0 : held[i]);
 			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
 			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
@@ -6716,7 +6733,7 @@ static void opaque_send_vec_seek_bound(struct kunit *test)
 /*
  * Counting the segments of the ranges stops once the limit is passed: a range
  * over a whole large object, or one that crosses the limit, counts as many as
- * it takes to know, and the vector fails having pinned and removed nothing.
+ * it takes to know, and the vector fails having removed nothing.
  */
 static void opaque_send_vec_count_cap(struct kunit *test)
 {
@@ -6746,12 +6763,14 @@ static void opaque_send_vec_count_cap(struct kunit *test)
 		counted = atomic_long_read(&io_opaque_vec_counted);
 		KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, op), -EMSGSIZE);
 		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_vec_counted) - counted, 11L);
+		opaque_vec_failed(test, op, last ? 0 : 1);
 		/* Eight fit; the second range crosses the limit after three more. */
 		op = opaque_vec_new(test, store, ent, 2, flags);
 		counted = atomic_long_read(&io_opaque_vec_counted);
 		KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, op), -EMSGSIZE);
 		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_vec_counted) - counted, 11L);
-		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		/* Both entries name one handle: the second shares the first's reference. */
+		opaque_vec_failed(test, op, last ? 0 : 2);
 		KUNIT_EXPECT_FALSE(test, op->consumed);
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
@@ -6913,9 +6932,10 @@ static struct io_opaque_req *opaque_grow_queued(struct kunit *test, struct io_op
 }
 
 /*
- * A block with too few segments for what the ranges span is grown with nothing
- * held, and the vector is resolved again: nothing is pinned or removed before
- * that, and what the second attempt sees is what counts.
+ * A block with too few segments for what the ranges span is grown, and the vector is
+ * resolved again. Nothing is removed before that. A vector that consumes what it names
+ * holds nothing meanwhile, and what the second attempt sees is what counts; any other
+ * holds the versions that the first attempt pinned, and the second goes on with them.
  */
 static void opaque_send_vec_grow_retry(struct kunit *test)
 {
@@ -6933,9 +6953,9 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, sk);
 
 	/*
-	 * The attempt that finds the block too small pins and removes nothing and
-	 * leaves the block as it is. The retry walks the ranges again and ends
-	 * as a single attempt would have.
+	 * The attempt that finds the block too small removes nothing and leaves the block as
+	 * it is, with the versions it pinned if the vector is not LAST. The retry walks the
+	 * ranges again and ends as a single attempt would have.
 	 */
 	opaque_test_publish(store, 0, 9, a);
 	opaque_grow_entries(ent, io_opaque_handle(0, 9));
@@ -6948,13 +6968,14 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 		pass = atomic_long_read(&io_opaque_vec_stepped) - before;
 		KUNIT_EXPECT_EQ(test, ret, 5);
 		KUNIT_EXPECT_GT(test, pass, 0L);
-		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		/* Both entries name A: one reference between them, held across the growing. */
+		KUNIT_EXPECT_EQ(test, op->vec->pinned, last ? 0U : 2U);
 		KUNIT_EXPECT_FALSE(test, op->consumed);
 		KUNIT_EXPECT_EQ(test, op->vec->cap_segs, 2U);
 		/* It stored what the block held and made no cursor of it. */
 		KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
 		KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)0);
-		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), last ? 1 : 2);
 		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
 		KUNIT_EXPECT_EQ(test, store->nr_objects, 1U);
 		KUNIT_EXPECT_TRUE(test, test_bit(0, store->object_used));
@@ -6992,6 +7013,9 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, op), -ESTALE);
 	KUNIT_EXPECT_EQ(test, io_opaque_vec_finish(op, -ESTALE), -ESTALE);
 	KUNIT_EXPECT_EQ(test, op->vec->cap_segs, 2U);
+	/* The first entry is pinned, and is the request's to give back. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+	opaque_vec_failed(test, op, 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 	opaque_test_free(store, 0);
 
@@ -7016,8 +7040,9 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 
 	/*
-	 * A block that cannot grow ends the admission with nothing taken, LAST
-	 * included, and it grows where no lock is held.
+	 * A block that cannot grow ends the admission, which consumes nothing, LAST
+	 * included, and leaves what a vector had pinned to the cleanup of the request;
+	 * and it grows where no lock is held.
 	 */
 	for (last = 0; last < 2; last++) {
 		op = opaque_grow_queued(test, store, io_opaque_handle(0, 11),
@@ -7031,13 +7056,13 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, opaque_window.grow_locked);
 		KUNIT_EXPECT_EQ(test, opaque_window.segs, 5U);
 		KUNIT_EXPECT_EQ(test, opaque_window.cap, 2U);
-		KUNIT_EXPECT_EQ(test, opaque_window.pinned, 0U);
+		KUNIT_EXPECT_EQ(test, opaque_window.pinned, last ? 0U : 2U);
 		KUNIT_EXPECT_FALSE(test, opaque_window.consumed);
 		KUNIT_EXPECT_FALSE(test, op->consumed);
-		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
-		KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
 		KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)0);
 		KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), last ? 1 : 2);
+		opaque_vec_failed(test, op, last ? 0 : 2);
 		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
 		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
@@ -7086,9 +7111,9 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 
 	/*
-	 * The object is compacted in the window: the second attempt pins the
-	 * replacement, and the cursor is over its segments, not the five that
-	 * the first counted.
+	 * The object is compacted in the window: the second attempt goes on with the
+	 * version that the first pinned, and the cursor is over its five segments, not
+	 * the replacement's. The replacement, which the table holds, is not referenced.
 	 */
 	a = opaque_sparse_data(test, store);
 	opaque_test_publish(store, 0, 14, a);
@@ -7107,18 +7132,19 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, opaque_window.grow_locked);
 	KUNIT_EXPECT_EQ(test, opaque_window.segs, 5U);
 	KUNIT_EXPECT_EQ(test, opaque_window.cap, 2U);
-	KUNIT_EXPECT_EQ(test, opaque_window.pinned, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_window.pinned, 2U);
 	KUNIT_EXPECT_FALSE(test, opaque_window.consumed);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 2U);
-	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], replacement);
-	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[1], replacement);
-	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
-	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], a);
+	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[1], a);
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
+	/* The worker's reference and the send's; the table's went to the replacement. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
 	opaque_grow_entries(ent, compact.handle);
 	n = opaque_ref_segs(replacement, ent[0].off, ent[0].len, NULL) +
 	    opaque_ref_segs(replacement, ent[1].off, ent[1].len, NULL);
 	KUNIT_ASSERT_NE(test, n, 5U);
-	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, n);
+	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 5U);
 	opaque_vec_expect_cursor(test, op);
 	opaque_test_tx_done(op, true);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(op), NULL);
@@ -7403,9 +7429,10 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 	op = opaque_vec_new(test, store, ent, 2, 0);
 	opaque_adm_read(&before);
 	KUNIT_EXPECT_EQ(test, opaque_vec_admit(op), -ESTALE);
-	/* The first entry was counted, the second was not found. */
+	/* The first entry was counted and is pinned, the second was not found. */
 	opaque_adm_expect(test, &before, 0, 0, 0, 1);
-	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&obj[5]->refs), 2);
+	opaque_vec_failed(test, op, 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&obj[5]->refs), 1);
 
 	for (i = 0; i < nobj; i++) {
@@ -7419,20 +7446,25 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 
 /*
  * One failure of a vector of eight entries, which span two segments each: entry
- * @k is made wrong in way @kind, the vector is admitted, and nothing of it is
- * left: it says what is wrong and not that its block, which holds the segments
- * if @room, is short, and nothing has been pinned, detached, consumed, counted
- * as an admission or made into a cursor. Mended, it goes through.
+ * @k is made wrong in way @kind, the vector is admitted, and it says what is wrong
+ * and not that its block, which holds the segments if @room, is short, and nothing
+ * has been detached, consumed, counted as an admission or made into a cursor. A
+ * vector that pins keeps what it pinned, for the cleanup of the request: the entries
+ * before @k, and @k too if it is the limit on segments that fails and not the
+ * entry. Mended, it goes through, from a block that was cleaned up or, with @resume,
+ * from the one that failed, which goes on with the versions it had pinned.
  */
-static void opaque_unwind_one(struct kunit *test, struct io_opaque_store *store,
-			      struct io_opaque_data **a, struct io_opaque_data **b,
-			      const struct io_uring_opaque_send_entry *ent, bool last, bool room,
-			      unsigned int kind, unsigned int k)
+static void opaque_fail_one(struct kunit *test, struct io_opaque_store *store,
+			    struct io_opaque_data **a, struct io_opaque_data **b,
+			    const struct io_uring_opaque_send_entry *ent, bool last, bool room,
+			    unsigned int kind, unsigned int k, bool resume)
 {
 	static const int errs[] = { -ERANGE, -ESTALE, -ESTALE, -EMSGSIZE };
 	const unsigned long limit = io_opaque_send_vec_segs;
 	struct io_opaque_req *op = opaque_vec_new(test, store, ent, 8,
 						  last ? IORING_OPAQUE_SEND_LAST : 0);
+	/* The entries alternate between A and B, so each has a reference of its own. */
+	const u32 held = last ? 0 : k + (kind == 3);
 	struct io_uring_opaque_send_entry mended;
 	struct opaque_adm before, after;
 
@@ -7453,16 +7485,21 @@ static void opaque_unwind_one(struct kunit *test, struct io_opaque_store *store,
 	KUNIT_EXPECT_EQ(test, after.fast, before.fast);
 	KUNIT_EXPECT_EQ(test, after.slow, before.slow);
 	KUNIT_EXPECT_FALSE(test, op->consumed);
-	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, held);
 	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
 	KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)0);
-	KUNIT_EXPECT_EQ(test, refcount_read(&(*a)->refs), 1);
-	KUNIT_EXPECT_EQ(test, refcount_read(&(*b)->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&(*a)->refs), 1 + (held + 1) / 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&(*b)->refs), 1 + held / 2);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), *a);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), *b);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 2U);
 	KUNIT_EXPECT_TRUE(test, test_bit(0, store->object_used));
 	KUNIT_EXPECT_TRUE(test, test_bit(1, store->object_used));
+	if (!resume) {
+		opaque_vec_failed(test, op, held);
+		KUNIT_EXPECT_EQ(test, refcount_read(&(*a)->refs), 1);
+		KUNIT_EXPECT_EQ(test, refcount_read(&(*b)->refs), 1);
+	}
 	/* Mended, it goes, however long it took to find out. */
 	op->vec->ent[k] = mended;
 	io_opaque_send_vec_segs = limit;
@@ -7470,6 +7507,9 @@ static void opaque_unwind_one(struct kunit *test, struct io_opaque_store *store,
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 8U);
 	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 16U);
 	KUNIT_EXPECT_EQ(test, op->consumed, last);
+	/* Four references on each, the table's or the repeats'; a resume holds the same. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&(*a)->refs), last ? 4 : 5);
+	KUNIT_EXPECT_EQ(test, refcount_read(&(*b)->refs), last ? 4 : 5);
 	opaque_vec_expect_cursor(test, op);
 	io_opaque_vec_release(op);
 	if (last) {
@@ -7491,16 +7531,17 @@ static void opaque_unwind_one(struct kunit *test, struct io_opaque_store *store,
  * eight entries, for any of the ways an entry fails (out of range, a handle of
  * another generation, a slot that holds nothing, one range too many for the
  * limit on segments), LAST or not, with a block that holds the segments of the
- * ranges and with one that is too short for them (opaque_unwind_one()).
+ * ranges and with one that is too short for them (opaque_fail_one()), and goes on
+ * to be admitted when it is mended, from a clean block or from the one that failed.
  */
-static void opaque_send_vec_admit_unwinds(struct kunit *test)
+static void opaque_send_vec_acquire_fails(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_data *a = opaque_sparse_data(test, store);
 	struct io_opaque_data *b = opaque_sparse_data(test, store);
 	struct io_uring_opaque_send_entry ent[8];
 	unsigned long limit = io_opaque_send_vec_segs;
-	unsigned int last, room, kind, k;
+	unsigned int last, room, kind, k, resume;
 
 	opaque_test_publish(store, 0, 9, a);
 	opaque_test_publish(store, 1, 7, b);
@@ -7516,8 +7557,9 @@ static void opaque_send_vec_admit_unwinds(struct kunit *test)
 		for (room = 0; room < 2; room++)
 			for (kind = 0; kind < 4; kind++)
 				for (k = 0; k < ARRAY_SIZE(ent); k++)
-					opaque_unwind_one(test, store, &a, &b, ent, last, room,
-							  kind, k);
+					for (resume = 0; resume < 2; resume++)
+						opaque_fail_one(test, store, &a, &b, ent, last,
+								room, kind, k, resume);
 	opaque_test_free(store, 0);
 	opaque_test_free(store, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
@@ -9156,11 +9198,12 @@ static void opaque_admit_between(struct kunit *test, struct io_opaque_req *op)
  * A head that cannot take its references while it owns the socket: a stale
  * handle, LAST or not, a vector whose block cannot grow, which fails with the
  * socket owned and a frame that joined meanwhile parked behind it, and a
- * vector whose object a LAST frame takes while the block grows, so that it
- * finds nothing when it looks again. It leaves with the error, which is not a
- * completion, nothing sent, nothing consumed and nothing held, and releases
- * the socket and does not fail the queue; the frame behind it is promoted
- * with its references and sends them.
+ * vector whose object a LAST frame takes while the block grows, so that a LAST
+ * vector finds nothing when it looks again, and any other, which pinned the
+ * version, goes on with it. A head that fails leaves with the error, which is
+ * not a completion, nothing sent and nothing consumed, and releases the socket
+ * and does not fail the queue; what a vector had pinned is left for its cleanup,
+ * and the frame behind it is promoted with its references and sends them.
  */
 static void opaque_send_locked_admit_fails(struct kunit *test)
 {
@@ -9169,7 +9212,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
 	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	u8 *got = kunit_kmalloc(test, 300, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 3200, GFP_KERNEL);
 	unsigned int mode, last;
 	struct sock *sk;
 
@@ -9226,11 +9269,16 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 			KUNIT_EXPECT_FALSE(test, head->consumed);
-			KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
 			KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
 			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
 			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
 					calls);
+			/*
+			 * The head that is not LAST still holds the version that it pinned, for its
+			 * cleanup: one reference for the two entries. LAST had pinned nothing.
+			 */
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), last ? 2 : 3);
+			opaque_vec_failed(test, head, last ? 0 : 2);
 			/* The frame that came in was parked with its pin, and is promoted whole. */
 			KUNIT_EXPECT_EQ(test, opaque_admit_hook.joined, IO_OPAQUE_TX_WAIT);
 			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
@@ -9255,8 +9303,9 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 
 			/*
-			 * The block grows again, and the frame that joins meanwhile is LAST:
-			 * it takes the object, and the head, which looks again, finds none.
+			 * The block grows again, and the frame that joins meanwhile is LAST: it
+			 * takes the object. A LAST head, which looks again, finds none. Any other
+			 * has pinned the version, and goes on with it.
 			 */
 			calls = atomic_long_read(&io_opaque_send_locked_calls);
 			opaque_grow_entries(ent, io_opaque_handle(0, 9));
@@ -9272,18 +9321,35 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			ret = opaque_wire_issue(w, 0, unlocked);
 			opaque_window_close(test);
 			lockdep_assert_none_held_once();
-			KUNIT_EXPECT_EQ(test, ret, -ESTALE);
-			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
 			KUNIT_EXPECT_TRUE(test, opaque_admit_hook.owned);
 			KUNIT_EXPECT_EQ(test, opaque_window.calls, 1U);
 			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
-			/* The head consumed and holds nothing; the queue is not failed. */
-			KUNIT_EXPECT_FALSE(test, head->consumed);
-			KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
-			KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+			if (last) {
+				/* The head consumed and holds nothing; the queue is not failed. */
+				KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+				KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
+				KUNIT_EXPECT_FALSE(test, head->consumed);
+				KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
+				KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+			} else {
+				/*
+				 * It sends its two ranges of the version it pinned, ahead of the
+				 * frame that took the object, and lets go of it.
+				 */
+				KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+				KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3200);
+				KUNIT_EXPECT_FALSE(test, head->consumed);
+				KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
+				KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+				opaque_wire_read(test, w, got, 0, 3200);
+				KUNIT_EXPECT_MEMEQ(test, got, source + 1500, 1000);
+				KUNIT_EXPECT_MEMEQ(test, got + 1000, source + 3900, 2200);
+			}
+			/* One part went out of the owned path, for the head that sent. */
 			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
-					calls);
+					calls + !last);
+			calls += !last;
 			/* The frame took the object, table reference and all, and is promoted. */
 			KUNIT_EXPECT_EQ(test, opaque_admit_hook.joined, IO_OPAQUE_TX_WAIT);
 			KUNIT_EXPECT_TRUE(test, follower->consumed);
@@ -13776,17 +13842,35 @@ static void opaque_ubuf_pool_smp_close(struct kunit *test)
  * io_opaque_lookup_between lets them reach, and then do the same from several CPUs. A hook runs
  * in the RCU section of the lookup, so it may take a spinlock and put, and it may not sleep
  * or make an expectation, which allocates when it fails: it records, and the test looks after.
+ * io_opaque_lookup_after is reached by a lookup that holds its reference, outside RCU and with no
+ * lock, where a hook may do what a context of its own does, such as another ring's FREE.
  */
+enum {
+	OPAQUE_LK_BETWEEN,
+	OPAQUE_LK_AFTER,
+};
+
 static void opaque_lookup_hook_reset(void *unused)
 {
 	WRITE_ONCE(io_opaque_lookup_between, NULL);
+	WRITE_ONCE(io_opaque_lookup_after, NULL);
+}
+
+/* Run @hook at @where in every lookup, until the end of the test. */
+static void opaque_lookup_hook_at(struct kunit *test, unsigned int where,
+				  void (*hook)(struct io_opaque_store *store))
+{
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_lookup_hook_reset, NULL), 0);
+	if (where == OPAQUE_LK_AFTER)
+		WRITE_ONCE(io_opaque_lookup_after, hook);
+	else
+		WRITE_ONCE(io_opaque_lookup_between, hook);
 }
 
 /* Run @hook in the window of every lookup, until the end of the test. */
 static void opaque_lookup_hook(struct kunit *test, void (*hook)(struct io_opaque_store *store))
 {
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_lookup_hook_reset, NULL), 0);
-	WRITE_ONCE(io_opaque_lookup_between, hook);
+	opaque_lookup_hook_at(test, OPAQUE_LK_BETWEEN, hook);
 }
 
 /* What the window of the tests that make it do something does, and what it saw. */
@@ -13827,26 +13911,50 @@ static void opaque_lk_window(struct io_opaque_store *store)
 		opaque_lk.refs = refcount_read(&opaque_lk.watch->refs);
 }
 
-/* Start the window: run @act in lookup number @at of this test. */
-static void opaque_lk_open(struct kunit *test, struct io_opaque_store *store, void (*act)(void),
-			   unsigned int at)
+/*
+ * Start the window: run @act at @where in lookup number @at of this test. Lookups are counted
+ * where the window is, so a window after the reference does not see the lookups that fail.
+ */
+static void opaque_lk_open_at(struct kunit *test, struct io_opaque_store *store,
+			      unsigned int where, void (*act)(void), unsigned int at)
 {
 	memset(&opaque_lk, 0, sizeof(opaque_lk));
 	opaque_lk.store = store;
 	opaque_lk.act = act;
 	opaque_lk.at = at;
-	opaque_lookup_hook(test, opaque_lk_window);
+	opaque_lookup_hook_at(test, where, opaque_lk_window);
+}
+
+/* Start the window between the read of the slot and the reference. */
+static void opaque_lk_open(struct kunit *test, struct io_opaque_store *store, void (*act)(void),
+			   unsigned int at)
+{
+	opaque_lk_open_at(test, store, OPAQUE_LK_BETWEEN, act, at);
 }
 
 static void opaque_lk_close(void)
 {
 	WRITE_ONCE(io_opaque_lookup_between, NULL);
+	WRITE_ONCE(io_opaque_lookup_after, NULL);
 }
 
 /* The object is freed, and the put of the table's reference may be the last. */
 static void opaque_lk_free(void)
 {
 	opaque_test_free(opaque_lk.store, 0);
+}
+
+/*
+ * The object is freed by another ring: the put of the table's reference is not the send's, and
+ * the spy of the test (opaque_put_spy_start()) does not count it.
+ */
+static void opaque_lk_free_other(void)
+{
+	struct kunit *test = kunit_get_current_test();
+
+	kunit_deactivate_static_stub(test, io_opaque_data_put);
+	opaque_test_free(opaque_lk.store, 0);
+	kunit_activate_static_stub(test, io_opaque_data_put, opaque_test_data_put_spy);
 }
 
 /* The compaction is published; with @drop the old version loses the compaction's reference too. */
@@ -13867,11 +13975,11 @@ static void opaque_lk_reuse(void)
 }
 
 /*
- * What a lookup returns for the handles that it must refuse, and what it takes and gives back
- * for the ones it takes: the version is the one the handle names and knows its handle, a slot
- * that was freed and taken by another object is not found by the handle of the first, and a
- * lookup that finds the wrong object, or one that is out of range, gives back the reference it
- * took. None of it needs the window, so none of it takes tables.
+ * What a lookup returns for the handles that it must refuse, and what it takes for the ones it
+ * takes: the version is the one the handle names and knows its handle, a slot that was freed and
+ * taken by another object is not found by the handle of the first, and a lookup that finds the
+ * wrong object, or a range that the version does not have, takes no reference. None of it needs
+ * the window, so none of it takes tables.
  */
 static void opaque_pin_handles(struct kunit *test)
 {
@@ -13912,7 +14020,7 @@ static void opaque_pin_handles(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
 	}
 
-	/* A range outside the version is refused, and the reference it took goes back. */
+	/* A range outside the version is refused, and no reference is taken. */
 	send.handle = first;
 	send.offset = old->length - 10;
 	send.length = 20;
@@ -14305,13 +14413,14 @@ static void opaque_pin_vec_run(struct kunit *test)
 }
 
 /*
- * A vector that fails after it has pinned gives its references back with decrements, which
- * cannot free: admission may own the socket. The last reference of a version is put, and the
- * version freed, only if the table let go of it meanwhile. Here the second entry names a range
- * that is not there, and the first object is freed in the window of the second lookup, so
- * that the pin of the first entry is the last reference when the vector is unwound.
+ * A vector that fails after it has pinned keeps its references, for the cleanup of the request:
+ * admission may own the socket, and a version that was freed meanwhile makes the pin of an entry
+ * the last reference, which is not to be put there. Here the second entry names a range that is
+ * not there, and the first object is freed in the window of the second lookup, so that the pin
+ * of the first entry is all that is left of it when the vector fails, and the cleanup puts it.
+ * The entry that failed took no reference.
  */
-static void opaque_pin_vec_unwind(struct kunit *test)
+static void opaque_pin_vec_failed(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_data *a = opaque_sparse_data(test, store);
@@ -14332,17 +14441,222 @@ static void opaque_pin_vec_unwind(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
 	KUNIT_EXPECT_EQ(test, opaque_lk.calls, 2U);
 	KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
-	/* The pin of the first entry was all that was left of A, and went with the unwinding. */
+	/* The pin of the first entry was all that was left of A. */
+	KUNIT_EXPECT_EQ(test, opaque_lk.before, 2);
 	KUNIT_EXPECT_EQ(test, opaque_lk.refs, 1);
-	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
-	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], a);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)(80 * PAGE_SIZE));
+	opaque_vec_failed(test, op, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)(40 * PAGE_SIZE));
 	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
 	opaque_test_free(store, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A head is admitted with the socket owned, inline or from io-wq, and the last reference of the
+ * version it has pinned is its own: another ring frees the object once the head's lookup holds
+ * it. A free is not for the socket lock to wait out, so the admission puts no version, whatever
+ * becomes of the vector: when an entry after the first is refused (ERANGE), the pin of the
+ * first stays with the request and the cleanup puts it, with the socket released; and when the
+ * block is too short for the ranges and grows, the pins go across the growing and the vector
+ * is sent from the versions it pinned, bytes of the freed object included, and the last
+ * reference is put by the send after it has let go of the socket. The spy sees every put the
+ * request makes, and none may have the socket owned.
+ */
+static void opaque_pin_vec_owned(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	u8 *source[2] = { kunit_kmalloc(test, 80000, GFP_KERNEL),
+			  kunit_kmalloc(test, 80000, GFP_KERNEL) };
+	u8 *got = kunit_kmalloc(test, 2000, GFP_KERNEL);
+	unsigned long user;
+	unsigned int kind, mode;
+	struct sock *sk;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source[0]);
+	KUNIT_ASSERT_NOT_NULL(test, source[1]);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	user = opaque_uvec_map(test);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_prep_setup(test, w, store);
+	opaque_wire_sndbuf(sk, SZ_1M);
+	/* kind 0: the second range is out of B. kind 1: a range in each, over two extents. */
+	for (kind = 0; kind < 2; kind++) {
+		for (mode = 0; mode < 2; mode++) {
+			struct io_opaque_data *a = opaque_sparse_data(test, store);
+			struct io_opaque_data *b = opaque_sparse_data(test, store);
+			struct io_uring_opaque_send_entry ent[2] = {
+				{ .handle = io_opaque_handle(0, 9), .off = kind ? 1500 : 100,
+				  .len = 1000 },
+				{ .handle = io_opaque_handle(1, 7),
+				  .off = kind ? 1500 : b->length - 10, .len = kind ? 1000 : 20 },
+			};
+			struct io_opaque_req *op;
+			int ret;
+
+			opaque_test_publish(store, 0, 9, a);
+			opaque_test_publish(store, 1, 7, b);
+			opaque_test_copy(a, source[0]);
+			opaque_test_copy(b, source[1]);
+			opaque_uvec_put(test, user, ent, sizeof(ent));
+			op = opaque_wire_prep(test, w, 0, IORING_OPAQUE_SEND_VECTOR, user, 0,
+					      ARRAY_SIZE(ent), 0);
+			/* The ring recycles a block that was grown: make it short again. */
+			kvfree(op->vec);
+			op->vec = NULL;
+			KUNIT_ASSERT_EQ(test, io_opaque_vec_grow(op, ARRAY_SIZE(ent), 2, 0), 0);
+			KUNIT_ASSERT_EQ(test, io_opaque_vec_copy_in(op, (const void __user *)user,
+								    ARRAY_SIZE(ent)), 0);
+			KUNIT_ASSERT_EQ(test, op->vec->cap_segs, 2U);
+			/* The lookup of the first entry holds its reference: free A now. */
+			opaque_lk_open_at(test, store, OPAQUE_LK_AFTER, opaque_lk_free_other, 0);
+			opaque_lk.sk = sk;
+			opaque_put_spy_start(test, sk);
+			ret = opaque_wire_issue(w, 0, !mode);
+			opaque_lk_close();
+			lockdep_assert_none_held_once();
+			/* The admission ran with the socket owned, outside RCU. */
+			KUNIT_EXPECT_TRUE(test, opaque_lk.owned);
+			KUNIT_EXPECT_FALSE(test, opaque_lk.rcu);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+			KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+			if (!kind) {
+				KUNIT_EXPECT_EQ(test, ret, -ERANGE);
+				KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
+				/* Nothing has been put: the request keeps the pin of A. */
+				KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+				KUNIT_EXPECT_EQ(test, op->vec->pinned, 1U);
+				KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], a);
+				KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+				KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+				opaque_put_spy_expect(test, 0, 0);
+				KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes),
+						(s64)(80 * PAGE_SIZE));
+				/* What the core does with a send that failed. */
+				req_set_fail(&w->req[0]);
+				io_opaque_fail(&w->req[0]);
+			} else {
+				KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+				KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 2000);
+				/* Both lookups held their references, and neither put one. */
+				KUNIT_EXPECT_EQ(test, opaque_lk.calls, 2U);
+				/* A's last reference was the send's, put after the socket. */
+				opaque_put_spy_expect(test, 1, 1);
+				KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes),
+						(s64)(40 * PAGE_SIZE));
+				opaque_wire_read(test, w, got, 0, 2000);
+				KUNIT_EXPECT_MEMEQ(test, got, source[0] + 1500, 1000);
+				KUNIT_EXPECT_MEMEQ(test, got + 1000, source[1] + 1500, 1000);
+			}
+			/* Cleanup has the rest to give back, with the socket released. */
+			opaque_wire_req_cleanup(w, 0);
+			opaque_put_spy_stop(test);
+			opaque_put_spy_expect(test, 1, 1);
+			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)(40 * PAGE_SIZE));
+			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+			opaque_test_free(store, 1);
+			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			kvfree_rcu_barrier();
+		}
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A single range, admitted with the socket owned, takes a reference only if it keeps it: a
+ * handle that a slot has since given to another object, and a range that the version does not
+ * have, are refused in the lookup, with no reference taken, and so nothing is given back and
+ * nothing put. The lookup that does take one is told, once it holds it, that another ring frees
+ * the object, which makes the send's pin the last reference, and that send puts it after the
+ * socket is released. The other two would otherwise have put it under the socket.
+ */
+static void opaque_pin_send_owned(struct kunit *test)
+{
+	static const int errs[] = { -ESTALE, -ERANGE, 0 };
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 1000, GFP_KERNEL);
+	unsigned int kind, mode;
+	struct sock *sk;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_prep_setup(test, w, store);
+	opaque_wire_sndbuf(sk, SZ_1M);
+	/* kind 0: the slot holds an object of the next generation. 1: out of range. 2: a send. */
+	for (kind = 0; kind < ARRAY_SIZE(errs); kind++) {
+		for (mode = 0; mode < 2; mode++) {
+			struct io_opaque_data *data = opaque_sparse_data(test, store);
+			struct io_opaque_req *op;
+			int ret;
+
+			opaque_test_publish(store, 0, kind ? 9 : 10, data);
+			opaque_test_copy(data, source);
+			op = opaque_wire_prep(test, w, 0, 0, io_opaque_handle(0, 9),
+					      kind == 1 ? data->length - 10 : 100,
+					      kind == 1 ? 20 : 1000, 0);
+			opaque_lk_open_at(test, store, OPAQUE_LK_AFTER, opaque_lk_free_other, 0);
+			opaque_lk.sk = sk;
+			opaque_put_spy_start(test, sk);
+			ret = opaque_wire_issue(w, 0, !mode);
+			opaque_lk_close();
+			lockdep_assert_none_held_once();
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+			KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
+			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+			if (errs[kind]) {
+				KUNIT_EXPECT_EQ(test, ret, errs[kind]);
+				KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
+				/* The lookup took no reference, so it was not told of the FREE. */
+				KUNIT_EXPECT_EQ(test, opaque_lk.calls, 0U);
+				KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
+				KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
+				KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+				opaque_put_spy_expect(test, 0, 0);
+				req_set_fail(&w->req[0]);
+				io_opaque_fail(&w->req[0]);
+				opaque_wire_req_cleanup(w, 0);
+				opaque_put_spy_stop(test);
+				opaque_put_spy_expect(test, 0, 0);
+				opaque_test_free(store, 0);
+			} else {
+				KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+				KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 1000);
+				KUNIT_EXPECT_TRUE(test, opaque_lk.owned);
+				KUNIT_EXPECT_FALSE(test, opaque_lk.rcu);
+				KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+				KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+				opaque_wire_req_cleanup(w, 0);
+				opaque_put_spy_stop(test);
+				/* The send's reference was the last, and went after the socket. */
+				opaque_put_spy_expect(test, 1, 1);
+				opaque_wire_read(test, w, got, 0, 1000);
+				KUNIT_EXPECT_MEMEQ(test, got, source + 100, 1000);
+			}
+			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			kvfree_rcu_barrier();
+		}
+	}
 	opaque_expect_lockdep(test, store);
 }
 
@@ -15168,14 +15482,16 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_grow_retry),
 	KUNIT_CASE(opaque_send_vec_cursor_pinned),
 	KUNIT_CASE(opaque_send_vec_one_pass),
-	KUNIT_CASE(opaque_send_vec_admit_unwinds),
+	KUNIT_CASE(opaque_send_vec_acquire_fails),
 	KUNIT_CASE(opaque_pin_handles),
 	KUNIT_CASE(opaque_pin_retired),
 	KUNIT_CASE(opaque_pin_retired_send),
 	KUNIT_CASE(opaque_pin_compacted),
 	KUNIT_CASE(opaque_pin_reused),
 	KUNIT_CASE(opaque_pin_vec_run),
-	KUNIT_CASE(opaque_pin_vec_unwind),
+	KUNIT_CASE(opaque_pin_vec_failed),
+	KUNIT_CASE(opaque_pin_vec_owned),
+	KUNIT_CASE(opaque_pin_send_owned),
 	KUNIT_CASE(opaque_pin_grace),
 	KUNIT_CASE(opaque_send_vec_prep),
 	KUNIT_CASE(opaque_send_vec_prep_errors),

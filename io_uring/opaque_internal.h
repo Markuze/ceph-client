@@ -221,7 +221,8 @@ struct io_opaque_vec {
 	 * Entries of pin[] that admission has set. The version of each is kept
 	 * alive by the send, by a reference of the entry's own or, unless the
 	 * vector is LAST, by that of the entry before it when both name the
-	 * same handle.
+	 * same handle. They stay set when admission fails, for the cleanup of the
+	 * request, and when it needs a bigger block, which takes them over.
 	 */
 	u32 pinned;
 	u32 cap_nr;
@@ -660,6 +661,7 @@ int io_opaque_apply_policy(struct io_opaque_store *store,
 extern unsigned int io_opaque_policy_chunk;
 extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
+extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 extern atomic_long_t io_opaque_pin_slow;
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
