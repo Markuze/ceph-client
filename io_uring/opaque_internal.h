@@ -4,9 +4,11 @@
 
 #include <linux/bitmap.h>
 #include <linux/bvec.h>
+#include <linux/llist.h>
 #include <linux/net.h>
 #include <linux/percpu.h>
 #include <linux/sizes.h>
+#include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <kunit/visibility.h>
 #include <uapi/linux/io_uring/opaque.h>
@@ -190,26 +192,15 @@ struct io_opaque_tx {
 };
 
 /*
- * Where one range of a vectored send starts in the version it pins. Admission
- * finds it under tables; the cursor is built from it once tables is dropped.
- */
-struct io_opaque_vec_start {
-	/* The first segment of the range. */
-	u32 seg;
-	/* Bytes of that segment before the range. */
-	u32 skip;
-};
-
-/*
  * What a vectored send needs besides the request: its entries, copied at prep,
- * the version each pins, where each starts in it and the segments of the
- * combined cursor. One block holds the header and the four arrays, so that
- * growing it is one allocation.
+ * the version each pins and the segments of the combined cursor, which
+ * admission stores as it finds the ranges. One block holds the header and the
+ * three arrays, so that growing it is one allocation.
  */
 struct io_opaque_vec {
 	/* Entries, from the SQE. */
 	u32 nr;
-	/* Segments of the combined cursor, from io_opaque_vec_build(). */
+	/* Segments of the combined cursor, from admission. */
 	u32 nr_segs;
 	/*
 	 * Entries of pin[] that admission has set. The version of each is kept
@@ -224,7 +215,6 @@ struct io_opaque_vec {
 	u32 max_len;
 	struct io_uring_opaque_send_entry *ent;
 	struct io_opaque_data **pin;
-	struct io_opaque_vec_start *start;
 	struct bio_vec *bv;
 };
 
@@ -342,6 +332,14 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_PAGES_COPIED,
 	/* Blocks of chunks that streams allocated. */
 	IO_OPAQUE_STAT_CHUNK_BLOCKS,
+	IO_OPAQUE_STAT_SEND_MANAGED_SKBS,
+	IO_OPAQUE_STAT_SEND_FOLIO_REFS,
+	IO_OPAQUE_STAT_SEND_FRAG_FALLBACK,
+	IO_OPAQUE_STAT_SEND_UBUF_COPIED,
+	IO_OPAQUE_STAT_SEND_FOLIO_GETS,
+	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
+	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
+	IO_OPAQUE_STAT_SEND_UBUF_REUSED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -358,12 +356,89 @@ static inline void io_opaque_count(enum io_opaque_stat_item item, u64 delta)
 
 u64 io_opaque_stat_read(enum io_opaque_stat_item item);
 
+struct io_opaque_send_cursor;
+
+/*
+ * The ubuf_info of the skbs that carry a send's managed fragments (see
+ * io_opaque_link_skb()): one per skb, shared by the skbs that are derived from it.
+ */
+struct io_opaque_ubuf {
+	struct ubuf_info uarg;
+	/* Entries of folio[]. */
+	u8 nr;
+	union {
+		/*
+		 * The send whose link_skb() has just been called, if it has folio
+		 * references to hand out; the fill that follows takes it and clears it,
+		 * so that it never outlives the call.
+		 */
+		struct io_opaque_send_cursor *cursor;
+		/*
+		 * Link in the pool of a ubuf that has completed and is waiting for a skb.
+		 * KASAN poisons a ubuf in the pool but for this (io_opaque_ubuf_poison()).
+		 */
+		struct llist_node node;
+	};
+	/* Where the ubuf goes when its last skb is freed; none for one that is only freed. */
+	struct io_opaque_ubuf_pool *pool;
+	/* The distinct folios of the fragments of the skbs that share the ubuf. */
+	struct folio *folio[MAX_SKB_FRAGS];
+};
+
+/*
+ * The ubufs of a store that have completed, kept for the next skbs (see
+ * io_opaque_ubuf_pool_get()). Completions, which run in any context on any CPU,
+ * push to done with a compare-and-exchange; the send side, which runs under the
+ * socket lock but for many sockets and rings at a time, takes all of done at once
+ * into stock, and hands out of that, under lock. nr counts what was pushed since
+ * done was last taken, so that done holds IO_OPAQUE_UBUF_POOL_MAX at most.
+ *
+ * refs is one for the store and one for every ubuf of the pool that has not been
+ * freed to the cache, wherever it is (in an skb, in done, in stock): the pool
+ * outlives the store and the ring for as long as an skb waits for an ACK.
+ */
+#define IO_OPAQUE_UBUF_POOL_MAX	128
+
+struct io_opaque_ubuf_pool {
+	refcount_t refs;
+	struct llist_head done ____cacheline_aligned_in_smp;
+	atomic_t nr;
+	spinlock_t lock ____cacheline_aligned_in_smp;
+	struct llist_node *stock;
+};
+
+/*
+ * A managed send prepays its folio references when it is short of folios and of
+ * segments, as many as these (io_opaque_cursor_prepay()).
+ */
+#define IO_OPAQUE_PREPAY_FOLIOS	4
+#define IO_OPAQUE_PREPAY_SEGS	32
+
+/*
+ * What msg_ubuf points at during one managed tcp_sendmsg_locked(): the ops that
+ * skb_zerocopy_iter_stream() finds link_skb() through, and the folio references
+ * that the send took before TCP allocated any skb, for the fill to give the
+ * ubufs of the skbs without an atomic of its own.
+ */
+struct io_opaque_send_cursor {
+	struct ubuf_info uarg;
+	/* The pool of the send's store, for the ubufs of its skbs; or none. */
+	struct io_opaque_ubuf_pool *pool;
+	/* Entries of folio[] and credit[]. */
+	u8 nr;
+	struct folio *folio[IO_OPAQUE_PREPAY_FOLIOS];
+	/* References on folio[] that the send holds and no ubuf has taken. */
+	unsigned int credit[IO_OPAQUE_PREPAY_FOLIOS];
+};
+
 /* Evaluation tunables; module parameters, not ABI. */
 extern unsigned long io_opaque_cache_bytes;
 extern unsigned int io_opaque_unit_order;
 extern unsigned int io_opaque_inline_compact_max;
 extern bool io_opaque_copy_per_page;
 extern unsigned int io_opaque_send_copy_max;
+extern bool io_opaque_send_managed;
+extern bool io_opaque_send_prepay;
 
 struct io_opaque_store {
 	refcount_t refs;
@@ -372,11 +447,12 @@ struct io_opaque_store {
 	/*
 	 * Handles and candidates; never held during copies or I/O, and for a time
 	 * that the request bounds: what admission does under it is a lookup per
-	 * entry, the segments its ranges span up to the limit, and for each range
-	 * a walk that the version's anchors keep to about two strides and a
-	 * binary search. Attach and the admission of a send take it with the
-	 * socket owned, so nothing may take a socket lock while holding it, or
-	 * wait for anything that holds one for long.
+	 * entry, the segments its ranges span up to the limit, which it counts and
+	 * stores in the request's block, and for each range a walk that the
+	 * version's anchors keep to about two strides and a binary search. Attach
+	 * and the admission of a send take it with the socket owned, so nothing
+	 * may take a socket lock while holding it, or wait for anything that holds
+	 * one for long.
 	 */
 	struct mutex tables;
 	struct io_opaque_slot *objects;
@@ -421,9 +497,14 @@ struct io_opaque_store {
 	atomic_t extents;
 	atomic_t requests;
 	atomic_t memory_mode;
+	/* Completed ubufs of managed sends, for the next skbs; none if there was no memory. */
+	struct io_opaque_ubuf_pool *ubuf_pool;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
 	spinlock_t wait_lock;
-	/* TX queues: the tree, every queue's requests and failed flag. Never with tables. */
+	/*
+	 * TX queues: the tree, every queue's requests and failed flag. Never with tables;
+	 * after the socket, which an inline send owns when it joins.
+	 */
 	spinlock_t tx_lock;
 	struct list_head budget_waits;
 	struct list_head copies;
@@ -567,31 +648,48 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 void io_opaque_send_resolve(struct io_opaque_req *op);
 int io_opaque_send_acquire(struct io_opaque_req *op);
-int io_opaque_vec_check(const struct io_uring_opaque_send_entry *ent, u32 nr,
-			u32 *total, u32 *max_len);
 int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
-int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr);
+void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total, u32 longest);
+int io_opaque_vec_copy_in(struct io_opaque_req *op,
+			  const struct io_uring_opaque_send_entry __user *uent, u32 nr);
 void io_opaque_vec_release(struct io_opaque_req *op);
-void io_opaque_vec_build(struct io_opaque_req *op);
 int io_opaque_vec_finish(struct io_opaque_req *op, int ret);
 int io_opaque_apply_policy(struct io_opaque_store *store,
 			   const struct io_uring_opaque_policy *policy);
 extern unsigned int io_opaque_policy_chunk;
 extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
 extern unsigned int io_opaque_send_vec_segs;
+extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;
 extern atomic_long_t io_opaque_vec_counted;
 extern atomic_long_t io_opaque_budget_wakes;
 int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk);
 int io_opaque_tx_settle_head(struct io_opaque_req *op);
+void io_opaque_req_uncount(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
-int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
-			   unsigned int issue_flags);
+extern const struct ubuf_info_ops io_opaque_ubuf_ops;
+extern const struct ubuf_info_ops io_opaque_cursor_ops;
+extern atomic_long_t io_opaque_ubufs_live;
+extern atomic_long_t io_opaque_ubuf_pools_live;
+struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
+void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool);
+struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool);
+u8 io_opaque_ubuf_flags(void);
+int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
+int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);
+void io_opaque_cursor_prepay(struct io_opaque_send_cursor *cursor, const struct iov_iter *iter);
+void io_opaque_cursor_refund(struct io_opaque_send_cursor *cursor);
+int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
+			    const struct io_opaque_req *op);
 extern atomic_long_t io_opaque_send_locked_calls;
+extern void (*io_opaque_send_part)(const struct msghdr *msg,
+				   const struct io_opaque_send_cursor *cursor,
+				   bool owned);
+extern int io_opaque_send_poison;
 int io_opaque_create_build(struct io_opaque_req *op);
 bool io_opaque_unit_retire(struct io_opaque_store *store, struct page *page);
 struct page *io_opaque_unit_take(struct io_opaque_store *store);

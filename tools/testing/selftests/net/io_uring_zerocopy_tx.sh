@@ -31,6 +31,20 @@ if [[ "$#" -eq "0" ]]; then
 			$0 "$IP" udp -m "$mode" -t 1 -n 32
 			$0 "$IP" tcp -m "$mode" -t 1 -n 1
 		done
+
+		# IORING_SEND_ZC_NO_RX_COPY: registered buffers that the
+		# receive path may hold, also in a stream that mixes them with
+		# sends that it may not
+		$0 "$IP" udp -m 2 -t 1 -n 32 -x
+		$0 "$IP" tcp -m 2 -t 1 -n 1 -x
+		$0 "$IP" tcp -m 3 -t 1 -n 1 -x
+		# where the flag is refused, and where it is not
+		$0 "$IP" udp -R
+		$0 "$IP" tcp -R
+		# a packet socket that holds the frames for 200 ms: copied
+		# without the flag, held and unchanged with it
+		$0 "$IP" udp -T 200 -n 4
+		$0 "$IP" udp -T 200 -n 4 -x
 	done
 
 	echo "OK. All tests passed"

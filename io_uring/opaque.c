@@ -5,6 +5,7 @@
 #include <linux/bvec.h>
 #include <linux/file.h>
 #include <linux/highmem.h>
+#include <linux/kasan.h>
 #include <linux/memcontrol.h>
 #include <linux/overflow.h>
 #include <linux/rbtree.h>
@@ -14,6 +15,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/hotdata.h>
 #include <net/page_pool/helpers.h>
 #include <net/rps.h>
 #include <net/tcp.h>
@@ -52,6 +54,8 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_vec_cleanup(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream);
 static void io_opaque_tx_put(struct io_opaque_req *op);
+VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
+VISIBLE_IF_KUNIT void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool);
 
 static bool io_opaque_budget_ready(struct io_opaque_req *op, unsigned long now)
 {
@@ -748,6 +752,7 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 
 VISIBLE_IF_KUNIT void io_opaque_stream_put(struct io_opaque_stream *stream)
 {
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_stream_put, stream);
 	if (stream && refcount_dec_and_test(&stream->refs)) {
 		io_opaque_extents_free(stream->store, &stream->extents);
 		io_opaque_capture_release(stream);
@@ -854,6 +859,8 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 		INIT_LIST_HEAD(&store->objects[i].candidate);
 	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
 	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
+	/* Not having one is fine: the ubufs of a store without a pool come from the cache alone. */
+	store->ubuf_pool = io_opaque_ubuf_pool_new();
 	return store;
 free_store:
 	bitmap_free(store->stream_used);
@@ -937,6 +944,8 @@ void io_opaque_free(struct io_opaque_store *store)
 	WARN_ON_ONCE(atomic_read(&store->requests));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_opaque_txs_free(store);
+	io_opaque_ubuf_pool_close(store->ubuf_pool);
+	store->ubuf_pool = NULL;
 	/*
 	 * Every backing is gone. The last ones released their pages into the
 	 * instance, so the reference ends after them.
@@ -976,9 +985,15 @@ void io_opaque_put(struct io_opaque_store *store)
 		io_opaque_free(store);
 }
 
-static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
-						 struct io_opaque_store *store,
-						 bool control)
+/*
+ * A request from the ring's cache, or a new one, that counts against the store's
+ * limit unless it is a control request, and has nothing set but the flag that
+ * the core cleans it up: a recycled one is what the last request left. The caller
+ * sets what it reads, all of the request but its block of a vector in
+ * io_opaque_req_alloc(), only what the opcode reads in io_opaque_send_prep().
+ */
+static struct io_opaque_req *io_opaque_req_get(struct io_kiocb *req,
+					       struct io_opaque_store *store, bool control)
 {
 	struct io_opaque_req *op;
 
@@ -994,6 +1009,18 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 			atomic_dec(&store->requests);
 		return ERR_PTR(-ENOMEM);
 	}
+	req->flags |= REQ_F_NEED_CLEANUP;
+	return op;
+}
+
+static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
+						 struct io_opaque_store *store,
+						 bool control)
+{
+	struct io_opaque_req *op = io_opaque_req_get(req, store, control);
+
+	if (IS_ERR(op))
+		return op;
 	/* Not the vector block, which a recycled request brings along. */
 	memset(op, 0, offsetof(struct io_opaque_req, vec));
 	op->op = U16_MAX;
@@ -1003,7 +1030,6 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 	op->retry_at = jiffies;
 	INIT_LIST_HEAD(&op->wait);
 	INIT_LIST_HEAD(&op->cancel);
-	req->flags |= REQ_F_NEED_CLEANUP;
 	return op;
 }
 
@@ -1019,8 +1045,25 @@ static void io_opaque_req_free(struct io_ring_ctx *ctx, struct io_opaque_req *op
 	}
 }
 
+/*
+ * Give back a request's place in the store's count of requests, once: the flag
+ * says whether it still has one. A send that ends with its socket owned gives it
+ * back there, where the locked decrement is part of the stretch in which the
+ * socket is not waited for. Cleanup gives it back for every request that has not,
+ * the sends that never got so far among them. Needs neither the ring lock nor the
+ * socket.
+ */
+VISIBLE_IF_KUNIT void io_opaque_req_uncount(struct io_opaque_req *op)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_req_uncount, op);
+	if (op->counted) {
+		op->counted = false;
+		atomic_dec(&op->store->requests);
+	}
+}
+
 /* The ring lock protects enrollment; wait_lock arbitrates remote wakeups. */
-static void io_opaque_enroll(struct io_opaque_req *op)
+static __always_inline void io_opaque_enroll(struct io_opaque_req *op)
 {
 	lockdep_assert_held(&op->req->ctx->uring_lock);
 	if (list_empty(&op->cancel))
@@ -2988,16 +3031,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	/*
 	 * Taking wait_lock is how cleanup waits out a waker that is still in
 	 * its hold: budget_waits and copies are walked under it, using the
-	 * request's file and stream after its entry has been unlinked. A send
-	 * is on neither list. What reaches one from outside comes through its
-	 * TX queue, which io_opaque_tx_put() below waits for, or from
-	 * cancellation, which holds the ring lock as cleanup does. It has no
-	 * waker to wait out, and takes the lock only if its entry is linked.
+	 * request's file and stream after its entry has been unlinked.
 	 */
-	if (req->opcode != IORING_OP_OPAQUE_OBJ_SEND || !list_empty(&op->wait)) {
-		scoped_guard(spinlock, &store->wait_lock)
-			list_del_init(&op->wait);
-	}
+	scoped_guard(spinlock, &store->wait_lock)
+		list_del_init(&op->wait);
 	/* Waiters have stopped accessing this request before cleanup. */
 	if (op->stream) {
 		mutex_lock(&op->stream->lock);
@@ -3025,25 +3062,66 @@ void io_opaque_cleanup(struct io_kiocb *req)
 				       store->objects[op->slot].generation);
 		mutex_unlock(&store->tables);
 	}
-	if (req->opcode == IORING_OP_OPAQUE_OBJ_SEND) {
-		io_opaque_tx_put(op);
-		kfree(op->framing);
-		if (op->frame_charge)
-			io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
-	}
 	if (unlikely(op->vec))
 		io_opaque_vec_cleanup(op);
 	if (op->op == IORING_OPAQUE_CREATE)
 		io_opaque_create_release(op);
-	else
+	else if (op->data)
 		io_opaque_data_put(store, op->data);
 	if (op->op == IORING_OPAQUE_COMPACT) {
 		io_opaque_data_put(store, op->replacement);
 		io_opaque_compact_end(op);
 	}
-	io_opaque_stream_put(op->stream);
+	if (op->stream)
+		io_opaque_stream_put(op->stream);
 	if (op->counted)
-		atomic_dec(&store->requests);
+		io_opaque_req_uncount(op);
+	lockdep_assert_held(&req->ctx->uring_lock);
+	io_opaque_req_free(req->ctx, op);
+	io_req_async_data_clear(req, 0);
+}
+
+/*
+ * Request cleanup of a send, which holds only what a send can hold: a place in
+ * a queue, a frame and its charge, references (a version, and those of a vector in
+ * its block), a place in the count of requests, and the block. A send that ended
+ * with its socket owned has given back all but the frame and the decision about
+ * the block (io_opaque_send()); any other has all of them to give back here, once,
+ * and each is given back only if it is there: a call that is made to find that
+ * out is a call for nothing.
+ *
+ * A send is on neither list that a waker walks under wait_lock, budget_waits and
+ * copies, so it has no waker to wait out, and takes the lock only if its entry is
+ * linked. What reaches a send from outside comes through its TX queue, which
+ * io_opaque_tx_put() waits for, or from cancellation, which holds the ring lock as
+ * cleanup does. Its stream is none, and it reserves no slot.
+ */
+void io_opaque_send_cleanup(struct io_kiocb *req)
+{
+	struct io_opaque_req *op = req->async_data;
+	struct io_opaque_store *store;
+
+	if (!op)
+		return;
+	store = op->store;
+	if (!list_empty(&op->cancel))
+		list_del_init(&op->cancel);
+	if (!list_empty(&op->wait)) {
+		scoped_guard(spinlock, &store->wait_lock)
+			list_del_init(&op->wait);
+	}
+	if (op->tx)
+		io_opaque_tx_put(op);
+	if (op->framing)
+		kfree(op->framing);
+	if (op->frame_charge)
+		io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
+	if (unlikely(op->vec))
+		io_opaque_vec_cleanup(op);
+	if (op->data)
+		io_opaque_data_put(store, op->data);
+	if (op->counted)
+		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
@@ -3139,6 +3217,9 @@ VISIBLE_IF_KUNIT void io_opaque_send_resolve(struct io_opaque_req *op)
 /* A variable under KUnit, so that a test reaches the limit with a few segments. */
 unsigned int io_opaque_send_vec_segs = IO_OPAQUE_SEND_VEC_SEGS;
 #define IO_OPAQUE_VEC_SEGS_LIMIT	io_opaque_send_vec_segs
+/* Calls of io_opaque_vec_seek(), for a test to read. */
+atomic_long_t io_opaque_vec_seeks = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_VEC_SEEKED()		atomic_long_inc(&io_opaque_vec_seeks)
 /* Segments that admission walked over to find where ranges start, for a test to read. */
 atomic_long_t io_opaque_vec_stepped = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_VEC_STEPPED(n)	atomic_long_add((n), &io_opaque_vec_stepped)
@@ -3147,42 +3228,30 @@ atomic_long_t io_opaque_vec_counted = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_VEC_COUNTED(n)	atomic_long_add((n), &io_opaque_vec_counted)
 #else
 #define IO_OPAQUE_VEC_SEGS_LIMIT	IO_OPAQUE_SEND_VEC_SEGS
+#define IO_OPAQUE_VEC_SEEKED()		((void)0)
 #define IO_OPAQUE_VEC_STEPPED(n)	((void)(n))
 #define IO_OPAQUE_VEC_COUNTED(n)	((void)(n))
 #endif
 
 /*
- * Check @nr entries copied from user memory; return the body they add up to
- * and the largest of them. A handle may repeat, and a range may too.
+ * Whether the request's block, if it has one, holds @nr entries and @segs
+ * segments already. A request that is made ready for a vector holds no
+ * reference in its block, which is what the warning says.
  */
-VISIBLE_IF_KUNIT int io_opaque_vec_check(const struct io_uring_opaque_send_entry *ent, u32 nr,
-					 u32 *total, u32 *max_len)
+static inline bool io_opaque_vec_fits(const struct io_opaque_vec *vec, u32 nr, u32 segs)
 {
-	u64 sum = 0, end;
-	u32 longest = 0, i;
-
-	BUILD_BUG_ON(sizeof(*ent) != 24);
-	if (!nr || nr > IORING_OPAQUE_SEND_VEC_MAX)
-		return -EINVAL;
-	for (i = 0; i < nr; i++) {
-		if (ent[i].__resv || !ent[i].len ||
-		    check_add_overflow(ent[i].off, (u64)ent[i].len, &end))
-			return -EINVAL;
-		sum += ent[i].len;
-		if (sum > INT_MAX)
-			return -EINVAL;
-		longest = max(longest, ent[i].len);
-	}
-	*total = sum;
-	*max_len = longest;
-	return 0;
+	if (!vec)
+		return false;
+	WARN_ON_ONCE(vec->pinned);
+	return vec->cap_nr >= nr && vec->cap_segs >= segs;
 }
 
 /*
  * Make room in the request's block for @nr entries and @segs segments, keeping
- * its first @keep entries. A block that is big enough stays as it is. This
- * allocates, so tables must not be held, and the send must hold no reference
- * yet: what admission recorded about the versions is not carried over.
+ * its first @keep entries. A block that is big enough stays as it is, and a
+ * caller that can tell (io_opaque_vec_fits()) does not call. This allocates, so
+ * tables must not be held, and the send must hold no reference yet: what
+ * admission recorded about the versions is not carried over.
  */
 VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep)
 {
@@ -3190,16 +3259,14 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_vec_grow, op, nr, segs, keep);
 	lockdep_assert_not_held(&op->store->tables);
+	if (io_opaque_vec_fits(old, nr, segs))
+		return 0;
 	if (old) {
-		WARN_ON_ONCE(old->pinned);
-		if (old->cap_nr >= nr && old->cap_segs >= segs)
-			return 0;
 		nr = max(nr, old->cap_nr);
 		segs = max(segs, old->cap_segs);
 	}
 	vec = kvmalloc(size_add(sizeof(*vec),
-				size_add(array_size(nr, sizeof(*vec->ent) + sizeof(*vec->pin) +
-						       sizeof(*vec->start)),
+				size_add(array_size(nr, sizeof(*vec->ent) + sizeof(*vec->pin)),
 					 array_size(segs, sizeof(*vec->bv)))),
 		       GFP_KERNEL_ACCOUNT);
 	if (!vec)
@@ -3208,8 +3275,7 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 	vec->cap_segs = segs;
 	vec->ent = (void *)(vec + 1);
 	vec->pin = (void *)(vec->ent + nr);
-	vec->start = (void *)(vec->pin + nr);
-	vec->bv = (void *)(vec->start + nr);
+	vec->bv = (void *)(vec->pin + nr);
 	vec->nr_segs = 0;
 	vec->pinned = 0;
 	if (old) {
@@ -3226,18 +3292,15 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 }
 
 /*
- * The @nr entries are in the block: validate them and make the request what
- * its length and offset say about a send, a body of their total at no offset.
+ * The @nr entries are in the block and add up to @total bytes, the largest being
+ * @longest: make the request what its length and offset say about a send, a body
+ * of their total at no offset.
  */
-VISIBLE_IF_KUNIT int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr)
+VISIBLE_IF_KUNIT void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total,
+					   u32 longest)
 {
 	struct io_opaque_vec *vec = op->vec;
-	u32 total, longest;
-	int ret;
 
-	ret = io_opaque_vec_check(vec->ent, nr, &total, &longest);
-	if (ret)
-		return ret;
 	vec->nr = nr;
 	vec->nr_segs = 0;
 	vec->pinned = 0;
@@ -3245,7 +3308,55 @@ VISIBLE_IF_KUNIT int io_opaque_vec_commit(struct io_opaque_req *op, u32 nr)
 	op->handle = 0;
 	op->offset = 0;
 	op->length = total;
+}
+
+/*
+ * Read the @nr entries at @uent into the request's block and check them as they
+ * are read, in the one pass that SEND_ZC makes over its iovecs
+ * (copy_iovec_from_user()). A copy_from_user() would also check the block as a
+ * heap object that the copy must not overrun, and a pass over the copy would
+ * check the entries. Each field is read from user memory once and what is checked
+ * is what is kept, so an array that changes meanwhile cannot make the block
+ * differ from what was checked. @nr is from one to IORING_OPAQUE_SEND_VEC_MAX,
+ * and the block holds that many.
+ *
+ * An entry must name a range: no reserved bits, at least a byte, and an end that
+ * does not pass U64_MAX. The lengths add up to the body, which with the frame
+ * must fit an int. A handle may repeat, and a range may too. All of the entries
+ * are read before one that is not valid is refused, so that a fault is -EFAULT
+ * whatever they hold, as it is when the copy comes first. Returns 0, with the
+ * request made of the vector by io_opaque_vec_commit(), or an error, with the
+ * block as far as it was read.
+ */
+VISIBLE_IF_KUNIT int io_opaque_vec_copy_in(struct io_opaque_req *op,
+					   const struct io_uring_opaque_send_entry __user *uent,
+					   u32 nr)
+{
+	struct io_uring_opaque_send_entry *ent = op->vec->ent;
+	u32 longest = 0, i;
+	bool bad = false;
+	u64 sum = 0, end;
+
+	BUILD_BUG_ON(sizeof(*ent) != 24);
+	scoped_user_read_access_size(uent, array_size(nr, sizeof(*uent)), efault) {
+		for (i = 0; i < nr; i++) {
+			unsafe_get_user(ent[i].handle, &uent[i].handle, efault);
+			unsafe_get_user(ent[i].off, &uent[i].off, efault);
+			unsafe_get_user(ent[i].len, &uent[i].len, efault);
+			unsafe_get_user(ent[i].__resv, &uent[i].__resv, efault);
+			bad |= !!ent[i].__resv | !ent[i].len |
+			       check_add_overflow(ent[i].off, (u64)ent[i].len, &end);
+			sum += ent[i].len;
+			longest = max(longest, ent[i].len);
+		}
+	}
+	/* The sum only grows, and a thousand lengths of 32 bits cannot overflow it. */
+	if (bad || sum > INT_MAX)
+		return -EINVAL;
+	io_opaque_vec_commit(op, nr, sum, longest);
 	return 0;
+efault:
+	return -EFAULT;
 }
 
 /*
@@ -3315,6 +3426,7 @@ static u32 io_opaque_vec_seek(const struct io_opaque_data *data, u64 off, u32 *s
 	u32 i = *seg, steps = 0;
 	u64 at = *pos;
 
+	IO_OPAQUE_VEC_SEEKED();
 	while (steps < IO_OPAQUE_SEEK_STRIDE && i < data->nr && at + src[i].bv_len <= off) {
 		at += src[i++].bv_len;
 		steps++;
@@ -3349,14 +3461,15 @@ static u32 io_opaque_vec_seek(const struct io_opaque_data *data, u64 off, u32 *s
 /*
  * The segments of the range of @len bytes that starts @skip bytes into segment
  * @seg of @data, as a cursor over the whole object would visit them: the first
- * starts inside its extent, the last ends inside its own. They are stored at
- * @bv, and all of them counted, unless it is NULL: then only the count is
- * wanted, and it stops at @room + 1, since a caller that has room for no more
- * has no use for how many more there are. The range must lie within the
- * object.
+ * starts inside its extent, the last ends inside its own. All of them are
+ * counted and the first @fit stored at @bv, since a caller whose block is too
+ * short has to learn how many segments it needs, and the ones stored are of no
+ * use to it then. The count stops at @room + 1, since a caller that has room
+ * for no more has no use for how many more there are. The range must lie
+ * within the object.
  */
 static u32 io_opaque_vec_span(const struct io_opaque_data *data, u32 seg, u32 skip, u32 len,
-			      struct bio_vec *bv, u64 room)
+			      struct bio_vec *bv, u32 fit, u64 room)
 {
 	const struct bio_vec *src = data->bvec;
 	u32 n = 0;
@@ -3364,13 +3477,13 @@ static u32 io_opaque_vec_span(const struct io_opaque_data *data, u32 seg, u32 sk
 	while (len && seg < data->nr) {
 		u32 take = min(src[seg].bv_len - skip, len);
 
-		if (bv) {
+		if (n < fit) {
 			bv[n] = src[seg];
 			bv[n].bv_offset += skip;
 			bv[n].bv_len = take;
 		}
 		n++;
-		if (!bv && n > room)
+		if (n > room)
 			break;
 		len -= take;
 		skip = 0;
@@ -3467,28 +3580,31 @@ static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *
 
 /*
  * Admission of a vectored send, under tables; every entry sees the versions
- * as they are in this one hold, and nothing in here sleeps. Pass one resolves
- * and counts, and fails without having pinned or detached anything, so a
+ * as they are in this one hold, and nothing in here sleeps. Pass one resolves,
+ * stores and counts, and fails without having pinned or detached anything, so a
  * vector that cannot go consumes nothing. It finds where each range starts by
  * walking the segments of its version, and an entry that follows another in
  * the same version, not before the segment that one started in, walks on from
  * there instead of from the first: ranges in ascending order walk each object
- * once. One that is more than a stride from where the walk is jumps to the
- * version's anchors (see io_opaque_vec_seek()), so that ranges that go back
- * or alternate between large objects cost a few dozen steps each, not an
- * object. Counting the segments of the ranges stops as soon as the limit is
+ * once, and a range that starts in the segment the walk is at, as every range
+ * of an object of one segment does, is found without a call. One that is more
+ * than a stride from where the walk is jumps to the version's anchors (see
+ * io_opaque_vec_seek()), so that ranges that go back or alternate between large
+ * objects cost a few dozen steps each, not an object. The segments of each
+ * range go to the block as the range is found, in the order of the ranges,
+ * which is the cursor over the bytes of the send, and are counted whether the
+ * block has room for them or not. Counting stops as soon as the limit is
  * passed. What tables is held for is therefore bounded by the entries and the
  * limit, whatever the ranges. A block with too few segments is not grown here,
  * as that allocates; the number needed is returned, and io_opaque_vec_finish()
- * grows the block and asks again. Pass two takes the references and looks
- * nothing up: pass one recorded every version in pin[], and tables has been
- * held since. A LAST vector detaches each handle at its first entry, and an
- * entry that repeats the handle takes one more reference on the version it
- * found. Any other vector takes one reference for each run of entries that
- * name the same handle (see io_opaque_vec_owns()), so eight ranges of one
- * object cost one reference, and a handle that returns after another one pins
- * again. Nothing can fail from there on. The cursor over the combined segments
- * is io_opaque_vec_build()'s, once tables is dropped.
+ * grows the block and asks again. Otherwise the cursor is made, and pass two
+ * takes the references and looks nothing up: pass one recorded every version
+ * in pin[], and tables has been held since. A LAST vector detaches each handle
+ * at its first entry, and an entry that repeats the handle takes one more
+ * reference on the version it found. Any other vector takes one reference for
+ * each run of entries that name the same handle (see io_opaque_vec_owns()), so
+ * eight ranges of one object cost one reference, and a handle that returns
+ * after another one pins again. Nothing can fail from there on.
  */
 static int io_opaque_vec_acquire(struct io_opaque_req *op)
 {
@@ -3506,7 +3622,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 		const struct io_uring_opaque_send_entry *ent = &vec->ent[i];
 		struct io_opaque_slot *slot = io_opaque_lookup(store, ent->handle);
 		struct io_opaque_data *data;
-		u32 skip, n;
+		u32 skip, n, stored;
 
 		ret = io_opaque_send_range(slot, ent->off, ent->len);
 		if (ret)
@@ -3517,11 +3633,15 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 			seg = 0;
 			pos = 0;
 		}
-		skip = io_opaque_vec_seek(data, ent->off, &seg, &pos);
-		vec->start[i].seg = seg;
-		vec->start[i].skip = skip;
-		n = io_opaque_vec_span(data, seg, skip, ent->len, NULL,
-				       IO_OPAQUE_VEC_SEGS_LIMIT - segs);
+		/* Usually the walk is at the range already, and there is nothing to call for. */
+		if (seg < data->nr && ent->off - pos < data->bvec[seg].bv_len)
+			skip = ent->off - pos;
+		else
+			skip = io_opaque_vec_seek(data, ent->off, &seg, &pos);
+		/* What the block holds so far; once it is full the rest is only counted. */
+		stored = min_t(u64, segs, vec->cap_segs);
+		n = io_opaque_vec_span(data, seg, skip, ent->len, vec->bv + stored,
+				       vec->cap_segs - stored, IO_OPAQUE_VEC_SEGS_LIMIT - segs);
 		IO_OPAQUE_VEC_COUNTED(n);
 		segs += n;
 		if (segs > IO_OPAQUE_VEC_SEGS_LIMIT)
@@ -3532,6 +3652,8 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 	/* Within the limit, so it fits an int. */
 	if (segs > vec->cap_segs)
 		return segs;
+	vec->nr_segs = segs;
+	iov_iter_bvec(&op->iter, ITER_SOURCE, vec->bv, segs, op->length);
 	for (i = 0; i < vec->nr; i++) {
 		struct io_opaque_slot *slot;
 
@@ -3553,30 +3675,11 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 }
 
 /*
- * The cursor over the combined segments, from the starts that admission
- * recorded. It takes no lock and is done without tables, which is the point of
- * it: each version is held by the send's own reference, and the segments of a
- * version never change.
- */
-VISIBLE_IF_KUNIT void io_opaque_vec_build(struct io_opaque_req *op)
-{
-	struct io_opaque_vec *vec = op->vec;
-	u32 i, filled = 0;
-
-	KUNIT_STATIC_STUB_REDIRECT(io_opaque_vec_build, op);
-	lockdep_assert_not_held(&op->store->tables);
-	for (i = 0; i < vec->nr; i++)
-		filled += io_opaque_vec_span(vec->pin[i], vec->start[i].seg, vec->start[i].skip,
-					     vec->ent[i].len, vec->bv + filled, U64_MAX);
-	vec->nr_segs = filled;
-	io_opaque_send_iter(op, vec->bv, filled, op->length, 0);
-}
-
-/*
- * Resolve what a send names and take its references, under tables. A send of
- * one range also gets its cursor. A vector returns 0 with its references taken,
- * a negative errno with none taken and nothing removed, or the number of
- * segments its ranges span when its block holds fewer, to be settled by
+ * Resolve what a send names and take its references, under tables. A send gets
+ * its cursor too: one range gets it over the segments of its version, a vector
+ * over the block's. A vector returns 0 with its references taken, a negative
+ * errno with none taken and nothing removed, or the number of segments its
+ * ranges span when its block holds fewer, to be settled by
  * io_opaque_vec_finish() once tables is dropped.
  */
 VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
@@ -3615,11 +3718,14 @@ VISIBLE_IF_KUNIT int io_opaque_send_acquire(struct io_opaque_req *op)
  * io_opaque_send_acquire() returned @ret. A block with too few segments (@ret
  * of them are needed) is grown here, where allocating is fine, and the vector
  * is resolved again in a new hold: nothing was pinned, and the versions may
- * have changed meanwhile, so every entry is looked at again. Once the vector
- * is admitted, the cursor is built.
+ * have changed meanwhile, so every entry is looked at again, and the block may
+ * still be short. A vector that goes in the first hold is counted as a fast
+ * admission, and one that needed the block grown, however often, as a slow one.
  */
 VISIBLE_IF_KUNIT int io_opaque_vec_finish(struct io_opaque_req *op, int ret)
 {
+	bool slow = ret > 0;
+
 	while (ret > 0) {
 		ret = io_opaque_vec_grow(op, op->vec->nr, ret, op->vec->nr);
 		if (ret)
@@ -3628,7 +3734,8 @@ VISIBLE_IF_KUNIT int io_opaque_vec_finish(struct io_opaque_req *op, int ret)
 			ret = io_opaque_send_acquire(op);
 	}
 	if (!ret)
-		io_opaque_vec_build(op);
+		io_opaque_count(slow ? IO_OPAQUE_STAT_SEND_ADMIT_SLOW :
+				       IO_OPAQUE_STAT_SEND_ADMIT_FAST, 1);
 	return ret;
 }
 
@@ -3646,15 +3753,43 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 	if (op->offset || !nr || nr > IORING_OPAQUE_SEND_VEC_MAX)
 		return -EINVAL;
 	/* Every entry spans a segment; admission grows the block if some span more. */
-	ret = io_opaque_vec_grow(op, nr, nr, 0);
-	if (ret)
-		return ret;
-	if (copy_from_user(op->vec->ent, u64_to_user_ptr(op->handle),
-			   array_size(nr, sizeof(*op->vec->ent))))
-		return -EFAULT;
-	return io_opaque_vec_commit(op, nr);
+	if (!io_opaque_vec_fits(op->vec, nr, nr)) {
+		ret = io_opaque_vec_grow(op, nr, nr, 0);
+		if (ret)
+			return ret;
+	}
+	return io_opaque_vec_copy_in(op, u64_to_user_ptr(op->handle), nr);
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Fill the request of a send with the poison of the test (io_opaque_send_poison)
+ * before the send sets what it reads, as the message and the cursor are filled
+ * in io_opaque_send(), so that a field that is read before it is written does not
+ * get away with what the last request left, or with zero. Not the block of a
+ * vector, which a request brings along.
+ */
+#define IO_OPAQUE_SEND_POISON_REQ(op)					\
+	do {								\
+		if (io_opaque_send_poison >= 0)				\
+			memset((op), io_opaque_send_poison,		\
+			       offsetof(struct io_opaque_req, vec));	\
+	} while (0)
+#else
+#define IO_OPAQUE_SEND_POISON_REQ(op)	((void)(op))
+#endif
+
+/*
+ * A send sets the members of its request that it reads before it writes them,
+ * and no more: the request is shared with the receives and the control operations,
+ * whose members it never looks at, and a recycled one is what the last request
+ * left, apart from the block of a vector that it keeps. What a send writes
+ * before it reads is left alone: iter (admission), send (the join, which links
+ * it into the queue), frame_reserved (the charge that sets frame_charge) and
+ * result (the wakeup that sets it). The stream is none because cancellation looks
+ * at it for every request that waits, and the total is none until the request is
+ * resolved, by this prep or by the import of its frame.
+ */
 int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_opaque_store *store = io_opaque_get_store(req, READ_ONCE(sqe->opaque_store_id));
@@ -3671,11 +3806,30 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
 	    (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
 		return -EINVAL;
-	op = io_opaque_req_alloc(req, store, false);
+	op = io_opaque_req_get(req, store, false);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
+	IO_OPAQUE_SEND_POISON_REQ(op);
+	op->req = req;
+	op->store = store;
+	op->stream = NULL;
+	op->data = NULL;
+	INIT_LIST_HEAD(&op->wait);
+	INIT_LIST_HEAD(&op->cancel);
+	op->progress = 0;
 	op->op = U16_MAX;
-	INIT_LIST_HEAD(&op->send);
+	op->phase = IO_OPAQUE_IDLE;
+	op->canceled = false;
+	op->counted = true;
+	op->consumed = false;
+	op->resolved = false;
+	op->tx = NULL;
+	op->framing = NULL;
+	op->frame_charge = 0;
+	op->prefix_length = 0;
+	op->suffix_length = 0;
+	op->total_length = 0;
+	op->tx_started = false;
 	op->send_flags = send_flags;
 	op->handle = READ_ONCE(sqe->addr);
 	op->offset = READ_ONCE(sqe->off);
@@ -3768,10 +3922,9 @@ static void io_opaque_tx_claim(struct io_opaque_store *store, struct io_opaque_t
 }
 
 /*
- * Resolve what @op names and take its references: the handles under tables,
- * and then, without it, the block and the cursor. A vector leaves tables once
- * its references are taken; one whose block is too small leaves it earlier, to
- * grow the block, and is resolved again.
+ * Resolve what @op names and take its references, and make its cursor, under
+ * tables. A vector leaves tables once its references are taken; one whose block
+ * is too small leaves it earlier, to grow the block, and is resolved again.
  */
 static int io_opaque_tx_acquire(struct io_opaque_req *op)
 {
@@ -3788,8 +3941,8 @@ static int io_opaque_tx_acquire(struct io_opaque_req *op)
  * The admission of a request that found frames ahead of it. It takes its
  * references before it waits, so that a LAST send parked behind another has
  * consumed its object, and joins the queue afterwards, in a second tx_lock
- * hold: a queue that fails in between cancels it. It holds tables alone, not
- * the socket. Returns as io_opaque_tx_join() does.
+ * hold: a queue that fails in between cancels it. It holds tables alone, and the
+ * socket if its caller owns it. Returns as io_opaque_tx_join() does.
  */
 static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx)
 {
@@ -3819,6 +3972,17 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
 }
 
 /*
+ * io_opaque_send() joins in two places, for an io-wq issue and for an inline one. The join
+ * is part of it, not a call, as it was when it had one place: both are inlined, except
+ * in a test, which calls the join and has it as a function.
+ */
+#if IS_ENABLED(CONFIG_KUNIT)
+#define IO_OPAQUE_JOIN_INLINE
+#else
+#define IO_OPAQUE_JOIN_INLINE	__always_inline
+#endif
+
+/*
  * Queue @op behind the frames already admitted for @sk. Returns
  * IO_OPAQUE_TX_WAIT when it waits for one (its phase is set before tx_lock is
  * dropped, so a release cannot miss it), IO_OPAQUE_TX_HEAD when it is the head
@@ -3833,15 +3997,23 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
  * takes its references now, and may find itself the head when it is done
  * (io_opaque_tx_settle()). A queue that has failed refuses it.
  *
+ * A send that is issued inline on a plain TCP socket joins with the socket
+ * owned (io_opaque_send()): tx_lock is taken under the socket, wait_lock under
+ * tx_lock to park, and tables under the socket and not with tx_lock. An io-wq
+ * issue joins before it takes the socket. tx_lock and tables are never held
+ * when the socket is taken.
+ *
  * @op->req is not used; the caller enrolls a waiting request for cancellation.
  */
-VISIBLE_IF_KUNIT int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk)
+VISIBLE_IF_KUNIT IO_OPAQUE_JOIN_INLINE int
+io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_tx *tx, *spare = NULL;
 	struct rb_node **link, *parent;
 	int ret = 0;
 
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_tx_join, op, sk);
 	spin_lock(&store->tx_lock);
 	tx = op->tx;
 	if (tx) {
@@ -3882,7 +4054,9 @@ VISIBLE_IF_KUNIT int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk
 		io_opaque_tx_claim(store, tx);
 	}
 	spin_unlock(&store->tx_lock);
-	kfree(spare);
+	/* Only a queue that another ring made first leaves one. */
+	if (unlikely(spare))
+		kfree(spare);
 	if (ret)
 		return ret;
 	return io_opaque_tx_settle(op, tx);
@@ -3897,6 +4071,7 @@ VISIBLE_IF_KUNIT int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk
  */
 VISIBLE_IF_KUNIT int io_opaque_tx_settle_head(struct io_opaque_req *op)
 {
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_tx_settle_head, op);
 	return io_opaque_tx_acquire(op);
 }
 
@@ -3984,6 +4159,671 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 }
 
 /*
+ * Managed fragments. Spliced, a body costs TCP a page reference for every
+ * fragment, taken and dropped by whichever CPU gets to it, and a charge of
+ * socket memory for every byte. SEND_ZC does without both: its skbs have
+ * managed fragments (SKBFL_MANAGED_FRAG_REFS), which take no page reference
+ * and, in a pure zerocopy skb, no socket memory, and the ubuf_info of the skb
+ * keeps alive what they point to. That ubuf_info holds a notification, which
+ * holds the registered buffer. This one holds the pages, and nothing else.
+ *
+ * It is made for each skb that gets fragments (io_opaque_link_skb()), owns one
+ * reference on every distinct folio that the fragments of the skbs sharing it
+ * use, and drops them when the last of those is freed, from whatever context
+ * that is: the ACK that frees a sent skb, the sender's own backlog, the
+ * completion of a device, a tap that held a clone (io_opaque_ubuf_complete()).
+ * It has no pointer to the request, the store or the version; it points to a
+ * pool that the store made, which it keeps alive. A send gives
+ * back its references on its version as it did, and a LAST send hands the
+ * extents back to the store as it did: what holds the pages then is the
+ * ubuf, as it was TCP's references before, and the unit cache keeps a unit
+ * cooling until it completes. What the store has charged, the handles and the
+ * lifetime of the request do not depend on it.
+ *
+ * Nor can a consumer be left with a page that is recycled or rewritten: a
+ * clone shares the shinfo, the shinfo holds the ubuf, and the ubuf holds the
+ * folios. An skb that gets a shinfo of its own, by a split, a segmentation or
+ * the copy of a clone, takes references on the pages for itself first and one
+ * on the ubuf. The completion is not a notification that anyone waits for, so
+ * the ubuf asks not to be copied on the receive path (SKBFL_DONT_ORPHAN_RX):
+ * a packet socket, or a socket of this host, may hold the skb for as long as
+ * it likes, as it may hold a spliced page.
+ */
+
+/*
+ * The flags of the ubuf. Not SKBFL_SHARED_FRAG: the pages cannot change. And
+ * not SKBFL_MANAGED_FRAG_REFS, which belongs to the shinfo and is set by the
+ * fill: were it the ubuf's, an skb derived from this one with
+ * skb_zerocopy_clone() would take no references of its own.
+ */
+#define IO_OPAQUE_UBUF_FLAGS \
+	(SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX)
+
+static struct kmem_cache *io_opaque_ubuf_cache __ro_after_init;
+
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops;
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_cursor_ops;
+
+VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_ubuf_flags);
+	return IO_OPAQUE_UBUF_FLAGS;
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Ubufs taken from the cache and not yet given back to it, and pools made and not yet
+ * freed, for a test to say that they are all back.
+ */
+atomic_long_t io_opaque_ubufs_live = ATOMIC_LONG_INIT(0);
+atomic_long_t io_opaque_ubuf_pools_live = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_UBUF_TAKEN()		atomic_long_inc(&io_opaque_ubufs_live)
+#define IO_OPAQUE_UBUF_GIVEN()		atomic_long_dec(&io_opaque_ubufs_live)
+#define IO_OPAQUE_UBUF_POOL_MADE()	atomic_long_inc(&io_opaque_ubuf_pools_live)
+#define IO_OPAQUE_UBUF_POOL_GONE()	atomic_long_dec(&io_opaque_ubuf_pools_live)
+#else
+#define IO_OPAQUE_UBUF_TAKEN()		((void)0)
+#define IO_OPAQUE_UBUF_GIVEN()		((void)0)
+#define IO_OPAQUE_UBUF_POOL_MADE()	((void)0)
+#define IO_OPAQUE_UBUF_POOL_GONE()	((void)0)
+#endif
+
+/*
+ * A ubuf is made for each skb that gets fragments and freed where the last skb
+ * that shares it is, which is an ACK on whatever CPU gets it: the sender takes
+ * from the cache what other CPUs give back to it. A store keeps the ubufs that
+ * have completed, up to IO_OPAQUE_UBUF_POOL_MAX of them on a list that any context
+ * can push to and a few more that the send side holds, and a send takes one of
+ * those before it asks the cache. Nothing about what a ubuf holds changes: it
+ * drops its folios when its last skb goes, whole until then for as long as an skb,
+ * a clone, a split or a tap of one holds it, and it is not kept longer than the
+ * pool has room for.
+ *
+ * The pool is the store's, because that is what a send is accounted to, but no skb
+ * has a pointer to the store or to the ring, and either may be gone while an
+ * skb waits in a queue for an ACK or at a tap. So the ubuf points to the pool, and
+ * the pool is freed by the last ubuf that points to it: the count of its
+ * references is one for the store and one for each ubuf made by the cache for it
+ * and not yet given back, which a ubuf that is only reused does not touch. A store
+ * that goes closes the pool: the ubufs it holds are freed, and a ubuf that
+ * completes later is refused and freed to the cache as it would be with no pool.
+ *
+ * The two ends. A completion pushes with a compare-and-exchange, and nothing else:
+ * it runs in softirq, in the context of a task closing a socket, or with interrupts
+ * off, on any CPU. The send side runs with the socket owned, but for any socket and
+ * any ring of the store, in a task that may be preempted: it takes whatever has
+ * been pushed in one exchange, into a stock that it hands out of under a lock that
+ * no completion takes, so that the head of the list is touched once for each batch
+ * and not once for each skb. Closing a pool takes the list with a sentinel in its
+ * place, so that a ubuf that completes after it finds the pool closed on its own
+ * push and is not left on a list that nobody takes. The nr that bounds the list is
+ * not exact: it is set to nothing when the list is taken, and a ubuf that completes
+ * at that moment may be on the list and not counted. A pool therefore holds at most
+ * twice IO_OPAQUE_UBUF_POOL_MAX ubufs and a few more, in done and in stock, and no
+ * more than the skbs of the store ever had in flight.
+ *
+ * KASAN. A ubuf in the pool is poisoned, as an entry of io_alloc_cache is, so that an
+ * access through a pointer that an skb kept to a ubuf that has completed is reported
+ * where it happens. It is poisoned before it is pushed, which is when the send side
+ * may take it, and unpoisoned when it is taken out or freed. The link is not: it
+ * shares its storage with the cursor, and the lists are read and written while the
+ * ubufs on them are poisoned. KASAN keeps the track of the free in the first bytes of
+ * the object, where the count is: a ubuf in the pool has a count of zero only in a
+ * build without KASAN, and with it the access that would have read the count is
+ * reported first. Without KASAN none of this is code.
+ */
+#define IO_OPAQUE_UBUF_POOL_CLOSED	((struct llist_node *)1UL)
+
+/*
+ * A ubuf goes into the pool poisoned, but for its link. False is KASAN's word that it
+ * was freed already, which it has reported; the ubuf is not the pool's.
+ */
+static __always_inline bool io_opaque_ubuf_poison(struct io_opaque_ubuf *u)
+{
+	if (!kasan_mempool_poison_object(u))
+		return false;
+	kasan_unpoison_range(&u->node, sizeof(u->node));
+	return true;
+}
+
+/* It comes out of the pool, to be used by a skb or freed to the cache. */
+static __always_inline void io_opaque_ubuf_unpoison(struct io_opaque_ubuf *u)
+{
+	kasan_mempool_unpoison_object(u, sizeof(*u));
+}
+
+VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void)
+{
+	struct io_opaque_ubuf_pool *pool = kzalloc_obj(*pool, GFP_KERNEL_ACCOUNT);
+
+	if (!pool)
+		return NULL;
+	refcount_set(&pool->refs, 1);
+	spin_lock_init(&pool->lock);
+	IO_OPAQUE_UBUF_POOL_MADE();
+	return pool;
+}
+
+static void io_opaque_ubuf_pool_unref(struct io_opaque_ubuf_pool *pool)
+{
+	if (refcount_dec_and_test(&pool->refs)) {
+		IO_OPAQUE_UBUF_POOL_GONE();
+		kfree(pool);
+	}
+}
+
+/* Give a ubuf that nothing holds back to the cache, and let go of the pool that it was made for. */
+static void io_opaque_ubuf_free(struct io_opaque_ubuf *u)
+{
+	struct io_opaque_ubuf_pool *pool = u->pool;
+
+	kmem_cache_free(io_opaque_ubuf_cache, u);
+	IO_OPAQUE_UBUF_GIVEN();
+	if (pool)
+		io_opaque_ubuf_pool_unref(pool);
+}
+
+/* Free a chain of ubufs that were in a pool. */
+static void io_opaque_ubuf_free_chain(struct llist_node *node)
+{
+	while (node) {
+		struct llist_node *next = node->next;
+		struct io_opaque_ubuf *u = llist_entry(node, struct io_opaque_ubuf, node);
+
+		io_opaque_ubuf_unpoison(u);
+		io_opaque_ubuf_free(u);
+		node = next;
+	}
+}
+
+/*
+ * Keep a ubuf that has completed, if its pool is open and has room: true, and it is
+ * the pool's, to be taken by the send side. False, and it is the caller's to free.
+ * Any context, any CPU, and nothing but atomics.
+ */
+static bool io_opaque_ubuf_pool_push(struct io_opaque_ubuf_pool *pool, struct io_opaque_ubuf *u)
+{
+	struct llist_node *first;
+
+	if (atomic_inc_return(&pool->nr) > IO_OPAQUE_UBUF_POOL_MAX)
+		goto refused;
+	/* Before the exchange that lets the send side have it, not after. */
+	if (!io_opaque_ubuf_poison(u))
+		goto refused;
+	first = READ_ONCE(pool->done.first);
+	do {
+		if (first == IO_OPAQUE_UBUF_POOL_CLOSED) {
+			io_opaque_ubuf_unpoison(u);
+			goto refused;
+		}
+		u->node.next = first;
+	} while (!try_cmpxchg(&pool->done.first, &first, &u->node));
+	return true;
+refused:
+	atomic_dec(&pool->nr);
+	return false;
+}
+
+/*
+ * A ubuf for a new skb from the pool, or none. The send side takes everything that
+ * the completions have pushed in one exchange when its stock has run out, and hands
+ * out of the stock one at a time. pool->lock is for the sends of the store, which
+ * run on many sockets and rings; the completions never take it.
+ */
+VISIBLE_IF_KUNIT struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool)
+{
+	struct io_opaque_ubuf *u;
+	struct llist_node *node;
+
+	spin_lock(&pool->lock);
+	node = pool->stock;
+	if (!node) {
+		node = READ_ONCE(pool->done.first);
+		while (node && node != IO_OPAQUE_UBUF_POOL_CLOSED &&
+		       !try_cmpxchg(&pool->done.first, &node, NULL))
+			;
+		if (node == IO_OPAQUE_UBUF_POOL_CLOSED)
+			node = NULL;
+		if (node)
+			atomic_set(&pool->nr, 0);
+	}
+	if (node)
+		pool->stock = node->next;
+	spin_unlock(&pool->lock);
+	if (!node)
+		return NULL;
+	/* After the link is read, and out of the lock: KASAN has a stack to save. */
+	u = llist_entry(node, struct io_opaque_ubuf, node);
+	io_opaque_ubuf_unpoison(u);
+	return u;
+}
+
+/*
+ * The store has gone, with no send running: free what the pool holds, and refuse what
+ * completes from now on, which is freed as it would be without a pool. The pool
+ * itself goes with the last of the ubufs that skbs still hold, if there are any, for
+ * which the store's reference is dropped last.
+ */
+VISIBLE_IF_KUNIT void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool)
+{
+	struct llist_node *done, *stock;
+
+	if (!pool)
+		return;
+	done = xchg(&pool->done.first, IO_OPAQUE_UBUF_POOL_CLOSED);
+	if (WARN_ON_ONCE(done == IO_OPAQUE_UBUF_POOL_CLOSED))
+		done = NULL;
+	spin_lock(&pool->lock);
+	stock = pool->stock;
+	pool->stock = NULL;
+	spin_unlock(&pool->lock);
+	io_opaque_ubuf_free_chain(done);
+	io_opaque_ubuf_free_chain(stock);
+	io_opaque_ubuf_pool_unref(pool);
+}
+
+/* The pages go back, whichever context frees the last skb that shares the ubuf. */
+static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
+{
+	struct io_opaque_ubuf *u = container_of(uarg, struct io_opaque_ubuf, uarg);
+	unsigned int i;
+
+	/* Told by skb_copy_ubufs() that the data was copied: a consumer did not wait. */
+	if (!success)
+		io_opaque_count(IO_OPAQUE_STAT_SEND_UBUF_COPIED, 1);
+	if (!refcount_dec_and_test(&uarg->refcnt))
+		return;
+	for (i = 0; i < u->nr; i++)
+		folio_put(u->folio[i]);
+	/* Whole until here, and nothing holds it from here: another skb may have it at once. */
+	if (u->pool && io_opaque_ubuf_pool_push(u->pool, u))
+		return;
+	io_opaque_ubuf_free(u);
+}
+
+/*
+ * Give @skb a ubuf of its own, called by TCP before it fills a skb and with
+ * the socket owned, where it may sleep. The new ubuf has the one reference
+ * that the skb's shinfo owns; the skbs that share the shinfo and the ones
+ * derived from it take theirs. A skb that has one of ours joins it, for the
+ * price of the comparison: a send appends to the tail of the write queue, and
+ * it does not matter whose send began that skb. Another provider's skb is a
+ * boundary, as io_uring's own link_skb() makes it for the provider it does not
+ * mix with: TCP pushes it and starts a new one.
+ *
+ * So is a skb of ours that has all the fragments it may have. -EEXIST makes
+ * TCP push it and start another, which is what is wanted of a skb that is
+ * full, and it does so before the fill: a fill that is let in finds no room,
+ * adds nothing and says -EMSGSIZE, and skb_zerocopy_iter_stream() then takes
+ * back what it did, ___pskb_trim() walking every fragment of the skb, for TCP
+ * to do the same. A range that would have extended the last fragment starts
+ * the next skb instead.
+ *
+ * A send that has folio references to hand out leaves its cursor in the ubuf
+ * for the fill that follows, which takes it and clears it: the cursor is on
+ * the send's stack, and the pointer lives from here to the next statement of
+ * skb_zerocopy_iter_stream().
+ *
+ * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
+ * the cursor names the pool and has one, else the cache's. TCP does not set
+ * skb->sk on a skb of its write queue, so the allocation has no socket to take
+ * its mask from. GFP_KERNEL is what a user's socket allocates its skbs with.
+ */
+VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
+{
+	struct io_opaque_send_cursor *cursor = NULL;
+	struct io_opaque_ubuf_pool *pool = NULL;
+	struct ubuf_info *cur = skb_zcopy(skb);
+	struct io_opaque_ubuf *u;
+
+	/* TCP passes the send's cursor; a caller that is not a send passes none. */
+	if (uarg && uarg->ops == &io_opaque_cursor_ops) {
+		cursor = container_of(uarg, struct io_opaque_send_cursor, uarg);
+		pool = cursor->pool;
+		if (!cursor->nr)
+			cursor = NULL;
+	}
+	if (cur) {
+		if (cur->ops != &io_opaque_ubuf_ops ||
+		    skb_shinfo(skb)->nr_frags >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
+			return -EEXIST;
+		if (cursor)
+			container_of(cur, struct io_opaque_ubuf, uarg)->cursor = cursor;
+		return 0;
+	}
+	u = pool ? io_opaque_ubuf_pool_get(pool) : NULL;
+	if (u) {
+		io_opaque_count(IO_OPAQUE_STAT_SEND_UBUF_REUSED, 1);
+	} else {
+		u = kmem_cache_alloc(io_opaque_ubuf_cache, GFP_KERNEL);
+		if (!u)
+			return -ENOMEM;
+		IO_OPAQUE_UBUF_TAKEN();
+		/* The pool lasts as long as a ubuf made for it does. */
+		if (pool)
+			refcount_inc(&pool->refs);
+		u->pool = pool;
+	}
+	u->uarg.ops = &io_opaque_ubuf_ops;
+	u->uarg.flags = io_opaque_ubuf_flags();
+	refcount_set(&u->uarg.refcnt, 1);
+	u->nr = 0;
+	u->cursor = cursor;
+	skb_zcopy_init(skb, &u->uarg);
+	io_opaque_count(IO_OPAQUE_STAT_SEND_MANAGED_SKBS, 1);
+	return 0;
+}
+
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops = {
+	.complete	= io_opaque_ubuf_complete,
+	.link_skb	= io_opaque_link_skb,
+};
+
+/*
+ * The ops of what msg_ubuf points at during a managed send, a struct
+ * io_opaque_send_cursor on the stack of io_opaque_send(), for
+ * skb_zerocopy_iter_stream() to find link_skb through. TCP never links it to
+ * an skb, because link_skb has given each skb its own, and it must not: it
+ * lives for the one call. The one path that would is fast open, whose SYN
+ * takes the msg_ubuf of its first send; a socket that could take that path is
+ * not sent managed, and a send never has MSG_FASTOPEN.
+ */
+static void io_opaque_cursor_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
+{
+	WARN_ON_ONCE(1);
+}
+
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_cursor_ops = {
+	.complete	= io_opaque_cursor_complete,
+	.link_skb	= io_opaque_link_skb,
+};
+
+static bool io_opaque_ubuf_holds(const struct io_opaque_ubuf *u, const struct folio *folio)
+{
+	unsigned int i = u->nr;
+
+	/* Ranges come in the order they are stored, so the last entry is nearly always the one. */
+	while (i--)
+		if (u->folio[i] == folio)
+			return true;
+	return false;
+}
+
+/*
+ * The page of a segment of a send's cursor. It is the first page of its folio,
+ * and the offset counts from it: io_opaque_extent_new() and io_opaque_append()
+ * keep the compound head of a backing and the offset from the head, compaction
+ * and CREATE fill whole compound pages from offset 0, and the cursor only moves
+ * the offset up and the length down inside a segment (io_opaque_vec_span(),
+ * io_opaque_send_iter() and the fill itself). So a segment is a fragment as it
+ * stands, with no lookup of its folio and no cut where the folio ends; a kernel
+ * with CONFIG_DEBUG_VM checks both.
+ */
+static inline struct page *io_opaque_seg_page(const struct bio_vec *bv)
+{
+	VM_WARN_ON_ONCE_PAGE(PageTail(bv->bv_page), bv->bv_page);
+	VM_WARN_ON_ONCE((size_t)bv->bv_offset + bv->bv_len > page_size(bv->bv_page));
+	return bv->bv_page;
+}
+
+/*
+ * Take, before TCP allocates its first skb, the folio references that the
+ * ubufs of its skbs will want, for the fill to give them without an atomic of
+ * its own. In the fill the first locked instruction after TCP has initialised
+ * a new skb, and link_skb() its ubuf, is a folio_get(), and it waits for those
+ * stores; here the call pays an atomic each way for a folio and nothing waits.
+ *
+ * A folio is credited with a reference for the skb that the call joins, which
+ * may not have it yet, and for each skb that the call can fill with it: one for
+ * every fragment limit's worth of its segments, and one for every 16 KiB of its
+ * bytes, which a skb that TCP fills to its size goal has when the device does
+ * segmentation offload. That is an estimate, and where it falls short the fill
+ * takes its own reference, which stat_send_folio_gets counts. Only a call whose
+ * bytes lie in IO_OPAQUE_PREPAY_FOLIOS folios and IO_OPAQUE_PREPAY_SEGS segments
+ * is prepaid: a longer one makes the fill's atomics a small part of its cost,
+ * and the scan below is not free.
+ *
+ * What the ubufs did not take goes back in io_opaque_cursor_refund() when TCP
+ * is done. The folios are alive all the while: the send holds its pin on the
+ * version, and the version's extents hold the pages. Off unless send_prepay is
+ * set.
+ */
+VISIBLE_IF_KUNIT void io_opaque_cursor_prepay(struct io_opaque_send_cursor *cursor,
+					      const struct iov_iter *iter)
+{
+	unsigned int limit = max(READ_ONCE(net_hotdata.sysctl_max_skb_frags), 1);
+	const struct bio_vec *bv = iter->bvec;
+	size_t left = iov_iter_count(iter), skip = iter->iov_offset;
+	unsigned long segs = iter->nr_segs;
+	struct page *head[IO_OPAQUE_PREPAY_FOLIOS];
+	size_t bytes[IO_OPAQUE_PREPAY_FOLIOS] = {};
+	unsigned int count[IO_OPAQUE_PREPAY_FOLIOS] = {};
+	unsigned int i, nr = 0, seen = 0;
+
+	cursor->nr = 0;
+	if (!READ_ONCE(io_opaque_send_prepay) || !iov_iter_is_bvec(iter))
+		return;
+	for (; left && segs; bv++, segs--, skip = 0) {
+		size_t part = min_t(size_t, bv->bv_len - skip, left);
+		struct page *page;
+
+		if (!part)
+			continue;
+		if (++seen > IO_OPAQUE_PREPAY_SEGS)
+			return;
+		page = io_opaque_seg_page(bv);
+		for (i = 0; i < nr && head[i] != page; i++)
+			;
+		if (i == nr) {
+			if (nr == IO_OPAQUE_PREPAY_FOLIOS)
+				return;
+			head[nr++] = page;
+		}
+		count[i]++;
+		bytes[i] += part;
+		left -= part;
+	}
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = page_folio(head[i]);
+
+		cursor->folio[i] = folio;
+		cursor->credit[i] = 1 + max_t(unsigned int, DIV_ROUND_UP(count[i], limit),
+					      DIV_ROUND_UP(bytes[i], SZ_16K));
+		VM_WARN_ON_ONCE_FOLIO(folio_ref_zero_or_close_to_overflow(folio), folio);
+		folio_ref_add(folio, cursor->credit[i]);
+	}
+	cursor->nr = nr;
+}
+
+/* Give back what the ubufs of the call did not take. */
+VISIBLE_IF_KUNIT void io_opaque_cursor_refund(struct io_opaque_send_cursor *cursor)
+{
+	unsigned int i;
+
+	for (i = 0; i < cursor->nr; i++)
+		if (cursor->credit[i])
+			folio_put_refs(cursor->folio[i], cursor->credit[i]);
+	cursor->nr = 0;
+}
+
+/* One of the call's prepaid references on @folio, if it has one left. */
+static bool io_opaque_cursor_take(struct io_opaque_send_cursor *cursor, const struct folio *folio)
+{
+	unsigned int i;
+
+	for (i = 0; i < cursor->nr; i++) {
+		if (cursor->folio[i] != folio)
+			continue;
+		if (!cursor->credit[i])
+			break;
+		cursor->credit[i]--;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Add the bytes of @from to @skb as managed fragments, at most @length of
+ * them: what a splice would add, with a folio's reference taken once for the
+ * ubuf and not once for each fragment, and no page reference in the skb. A
+ * fragment starts where the previous one ends if it continues in the same
+ * folio (skb_can_coalesce() refuses zerocopy skbs). The fragment limit is
+ * the splice's, and so is what a fragment weighs, its bytes, for a skb that
+ * owns no page. A reference is taken together with the fragment that needs
+ * it, before the fragment is published, so that every fragment of the skb
+ * has its folio in the ubuf. The list can hold as many folios as an skb has
+ * fragments, which it does if the skb is the only one to use the ubuf, as it
+ * is while the skb is managed; one that is full ends the fill like a full skb.
+ *
+ * Per fragment, the loop is io_sg_from_iter()'s: the segment is the fragment
+ * (io_opaque_seg_page()), to which the fill adds the test against the last
+ * fragment and, when the folio is not that fragment's, a look at the ubuf's
+ * list. The cursor is advanced here, as io_sg_from_iter() advances it, and not
+ * walked again by iov_iter_advance().
+ *
+ * The reference for a new folio is one of the send's prepaid ones when it has
+ * any left for the folio (io_opaque_cursor_prepay()), else a folio_get(),
+ * which is counted.
+ *
+ * A skb that has fragments of its own cannot be managed: the fill takes a
+ * reference for each, as a splice does (a framed send's prefix is copied into
+ * the skb first). Returns 0 with the bytes added, or -EMSGSIZE if the skb
+ * cannot take any more, in which case TCP starts another when nothing was added.
+ */
+VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from,
+					    size_t length)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	struct ubuf_info *uarg = skb_zcopy(skb);
+	unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
+	unsigned int nr = shinfo->nr_frags, refs = 0, gets = 0;
+	const struct bio_vec *bv = from->bvec;
+	unsigned long segs = from->nr_segs;
+	size_t skip = from->iov_offset;
+	size_t left = min(from->count, length), added = 0;
+	struct io_opaque_send_cursor *cursor;
+	struct page *held = NULL;
+	skb_frag_t *last = NULL;
+	struct io_opaque_ubuf *u;
+	int ret = 0;
+
+	if (WARN_ON_ONCE(!uarg || uarg->ops != &io_opaque_ubuf_ops || !iov_iter_is_bvec(from)))
+		return -EFAULT;
+	u = container_of(uarg, struct io_opaque_ubuf, uarg);
+	/* The send's, if link_skb() left one: it is good for this call only. */
+	cursor = u->cursor;
+	if (cursor)
+		u->cursor = NULL;
+	if (nr && !skb_zcopy_managed(skb)) {
+		ssize_t spliced;
+
+		io_opaque_count(IO_OPAQUE_STAT_SEND_FRAG_FALLBACK, 1);
+		spliced = skb_splice_from_iter(skb, from, left);
+		if (spliced == -EMSGSIZE)
+			return -EMSGSIZE;
+		/* TCP takes -EFAULT as the end of the send, and no other error is worth more. */
+		return spliced < 0 ? -EFAULT : 0;
+	}
+	if (!nr) {
+		shinfo->flags |= SKBFL_MANAGED_FRAG_REFS;
+	} else {
+		/* Every fragment of a managed skb is the head of a folio that the ubuf holds. */
+		last = &shinfo->frags[nr - 1];
+		held = skb_frag_page(last);
+	}
+
+	while (left) {
+		struct page *page;
+		size_t off, part;
+
+		/* The cursor holds as many bytes as its count says, or the count is wrong. */
+		if (unlikely(!segs)) {
+			ret = -EFAULT;
+			break;
+		}
+		part = min(bv->bv_len - skip, left);
+		if (unlikely(!part)) {
+			bv++;
+			segs--;
+			skip = 0;
+			continue;
+		}
+		page = io_opaque_seg_page(bv);
+		off = bv->bv_offset + skip;
+
+		if (last && skb_frag_page(last) == page &&
+		    skb_frag_off(last) + skb_frag_size(last) == off) {
+			skb_frag_size_add(last, part);
+		} else {
+			if (nr >= limit) {
+				ret = -EMSGSIZE;
+				break;
+			}
+			if (page != held) {
+				struct folio *folio = page_folio(page);
+
+				if (!io_opaque_ubuf_holds(u, folio)) {
+					if (u->nr == ARRAY_SIZE(u->folio)) {
+						ret = -EMSGSIZE;
+						break;
+					}
+					if (!cursor || !io_opaque_cursor_take(cursor, folio)) {
+						folio_get(folio);
+						gets++;
+					}
+					u->folio[u->nr++] = folio;
+					refs++;
+				}
+				held = page;
+			}
+			last = &shinfo->frags[nr];
+			__skb_fill_page_desc_noacc(shinfo, nr++, page, off, part);
+		}
+		added += part;
+		left -= part;
+		skip += part;
+		if (skip == bv->bv_len) {
+			bv++;
+			segs--;
+			skip = 0;
+		}
+	}
+	shinfo->nr_frags = nr;
+	skb_len_add(skb, added);
+	/* What iov_iter_advance(from, added) comes to, without walking the segments again. */
+	from->bvec = bv;
+	from->nr_segs = segs;
+	from->iov_offset = skip;
+	from->count -= added;
+	if (refs)
+		io_opaque_count(IO_OPAQUE_STAT_SEND_FOLIO_REFS, refs);
+	if (gets)
+		io_opaque_count(IO_OPAQUE_STAT_SEND_FOLIO_GETS, gets);
+	return ret;
+}
+
+/*
+ * Whether a body that is spliced goes out as managed fragments: when the
+ * send calls tcp_sendmsg_locked() itself, not on a socket that TCP fast open
+ * could take (see io_opaque_cursor_ops), and unless the evaluation
+ * parameter turned it off. Anywhere else the body is spliced as before.
+ */
+static bool io_opaque_sends_managed(const struct sock *sk)
+{
+	return READ_ONCE(io_opaque_send_managed) && io_opaque_ubuf_cache &&
+	       !inet_test_bit(DEFER_CONNECT, sk);
+}
+
+static int __init io_opaque_ubuf_init(void)
+{
+	BUILD_BUG_ON(MAX_SKB_FRAGS > U8_MAX);
+	/* A cache that failed leaves every send spliced. */
+	io_opaque_ubuf_cache = KMEM_CACHE(io_opaque_ubuf, 0);
+	return 0;
+}
+device_initcall(io_opaque_ubuf_init);
+
+/*
  * A body of up to send_copy_max bytes is copied by TCP: below that a page
  * reference and a fragment cost more than the copy. The object stays immutable
  * and TCP keeps no reference to it, so nothing else about the send changes.
@@ -4005,8 +4845,32 @@ VISIBLE_IF_KUNIT bool io_opaque_send_splices(const struct io_opaque_req *op)
 /* tcp_sendmsg_locked() calls made by sends, for a test to tell them from sock_sendmsg()'s. */
 atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_SEND_LOCKED_CALL()	atomic_long_inc(&io_opaque_send_locked_calls)
+/*
+ * Called with the message of every part of a frame, just before it goes to TCP
+ * (@owned) or to sock_sendmsg(), and the send's cursor, for a test to look at.
+ */
+void (*io_opaque_send_part)(const struct msghdr *msg,
+			    const struct io_opaque_send_cursor *cursor, bool owned);
+#define IO_OPAQUE_SEND_PART(msg, cursor, owned)				\
+	do {								\
+		if (io_opaque_send_part)				\
+			io_opaque_send_part((msg), (cursor), (owned));	\
+	} while (0)
+/*
+ * A byte that a test fills the message and the cursor of a send with before they
+ * are set (-1: leave them), so that a field that is read before it is written
+ * does not get away with a zero.
+ */
+int io_opaque_send_poison = -1;
+#define IO_OPAQUE_SEND_POISON(p)					\
+	do {								\
+		if (io_opaque_send_poison >= 0)				\
+			memset((p), io_opaque_send_poison, sizeof(*(p)));	\
+	} while (0)
 #else
 #define IO_OPAQUE_SEND_LOCKED_CALL()	((void)0)
+#define IO_OPAQUE_SEND_PART(msg, cursor, owned)	((void)(msg), (void)(cursor), (void)(owned))
+#define IO_OPAQUE_SEND_POISON(p)	((void)(p))
 #endif
 
 /*
@@ -4037,6 +4901,29 @@ VISIBLE_IF_KUNIT bool io_opaque_send_direct(const struct sock *sk)
 	return prot->sendmsg == tcp_sendmsg && prot == sk->sk_prot_creator && port;
 }
 
+/*
+ * Join the queue of the destination for an issue, under the ring lock. Returns 0
+ * when the request goes on, as the head (@fresh if it has still to take its
+ * references), IOU_ISSUE_SKIP_COMPLETE when it has parked behind another frame
+ * and is listed for cancellation, or the errno that ends the issue. Inlined, so
+ * that the join stays part of io_opaque_send() in a profile, as it was.
+ */
+static __always_inline int io_opaque_send_join(struct io_opaque_req *op, struct sock *sk,
+					       bool *fresh)
+{
+	int ret = io_opaque_tx_join(op, sk);
+
+	if (ret < 0)
+		return ret;
+	if (ret == IO_OPAQUE_TX_WAIT) {
+		/* The ring lock keeps the wakeup from running before the request is listed. */
+		io_opaque_enroll(op);
+		return IOU_ISSUE_SKIP_COMPLETE;
+	}
+	*fresh = ret == IO_OPAQUE_TX_SETTLE;
+	return 0;
+}
+
 static u32 io_opaque_send_msg_flags(const struct io_opaque_req *op, unsigned int issue_flags)
 {
 	u32 flags = MSG_NOSIGNAL | op->msg_flags;
@@ -4060,15 +4947,18 @@ static u32 io_opaque_send_msg_flags(const struct io_opaque_req *op, unsigned int
  * It is asked with the socket not owned, because a hook may take the socket
  * lock itself: AppArmor's finds the address with getname(), which does, and
  * would wait for the owner of the socket for ever.
+ *
+ * @msg is the message of the issue, as it is before any part is made of it: the
+ * flags of the issue, no address, no control data, no bytes. It is the one the
+ * parts are sent with, as it is for the first sock_sendmsg() of the other path,
+ * so the issue zeroes one message and not two.
  */
-VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct io_opaque_req *op,
-					     unsigned int issue_flags)
+VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
+					     const struct io_opaque_req *op)
 {
-	struct msghdr msg = { .msg_flags = io_opaque_send_msg_flags(op, issue_flags) };
-
-	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_security, sock, op, issue_flags);
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_send_security, sock, msg, op);
 	lockdep_assert_not_held(&sock->sk->sk_lock);
-	return security_socket_sendmsg(sock, &msg, op->total_length - op->progress);
+	return security_socket_sendmsg(sock, msg, op->total_length - op->progress);
 }
 
 /*
@@ -4078,33 +4968,54 @@ VISIBLE_IF_KUNIT int io_opaque_send_security(struct socket *sock, const struct i
  * is queued to TCP.
  *
  * On a plain TCP socket (io_opaque_send_direct()) the head asks the security
- * hook, and then does all of the rest under one lock_sock(): it takes the
- * references it has not taken yet, applies what the hook said, calls
- * tcp_sendmsg_locked() for each part of the frame, hands the queue on, lets go
- * of the references that are not the last and only then releases the socket,
- * and after it puts the last ones. While the socket is
- * unowned, ACKs and the transmit that autocorking left queued run under its
+ * hook, and then does all of the rest under one lock_sock(): it joins the queue
+ * if it is an inline issue, takes the references it has not taken yet, applies
+ * what the hook said, calls tcp_sendmsg_locked() for each part of the frame,
+ * hands the queue on, lets go of the references that are not the last and only
+ * then releases the socket, and after it puts the last ones. While the socket
+ * is unowned, ACKs and the transmit that autocorking left queued run under its
  * spinlock, for as long as they take, and the sender's next lock_sock() waits
  * for them; the less the sender does in that window, the less often it does.
  * Any other socket takes its references first and goes through sock_sendmsg()
  * for each part, with the ring lock dropped around it.
  *
+ * An inline issue that finds a frame ahead of it, or its own place not at the
+ * front, has asked the hook and taken the socket for nothing, and parks. The
+ * join has set its phase under tx_lock (io_opaque_tx_join()), the request is
+ * then listed for cancellation (io_opaque_enroll()), and only then is the
+ * socket released. The head may hand the queue on, and queue the wakeup of the
+ * request, as soon as tx_lock is dropped. The wakeup is task work, which runs
+ * with the ring lock held, and an inline issue holds that throughout, so it
+ * cannot run until the request is listed and the issue has returned. That is
+ * the rare case, and the hook's verdict is dropped.
+ *
  * Under IO_URING_F_UNLOCKED the ring lock is dropped before the socket is
  * taken, and an issue that owned the socket returns without taking it again,
  * as io-wq expects; an inline issue holds it throughout, as it holds it across
- * sock_sendmsg().
+ * sock_sendmsg(). A request that waits is listed under the ring lock, before
+ * the wakeup of its predecessor can run (io_opaque_enroll()), so an io-wq issue
+ * joins the queue before it drops the ring lock, and parks without the hook or
+ * the socket.
  */
 int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_opaque_req *op = req->async_data;
 	struct socket *sock = sock_from_file(req->file);
+	/*
+	 * Neither is zeroed on entry, as CONFIG_INIT_STACK_ALL_ZERO would: the message
+	 * is zeroed once below, and the cursor is set when a body is managed.
+	 */
+	struct io_opaque_send_cursor cursor __uninitialized;
+	struct msghdr msg __uninitialized;
 	struct sock *sk = NULL;
-	struct msghdr msg;
 	struct kvec vec;
 	u32 body_end;
-	bool body = false, splice = false, fresh, left, owned = false;
+	bool body = false, splice = false, managed, fresh = false, left, owned = false;
+	bool joined = false;
 	int ret, sec = 0;
 
+	IO_OPAQUE_SEND_POISON(&cursor);
+	IO_OPAQUE_SEND_POISON(&msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
 		ret = -EOPNOTSUPP;
@@ -4120,17 +5031,26 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 			goto finish;
 	}
 	sk = sock->sk;
-	ret = io_opaque_tx_join(op, sk);
-	if (ret < 0)
-		goto out;
-	if (ret == IO_OPAQUE_TX_WAIT) {
-		/* The ring lock keeps the wakeup from running before the request is listed. */
-		io_opaque_enroll(op);
-		ret = IOU_ISSUE_SKIP_COMPLETE;
-		goto out;
+	/*
+	 * An issue that holds the ring lock throughout joins the queue once it owns the
+	 * socket, below. io-wq drops the ring lock for the socket, and a request that
+	 * waits is listed under the ring lock, before its wakeup can run: it joins
+	 * here, as it always did, and never waits with the socket owned.
+	 */
+	if (unlikely(issue_flags & IO_URING_F_UNLOCKED)) {
+		ret = io_opaque_send_join(op, sk, &fresh);
+		if (ret)
+			goto out;
+		joined = true;
 	}
-	fresh = ret == IO_OPAQUE_TX_SETTLE;
 
+	/*
+	 * The one message of the issue, zeroed once: TCP and the security hooks read
+	 * the address and the control data, which are none. Each part sets the fields
+	 * it uses, and no other.
+	 */
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
 	if (io_opaque_send_direct(sk)) {
 		/*
 		 * The hint says plain TCP; the socket decides once it is owned.
@@ -4138,13 +5058,26 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 		 * says is applied below, after the references are taken.
 		 */
 		io_ring_submit_unlock(req->ctx, issue_flags);
-		sec = io_opaque_send_security(sock, op, issue_flags);
+		sec = io_opaque_send_security(sock, &msg, op);
 		sock_rps_record_flow(sk);
 		lock_sock(sk);
 		owned = io_opaque_send_direct(sk);
 		if (!owned) {
 			release_sock(sk);
 			io_ring_submit_lock(req->ctx, issue_flags);
+		}
+	}
+	if (!joined) {
+		/*
+		 * A head finds its queue free under the socket, and goes on. One that finds a
+		 * frame ahead, or its own place not at the front, is parked and listed by the
+		 * join, and then lets the socket go with the ring lock still held.
+		 */
+		ret = io_opaque_send_join(op, sk, &fresh);
+		if (ret) {
+			if (owned)
+				release_sock(sk);
+			goto out;
 		}
 	}
 	if (fresh) {
@@ -4163,8 +5096,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	}
 
 again:
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
+	managed = false;
 	body_end = op->prefix_length + op->length;
 	body = op->length && op->progress >= op->prefix_length &&
 	       op->progress < body_end;
@@ -4178,8 +5110,21 @@ again:
 	} else if (body) {
 		msg.msg_iter = op->iter;
 		splice = io_opaque_send_splices(op);
-		if (splice)
+		managed = splice && owned && io_opaque_sends_managed(sk);
+		if (managed) {
+			/*
+			 * The ubuf_info is whole, as it was. Of the rest io_opaque_cursor_prepay()
+			 * sets the count of folios before anything reads it, and the folios and
+			 * their credits are read below that count only.
+			 */
+			cursor.uarg = (struct ubuf_info) { .ops = &io_opaque_cursor_ops };
+			cursor.pool = READ_ONCE(op->store->ubuf_pool);
+			msg.msg_flags |= MSG_ZEROCOPY;
+			msg.msg_ubuf = &cursor.uarg;
+			msg.sg_from_iter = io_opaque_sg_from_iter;
+		} else if (splice) {
 			msg.msg_flags |= MSG_SPLICE_PAGES;
+		}
 		if (op->suffix_length)
 			msg.msg_flags |= MSG_MORE;
 	} else {
@@ -4190,12 +5135,19 @@ again:
 		iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &vec, 1, vec.iov_len);
 	if (owned) {
 		IO_OPAQUE_SEND_LOCKED_CALL();
+		if (managed)
+			io_opaque_cursor_prepay(&cursor, &msg.msg_iter);
+		IO_OPAQUE_SEND_PART(&msg, &cursor, true);
 		ret = tcp_sendmsg_locked(sk, &msg, iov_iter_count(&msg.msg_iter));
+		/* However the call ended, what the ubufs did not take goes back. */
+		if (managed)
+			io_opaque_cursor_refund(&cursor);
 		if (trace_sock_send_length_enabled())
 			trace_sock_send_length(sk, ret, 0);
 	} else {
 		/* io-wq may block in TCP; other requests must retain access to the ring. */
 		io_ring_submit_unlock(req->ctx, issue_flags);
+		IO_OPAQUE_SEND_PART(&msg, &cursor, false);
 		ret = sock_sendmsg(sock, &msg);
 		io_ring_submit_lock(req->ctx, issue_flags);
 	}
@@ -4217,6 +5169,13 @@ sent:
 				io_ring_submit_lock(req->ctx, issue_flags);
 				owned = false;
 			}
+			/*
+			 * The next part sets the fields it uses; it must not find the
+			 * body's ubuf and fill, or its zerocopy flag.
+			 */
+			msg.msg_flags = io_opaque_send_msg_flags(op, issue_flags);
+			msg.msg_ubuf = NULL;
+			msg.sg_from_iter = NULL;
 			goto again;
 		}
 		if (op->progress < op->total_length && !(req->flags & REQ_F_NOWAIT)) {
@@ -4236,8 +5195,16 @@ finish:
 		ret = op->progress;
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
-	/* The references go with the socket, the last of a version after it. */
-	left = owned && io_opaque_send_unpin_cheap(op);
+	/*
+	 * The references go with the socket, the last of a version after it, and so does
+	 * the request's place in the store's count: what cleanup is left to give back for
+	 * this send is the request itself.
+	 */
+	left = false;
+	if (owned) {
+		left = io_opaque_send_unpin_cheap(op);
+		io_opaque_req_uncount(op);
+	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*

@@ -899,7 +899,7 @@ const struct io_cold_def io_cold_defs[] = {
 	},
 	[IORING_OP_OPAQUE_OBJ_SEND] = {
 		.name			= "OPAQUE_OBJ_SEND",
-		.cleanup		= io_opaque_cleanup,
+		.cleanup		= io_opaque_send_cleanup,
 #ifdef CONFIG_IO_URING_OPAQUE_OBJ
 		.fail			= io_opaque_fail,
 #endif

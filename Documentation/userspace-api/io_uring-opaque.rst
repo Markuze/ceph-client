@@ -377,14 +377,16 @@ claims what it names, the pin of an ordinary one and, for SEND_LAST, the removal
 of the handle with the transfer of the table reference into the request, when
 it is admitted to its destination's queue, after destination validation,
 framing snapshot and TX queue allocation. One that finds the queue free is the
-head at once, and claims with the destination socket owned if that is plain TCP.
-One admitted behind an earlier send claims before it waits for its turn, and
-holds what it took while it waits. A claim uses the version current when it is
-made, including any compaction published since preparation, and subsequent
-retries retain what it took. Two sends that contend for one SEND_LAST handle are
-decided by which of them claims first, not by their place in the queue, and that
-is not ordered between rings or between inline and io-wq issue; the loser
-returns ESTALE without the consumed flag.
+head at once, and claims with the destination socket owned if that is plain
+TCP; an inline issue on such a socket also joins the queue with the socket
+owned, and an io-wq issue before it takes the socket. One admitted behind an
+earlier send claims before it waits for its turn, and holds what it took while
+it waits. A claim uses the version current when it is made, including any
+compaction published since preparation, and subsequent retries retain what it
+took. Two sends that contend for one SEND_LAST handle are decided by which of
+them claims first, not by their place in the queue, and that is not ordered
+between rings or between inline and io-wq issue; the loser returns ESTALE
+without the consumed flag.
 
 The prefix and suffix are copied into private request storage before admission.
 Descriptor and framing faults, invalid lengths, allocation failure or framing
@@ -409,11 +411,30 @@ and fails with ESTALE if another operation removes the handle first.
 
 One SQE, queue item, continuation cursor and CQE cover prefix, opaque body and
 suffix, also when the body is a vector of ranges. The body uses the retained
-bvec array with ``MSG_SPLICE_PAGES``; private
-framing uses ordinary copied TCP sends. The ``send_copy_max`` evaluation
-parameter can make TCP copy a small body the same way instead: the object stays
-immutable and TCP keeps no reference to it, so nothing else about the send
-changes. A vector is spliced or copied as a whole, by its largest range.
+bvec array; private framing uses ordinary copied TCP sends. On a plain TCP
+socket that the send owns, the body is added to TCP's skbs as managed
+fragments, as ``SEND_ZC`` adds a registered buffer: the skb takes no page
+reference for a fragment and charges the socket no memory for its bytes, and a
+completion of the skb holds one reference on each distinct folio that the skb
+uses until the last skb that shares it is freed, wherever that is. Like the
+page references that TCP held before, it ends with the data and not with the
+send: it does not hold the request, the store or the version, and a LAST send
+still frees the object when it is done. The completion itself, once its last skb
+is freed and its folios are released, is kept by the store for the next skb, up
+to a small number of them, instead of being freed and allocated again for each;
+the store frees them when it goes, and one that an skb still holds then is freed
+when that skb is, as it would be with no store. Because the completion is not a
+notification that anyone waits for, the receive path does not copy the skb on
+its way to a packet socket or to a socket of this host, which may hold it as
+long as it likes, as it may hold a spliced page. On any other socket, such as
+one with a ULP, and when ``send_managed`` is off, the body is added with
+``MSG_SPLICE_PAGES``, a page reference for each fragment. The skb that a prefix
+starts has fragments of its own and takes a page reference for each fragment of
+the body that goes into it, and a suffix makes the last skb of the body take
+references too. The ``send_copy_max`` evaluation parameter can make TCP copy a
+small body instead of either: the object stays immutable and TCP keeps no
+reference to it, so nothing else about the send changes. A vector is added or
+copied as a whole, by its largest range.
 Internal send attempts advance across
 these segments, setting MSG_MORE while segments remain. Partial progress resumes
 at the saved whole-frame cursor. Without MSG_DONTWAIT,
@@ -443,11 +464,11 @@ An error/short result counts the prefix of the complete response, including
 cases where no body byte was queued. The consumed flag is independent of that
 total. No user-buffer reuse notification is
 needed: userspace cannot overwrite the payload of a store that binds no MAIO
-instance, and TCP owns ordinary page references. A process can overwrite the
-payload of a bound store, see "Writes". FREE after queued sends can invalidate
-the handle while TCP still retains those pages. SEND_LAST does this without a
-separate FREE SQE or CQE and transfers a reference rather than adding and
-dropping a send pin.
+instance, and TCP, or the completion of its skbs, owns the page references. A
+process can overwrite the payload of a bound store, see "Writes". FREE after
+queued sends can invalidate the handle while TCP still retains those pages.
+SEND_LAST does this without a separate FREE SQE or CQE and transfers a
+reference rather than adding and dropping a send pin.
 An ordinary SEND awaiting first issue has not acquired its backing reference;
 users must order handle release accordingly.
 
@@ -479,18 +500,22 @@ head polls for write space; later requests reuse their own request state as
 queue entries. On a plain TCP socket the head, whether it found its queue free
 or was promoted from behind an earlier send, gives its references back, all but
 the last on an object, while it owns the destination socket, and puts the last
-as soon as it has released the socket. One that returns EAGAIN keeps them, and
-its place at the head, for the next issue, and cancellation or failure then
-releases them with the request. The socket's security hook is asked before the
-socket is taken, once per issue while the send stays on this path, for what is
-left of the frame. Its verdict applies once the references are taken and the
-send has started, and a refusal or EAGAIN from it ends the issue as one from the
-first part of the frame would. A socket whose TCP sendmsg has been replaced, by
-kTLS or a socket map for example, takes the ordinary send path instead:
-references first, then the hook and TCP for each part, and the references stay
-with the request until it is cleaned up. So do the remaining parts of a frame
-whose socket is found replaced part-way through, each asking the hook as the
-ordinary send does. This ordering does not cover plain writes or other stores.
+as soon as it has released the socket. It gives back its place in the store's
+count of requests there too, and does not wait for its request to be cleaned up
+to do it. One that returns EAGAIN keeps them, and its place at the head, for
+the next issue, and cancellation or failure then releases them with the
+request. The socket's security hook is asked before the socket is taken, once
+per issue while the send stays on this path, for what is left of the frame. Its
+verdict applies once the references are taken and the send has started, and a
+refusal or EAGAIN from it ends the issue as one from the first part of the
+frame would. An inline issue that then finds a frame ahead of it has asked the
+hook for nothing, and parks without applying the verdict; an io-wq issue parks
+before it asks. A socket whose TCP sendmsg has been replaced, by kTLS or a
+socket map for example, takes the ordinary send path instead: references first,
+then the hook and TCP for each part, and the references stay with the request
+until it is cleaned up. So do the remaining parts of a frame whose socket is
+found replaced part-way through, each asking the hook as the ordinary send
+does. This ordering does not cover plain writes or other stores.
 
 Backing and memory management
 =============================
@@ -741,13 +766,14 @@ Evaluation parameters
 =====================
 
 The destination unit cache, the unit size, inline manual compaction, the
-compaction copy loop and the send copy threshold are selected by parameters under
+compaction copy loop, the send copy threshold, managed fragments and prepaid
+references are selected by parameters under
 ``/sys/module/io_uring_opaque/parameters/``, writable by root at run time or
 set on the kernel command line as ``io_uring_opaque.<name>=<value>``. They
 exist for measurement, are not ABI and may change or disappear. The defaults
 keep the behaviour without the cache, without inline compaction and with every
-body spliced; the per-run copy is byte-identical to the page-split copy it
-replaces.
+body added to TCP's skbs without a copy; the per-run copy is byte-identical to
+the page-split copy it replaces.
 
 ``cache_bytes`` (default 0)
     Per-store unit cache size in bytes, sampled when a store is registered;
@@ -764,8 +790,24 @@ replaces.
     source and destination page. Read at each compaction.
 ``send_copy_max`` (default 0)
     Largest send body in bytes (``len``, without prefix or suffix) that TCP
-    copies instead of splicing page references; 0 splices every body. Read at
-    each send.
+    copies instead of adding it to its skbs without a copy; 0 copies none.
+    Read at each send.
+``send_managed`` (default Y)
+    Y adds a body that is not copied to TCP's skbs as managed fragments on a
+    plain TCP socket that the send owns. N takes a page reference for each
+    fragment, as ``MSG_SPLICE_PAGES`` does, which is what every other socket
+    does. Read at each send.
+``send_prepay`` (default N)
+    Y makes a managed send take, before TCP allocates its first skb, the folio
+    references that the ubufs of its skbs will want, and its fill hand them to
+    the ubufs without an atomic of its own; N takes each in the fill, when a
+    ubuf first uses a folio. A send prepays when its bytes lie in at most four
+    folios and thirty-two segments: for each folio, a reference for the skb
+    that the send joins and for every skb that its segments or its bytes can
+    fill. A ubuf that finds the credit of its folio spent, or the folio not
+    prepaid, takes its own, and the references that no ubuf took go back when
+    TCP returns, however the call ended: complete, short, an error or EAGAIN.
+    Read at each send.
 
 The same directory holds read-only counters summed over all stores. They are
 cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
@@ -806,6 +848,35 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     Blocks of extent records that streams allocated. A stream allocates a block
     of 4 KiB for every few dozen pages it keeps by reference or by copy, and not
     one record per page.
+``stat_send_managed_skbs``, ``stat_send_folio_refs``
+    Skbs given a ubuf for managed fragments, and the folio references those
+    ubufs took: one for each distinct folio that the fragments of the skbs
+    sharing a ubuf use, taken once however many fragments use it.
+``stat_send_folio_gets``
+    The references of ``stat_send_folio_refs`` that the fill took with an
+    atomic of its own. All of them with ``send_prepay`` off; with it on, those
+    that a send did not have in hand, which is none where its prepayment was
+    enough.
+``stat_send_frag_fallback``
+    Fills of an skb that already had fragments of its own, such as the one a
+    prefix starts, which took a page reference for each fragment instead.
+``stat_send_ubuf_copied``
+    Ubufs let go of because somebody copied the data of an skb
+    (``skb_copy_ubufs()``) instead of holding it. A consumer on the receive
+    path that holds a clone, such as a packet socket or a socket of this host,
+    does not copy it, and neither does the transmit path, so it stays at zero;
+    a count means that something copied the data of a managed send.
+``stat_send_ubuf_reused``
+    Skbs of ``stat_send_managed_skbs`` that were given a ubuf which an earlier
+    skb had finished with and the store had kept, instead of one allocated for
+    them.
+``stat_send_admit_fast``, ``stat_send_admit_slow``
+    Vectored sends admitted in one pass over their entries, and those whose
+    request had a block too short for the segments that their ranges span,
+    which grew it and resolved the vector again, however often that took. The
+    block of a request is kept for the next, so a send is slow when its
+    request is new or its ranges span more segments than any before it did. A
+    send of one range is neither, and neither is a vector that fails.
 
 Stores in the area of a MAIO instance
 =====================================
@@ -1078,6 +1149,12 @@ Copy cases compare the per-run and page-split loops byte for byte with and
 without units; inline cases cover synchronous publication, the dispatcher
 threshold and an inline reservation failure. A pressure case shows that a full
 cache leaves capture admission and watermarks unchanged.
+Managed fragment cases fill skbs without TCP, for folios shared by fragments
+and ranges that touch, the fragment limit, a ubuf that is full, and an skb with
+fragments of its own, and they send over loopback for the counters, the pages
+that a ubuf or a peer that has not read holds, a unit that the cache cannot take
+until the peer reads, the copy that the receive path makes without the waiver,
+framed and mixed sends, and the completion in a softirq.
 ``CONFIG_KUNIT`` is required. Compaction and tests compile as separate source
 files instead of being included by the collector. Lockdep and atomic-sleep
 checks are useful for validating ownership and worker paths.
@@ -1090,6 +1167,24 @@ puts the payload into pages of the area, and the store holds them by pool
 reference. These two tests need ``CONFIG_NETDEVSIM``, ``CONFIG_NET_NS`` and
 root. A test skips when its requirement is missing. The KUnit tests of
 bound stores also need ``CONFIG_IO_URING_ZCRX_KUNIT_TEST``.
+
+A UML kernel runs the tests with ``tools/testing/kunit/kunit.py run``, using a
+``--kunitconfig`` fragment that sets ``CONFIG_KUNIT``, ``CONFIG_IO_URING``,
+``CONFIG_NET``, ``CONFIG_INET``, ``CONFIG_IO_URING_OPAQUE_OBJ`` and
+``CONFIG_IO_URING_OPAQUE_OBJ_KUNIT_TEST``, and the lockdep and atomic-sleep
+options if wanted. Two cases race the ubuf pool of a store on several CPUs:
+three tasks take ubufs as sends do and three free the skbs that hold them, and
+in the second case the store goes meanwhile. They are skipped with fewer than
+two CPUs online, as on a UML kernel without ``CONFIG_SMP``. To run them, build
+with ``CONFIG_SMP=y`` and ``CONFIG_NR_CPUS=4`` and start UML with ``ncpus=4``,
+which it accepts only with ``seccomp=on``::
+
+  tools/testing/kunit/kunit.py run --build_dir="$build" \
+      --kunitconfig="$fragment" --kconfig_add CONFIG_SMP=y \
+      --kconfig_add CONFIG_NR_CPUS=4 --kernel_args ncpus=4 \
+      --kernel_args seccomp=on 'io_uring-opaque*'
+
+The VM below has two CPUs, so these cases run there.
 
 To test without replacing the host kernel, build ``bzImage`` with loopback,
 initramfs and serial-console support, build a static test, and use the optional
