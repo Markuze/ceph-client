@@ -7,6 +7,7 @@
 #include <linux/llist.h>
 #include <linux/net.h>
 #include <linux/percpu.h>
+#include <linux/rcupdate.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
@@ -144,6 +145,14 @@ struct io_opaque_block {
 
 struct io_opaque_data {
 	refcount_t refs;
+	/*
+	 * The handle that names this version. Set before the version is published and
+	 * never changed, so that a lookup that holds a reference and not tables can tell
+	 * whether the slot it read the version from still holds what the handle names.
+	 */
+	u64 handle;
+	/* The struct outlives its last reference by a grace period, see io_opaque_data_put(). */
+	struct rcu_head rcu;
 	struct list_head extents;
 	struct bio_vec *bvec;
 	/*
@@ -166,7 +175,12 @@ struct io_opaque_data {
 };
 
 struct io_opaque_slot {
-	struct io_opaque_data *data;
+	/*
+	 * The version that the handle names. It is changed with tables held, and read with
+	 * it, or in RCU by the lookup of a send that does not consume the object
+	 * (io_opaque_pin()).
+	 */
+	struct io_opaque_data __rcu *data;
 	u64 generation;
 	bool reserved;
 	bool compacting;
@@ -424,12 +438,15 @@ struct io_opaque_store {
 	/*
 	 * Handles and candidates. A spinlock: nothing under it sleeps or allocates, and
 	 * a version is put, a copy made and a socket locked only after it is dropped. It
-	 * is held for a time that the request bounds: what admission does under it is a
-	 * lookup per entry, the segments its ranges span up to the limit, which it counts
-	 * and stores in the request's block, and for each range a walk that the version's
-	 * anchors keep to about two strides and a binary search. Attach and the admission
-	 * of a send take it with the socket owned, so a socket lock is never taken while
-	 * holding it.
+	 * is held for a time that the request bounds: what the admission of a send that
+	 * consumes its object does under it is a lookup per entry, the segments its
+	 * ranges span up to the limit, which it counts and stores in the request's
+	 * block, and for each range a walk that the version's anchors keep to about two
+	 * strides and a binary search. Attach and that admission take it with the socket
+	 * owned, so a socket lock is never taken while holding it. Every change of a
+	 * slot's version is made with it held, and a send that does not consume its
+	 * object does not take it to read one (see io_opaque_pin()), but for the lookup
+	 * that finds the version it read already gone.
 	 */
 	spinlock_t tables;
 	struct io_opaque_slot *objects;
@@ -576,6 +593,14 @@ struct page *io_opaque_dest_page(struct io_opaque_store *store, u64 pages_left,
 u64 io_opaque_handle(u32 index, u64 generation);
 struct io_opaque_slot *io_opaque_lookup(struct io_opaque_store *store,
 					u64 handle);
+
+/* The version that @slot holds, for a caller that holds tables, which is what changes it. */
+static inline struct io_opaque_data *io_opaque_slot_data(struct io_opaque_store *store,
+							 const struct io_opaque_slot *slot)
+{
+	return rcu_dereference_protected(slot->data, lockdep_is_held(&store->tables));
+}
+
 void io_opaque_wait(struct io_opaque_req *op, enum io_opaque_phase phase);
 void io_opaque_queue_ready(struct io_opaque_req *op, int result);
 int io_opaque_compact_build(struct io_opaque_req *op);
@@ -634,6 +659,8 @@ int io_opaque_apply_policy(struct io_opaque_store *store,
 			   const struct io_uring_opaque_policy *policy);
 extern unsigned int io_opaque_policy_chunk;
 extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
+extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
+extern atomic_long_t io_opaque_pin_slow;
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;

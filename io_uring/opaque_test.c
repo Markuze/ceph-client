@@ -69,18 +69,43 @@ static struct io_opaque_store *opaque_test_store(struct kunit *test)
 }
 
 /*
- * io_opaque_send_acquire() as admission calls it, in a hold of tables. What a test says
- * about the result it says after the hold: a failed expectation allocates, and tables is
- * a spinlock.
+ * io_opaque_send_acquire() as admission calls it, with no lock held: a send that consumes
+ * its object takes tables itself, and any other reads the table in RCU.
  */
 static int opaque_test_acquire(struct io_opaque_store *store, struct io_opaque_req *op)
 {
-	int ret;
+	lockdep_assert_not_held(&store->tables);
+	return io_opaque_send_acquire(op);
+}
 
-	spin_lock(&store->tables);
-	ret = io_opaque_send_acquire(op);
-	spin_unlock(&store->tables);
-	return ret;
+/*
+ * The version that slot @i holds, in a test that is alone with the table: nothing changes it
+ * while the test looks, and it holds no lock.
+ */
+static struct io_opaque_data *opaque_slot_data(struct io_opaque_store *store, u32 i)
+{
+	return rcu_dereference_protected(store->objects[i].data, true);
+}
+
+/*
+ * Make @data what slot @i holds, or nothing, in a test that is alone with the table. A version
+ * carries the handle that its slot gives it, which the slot's generation must already be.
+ */
+static void opaque_slot_set(struct io_opaque_store *store, u32 i, struct io_opaque_data *data)
+{
+	if (data)
+		data->handle = io_opaque_handle(i, store->objects[i].generation);
+	rcu_assign_pointer(store->objects[i].data, data);
+}
+
+/* Publish @data in @slot under @generation. */
+static void opaque_test_publish(struct io_opaque_store *store, u32 slot, u64 generation,
+				struct io_opaque_data *data)
+{
+	store->objects[slot].generation = generation;
+	opaque_slot_set(store, slot, data);
+	store->nr_objects++;
+	__set_bit(slot, store->object_used);
 }
 
 /* FREE as the issue does it: the handle goes under tables, and the version is put after. */
@@ -132,6 +157,18 @@ static bool opaque_test_held(spinlock_t *lock)
 	if (state == OPAQUE_LOCK_UNKNOWN)
 		pr_info_once("opaque_test: neither lockdep nor the lock can say whether a spinlock is held: the expectations that one is free are not checked\n");
 	return state == 1;
+}
+
+/*
+ * Lockdep turns itself off after its first report, and an RCU report is one: a test that is about
+ * the locks and the RCU sections of a lookup says at its end that lockdep is still on, so that a
+ * report made in it is a failure and not a line on the console. Where nothing can tell, it is
+ * silent.
+ */
+static void opaque_expect_lockdep(struct kunit *test, struct io_opaque_store *store)
+{
+	if (IS_ENABLED(CONFIG_LOCKDEP))
+		KUNIT_EXPECT_NE(test, opaque_test_lock_state(&store->tables), OPAQUE_LOCK_UNKNOWN);
 }
 
 /* Fragments of a test skb: MAX_SKB_FRAGS is 17 to 45, depending on the configuration. */
@@ -882,10 +919,7 @@ static void opaque_compact_versions(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, before);
 	KUNIT_ASSERT_NOT_NULL(test, after);
-	store->objects[0].data = data;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
-	store->objects[0].generation = 9;
+	opaque_test_publish(store, 0, 9, data);
 	refcount_add(2, &data->refs); /* worker and an old read/send version */
 	opaque_test_copy(data, before);
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&op), 0);
@@ -898,7 +932,7 @@ static void opaque_compact_versions(struct kunit *test)
 			(s64)(40 * PAGE_SIZE + ALIGN(80000, PAGE_SIZE)));
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&op), 0);
 	KUNIT_EXPECT_EQ(test, store->objects[0].generation, 9ULL);
-	KUNIT_EXPECT_PTR_NE(test, store->objects[0].data, data);
+	KUNIT_EXPECT_PTR_NE(test, opaque_slot_data(store, 0), data);
 	io_opaque_data_put(store, data); /* worker */
 	io_opaque_compact_end(&op);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
@@ -906,8 +940,8 @@ static void opaque_compact_versions(struct kunit *test)
 			(s64)(40 * PAGE_SIZE + ALIGN(80000, PAGE_SIZE)));
 	io_opaque_data_put(store, data); /* old read/send */
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)ALIGN(80000, PAGE_SIZE));
-	io_opaque_data_put(store, store->objects[0].data);
-	store->objects[0].data = NULL;
+	io_opaque_data_put(store, opaque_slot_data(store, 0));
+	opaque_slot_set(store, 0, NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
@@ -924,10 +958,7 @@ static void opaque_compact_watermarks(struct kunit *test)
 	/* Counting the copy would cross the high watermark. */
 	store->config.high_watermark = sparse + PAGE_SIZE;
 	store->config.low_watermark = PAGE_SIZE;
-	store->objects[0].data = data;
-	store->objects[0].generation = 9;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
+	opaque_test_publish(store, 0, 9, data);
 	refcount_inc(&data->refs); /* worker */
 	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_NORMAL);
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&op), 0);
@@ -939,8 +970,8 @@ static void opaque_compact_watermarks(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)dense);
 	KUNIT_EXPECT_EQ(test, io_opaque_memory_mode(store), IORING_OPAQUE_MEMORY_NORMAL);
-	io_opaque_data_put(store, store->objects[0].data);
-	store->objects[0].data = NULL;
+	io_opaque_data_put(store, opaque_slot_data(store, 0));
+	opaque_slot_set(store, 0, NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
@@ -1037,16 +1068,13 @@ static void opaque_send_last_ownership(struct kunit *test)
 	};
 	u8 actual[12], expected[12] = { 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 
-	slot->data = data;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
-	slot->generation = 9;
+	opaque_test_publish(store, 0, 9, data);
 	slot->compacting = true;
 	list_add(&slot->candidate, &store->candidates);
 	refcount_inc(&data->refs); /* an already issued read/send */
 	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ERANGE);
 	KUNIT_EXPECT_FALSE(test, send.consumed);
-	KUNIT_EXPECT_PTR_EQ(test, slot->data, data);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
 	KUNIT_EXPECT_FALSE(test, list_empty(&slot->candidate));
 	send.offset = 1997;
 	send.length = sizeof(actual);
@@ -1054,7 +1082,7 @@ static void opaque_send_last_ownership(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &other), -ESTALE);
 	KUNIT_EXPECT_TRUE(test, send.consumed);
 	KUNIT_EXPECT_FALSE(test, other.consumed);
-	KUNIT_EXPECT_PTR_EQ(test, slot->data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_FALSE(test, slot->compacting);
 	KUNIT_EXPECT_TRUE(test, list_empty(&store->candidates));
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
@@ -1079,10 +1107,7 @@ static void opaque_send_last_compacted(struct kunit *test)
 		.send_flags = IORING_OPAQUE_SEND_LAST,
 	};
 
-	store->objects[0].data = data;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
-	store->objects[0].generation = 9;
+	opaque_test_publish(store, 0, 9, data);
 	refcount_inc(&data->refs); /* compaction worker */
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
 	replacement = compact.replacement;
@@ -1110,23 +1135,20 @@ static void opaque_send_last_compact_race(struct kunit *test)
 	};
 	struct io_opaque_req reuse = { .store = store };
 
-	store->objects[0].data = data;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
-	store->objects[0].generation = 9;
+	opaque_test_publish(store, 0, 9, data);
 	refcount_inc(&data->refs); /* compaction worker */
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
 	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), 0);
 	KUNIT_EXPECT_EQ(test, io_opaque_compact_publish(&compact), -ESTALE);
 	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&reuse), 0);
 	next = opaque_sparse_data(test, store);
-	store->objects[0].data = next;
+	opaque_slot_set(store, 0, next);
 	store->nr_objects++;
 	store->objects[0].reserved = false;
 	store->objects[0].compacting = true;
 	KUNIT_EXPECT_EQ(test, reuse.handle, 10ULL << IO_OPAQUE_INDEX_BITS);
 	KUNIT_EXPECT_EQ(test, io_opaque_compact_publish(&compact), -ESTALE);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, next);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), next);
 	KUNIT_EXPECT_TRUE(test, store->objects[0].compacting);
 	io_opaque_data_put(store, compact.replacement);
 	io_opaque_data_put(store, compact.data);
@@ -1152,10 +1174,7 @@ static void opaque_send_versions(struct kunit *test)
 	};
 	struct io_opaque_req second = first;
 
-	store->objects[0].data = data;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
-	store->objects[0].generation = 9;
+	opaque_test_publish(store, 0, 9, data);
 	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &first), 0);
 	refcount_inc(&data->refs); /* compaction worker */
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
@@ -1321,10 +1340,7 @@ static struct io_opaque_data *opaque_test_object(struct kunit *test,
 {
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
 
-	store->objects[0].data = data;
-	store->objects[0].generation = 9;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
+	opaque_test_publish(store, 0, 9, data);
 	return data;
 }
 
@@ -1421,7 +1437,7 @@ static void opaque_tx_failed_head(struct kunit *test)
 	e.send_flags = IORING_OPAQUE_SEND_LAST;
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&e, &sk[0]), -ECANCELED);
 	KUNIT_EXPECT_FALSE(test, e.consumed);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, data);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 	/* The followers' own releases wake nobody; draining clears the failure. */
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&b), NULL);
@@ -1456,7 +1472,7 @@ static void opaque_tx_failed_head(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, c.consumed);
 	KUNIT_EXPECT_PTR_EQ(test, c.data, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, c.tx, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, a.tx->admitting, 0U);
@@ -2027,9 +2043,10 @@ static void opaque_test_sock_release(void *sock)
 }
 
 /*
- * Lock order: tables alone around the handle; tx_lock before wait_lock to park and wake; and,
- * for an inline send, which joins and takes its references once it owns the socket, the socket
- * before tx_lock, wait_lock and tables, none of which is held when the socket is taken.
+ * Lock order: tables alone around the handle, for a send that consumes its object (any other
+ * takes no lock for it); tx_lock before wait_lock to park and wake; and, for an inline send,
+ * which joins and takes its references once it owns the socket, the socket before tx_lock,
+ * wait_lock and tables, none of which is held when the socket is taken.
  */
 static void opaque_tx_lock_order(struct kunit *test)
 {
@@ -2044,14 +2061,14 @@ static void opaque_tx_lock_order(struct kunit *test)
 	b.handle = a.handle;
 	a.length = 100;
 	b.length = 100;
-	/* The head links with tx_lock alone, and takes its references later, with tables alone. */
+	/* The head links with tx_lock alone, and takes its references later, with no lock. */
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&a, sk), IO_OPAQUE_TX_SETTLE);
 	lockdep_assert_none_held_once();
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_settle_head(&a), 0);
 	lockdep_assert_none_held_once();
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
-	/* A follower takes its references before it parks, with tables and then tx_lock. */
+	/* A follower takes its references before it parks, with no lock, and then tx_lock. */
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&b, sk), 0);
 	lockdep_assert_none_held_once();
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 3);
@@ -2066,21 +2083,27 @@ static void opaque_tx_lock_order(struct kunit *test)
 
 	/*
 	 * With the socket owned, as an inline send joins: a real socket, whose lockdep class is
-	 * the sends'. The head links (the socket, then tx_lock) and takes its references (the
-	 * socket, then tables), a frame behind it takes its references and parks (the socket,
-	 * then tables, then tx_lock and wait_lock), and the head hands the queue on, all before
-	 * the socket is let go. The reverse order of any of them is a splat here and in every
-	 * other test that takes the socket.
+	 * the sends'. The sends consume their objects, as it is they that take tables. The head
+	 * links (the socket, then tx_lock) and takes its references (the socket, then tables), a
+	 * frame behind it takes its references and parks (the socket, then tables, then tx_lock
+	 * and wait_lock), and the head hands the queue on, all before the socket is let go. The
+	 * reverse order of any of them is a splat here and in every other test that takes the
+	 * socket.
 	 */
 	KUNIT_ASSERT_EQ(test, sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock),
 			0);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_sock_release, sock), 0);
+	opaque_test_publish(store, 1, 7, opaque_sparse_data(test, store));
+	opaque_test_publish(store, 2, 5, opaque_sparse_data(test, store));
 	opaque_test_tx_op(&c, store);
 	opaque_test_tx_op(&d, store);
 	opaque_test_tx_op(&e, store);
-	c.handle = a.handle;
-	d.handle = a.handle;
-	e.handle = a.handle;
+	c.handle = io_opaque_handle(0, 9);
+	d.handle = io_opaque_handle(1, 7);
+	e.handle = io_opaque_handle(2, 5);
+	c.send_flags = IORING_OPAQUE_SEND_LAST;
+	d.send_flags = IORING_OPAQUE_SEND_LAST;
+	e.send_flags = IORING_OPAQUE_SEND_LAST;
 	c.length = 100;
 	d.length = 100;
 	e.length = 100;
@@ -2193,7 +2216,7 @@ static void opaque_send_head_admit_fails(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&last, sk), -ESTALE);
 	KUNIT_EXPECT_FALSE(test, last.consumed);
 	KUNIT_EXPECT_PTR_EQ(test, last.tx, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, data);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
 	/* A queue that took a head that failed this way takes the next frame as its head. */
 	opaque_test_tx_op(&follower, store);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&follower, sk), IO_OPAQUE_TX_HEAD);
@@ -2247,7 +2270,7 @@ static void opaque_send_head_races_follower(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, follower.data, data);
 		KUNIT_EXPECT_EQ(test, follower.consumed, !!c);
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), c ? 1 : 2);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, c ? NULL : data);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), c ? NULL : data);
 
 		if (!c) {
 			/* The head takes its own, and goes first. */
@@ -2488,10 +2511,7 @@ static void opaque_forward_only_versions(struct kunit *test)
 	};
 
 	data->forward_only = true;
-	store->objects[0].data = data;
-	store->objects[0].generation = 9;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
+	opaque_test_publish(store, 0, 9, data);
 	refcount_inc(&data->refs);
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
 	KUNIT_EXPECT_TRUE(test, compact.replacement->forward_only);
@@ -2560,7 +2580,7 @@ static void opaque_create_publish_revalidate(struct kunit *test)
 	store->objects[op.slot].generation--;
 	store->dead = true;
 	KUNIT_EXPECT_EQ(test, io_opaque_publish(&op, &flags), -ECANCELED);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[op.slot].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, op.slot), NULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	KUNIT_EXPECT_EQ(test, flags, 0ULL);
 	io_opaque_create_release(&op);
@@ -3248,10 +3268,7 @@ static void opaque_cache_accounting(struct kunit *test)
 	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
 	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
 	for (i = 0; i < 2; i++) {
-		store->objects[i].data = i ? second : first;
-		store->objects[i].generation = 9;
-		__set_bit(i, store->object_used);
-		store->nr_objects++;
+		opaque_test_publish(store, i, 9, i ? second : first);
 	}
 	refcount_inc(&first->refs); /* compaction */
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&op), 0);
@@ -3283,7 +3300,7 @@ static void opaque_cache_accounting(struct kunit *test)
 	io_opaque_compact_end(&op);
 	KUNIT_EXPECT_EQ(test, store->cache.hits, 2ULL);
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 1U);
-	dense = store->objects[1].data;
+	dense = opaque_slot_data(store, 1);
 	refcount_inc(&dense->refs); /* in-flight send */
 	KUNIT_ASSERT_EQ(test, opaque_test_pages(dense, units, 3), 3U);
 	get_page(units[0]);
@@ -3920,10 +3937,7 @@ static void opaque_send_loopback(struct kunit *test)
 	opaque_test_cache(test, store, 4);
 	opaque_test_copy(data, source);
 	/* Publish the compacted copy, whose units are the compound pages TCP will see. */
-	store->objects[0].data = data;
-	store->objects[0].generation = 9;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
+	opaque_test_publish(store, 0, 9, data);
 	refcount_inc(&data->refs); /* compaction worker */
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
 	KUNIT_ASSERT_EQ(test, opaque_test_pages(compact.replacement, units, 3), 3U);
@@ -4142,23 +4156,19 @@ static void opaque_vec_room(struct kunit *test, struct io_opaque_req *op, u32 se
 
 /*
  * Admission of a vector as io_opaque_tx_admit() does it, without the queue: the
- * references are taken under tables, and the block is grown and the cursor
- * built without it.
+ * references are taken by io_opaque_send_acquire(), with tables for a LAST vector
+ * and without it for any other, and the block is grown and the cursor built
+ * without it.
  */
 static int opaque_vec_admit(struct io_opaque_req *op)
 {
-	int ret;
-
-	spin_lock(&op->store->tables);
-	ret = io_opaque_send_acquire(op);
-	spin_unlock(&op->store->tables);
-	return io_opaque_vec_finish(op, ret);
+	return io_opaque_vec_finish(op, opaque_test_acquire(op->store, op));
 }
 
 /*
  * The segments of a range as the first version of the vectored send found
- * them: its object walked from the first segment for every range, under tables.
- * Counted when @bv is NULL, else stored there.
+ * them: its object walked from the first segment for every range. Counted when
+ * @bv is NULL, else stored there.
  */
 static u32 opaque_ref_segs(const struct io_opaque_data *data, u64 off, u32 len,
 			   struct bio_vec *bv)
@@ -4208,16 +4218,6 @@ static void opaque_vec_expect_cursor(struct kunit *test, struct io_opaque_req *o
 	KUNIT_EXPECT_PTR_EQ(test, op->iter.bvec, vec->bv);
 	KUNIT_EXPECT_EQ(test, op->iter.nr_segs, (unsigned long)n);
 	KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)op->length);
-}
-
-/* Publish @data in @slot under @generation. */
-static void opaque_test_publish(struct io_opaque_store *store, u32 slot, u64 generation,
-				struct io_opaque_data *data)
-{
-	store->objects[slot].data = data;
-	store->objects[slot].generation = generation;
-	store->nr_objects++;
-	__set_bit(slot, store->object_used);
 }
 
 /* Rewrite every extent of a sparse object so that it differs from the others. */
@@ -4712,7 +4712,7 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 
 	if (c->last) {
 		/* The send held the only reference: the object went with it. */
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	} else {
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 		opaque_test_free(store, 0);
@@ -4928,7 +4928,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 		KUNIT_EXPECT_PTR_EQ(test, op->data, data);
 	/* LAST takes the table's reference for each entry; any other send one for the run. */
 	KUNIT_EXPECT_EQ(test, op->consumed, last);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, last ? NULL : data);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), last ? NULL : data);
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), last ? (int)nr : 2);
 	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
@@ -4936,7 +4936,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 	/* The handle goes while the send is held, with nobody to put the version but the send. */
 	if (action == OPAQUE_EAGAIN_FREE) {
 		opaque_test_free(store, 0);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	} else if (action == OPAQUE_EAGAIN_COMPACT) {
 		struct io_opaque_req compact = { .store = store, .data = data, .handle = handle };
 
@@ -4945,7 +4945,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 		KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
 		io_opaque_data_put(store, compact.data);
 		io_opaque_compact_end(&compact);
-		KUNIT_EXPECT_PTR_NE(test, store->objects[0].data, data);
+		KUNIT_EXPECT_PTR_NE(test, opaque_slot_data(store, 0), data);
 	}
 	if (action != OPAQUE_EAGAIN_KEEP)
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
@@ -4994,8 +4994,8 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 
 	/* What the table still holds, the version or its compacted copy, is the table's alone. */
 	if (!last && action != OPAQUE_EAGAIN_FREE) {
-		KUNIT_ASSERT_NOT_NULL(test, store->objects[0].data);
-		KUNIT_EXPECT_EQ(test, refcount_read(&store->objects[0].data->refs), 1);
+		KUNIT_ASSERT_NOT_NULL(test, opaque_slot_data(store, 0));
+		KUNIT_EXPECT_EQ(test, refcount_read(&opaque_slot_data(store, 0)->refs), 1);
 		opaque_test_free(store, 0);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
@@ -5198,7 +5198,7 @@ static void opaque_send_locked_error(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 			if (last) {
-				KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+				KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 			} else {
 				KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 				opaque_test_free(store, 0);
@@ -5251,8 +5251,8 @@ static void opaque_send_locked_last_versions(struct kunit *test)
 	/* A's first reference, B's only one and A's last: B and A are freed after the socket. */
 	opaque_put_spy_expect(test, 3, 2);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
@@ -5860,8 +5860,8 @@ static void opaque_test_vec_segs_restore(void *limit)
 }
 
 /*
- * Admission pins every entry under one hold of tables, or none: a vector that
- * cannot go consumes nothing, and a LAST vector detaches each handle once.
+ * Admission pins every entry, or none: a vector that cannot go consumes nothing and holds
+ * nothing, and a LAST vector detaches each handle once, under tables.
  */
 static void opaque_send_vec_acquire(struct kunit *test)
 {
@@ -5905,8 +5905,8 @@ static void opaque_send_vec_acquire(struct kunit *test)
 	opaque_vec_expect_cursor(test, op);
 	KUNIT_EXPECT_FALSE(test, op->consumed);
 	KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, a);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, b);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), b);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 2U);
 	io_opaque_vec_release(op);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
@@ -5961,8 +5961,8 @@ static void opaque_send_vec_acquire(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, other->vec->pinned, 0U);
 			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
-			KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, a);
-			KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, b);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), b);
 			KUNIT_EXPECT_EQ(test, store->nr_objects, 2U);
 		}
 	}
@@ -5994,7 +5994,7 @@ static void opaque_send_vec_acquire(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], c);
 	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[1], c);
 	KUNIT_EXPECT_EQ(test, refcount_read(&c->refs), 2);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[2].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 2), NULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 2U);
 	io_opaque_vec_release(op);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)80 * PAGE_SIZE);
@@ -6005,8 +6005,8 @@ static void opaque_send_vec_acquire(struct kunit *test)
 	/* The cursor is over the pinned versions, whose handles are gone. */
 	opaque_vec_expect_cursor(test, op);
 	KUNIT_EXPECT_TRUE(test, op->consumed);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), NULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	KUNIT_EXPECT_FALSE(test, test_bit(0, store->object_used));
 	KUNIT_EXPECT_FALSE(test, test_bit(1, store->object_used));
@@ -6130,7 +6130,7 @@ static void opaque_send_vec_pin_once(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, op->consumed);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 4U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&obj[2]->refs), 4);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[2].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 2), NULL);
 	bytes = atomic64_read(&store->bytes);
 	io_opaque_vec_release(op);
 	KUNIT_EXPECT_EQ(test, bytes - atomic64_read(&store->bytes), charge);
@@ -6368,10 +6368,10 @@ static void opaque_send_vec_loopback(struct kunit *test)
 		/* TCP lets go of a spliced body once it is acknowledged. */
 		for (i = 0; i < ARRAY_SIZE(units); i++)
 			KUNIT_EXPECT_TRUE(test, opaque_wire_unit_free(units[i]));
-		KUNIT_EXPECT_PTR_NE(test, store->objects[0].data, NULL);
+		KUNIT_EXPECT_PTR_NE(test, opaque_slot_data(store, 0), NULL);
 	}
 	/* LAST took the handle and, with the references, the object. */
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
@@ -6413,12 +6413,12 @@ static void opaque_send_vec_admit_fail(struct kunit *test)
 		if (!i) {
 			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
-			KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, a);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
 		}
 	}
 	/* Both handles went with the LAST vector, and the pins with the failed admission. */
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, head.tx->admitting, 0U);
@@ -6754,7 +6754,7 @@ static void opaque_send_vec_count_cap(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
 		KUNIT_EXPECT_FALSE(test, op->consumed);
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, data);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
 	}
 	/* At the limit exactly, all of it is counted and the vector goes. */
 	io_opaque_send_vec_segs = 8;
@@ -6913,9 +6913,9 @@ static struct io_opaque_req *opaque_grow_queued(struct kunit *test, struct io_op
 }
 
 /*
- * A block with too few segments for what the ranges span is grown without
- * tables, and the vector is resolved again in a new hold: nothing is pinned or
- * removed before that, and what the second hold sees is what counts.
+ * A block with too few segments for what the ranges span is grown with nothing
+ * held, and the vector is resolved again: nothing is pinned or removed before
+ * that, and what the second attempt sees is what counts.
  */
 static void opaque_send_vec_grow_retry(struct kunit *test)
 {
@@ -6933,9 +6933,9 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, sk);
 
 	/*
-	 * The hold that finds the block too small pins and removes nothing and
+	 * The attempt that finds the block too small pins and removes nothing and
 	 * leaves the block as it is. The retry walks the ranges again and ends
-	 * as a single hold would have.
+	 * as a single attempt would have.
 	 */
 	opaque_test_publish(store, 0, 9, a);
 	opaque_grow_entries(ent, io_opaque_handle(0, 9));
@@ -6944,9 +6944,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 				    last ? IORING_OPAQUE_SEND_LAST : 0);
 		KUNIT_ASSERT_EQ(test, op->vec->cap_segs, 2U);
 		before = atomic_long_read(&io_opaque_vec_stepped);
-		spin_lock(&store->tables);
-		ret = io_opaque_send_acquire(op);
-		spin_unlock(&store->tables);
+		ret = opaque_test_acquire(store, op);
 		pass = atomic_long_read(&io_opaque_vec_stepped) - before;
 		KUNIT_EXPECT_EQ(test, ret, 5);
 		KUNIT_EXPECT_GT(test, pass, 0L);
@@ -6957,11 +6955,11 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
 		KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)0);
 		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, a);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
 		KUNIT_EXPECT_EQ(test, store->nr_objects, 1U);
 		KUNIT_EXPECT_TRUE(test, test_bit(0, store->object_used));
 		KUNIT_EXPECT_EQ(test, io_opaque_vec_finish(op, ret), 0);
-		/* The second hold walked as the first did: pass one was done again. */
+		/* The second attempt walked as the first did: pass one was done again. */
 		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_vec_stepped) - before, 2 * pass);
 		KUNIT_EXPECT_GE(test, op->vec->cap_segs, 5U);
 		KUNIT_EXPECT_MEMEQ(test, op->vec->ent, ent, sizeof(ent));
@@ -6970,7 +6968,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, op->consumed, (bool)last);
 		/* LAST: the detached reference and the repeat's. Else: the table's and one pin. */
 		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, last ? NULL : a);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), last ? NULL : a);
 		opaque_vec_expect_cursor(test, op);
 		io_opaque_vec_release(op);
 	}
@@ -7041,11 +7039,11 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)0);
 		KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
 		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, a);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
 		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 	}
 
-	/* The handle is gone when the second hold looks: it fails and consumes nothing. */
+	/* The handle is gone when the second attempt looks: it fails and consumes nothing. */
 	op = opaque_grow_queued(test, store, io_opaque_handle(0, 11), IORING_OPAQUE_SEND_LAST);
 	opaque_window_open(test, opaque_window_free);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(op, sk), -ESTALE);
@@ -7062,7 +7060,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 
 	/*
 	 * Nothing changes in the window, and the vector is LAST: the retry takes
-	 * the handle with the references, in the hold that makes the cursor.
+	 * the handle with the references, in the hold of tables that makes the cursor.
 	 */
 	a = opaque_sparse_data(test, store);
 	opaque_test_publish(store, 0, 13, a);
@@ -7076,7 +7074,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_window.pinned, 0U);
 	KUNIT_EXPECT_FALSE(test, opaque_window.consumed);
 	KUNIT_EXPECT_TRUE(test, op->consumed);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
 	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 5U);
 	opaque_vec_expect_cursor(test, op);
@@ -7088,9 +7086,9 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 
 	/*
-	 * The object is compacted in the window: the second hold pins the
+	 * The object is compacted in the window: the second attempt pins the
 	 * replacement, and the cursor is over its segments, not the five that
-	 * the first hold counted.
+	 * the first counted.
 	 */
 	a = opaque_sparse_data(test, store);
 	opaque_test_publish(store, 0, 14, a);
@@ -7103,7 +7101,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, io_opaque_tx_admit(op, sk), 1);
 	opaque_window_close(test);
 	lockdep_assert_none_held_once();
-	replacement = store->objects[0].data;
+	replacement = opaque_slot_data(store, 0);
 	KUNIT_ASSERT_PTR_NE(test, replacement, a);
 	KUNIT_EXPECT_EQ(test, opaque_window.calls, 1U);
 	KUNIT_EXPECT_FALSE(test, opaque_window.grow_locked);
@@ -7201,7 +7199,7 @@ static void opaque_vec_expect_bytes(struct kunit *test, struct io_opaque_req *op
 }
 
 /*
- * Admission in one pass, under tables, ending with the cursor made: what it
+ * Admission in one pass, ending with the cursor made: what it
  * stores, finds, pins and counts, for the vectors that the workload sends and
  * for those that it does not. Objects of one segment (slots 0 to 31), of three
  * (32 to 35) and of forty, which has anchors (36). The calls to find where a
@@ -7287,9 +7285,9 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 
 	/*
 	 * Objects of three segments, the whole of each: twelve segments for four
-	 * entries is more than the block holds. The first hold counts them without
-	 * storing the rest, the block grows and the second hold stores: one slow
-	 * admission, and no start found with a call, in either hold.
+	 * entries is more than the block holds. The first attempt counts them without
+	 * storing the rest, the block grows and the second stores: one slow
+	 * admission, and no start found with a call, in either attempt.
 	 */
 	for (i = 0; i < threes; i++)
 		ent[i] = (struct io_uring_opaque_send_entry) {
@@ -7306,7 +7304,7 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 	opaque_vec_expect_cursor(test, op);
 	opaque_vec_expect_bytes(test, op, source);
 	io_opaque_vec_release(op);
-	/* The block is kept for the next vector of the request, which then goes in one hold. */
+	/* The block is kept for the next vector of the request, which then goes at once. */
 	opaque_adm_read(&before);
 	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
 	opaque_adm_expect(test, &before, 1, 0, 0, 3 * threes);
@@ -7373,7 +7371,7 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 	opaque_adm_expect(test, &before, 1, 0, 0, 5);
 	KUNIT_EXPECT_TRUE(test, op->consumed);
 	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[i].data, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, i), NULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, nobj - 3);
 	/* The table's reference went to the send, a repeat took one: two for 0 and 1, one for 2. */
 	KUNIT_EXPECT_EQ(test, refcount_read(&obj[0]->refs), 2);
@@ -7411,7 +7409,7 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&obj[5]->refs), 1);
 
 	for (i = 0; i < nobj; i++) {
-		if (i < 3 && !store->objects[i].data)
+		if (i < 3 && !opaque_slot_data(store, i))
 			continue;
 		opaque_test_free(store, i);
 	}
@@ -7460,8 +7458,8 @@ static void opaque_unwind_one(struct kunit *test, struct io_opaque_store *store,
 	KUNIT_EXPECT_EQ(test, iov_iter_count(&op->iter), (size_t)0);
 	KUNIT_EXPECT_EQ(test, refcount_read(&(*a)->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&(*b)->refs), 1);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, *a);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, *b);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), *a);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), *b);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 2U);
 	KUNIT_EXPECT_TRUE(test, test_bit(0, store->object_used));
 	KUNIT_EXPECT_TRUE(test, test_bit(1, store->object_used));
@@ -7476,8 +7474,8 @@ static void opaque_unwind_one(struct kunit *test, struct io_opaque_store *store,
 	io_opaque_vec_release(op);
 	if (last) {
 		/* The handles went with it, and so did the objects: new ones for the next. */
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), NULL);
 		KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 		*a = opaque_sparse_data(test, store);
 		*b = opaque_sparse_data(test, store);
@@ -7527,7 +7525,7 @@ static void opaque_send_vec_admit_unwinds(struct kunit *test)
 }
 
 /*
- * The cursor is made in the hold that pins the versions, from the segments of
+ * The cursor is made as the versions are pinned, from the segments of
  * the versions it pins, so it does not matter that the slot holds another by
  * the time the bytes are read, nor that the pins are the last references of the
  * version: its segments are still there.
@@ -7576,7 +7574,7 @@ static void opaque_send_vec_cursor_pinned(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
 	io_opaque_data_put(store, compact.data);
 	io_opaque_compact_end(&compact);
-	KUNIT_ASSERT_PTR_EQ(test, store->objects[0].data, replacement);
+	KUNIT_ASSERT_PTR_EQ(test, opaque_slot_data(store, 0), replacement);
 	KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
 	/* Only the send holds the old version now, and its cursor reads it. */
 	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], old);
@@ -8126,10 +8124,7 @@ static void opaque_compact_inline(struct kunit *test)
 							&store->compact_work), 0);
 	for (i = 0; i < 4; i++) {
 		data[i] = opaque_sparse_data(test, store);
-		store->objects[i].data = data[i];
-		store->objects[i].generation = 9;
-		__set_bit(i, store->object_used);
-		store->nr_objects++;
+		opaque_test_publish(store, i, 9, data[i]);
 		req[i].ctx = ctx;
 		ops[i] = (struct io_opaque_req) {
 			.store = store, .req = &req[i], .op = IORING_OPAQUE_COMPACT,
@@ -8155,12 +8150,12 @@ static void opaque_compact_inline(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret[2], IOU_ISSUE_SKIP_COMPLETE);
 	KUNIT_EXPECT_EQ(test, ret[3], -ENOBUFS);
 	/* Inline: published synchronously, nothing queued or left pinned. */
-	KUNIT_EXPECT_PTR_NE(test, store->objects[1].data, data[1]);
-	KUNIT_EXPECT_TRUE(test, store->objects[1].data->dense);
+	KUNIT_EXPECT_PTR_NE(test, opaque_slot_data(store, 1), data[1]);
+	KUNIT_EXPECT_TRUE(test, opaque_slot_data(store, 1)->dense);
 	KUNIT_EXPECT_FALSE(test, store->objects[1].compacting);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->compactions), 1LL);
 	/* A failed inline copy keeps the original and releases the claim. */
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[3].data, data[3]);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 3), data[3]);
 	KUNIT_EXPECT_FALSE(test, store->objects[3].compacting);
 	for (i = 1; i < 4; i += 2) {
 		KUNIT_EXPECT_PTR_EQ(test, ops[i].data, NULL);
@@ -8321,7 +8316,7 @@ static void opaque_policy_chunks(struct kunit *test)
 		KUNIT_ASSERT_NOT_NULL(test, data[i]);
 		data[i]->dense = i == 1 || i == 10;
 		data[i]->forward_only = i == 4;
-		store->objects[i].data = data[i];
+		opaque_slot_set(store, i, data[i]);
 	}
 	memset(&opaque_policy_hook, 0, sizeof(opaque_policy_hook));
 	opaque_policy_hook.newer = &off;
@@ -9104,7 +9099,7 @@ static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, 
 	 * gone with a LAST send that ran. A LAST send that was canceled before it was admitted
 	 * took nothing, or it ran only as far as the point at which it did.
 	 */
-	if (store->objects[0].data) {
+	if (opaque_slot_data(store, 0)) {
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 		opaque_test_free(store, 0);
 	}
@@ -9233,7 +9228,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, head->consumed);
 			KUNIT_EXPECT_EQ(test, head->vec->pinned, 0U);
 			KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
-			KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, data);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), data);
 			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls),
 					calls);
 			/* The frame that came in was parked with its pin, and is promoted whole. */
@@ -9293,7 +9288,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, opaque_admit_hook.joined, IO_OPAQUE_TX_WAIT);
 			KUNIT_EXPECT_TRUE(test, follower->consumed);
 			KUNIT_EXPECT_PTR_EQ(test, follower->data, data);
-			KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 			KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_QUEUED);
 			KUNIT_EXPECT_FALSE(test, follower->canceled);
@@ -9544,7 +9539,7 @@ static void opaque_blocking_run(struct kunit *test, struct opaque_wire *w,
 		KUNIT_EXPECT_MEMEQ(test, got + i * 80000, source, 80000);
 	if (freed) {
 		/* The object went with the send. */
-		KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	} else {
 		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 		opaque_test_free(store, 0);
@@ -10359,10 +10354,7 @@ static void opaque_maio_compact(struct kunit *test)
 	opaque_maio_take(test, &stream, skb, 100);
 	data = opaque_maio_object(test, &stream);
 	KUNIT_ASSERT_TRUE(test, data->mapped);
-	store->objects[0].data = data;
-	store->objects[0].generation = 9;
-	store->nr_objects++;
-	__set_bit(0, store->object_used);
+	opaque_test_publish(store, 0, 9, data);
 	KUNIT_EXPECT_EQ(test, io_opaque_compact_start(&op), -EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, store->objects[0].compacting);
 	op.handle = 10ULL << IO_OPAQUE_INDEX_BITS;
@@ -10372,7 +10364,7 @@ static void opaque_maio_compact(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, sparse->mapped);
 
 	kfree_skb(skb);
-	store->objects[0].data = NULL;
+	opaque_slot_set(store, 0, NULL);
 	io_opaque_data_put(store, data);
 	io_opaque_data_put(plain, sparse);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
@@ -10427,7 +10419,7 @@ static void opaque_maio_create(struct kunit *test)
 	/* No page of the area is in use, and the object is not mapped. */
 	KUNIT_EXPECT_EQ(test, area->free_count, 16U);
 	KUNIT_EXPECT_EQ(test, opaque_slots_in(ifq, IO_ZCRX_KSLOT_OWNED), 0U);
-	data = store->objects[op.slot].data;
+	data = opaque_slot_data(store, op.slot);
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	KUNIT_EXPECT_FALSE(test, data->mapped);
 	KUNIT_EXPECT_TRUE(test, data->dense);
@@ -11727,7 +11719,7 @@ static void opaque_send_managed_holds_unit(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, true), IOU_COMPLETE);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 40000);
-	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	/* The units left with the object, and the ubuf's references keep them cooling. */
 	KUNIT_EXPECT_EQ(test, store->cache.nr_cooling, 2U);
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 0U);
@@ -13778,6 +13770,1062 @@ static void opaque_ubuf_pool_smp_close(struct kunit *test)
 }
 
 /*
+ * A send that does not consume its object takes its reference on the version in RCU, with no
+ * lock (io_opaque_pin()): it reads the slot, and takes the reference if the count is not zero.
+ * The tests below change what the slot holds in the window between the two, which
+ * io_opaque_lookup_between lets them reach, and then do the same from several CPUs. A hook runs
+ * in the RCU section of the lookup, so it may take a spinlock and put, and it may not sleep
+ * or make an expectation, which allocates when it fails: it records, and the test looks after.
+ */
+static void opaque_lookup_hook_reset(void *unused)
+{
+	WRITE_ONCE(io_opaque_lookup_between, NULL);
+}
+
+/* Run @hook in the window of every lookup, until the end of the test. */
+static void opaque_lookup_hook(struct kunit *test, void (*hook)(struct io_opaque_store *store))
+{
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_lookup_hook_reset, NULL), 0);
+	WRITE_ONCE(io_opaque_lookup_between, hook);
+}
+
+/* What the window of the tests that make it do something does, and what it saw. */
+static struct {
+	void (*act)(void);
+	/* It acts in the lookup with this number, counting from zero, and in no other. */
+	unsigned int at, calls;
+	struct io_opaque_store *store;
+	/* A compaction that has been built, which the window publishes. */
+	struct io_opaque_req *compact;
+	/* Whether it also puts the reference that the compaction holds on the old version. */
+	bool drop;
+	/* A request that takes the slot over with a new object. */
+	struct io_opaque_req *reuse;
+	/* A socket, to say whether the lookup had it owned. */
+	struct sock *sk;
+	bool owned;
+	/* Whether the window ran in an RCU read-side section, as it must. */
+	bool rcu;
+	/* What the act got, and the count of @watch before it and after. */
+	int ret;
+	u64 flags;
+	struct io_opaque_data *watch;
+	int before, refs;
+} opaque_lk;
+
+static void opaque_lk_window(struct io_opaque_store *store)
+{
+	if (opaque_lk.calls++ != opaque_lk.at || !opaque_lk.act)
+		return;
+	opaque_lk.rcu = rcu_read_lock_held();
+	if (opaque_lk.sk)
+		opaque_lk.owned = sock_owned_by_user_nocheck(opaque_lk.sk);
+	if (opaque_lk.watch)
+		opaque_lk.before = refcount_read(&opaque_lk.watch->refs);
+	opaque_lk.act();
+	if (opaque_lk.watch)
+		opaque_lk.refs = refcount_read(&opaque_lk.watch->refs);
+}
+
+/* Start the window: run @act in lookup number @at of this test. */
+static void opaque_lk_open(struct kunit *test, struct io_opaque_store *store, void (*act)(void),
+			   unsigned int at)
+{
+	memset(&opaque_lk, 0, sizeof(opaque_lk));
+	opaque_lk.store = store;
+	opaque_lk.act = act;
+	opaque_lk.at = at;
+	opaque_lookup_hook(test, opaque_lk_window);
+}
+
+static void opaque_lk_close(void)
+{
+	WRITE_ONCE(io_opaque_lookup_between, NULL);
+}
+
+/* The object is freed, and the put of the table's reference may be the last. */
+static void opaque_lk_free(void)
+{
+	opaque_test_free(opaque_lk.store, 0);
+}
+
+/* The compaction is published; with @drop the old version loses the compaction's reference too. */
+static void opaque_lk_compact(void)
+{
+	opaque_lk.ret = io_opaque_compact_publish(opaque_lk.compact);
+	if (opaque_lk.drop)
+		io_opaque_data_put(opaque_lk.store, opaque_lk.compact->data);
+}
+
+/* The object is freed and its slot taken by a new one, under the next generation. */
+static void opaque_lk_reuse(void)
+{
+	opaque_test_free(opaque_lk.store, 0);
+	opaque_lk.ret = io_opaque_slot_reserve(opaque_lk.reuse);
+	if (!opaque_lk.ret)
+		opaque_lk.ret = io_opaque_publish(opaque_lk.reuse, &opaque_lk.flags);
+}
+
+/*
+ * What a lookup returns for the handles that it must refuse, and what it takes and gives back
+ * for the ones it takes: the version is the one the handle names and knows its handle, a slot
+ * that was freed and taken by another object is not found by the handle of the first, and a
+ * lookup that finds the wrong object, or one that is out of range, gives back the reference it
+ * took. None of it needs the window, so none of it takes tables.
+ */
+static void opaque_pin_handles(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *old = opaque_sparse_data(test, store);
+	struct io_opaque_data *new = opaque_sparse_data(test, store);
+	struct io_opaque_req reuse = { .store = store, .data = new, .length = new->length };
+	struct io_opaque_req send = { .store = store, .offset = 100, .length = 1000 };
+	const u64 first = io_opaque_handle(0, 9), second = io_opaque_handle(0, 10);
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	u64 flags = 0, name[5];
+	unsigned int i;
+
+	opaque_test_publish(store, 0, 9, old);
+	KUNIT_EXPECT_EQ(test, old->handle, first);
+
+	/* The version the handle names, with a reference of the send's own. */
+	send.handle = first;
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), 0);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, old);
+	KUNIT_EXPECT_FALSE(test, send.consumed);
+	KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 2);
+	KUNIT_EXPECT_EQ(test, iov_iter_count(&send.iter), (size_t)1000);
+	io_opaque_data_put(store, send.data);
+	KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
+
+	/* Names of nothing: no handle, no such slot, a slot that holds none, two generations. */
+	name[0] = 0;
+	name[1] = io_opaque_handle(store->config.max_objects, 9);
+	name[2] = io_opaque_handle(1, 9);
+	name[3] = io_opaque_handle(0, 10);
+	name[4] = io_opaque_handle(0, 8);
+	for (i = 0; i < ARRAY_SIZE(name); i++) {
+		send.data = NULL;
+		send.handle = name[i];
+		KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ESTALE);
+		KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+		KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
+	}
+
+	/* A range outside the version is refused, and the reference it took goes back. */
+	send.handle = first;
+	send.offset = old->length - 10;
+	send.length = 20;
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ERANGE);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
+	send.offset = 100;
+	send.length = 1000;
+
+	/*
+	 * The object is freed and the slot taken by another, as RECV_OBJECT does it. The old handle
+	 * reaches the new version, which is not what it names: it finds that, and gives the
+	 * reference back. The new handle gets it. Publishing writes the handle the version knows.
+	 */
+	opaque_test_free(store, 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&reuse), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_publish(&reuse, &flags), (int)new->length);
+	KUNIT_EXPECT_EQ(test, reuse.handle, second);
+	KUNIT_EXPECT_EQ(test, new->handle, second);
+	send.handle = first;
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ESTALE);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 1);
+	send.handle = second;
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), 0);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, new);
+	KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 2);
+	io_opaque_data_put(store, send.data);
+
+	/* A store that is stopping lets nothing in. */
+	send.data = NULL;
+	WRITE_ONCE(store->dead, 1);
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), -ESHUTDOWN);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 1);
+	WRITE_ONCE(store->dead, 0);
+
+	/* No lookup here met a version that was gone. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow);
+
+	/*
+	 * A send that consumes its object takes tables itself, for it removes the handle, and
+	 * the table says so if it does not hold it: that would be a warning, which is counted.
+	 */
+	send.handle = second;
+	send.send_flags = IORING_OPAQUE_SEND_LAST;
+	kunit_warning_suppress(test) {
+		KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), 0);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 0);
+	}
+	KUNIT_EXPECT_TRUE(test, send.consumed);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, new);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 1);
+	io_opaque_data_put(store, send.data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * The version that a lookup has read is put for the last time before the lookup takes its
+ * reference. Its count is zero then, and the lookup finds that in the struct, which is still
+ * there; it asks the table again, finds the slot empty, and returns ESTALE without a version.
+ * One put frees it, and the extents are gone at once. If an earlier send still holds the
+ * version, the lookup takes its reference as it should: the send is ordered before the free.
+ */
+static void opaque_pin_retired(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	unsigned int held;
+
+	for (held = 0; held < 2; held++) {
+		struct io_opaque_data *data = opaque_sparse_data(test, store);
+		const u64 generation = 9 + held;
+		struct io_opaque_req send = {
+			.store = store, .handle = io_opaque_handle(0, generation),
+			.offset = 100, .length = 1000,
+		};
+		long slow = atomic_long_read(&io_opaque_pin_slow);
+		int ret;
+
+		opaque_test_publish(store, 0, generation, data);
+		if (held)
+			refcount_inc(&data->refs); /* an earlier send */
+		opaque_lk_open(test, store, opaque_lk_free, 0);
+		opaque_lk.watch = data;
+		ret = opaque_test_acquire(store, &send);
+		opaque_lk_close();
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+		if (!held) {
+			KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+			KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+			KUNIT_EXPECT_FALSE(test, send.consumed);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 1L);
+			/* The put in the window was the last, and the struct was still there. */
+			KUNIT_EXPECT_EQ(test, opaque_lk.before, 1);
+			KUNIT_EXPECT_EQ(test, opaque_lk.refs, 0);
+			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		} else {
+			KUNIT_EXPECT_EQ(test, ret, 0);
+			KUNIT_EXPECT_PTR_EQ(test, send.data, data);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 0L);
+			KUNIT_EXPECT_EQ(test, opaque_lk.before, 2);
+			KUNIT_EXPECT_EQ(test, opaque_lk.refs, 1);
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+			KUNIT_EXPECT_EQ(test, data->handle, send.handle);
+			io_opaque_data_put(store, send.data);
+			io_opaque_data_put(store, data);
+			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		}
+		kvfree_rcu_barrier();
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * The same in a send that the ring issues: the head owns the socket when it takes its
+ * references, and the lookup that finds the version gone asks the table again with it owned,
+ * which lockdep checks against the order of the locks. The send ends with ESTALE and holds
+ * nothing; no byte is sent and nobody is left waiting.
+ */
+static void opaque_pin_retired_send(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct sock *sk;
+	unsigned int mode;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_sndbuf(sk, SZ_1M);
+	for (mode = 0; mode < 2; mode++) {
+		struct io_opaque_data *data = opaque_sparse_data(test, store);
+		const u64 generation = 9 + mode;
+		struct io_opaque_req *head;
+		long calls = atomic_long_read(&io_opaque_send_locked_calls);
+		long slow = atomic_long_read(&io_opaque_pin_slow);
+		int ret;
+
+		opaque_test_publish(store, 0, generation, data);
+		head = opaque_wire_req(test, w, store, 0, 0, 100, 1000);
+		head->handle = io_opaque_handle(0, generation);
+		memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
+		opaque_lk_open(test, store, opaque_lk_free, 0);
+		opaque_lk.sk = sk;
+		ret = opaque_wire_issue(w, 0, !mode);
+		opaque_lk_close();
+		lockdep_assert_none_held_once();
+		KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 0);
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+		/* The lookup ran with the socket owned, as a head's does. */
+		KUNIT_EXPECT_TRUE(test, opaque_lk.owned);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 1L);
+		KUNIT_EXPECT_FALSE(test, head->consumed);
+		KUNIT_EXPECT_PTR_EQ(test, head->data, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, head->tx, NULL);
+		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+		KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+		KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls), calls);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		kvfree_rcu_barrier();
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A compaction is published in the window. If the old version is gone as well (its last
+ * reference put there) the lookup that read it asks the table again, finds the replacement
+ * and sends that: the handle was never freed, and ESTALE for it would be wrong. If the old
+ * version is still held, the lookup takes it, as the send that it is ordered before the
+ * publication; both have the bytes and the handle that was asked for.
+ */
+static void opaque_pin_compacted(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	unsigned int gone;
+
+	for (gone = 0; gone < 2; gone++) {
+		struct io_opaque_data *data = opaque_sparse_data(test, store), *replacement;
+		const u64 generation = 9 + gone;
+		struct io_opaque_req compact = {
+			.store = store, .data = data, .handle = io_opaque_handle(0, generation),
+		};
+		struct io_opaque_req send = {
+			.store = store, .handle = compact.handle, .offset = 100, .length = 1000,
+		};
+		long slow = atomic_long_read(&io_opaque_pin_slow);
+		u8 *source = kunit_kmalloc(test, data->length, GFP_KERNEL);
+		u8 *got = kunit_kmalloc(test, send.length, GFP_KERNEL);
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, source);
+		KUNIT_ASSERT_NOT_NULL(test, got);
+		opaque_test_publish(store, 0, generation, data);
+		opaque_test_copy(data, source);
+		refcount_inc(&data->refs); /* compaction worker */
+		KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+		replacement = compact.replacement;
+		opaque_lk_open(test, store, opaque_lk_compact, 0);
+		opaque_lk.compact = &compact;
+		opaque_lk.drop = gone;
+		ret = opaque_test_acquire(store, &send);
+		opaque_lk_close();
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+		KUNIT_EXPECT_EQ(test, opaque_lk.ret, 0);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), replacement);
+		KUNIT_EXPECT_EQ(test, replacement->handle, compact.handle);
+		KUNIT_EXPECT_EQ(test, send.data->handle, compact.handle);
+		KUNIT_EXPECT_EQ(test, copy_from_iter(got, send.length, &send.iter),
+				(size_t)send.length);
+		KUNIT_EXPECT_MEMEQ(test, got, source + send.offset, send.length);
+		if (gone) {
+			KUNIT_EXPECT_PTR_EQ(test, send.data, replacement);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 1L);
+			KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
+		} else {
+			KUNIT_EXPECT_PTR_EQ(test, send.data, data);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 0L);
+			/* The worker's reference and the send's; the table's went with the old. */
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+			io_opaque_data_put(store, compact.data);
+		}
+		io_opaque_compact_end(&compact);
+		io_opaque_data_put(store, send.data);
+		opaque_test_free(store, 0);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
+		kvfree_rcu_barrier();
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * The slot is freed and taken by another object in the window, as the last reference of the old
+ * one goes or while an earlier send holds it. Asking for the old handle never gets the new
+ * version, whatever order those happen in: the version that the lookup read is the old one,
+ * which it takes if it can, and then it is the right one for the handle; or it cannot, and the
+ * table, asked again, has a new generation in the slot.
+ */
+static void opaque_pin_reused(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	unsigned int held;
+
+	for (held = 0; held < 2; held++) {
+		struct io_opaque_data *old = opaque_sparse_data(test, store);
+		struct io_opaque_data *new = opaque_sparse_data(test, store);
+		const u64 generation = 9 + 2 * held;
+		struct io_opaque_req reuse = { .store = store, .data = new, .length = new->length };
+		struct io_opaque_req send = {
+			.store = store, .handle = io_opaque_handle(0, generation),
+			.offset = 100, .length = 1000,
+		};
+		long slow = atomic_long_read(&io_opaque_pin_slow);
+		int ret;
+
+		opaque_test_publish(store, 0, generation, old);
+		store->object_cursor = 0;
+		if (held)
+			refcount_inc(&old->refs); /* an earlier send */
+		opaque_lk_open(test, store, opaque_lk_reuse, 0);
+		opaque_lk.reuse = &reuse;
+		ret = opaque_test_acquire(store, &send);
+		opaque_lk_close();
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+		KUNIT_ASSERT_EQ(test, opaque_lk.ret, (int)new->length);
+		KUNIT_EXPECT_EQ(test, reuse.handle, io_opaque_handle(0, generation + 1));
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), new);
+		KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 1);
+		if (held) {
+			KUNIT_ASSERT_EQ(test, ret, 0);
+			KUNIT_EXPECT_PTR_EQ(test, send.data, old);
+			KUNIT_EXPECT_EQ(test, send.data->handle, send.handle);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 0L);
+			io_opaque_data_put(store, send.data);
+			io_opaque_data_put(store, old);
+		} else {
+			KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+			KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 1L);
+		}
+		opaque_test_free(store, 0);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		kvfree_rcu_barrier();
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * The entries of a vector that name one handle are a run: the first pins the version, and the
+ * rest use that pin and do not read the slot, which may hold another version by then. Here a
+ * compaction is published in the window of the first lookup, so the slot holds the
+ * replacement while the second entry is resolved; both entries have the old version, with a
+ * single reference between them, and the slot was read once. A handle that comes back after
+ * another is looked up again, and gets the replacement, in a vector for which the compaction is
+ * published in the window of the second lookup. The cursor reads the same bytes from either
+ * version.
+ */
+static void opaque_pin_vec_run(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	unsigned int again;
+
+	for (again = 0; again < 2; again++) {
+		struct io_opaque_data *a = opaque_sparse_data(test, store);
+		struct io_opaque_data *b = opaque_sparse_data(test, store), *replacement;
+		const u64 ha = io_opaque_handle(0, 9 + again), hb = io_opaque_handle(1, 7 + again);
+		/* Single segments: the extents are 2000 bytes, and 4000 to 6000 is the third. */
+		struct io_uring_opaque_send_entry ent[3] = {
+			{ .handle = ha, .off = 100, .len = 1000 },
+			{ .handle = again ? hb : ha, .off = again ? 0 : 5000,
+			  .len = again ? 500 : 1000 },
+			{ .handle = ha, .off = 9000, .len = 300 },
+		};
+		struct io_opaque_req compact = { .store = store, .data = a, .handle = ha };
+		const u32 nr = again ? 3 : 2;
+		struct io_opaque_req *op;
+		u8 *source[2];
+
+		source[0] = kunit_kmalloc(test, a->length, GFP_KERNEL);
+		source[1] = kunit_kmalloc(test, b->length, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, source[0]);
+		KUNIT_ASSERT_NOT_NULL(test, source[1]);
+		opaque_test_publish(store, 0, 9 + again, a);
+		opaque_test_publish(store, 1, 7 + again, b);
+		opaque_test_copy(a, source[0]);
+		opaque_test_copy(b, source[1]);
+		refcount_inc(&a->refs); /* compaction worker */
+		KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+		replacement = compact.replacement;
+		op = opaque_vec_new(test, store, ent, nr, 0);
+		KUNIT_ASSERT_GE(test, op->vec->cap_segs, nr);
+		/* The second case also takes the worker's reference off the old version there. */
+		opaque_lk_open(test, store, opaque_lk_compact, again);
+		opaque_lk.compact = &compact;
+		opaque_lk.drop = again;
+		KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
+		opaque_lk_close();
+		/* One lookup for the run of A; three for A, B and A again. */
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, again ? 3U : 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+		KUNIT_EXPECT_EQ(test, opaque_lk.ret, 0);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), replacement);
+		KUNIT_EXPECT_EQ(test, op->vec->pinned, nr);
+		KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], a);
+		if (!again) {
+			/* One reference for the run, and the worker's; the table's is gone. */
+			KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[1], a);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+			KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
+		} else {
+			KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[1], opaque_slot_data(store, 1));
+			KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[2], replacement);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+			KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
+		}
+		opaque_vec_expect_cursor(test, op);
+		opaque_vec_expect_bytes(test, op, source);
+		io_opaque_vec_release(op);
+		if (!again) {
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+			io_opaque_data_put(store, compact.data);
+		}
+		io_opaque_compact_end(&compact);
+		opaque_test_free(store, 0);
+		opaque_test_free(store, 1);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
+		kvfree_rcu_barrier();
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A vector that fails after it has pinned gives its references back with decrements, which
+ * cannot free: admission may own the socket. The last reference of a version is put, and the
+ * version freed, only if the table let go of it meanwhile. Here the second entry names a range
+ * that is not there, and the first object is freed in the window of the second lookup, so
+ * that the pin of the first entry is the last reference when the vector is unwound.
+ */
+static void opaque_pin_vec_unwind(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *a = opaque_sparse_data(test, store);
+	struct io_opaque_data *b = opaque_sparse_data(test, store);
+	struct io_uring_opaque_send_entry ent[2] = {
+		{ .handle = io_opaque_handle(0, 9), .off = 100, .len = 1000 },
+		{ .handle = io_opaque_handle(1, 7), .off = b->length - 10, .len = 20 },
+	};
+	struct io_opaque_req *op = opaque_vec_new(test, store, ent, 2, 0);
+	int ret;
+
+	opaque_test_publish(store, 0, 9, a);
+	opaque_test_publish(store, 1, 7, b);
+	opaque_lk_open(test, store, opaque_lk_free, 1);
+	opaque_lk.watch = a;
+	ret = opaque_vec_admit(op);
+	opaque_lk_close();
+	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
+	KUNIT_EXPECT_EQ(test, opaque_lk.calls, 2U);
+	KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+	/* The pin of the first entry was all that was left of A, and went with the unwinding. */
+	KUNIT_EXPECT_EQ(test, opaque_lk.refs, 1);
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)(40 * PAGE_SIZE));
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+	opaque_test_free(store, 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * The struct of a version outlives its last reference by a grace period: a reader that has
+ * the version from the table when the last reference is put can still read the count, and
+ * find it zero. The extents go with the put, as they always did. Under KASAN, a struct that
+ * was freed with the put is reported here.
+ */
+static void opaque_pin_grace(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store), *seen;
+	int refs;
+
+	opaque_test_publish(store, 0, 9, data);
+	rcu_read_lock();
+	seen = rcu_dereference(store->objects[0].data);
+	opaque_test_free(store, 0);
+	refs = refcount_read(&seen->refs);
+	rcu_read_unlock();
+	KUNIT_EXPECT_PTR_EQ(test, seen, data);
+	KUNIT_EXPECT_EQ(test, refs, 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+#define OPAQUE_PIN_READERS	2
+#define OPAQUE_PIN_TASKS	(OPAQUE_PIN_READERS + 1)
+#define OPAQUE_PIN_ROUNDS	20000
+#define OPAQUE_PIN_BYTES	4000
+
+enum opaque_pin_mode {
+	/* A new object each round, which the writer sends LAST. */
+	OPAQUE_PIN_LAST,
+	/* The same, freed. */
+	OPAQUE_PIN_FREE,
+	/* One object, whose version the writer replaces by compaction. */
+	OPAQUE_PIN_COMPACT,
+	/* Four objects, until the store stops. */
+	OPAQUE_PIN_STOP,
+};
+
+struct opaque_pin_race;
+
+struct opaque_pin_task {
+	struct opaque_pin_race *r;
+	unsigned int id;
+};
+
+struct opaque_pin_race {
+	struct io_opaque_store *store;
+	enum opaque_pin_mode mode;
+	/* The newest handle and the one before it; the readers ask for both. */
+	u64 handle, prev;
+	unsigned int nr;
+	atomic_t ready, go, stop, stopped;
+	/* Lookups that returned a version, found the handle stale, or the store stopped. */
+	atomic_long_t ok, stale, shutdown;
+	/* Anything else, or a version that was not the one asked for. */
+	atomic_long_t bad;
+	/* Rounds the writer got through. */
+	unsigned int rounds;
+	struct opaque_pin_task task[OPAQUE_PIN_TASKS];
+	struct completion done[OPAQUE_PIN_TASKS];
+};
+
+/*
+ * An object of two extents of 2000 bytes, made where an assertion cannot be used: NULL if
+ * there was no memory or no room.
+ */
+static struct io_opaque_data *opaque_pin_object(struct io_opaque_store *store)
+{
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	u32 i;
+
+	if (!data)
+		return NULL;
+	for (i = 0; i < 2; i++) {
+		struct page *page = alloc_page(GFP_KERNEL);
+		struct io_opaque_extent *extent;
+
+		if (!page)
+			goto fail;
+		extent = io_opaque_extent_new(store, page, 0, 2000, i * 2000, 0);
+		if (IS_ERR(extent)) {
+			__free_page(page);
+			goto fail;
+		}
+		list_add_tail(&extent->list, &data->extents);
+		data->length += 2000;
+	}
+	if (io_opaque_vector(data))
+		goto fail;
+	return data;
+fail:
+	io_opaque_data_put(store, data);
+	return NULL;
+}
+
+/* Publish @data in a free slot as RECV_OBJECT does. Returns its handle, or zero. */
+static u64 opaque_pin_publish(struct io_opaque_store *store, struct io_opaque_data *data)
+{
+	struct io_opaque_req op = { .store = store, .data = data, .length = data->length };
+	u64 flags = 0;
+
+	if (io_opaque_slot_reserve(&op))
+		return 0;
+	if (io_opaque_publish(&op, &flags) < 0)
+		return 0;
+	return op.handle;
+}
+
+/* Everything waits for the others, so that no task is over when another starts. */
+static void opaque_pin_start(struct opaque_pin_race *r)
+{
+	atomic_inc(&r->ready);
+	while (!atomic_read(&r->go))
+		cond_resched();
+}
+
+/*
+ * The window of the lookups, a little longer in some of them than it takes to get from the read
+ * to the reference, so that what the writer does is often done in it.
+ */
+static atomic_t opaque_pin_bare;
+
+static void opaque_pin_jitter(struct io_opaque_store *store)
+{
+	u32 r = get_random_u32();
+
+	if (!rcu_read_lock_held())
+		atomic_inc(&opaque_pin_bare);
+
+	if (!(r & 7))
+		udelay(1 + ((r >> 3) & 3));
+}
+
+/*
+ * Lookups of a send that does not consume what it names, as fast as they go: of the newest
+ * handle and of the one before it, which names a slot the writer has taken over since. A lookup
+ * that returns a version has the one it asked for, in full, and the range it asked for; one
+ * that does not says that the handle is stale (or, once the store has stopped, that it has).
+ */
+static int opaque_pin_reader(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	unsigned long n = 0;
+
+	opaque_pin_start(r);
+	while (!atomic_read(&r->stop)) {
+		/* If the store had stopped before this lookup began, it may only fail. */
+		bool after = atomic_read(&r->stopped);
+		u64 h = n & 1 ? READ_ONCE(r->prev) : READ_ONCE(r->handle);
+		struct io_opaque_req send = {
+			.store = r->store, .offset = 500, .length = 1000,
+		};
+		int ret;
+
+		if (r->mode == OPAQUE_PIN_STOP)
+			h = io_opaque_handle(n % 4, 9);
+		send.handle = h;
+		ret = io_opaque_send_acquire(&send);
+		if (!ret) {
+			if (after || send.consumed || send.data->handle != h ||
+			    send.data->length != OPAQUE_PIN_BYTES ||
+			    iov_iter_count(&send.iter) != send.length)
+				atomic_long_inc(&r->bad);
+			io_opaque_data_put(r->store, send.data);
+			atomic_long_inc(&r->ok);
+		} else if (ret == -ESTALE) {
+			atomic_long_inc(&r->stale);
+		} else if (ret == -ESHUTDOWN && r->mode == OPAQUE_PIN_STOP) {
+			atomic_long_inc(&r->shutdown);
+		} else {
+			atomic_long_inc(&r->bad);
+		}
+		if (!(++n & 63))
+			cond_resched();
+	}
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+/*
+ * Objects made, published, told to the readers and then taken away, in the slot that the one
+ * before had: sent LAST, which takes the table's reference and puts it, or freed.
+ */
+static int opaque_pin_writer(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	struct io_opaque_store *store = r->store;
+	unsigned int n;
+
+	opaque_pin_start(r);
+	for (n = 0; n < OPAQUE_PIN_ROUNDS && !atomic_read(&r->stop); n++) {
+		struct io_opaque_data *data = opaque_pin_object(store);
+		struct io_opaque_req last = {
+			.store = store, .length = OPAQUE_PIN_BYTES,
+			.send_flags = IORING_OPAQUE_SEND_LAST,
+		};
+		u64 h;
+
+		if (!data) {
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		h = opaque_pin_publish(store, data);
+		if (!h) {
+			io_opaque_data_put(store, data);
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		WRITE_ONCE(r->prev, READ_ONCE(r->handle));
+		WRITE_ONCE(r->handle, h);
+		udelay(get_random_u32_below(6));
+		if (r->mode == OPAQUE_PIN_LAST) {
+			last.handle = h;
+			if (io_opaque_send_acquire(&last) || !last.consumed ||
+			    last.data->handle != h)
+				atomic_long_inc(&r->bad);
+			else
+				io_opaque_data_put(store, last.data);
+		} else {
+			opaque_test_free(store, 0);
+		}
+		r->rounds = n + 1;
+	}
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+/*
+ * One object, which keeps its handle, and a version of it that is replaced over and over: the
+ * way compaction does it, with a reference on the version it copies, a copy published in its
+ * place and the references put after. The readers never see it go.
+ */
+static int opaque_pin_compactor(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	struct io_opaque_store *store = r->store;
+	unsigned int n;
+
+	opaque_pin_start(r);
+	for (n = 0; n < OPAQUE_PIN_ROUNDS / 3 && !atomic_read(&r->stop); n++) {
+		struct io_opaque_req compact = { .store = store, .handle = r->handle };
+		struct io_opaque_slot *slot;
+		int ret;
+
+		spin_lock(&store->tables);
+		slot = io_opaque_lookup(store, compact.handle);
+		compact.data = slot ? io_opaque_slot_data(store, slot) : NULL;
+		if (compact.data)
+			refcount_inc(&compact.data->refs);
+		spin_unlock(&store->tables);
+		if (!compact.data) {
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		ret = io_opaque_compact_build(&compact);
+		if (!ret)
+			ret = io_opaque_compact_publish(&compact);
+		if (ret)
+			atomic_long_inc(&r->bad);
+		io_opaque_data_put(store, compact.data);
+		io_opaque_data_put(store, compact.replacement);
+		io_opaque_compact_end(&compact);
+		udelay(get_random_u32_below(4));
+		r->rounds = n + 1;
+	}
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+/*
+ * Make the readers and, if there is one, the @writer, and let them go when all are running. They
+ * are made before any is woken, so that one that cannot be made takes the others down before
+ * they have run.
+ */
+static bool opaque_pin_launch(struct opaque_pin_race *r, int (*writer)(void *))
+{
+	struct task_struct *task[OPAQUE_PIN_TASKS];
+	unsigned int i;
+
+	r->nr = writer ? OPAQUE_PIN_TASKS : OPAQUE_PIN_READERS;
+	for (i = 0; i < r->nr; i++) {
+		r->task[i] = (struct opaque_pin_task) { .r = r, .id = i };
+		init_completion(&r->done[i]);
+		task[i] = kthread_create(i < OPAQUE_PIN_READERS ? opaque_pin_reader : writer,
+					 &r->task[i], "opaque_pin%u", i);
+		if (IS_ERR(task[i])) {
+			while (i--)
+				kthread_stop(task[i]);
+			return false;
+		}
+	}
+	for (i = 0; i < r->nr; i++)
+		wake_up_process(task[i]);
+	while (atomic_read(&r->ready) < r->nr)
+		cond_resched();
+	atomic_set(&r->go, 1);
+	return true;
+}
+
+/*
+ * Wait for the writer, then stop the readers and wait for them. Returns whether the writer was
+ * in time; if it was not, the readers stop it too, and it is waited for after them.
+ */
+static bool opaque_pin_finish(struct opaque_pin_race *r)
+{
+	bool timely = true;
+	unsigned int i;
+
+	if (r->nr > OPAQUE_PIN_READERS &&
+	    !wait_for_completion_timeout(&r->done[OPAQUE_PIN_READERS], 60 * HZ))
+		timely = false;
+	atomic_set(&r->stop, 1);
+	for (i = 0; i < OPAQUE_PIN_READERS; i++)
+		wait_for_completion(&r->done[i]);
+	if (!timely)
+		wait_for_completion(&r->done[OPAQUE_PIN_READERS]);
+	return timely;
+}
+
+/* The hook of the lookups is the jitter, and goes with the test. */
+static struct opaque_pin_race *opaque_pin_race_new(struct kunit *test, enum opaque_pin_mode mode)
+{
+	struct opaque_pin_race *r = kunit_kzalloc(test, sizeof(*r), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	r->store = opaque_test_store(test);
+	/* One slot, so that every round takes over the one the round before had. */
+	r->store->config.max_objects = 1;
+	r->mode = mode;
+	atomic_set(&opaque_pin_bare, 0);
+	opaque_lookup_hook(test, opaque_pin_jitter);
+	return r;
+}
+
+/* What every race expects at its end: nothing wrong, everything given back, the race run. */
+static void opaque_pin_expect(struct kunit *test, struct opaque_pin_race *r, long slow)
+{
+	struct io_opaque_store *store = r->store;
+
+	kunit_info(test,
+		   "%u rounds on %u CPUs: %ld lookups took a version, %ld found it stale, %ld were refused by the store, %ld met a version that was gone",
+		   r->rounds, num_online_cpus(), atomic_long_read(&r->ok),
+		   atomic_long_read(&r->stale), atomic_long_read(&r->shutdown),
+		   atomic_long_read(&io_opaque_pin_slow) - slow);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->bad), 0L);
+	/* Every lookup was in an RCU read-side section between the read and the reference. */
+	KUNIT_EXPECT_EQ(test, atomic_read(&opaque_pin_bare), 0);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->ok), 0L);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+	opaque_expect_lockdep(test, store);
+	/* It ran on the SMP configuration, as it says it needs: two CPUs at least. */
+	KUNIT_EXPECT_TRUE(test, IS_ENABLED(CONFIG_SMP));
+	KUNIT_EXPECT_GE(test, num_online_cpus(), 2U);
+	kvfree_rcu_barrier();
+}
+
+/*
+ * Lookups of a handle that is being consumed by a LAST send, which takes the table's reference
+ * with tables held, and of the one before it, whose slot has been taken over by the next object.
+ * Every lookup gets the version of the handle it asked for, whole, or ESTALE; the objects are
+ * all gone, bytes and extents, at the end. It needs two CPUs to race on.
+ */
+static void opaque_pin_smp_last(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_LAST);
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_writer));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&io_opaque_pin_slow), slow);
+	opaque_pin_expect(test, r, slow);
+}
+
+/* The same against FREE, which detaches under tables and puts after. It needs two CPUs. */
+static void opaque_pin_smp_free(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_FREE);
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_writer));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&io_opaque_pin_slow), slow);
+	opaque_pin_expect(test, r, slow);
+}
+
+/*
+ * Lookups of a handle whose version is replaced by compaction over and over. The handle is
+ * never freed, so no lookup may be told it is stale, whatever version it read; and whichever it
+ * pins, it is for that handle. Both the old and the new version end at a count of zero. It needs
+ * two CPUs to race on.
+ */
+static void opaque_pin_smp_compact(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_COMPACT);
+	{
+		struct io_opaque_data *data = opaque_pin_object(r->store);
+
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		r->handle = opaque_pin_publish(r->store, data);
+		KUNIT_ASSERT_NE(test, r->handle, 0ULL);
+		/* The readers ask for the newest handle and the one before: here they are one. */
+		r->prev = r->handle;
+	}
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_compactor));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS / 3);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->compactions), (s64)r->rounds);
+	opaque_test_free(r->store, 0);
+	opaque_pin_expect(test, r, slow);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->transient), 0LL);
+}
+
+/*
+ * The store stops while lookups go on: its objects are detached and put, the free of a version
+ * left to whichever lookup holds the last reference. Lookups that began after the stop was done
+ * fail; the others take a version or fail, and none gets one that is not what it asked for.
+ * Nothing is left behind. It needs two CPUs to race on.
+ */
+static void opaque_pin_smp_stop(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow), seen;
+	unsigned long until;
+	u32 i;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_STOP);
+	r->store->config.max_objects = 4;
+	INIT_LIST_HEAD(&r->store->copies);
+	INIT_DELAYED_WORK(&r->store->compact_work, io_opaque_compact_work);
+	INIT_DELAYED_WORK(&r->store->retry_work, io_opaque_retry_work);
+	opaque_test_cache(test, r->store, 2);
+	for (i = 0; i < 4; i++) {
+		struct io_opaque_data *data = opaque_pin_object(r->store);
+
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		opaque_test_publish(r->store, i, 9, data);
+	}
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, NULL));
+	until = jiffies + 10 * HZ;
+	while (atomic_long_read(&r->ok) < 2000 && time_before(jiffies, until))
+		usleep_range(100, 200);
+	io_opaque_stop(r->store);
+	atomic_set(&r->stopped, 1);
+	seen = atomic_long_read(&r->shutdown);
+	until = jiffies + 10 * HZ;
+	while (atomic_long_read(&r->shutdown) < seen + 2000 && time_before(jiffies, until))
+		usleep_range(100, 200);
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_GE(test, atomic_long_read(&r->shutdown), seen + 2000);
+	opaque_pin_expect(test, r, slow);
+}
+
+/*
  * SEND_ZC's notification and IORING_SEND_ZC_NO_RX_COPY, the counterpart of the managed sends
  * above that a registered-buffer send gets by asking for it. The notifications are built by
  * hand, as io_alloc_notif() and io_send_zc_prep() leave them, with no ring behind them, and
@@ -14121,6 +15169,14 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_vec_cursor_pinned),
 	KUNIT_CASE(opaque_send_vec_one_pass),
 	KUNIT_CASE(opaque_send_vec_admit_unwinds),
+	KUNIT_CASE(opaque_pin_handles),
+	KUNIT_CASE(opaque_pin_retired),
+	KUNIT_CASE(opaque_pin_retired_send),
+	KUNIT_CASE(opaque_pin_compacted),
+	KUNIT_CASE(opaque_pin_reused),
+	KUNIT_CASE(opaque_pin_vec_run),
+	KUNIT_CASE(opaque_pin_vec_unwind),
+	KUNIT_CASE(opaque_pin_grace),
 	KUNIT_CASE(opaque_send_vec_prep),
 	KUNIT_CASE(opaque_send_vec_prep_errors),
 	KUNIT_CASE(opaque_cleanup_calls),
@@ -14173,6 +15229,10 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_managed_pool),
 	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_stress),
 	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_close),
+	KUNIT_CASE_SLOW(opaque_pin_smp_last),
+	KUNIT_CASE_SLOW(opaque_pin_smp_free),
+	KUNIT_CASE_SLOW(opaque_pin_smp_compact),
+	KUNIT_CASE_SLOW(opaque_pin_smp_stop),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}
