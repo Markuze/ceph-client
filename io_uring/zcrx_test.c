@@ -1342,6 +1342,77 @@ static void zcrx_maio_condense(struct kunit *test)
 	zt_env_exit(test, &env);
 }
 
+/* A linear skb marked for recycling: ZT_CONDENSE_LEN bytes of @fill, and room for more. */
+static struct sk_buff *zt_linear_skb(struct kunit *test, u8 fill)
+{
+	struct sk_buff *skb = alloc_skb(4 * ZT_CONDENSE_LEN, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	memset(skb_put(skb, ZT_CONDENSE_LEN), fill, ZT_CONDENSE_LEN);
+	skb_mark_for_recycle(skb);
+	return skb;
+}
+
+/*
+ * skb_try_coalesce() copies all of @from into the tail room of a linear @to
+ * when it fits, as TCP's receive queue and backlog ask it to. A MAIO instance
+ * receives a page of its pools by reference, so the copy would turn the
+ * reference into a copy (io_zcrx_recv_head()). Such a frag moves to @to as a
+ * frag instead, and its bytes stay in the slot. A page of an ordinary pool is
+ * still copied.
+ */
+static void zcrx_maio_coalesce(struct kunit *test)
+{
+	struct sk_buff *to, *from;
+	struct page_pool *ordinary;
+	struct io_zcrx_slot s = {};
+	struct page *slot, *pooled;
+	struct zt_env env;
+	int delta = 0;
+	bool stolen;
+	u8 want[2 * ZT_CONDENSE_LEN];
+
+	zt_env_init(test, &env, 16, 1);
+	ordinary = zt_pool(test, env.dev, 1, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_ASSERT_NULL(test, ordinary->mp_ops);
+
+	/* A page of a pool without a provider fits the tail room: it is copied. */
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	to = zt_linear_skb(test, 0x33);
+	from = zt_condense_skb(test, pooled, 0x11, true);
+	KUNIT_EXPECT_TRUE(test, skb_try_coalesce(to, from, &stolen, &delta));
+	KUNIT_EXPECT_EQ(test, to->data_len, 0U);
+	KUNIT_EXPECT_EQ(test, skb_headlen(to), 2U * ZT_CONDENSE_LEN);
+	memset(want, 0x33, ZT_CONDENSE_LEN);
+	memset(want + ZT_CONDENSE_LEN, 0x11, ZT_CONDENSE_LEN);
+	if (skb_headlen(to) == 2 * ZT_CONDENSE_LEN)
+		KUNIT_EXPECT_MEMEQ(test, to->data, want, 2 * ZT_CONDENSE_LEN);
+	kfree_skb_partial(from, stolen);
+	consume_skb(to);
+
+	/* A slot of the area moves to @to as a frag, and stays a slot. */
+	slot = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	to = zt_linear_skb(test, 0x33);
+	from = zt_condense_skb(test, slot, 0x11, true);
+	KUNIT_EXPECT_TRUE(test, skb_try_coalesce(to, from, &stolen, &delta));
+	KUNIT_EXPECT_FALSE(test, stolen);
+	KUNIT_EXPECT_EQ(test, skb_headlen(to), (unsigned int)ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_EQ(test, to->data_len, (unsigned int)ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(to)->nr_frags, 1);
+	if (skb_shinfo(to)->nr_frags)
+		KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(&skb_shinfo(to)->frags[0]), slot);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(from)->nr_frags, 0);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(env.ifq, slot, 0, ZT_CONDENSE_LEN, true,
+						       &s));
+	kfree_skb_partial(from, stolen);
+	consume_skb(to);
+
+	page_pool_destroy(ordinary);
+	zt_env_exit(test, &env);
+}
+
 /*
  * A pool and a copy share one exhaustion episode. The first allocation that
  * finds the area empty counts it, whoever it is. A retry does not count again.
@@ -2111,6 +2182,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_page_slot),
 	KUNIT_CASE(zcrx_maio_net_iov_frag),
 	KUNIT_CASE(zcrx_maio_condense),
+	KUNIT_CASE(zcrx_maio_coalesce),
 	KUNIT_CASE(zcrx_maio_copy_episode),
 	KUNIT_CASE(zcrx_maio_queues),
 	KUNIT_CASE(zcrx_maio_queues_down),
