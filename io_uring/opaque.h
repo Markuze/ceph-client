@@ -46,7 +46,6 @@ struct io_opaque_req {
 	u16 collect_flags;
 	enum io_opaque_phase phase;
 	bool canceled;
-	bool counted;
 	bool slot_reserved;
 	bool consumed;
 	bool resolved;

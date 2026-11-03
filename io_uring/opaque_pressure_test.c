@@ -507,7 +507,6 @@ static void pressure_available_prep(struct kunit *test)
 	KUNIT_ASSERT_FALSE(test, io_opaque_cache_init(f->ctx));
 	xa_init(&f->ctx->opaque_stores);
 	mutex_init(&f->store.tables);
-	f->store.config.max_requests = 8;
 	ret = xa_err(xa_store(&f->ctx->opaque_stores, 1, &f->store, GFP_KERNEL));
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -531,7 +530,6 @@ static void pressure_available_prep(struct kunit *test)
 		}
 		req.flags = 0;
 	}
-	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.requests), 0);
 	xa_destroy(&f->ctx->opaque_stores);
 	io_opaque_cache_free(f->ctx);
 }

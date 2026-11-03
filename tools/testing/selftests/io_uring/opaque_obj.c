@@ -2279,7 +2279,6 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	cfg.hard_limit = 3 * sysconf(_SC_PAGESIZE);
 	cfg.compact_headroom = 0;
 	cfg.max_object_size = 8U << 20;
-	cfg.max_requests = 2;
 	require(!ring_init(&r, IORING_SETUP_CQE32), "budget ring");
 	require(!register_store(&r, &cfg, &context), "budget store");
 	tcp_pair(pair);
@@ -2301,18 +2300,10 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	pending = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, 3, 1, NULL);
 	write_all(pair[0], &byte, 1);
 	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
-		"STAT admitted at pending limit");
+		"STAT with a collector waiting for budget");
 	require(stat.backing_bytes == cfg.hard_limit, "budget full");
-	{
-		uint64_t last = send_stage_flags(&r, context, pair[0], objects[0], 0, 1,
-						 IORING_OPAQUE_SEND_LAST, 0, 0);
-
-		event = wait_tag(&r, last);
-		require(event.res == -EAGAIN && !(event.flags & IORING_CQE_F_OPAQUE_CONSUMED),
-			"request admission rejects LAST without consuming");
-	}
 	require(!command(&r, context, IORING_OPAQUE_FREE, objects[0], 0, 0, NULL).res,
-		"FREE admitted at pending limit");
+		"FREE with a collector waiting for budget");
 	event = wait_tag(&r, pending);
 	require(event.res == 1, "budget release resumes collector");
 	objects[3] = event.extra[0];
@@ -2327,7 +2318,7 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	ring_exit(&r);
 	close(pair[0]);
 	close(pair[1]);
-	ksft_test_result_pass("budget stall/resume, control admission and discard at capacity\n");
+	ksft_test_result_pass("budget stall/resume and discard at capacity\n");
 }
 
 static void wait_unread(int fd, unsigned int length)
@@ -4193,11 +4184,11 @@ static void create_drained(struct ring *r, uint32_t context)
 	for (i = 0; i < 1000; i++) {
 		require(!command(r, context, IORING_OPAQUE_STAT, 0, 0,
 				 sizeof(stat), &stat).res, "CREATE drain STAT");
-		if (!stat.backing_bytes && !stat.extents && !stat.objects && !stat.requests)
+		if (!stat.backing_bytes && !stat.extents && !stat.objects)
 			return;
 		usleep(1000);
 	}
-	require(false, "CREATE backing, extents, objects and requests drain");
+	require(false, "CREATE backing, extents and objects drain");
 }
 
 static void test_create(struct io_uring_opaque_config cfg)
@@ -4465,23 +4456,7 @@ static void test_create_quota(struct io_uring_opaque_config cfg)
 		"CREATE slot release");
 	create_drained(&r, context);
 	ring_exit(&r);
-
-	cfg.max_objects = 8;
-	cfg.max_requests = 1;
-	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE request cap ring");
-	require(!register_store(&r, &cfg, &context), "CREATE request cap store");
-	handles[0] = cmd_stage(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
-	handles[1] = cmd_stage(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
-	event = wait_tag(&r, handles[1]);
-	require(event.res == -EAGAIN && !event.extra[0] && !event.extra[1],
-		"CREATE counts against request cap");
-	event = wait_tag(&r, handles[0]);
-	require(event.res == 1 && event.extra[0], "CREATE admitted request completes");
-	require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
-		"CREATE request cap FREE");
-	create_drained(&r, context);
-	ring_exit(&r);
-	ksft_test_result_pass("CREATE slot exhaustion and counted request admission\n");
+	ksft_test_result_pass("CREATE slot exhaustion\n");
 }
 
 static void test_create_cancel(struct io_uring_opaque_config cfg)
@@ -6312,7 +6287,6 @@ int main(void)
 		.max_objects = 128,
 		.max_streams = 16,
 		.max_extents = 65536,
-		.max_requests = 256,
 	};
 	struct io_uring_opaque_object_stat object_stat;
 	struct io_uring_opaque_stat stat;

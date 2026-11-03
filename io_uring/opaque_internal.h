@@ -470,7 +470,6 @@ struct io_opaque_store {
 	spinlock_t transient_lock;
 	seqcount_spinlock_t transient_seq;
 	atomic_t extents;
-	atomic_t requests;
 	atomic_t memory_mode;
 	/* Completed ubufs of managed sends, for the next skbs; none if there was no memory. */
 	struct io_opaque_ubuf_pool *ubuf_pool;
@@ -640,7 +639,6 @@ extern atomic_long_t io_opaque_vec_counted;
 extern atomic_long_t io_opaque_budget_wakes;
 int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk);
 int io_opaque_tx_settle_head(struct io_opaque_req *op);
-void io_opaque_req_uncount(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);

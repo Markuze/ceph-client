@@ -782,8 +782,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	    !cfg.max_object_size || cfg.max_object_size > INT_MAX ||
 	    !cfg.max_objects || cfg.max_objects > 16384 ||
 	    !cfg.max_streams || cfg.max_streams > 1024 ||
-	    cfg.max_extents < 4 || cfg.max_extents > 65536 ||
-	    !cfg.max_requests || cfg.max_requests > 4096)
+	    cfg.max_extents < 4 || cfg.max_extents > 65536)
 		return ERR_PTR(-EINVAL);
 	if (!IS_ALIGNED(cfg.reply_reserve, PAGE_SIZE) ||
 	    cfg.reply_reserve >= cfg.hard_limit - cfg.compact_headroom ||
@@ -941,7 +940,6 @@ void io_opaque_free(struct io_opaque_store *store)
 	io_opaque_stop(store);
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
 	WARN_ON_ONCE(atomic_read(&store->extents));
-	WARN_ON_ONCE(atomic_read(&store->requests));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_opaque_txs_free(store);
 	io_opaque_ubuf_pool_close(store->ubuf_pool);
@@ -986,38 +984,29 @@ void io_opaque_put(struct io_opaque_store *store)
 }
 
 /*
- * A request from the ring's cache, or a new one, that counts against the store's
- * limit unless it is a control request, and has nothing set but the flag that
- * the core cleans it up: a recycled one is what the last request left. The caller
- * sets what it reads, all of the request but its block of a vector in
+ * A request from the ring's cache, or a new one, with nothing set but the flag
+ * that the core cleans it up: a recycled one is what the last request left. The
+ * caller sets what it reads, all of the request but its block of a vector in
  * io_opaque_req_alloc(), only what the opcode reads in io_opaque_send_prep().
  */
 static struct io_opaque_req *io_opaque_req_get(struct io_kiocb *req,
-					       struct io_opaque_store *store, bool control)
+					       struct io_opaque_store *store)
 {
 	struct io_opaque_req *op;
 
 	if (READ_ONCE(store->dead))
 		return ERR_PTR(-ESHUTDOWN);
-	if (!control && atomic_inc_return(&store->requests) > store->config.max_requests) {
-		atomic_dec(&store->requests);
-		return ERR_PTR(-EAGAIN);
-	}
 	op = io_uring_alloc_async_data(&req->ctx->opaque_cache, req);
-	if (!op) {
-		if (!control)
-			atomic_dec(&store->requests);
+	if (!op)
 		return ERR_PTR(-ENOMEM);
-	}
 	req->flags |= REQ_F_NEED_CLEANUP;
 	return op;
 }
 
 static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
-						 struct io_opaque_store *store,
-						 bool control)
+						 struct io_opaque_store *store)
 {
-	struct io_opaque_req *op = io_opaque_req_get(req, store, control);
+	struct io_opaque_req *op = io_opaque_req_get(req, store);
 
 	if (IS_ERR(op))
 		return op;
@@ -1026,7 +1015,6 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 	op->op = U16_MAX;
 	op->req = req;
 	op->store = store;
-	op->counted = !control;
 	op->retry_at = jiffies;
 	INIT_LIST_HEAD(&op->wait);
 	INIT_LIST_HEAD(&op->cancel);
@@ -1042,23 +1030,6 @@ static void io_opaque_req_free(struct io_ring_ctx *ctx, struct io_opaque_req *op
 	if (!io_alloc_cache_put(&ctx->opaque_cache, op)) {
 		kvfree(op->vec);
 		kvfree(op);
-	}
-}
-
-/*
- * Give back a request's place in the store's count of requests, once: the flag
- * says whether it still has one. A send that ends with its socket owned gives it
- * back there, where the locked decrement is part of the stretch in which the
- * socket is not waited for. Cleanup gives it back for every request that has not,
- * the sends that never got so far among them. Needs neither the ring lock nor the
- * socket.
- */
-VISIBLE_IF_KUNIT void io_opaque_req_uncount(struct io_opaque_req *op)
-{
-	KUNIT_STATIC_STUB_REDIRECT(io_opaque_req_uncount, op);
-	if (op->counted) {
-		op->counted = false;
-		atomic_dec(&op->store->requests);
 	}
 }
 
@@ -2070,7 +2041,7 @@ int io_opaque_recv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    (flags & ~IORING_RECVSEND_POLL_FIRST) ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FORCE_ASYNC)))
 		return -EINVAL;
-	op = io_opaque_req_alloc(req, store, false);
+	op = io_opaque_req_alloc(req, store);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	op->op = U16_MAX - 1;
@@ -2474,7 +2445,6 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	struct io_opaque_req *op;
 	u64 end;
 	u16 cmd = READ_ONCE(sqe->ioprio);
-	bool control;
 
 	if (!store)
 		return -ENXIO;
@@ -2483,9 +2453,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    cmd > IORING_OPAQUE_OBJECT_EXTENTS ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
-	control = cmd == IORING_OPAQUE_FREE || cmd == IORING_OPAQUE_STAT ||
-		  cmd == IORING_OPAQUE_STREAM_CLOSE || cmd == IORING_OPAQUE_SET_POLICY;
-	op = io_opaque_req_alloc(req, store, control);
+	op = io_opaque_req_alloc(req, store);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	op->op = cmd;
@@ -2704,7 +2672,6 @@ static int io_opaque_stat(struct io_opaque_req *op)
 		.compacted_bytes = atomic64_read(&store->compacted),
 		.compact_count = atomic64_read(&store->compactions),
 		.extents = atomic_read(&store->extents),
-		.requests = atomic_read(&store->requests),
 		.framing_bytes = atomic64_read(&store->framing),
 		.framing_copied_bytes = atomic64_read(&store->framing_copied),
 		.memory_mode = io_opaque_memory_mode(store),
@@ -3074,8 +3041,6 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	}
 	if (op->stream)
 		io_opaque_stream_put(op->stream);
-	if (op->counted)
-		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
@@ -3084,11 +3049,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
 /*
  * Request cleanup of a send, which holds only what a send can hold: a place in
  * a queue, a frame and its charge, references (a version, and those of a vector in
- * its block), a place in the count of requests, and the block. A send that ended
- * with its socket owned has given back all but the frame and the decision about
- * the block (io_opaque_send()); any other has all of them to give back here, once,
- * and each is given back only if it is there: a call that is made to find that
- * out is a call for nothing.
+ * its block), and the block. A send that ended with its socket owned has given
+ * back all but the frame and the decision about the block (io_opaque_send()); any
+ * other has all of them to give back here, once, and each is given back only if it
+ * is there: a call that is made to find that out is a call for nothing.
  *
  * A send is on neither list that a waker walks under wait_lock, budget_waits and
  * copies, so it has no waker to wait out, and takes the lock only if its entry is
@@ -3120,8 +3084,6 @@ void io_opaque_send_cleanup(struct io_kiocb *req)
 		io_opaque_vec_cleanup(op);
 	if (op->data)
 		io_opaque_data_put(store, op->data);
-	if (op->counted)
-		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
@@ -3806,7 +3768,7 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
 	    (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
 		return -EINVAL;
-	op = io_opaque_req_get(req, store, false);
+	op = io_opaque_req_get(req, store);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	IO_OPAQUE_SEND_POISON_REQ(op);
@@ -3820,7 +3782,6 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	op->op = U16_MAX;
 	op->phase = IO_OPAQUE_IDLE;
 	op->canceled = false;
-	op->counted = true;
 	op->consumed = false;
 	op->resolved = false;
 	op->tx = NULL;
@@ -5062,15 +5023,12 @@ finish:
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
 	/*
-	 * The references go with the socket, the last of a version after it, and so does
-	 * the request's place in the store's count: what cleanup is left to give back for
-	 * this send is the request itself.
+	 * The references go with the socket, the last of a version after it: what cleanup
+	 * is left to give back for this send is the request itself.
 	 */
 	left = false;
-	if (owned) {
+	if (owned)
 		left = io_opaque_send_unpin_cheap(op);
-		io_opaque_req_uncount(op);
-	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*
