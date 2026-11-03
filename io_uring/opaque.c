@@ -3726,7 +3726,7 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 #if IS_ENABLED(CONFIG_KUNIT)
 /*
  * Fill the request of a send with the poison of the test (io_opaque_send_poison)
- * before the send sets what it reads, as the message and the cursor are filled
+ * before the send sets what it reads, as the message and the msg_ubuf are filled
  * in io_opaque_send(), so that a field that is read before it is written does not
  * get away with what the last request left, or with zero. Not the block of a
  * vector, which a request brings along.
@@ -4163,7 +4163,7 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 static struct kmem_cache *io_opaque_ubuf_cache __ro_after_init;
 
 VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops;
-VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_cursor_ops;
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_msg_ubuf_ops;
 
 VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
 {
@@ -4421,7 +4421,7 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * the next skb instead.
  *
  * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
- * the cursor names the pool and has one, else the cache's. TCP does not set
+ * the msg_ubuf names the pool and has one, else the cache's. TCP does not set
  * skb->sk on a skb of its write queue, so the allocation has no socket to take
  * its mask from. GFP_KERNEL is what a user's socket allocates its skbs with.
  */
@@ -4431,9 +4431,9 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 	struct ubuf_info *cur = skb_zcopy(skb);
 	struct io_opaque_ubuf *u;
 
-	/* TCP passes the send's cursor; a caller that is not a send passes none. */
-	if (uarg && uarg->ops == &io_opaque_cursor_ops)
-		pool = container_of(uarg, struct io_opaque_send_cursor, uarg)->pool;
+	/* TCP passes the msg_ubuf of the send; a caller that is not a send passes none. */
+	if (uarg && uarg->ops == &io_opaque_msg_ubuf_ops)
+		pool = container_of(uarg, struct io_opaque_msg_ubuf, uarg)->pool;
 	if (cur) {
 		if (cur->ops != &io_opaque_ubuf_ops ||
 		    skb_shinfo(skb)->nr_frags >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
@@ -4469,20 +4469,20 @@ VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops = {
 
 /*
  * The ops of what msg_ubuf points at during a managed send, a struct
- * io_opaque_send_cursor on the stack of io_opaque_send(), for
+ * io_opaque_msg_ubuf on the stack of io_opaque_send(), for
  * skb_zerocopy_iter_stream() to find link_skb through. TCP never links it to
  * an skb, because link_skb has given each skb its own, and it must not: it
  * lives for the one call. The one path that would is fast open, whose SYN
  * takes the msg_ubuf of its first send; a socket that could take that path is
  * not sent managed, and a send never has MSG_FASTOPEN.
  */
-static void io_opaque_cursor_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
+static void io_opaque_msg_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
 {
 	WARN_ON_ONCE(1);
 }
 
-VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_cursor_ops = {
-	.complete	= io_opaque_cursor_complete,
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_msg_ubuf_ops = {
+	.complete	= io_opaque_msg_ubuf_complete,
 	.link_skb	= io_opaque_link_skb,
 };
 
@@ -4643,7 +4643,7 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 /*
  * Whether a body that is spliced goes out as managed fragments: when the
  * send calls tcp_sendmsg_locked() itself, not on a socket that TCP fast open
- * could take (see io_opaque_cursor_ops), and unless the evaluation
+ * could take (see io_opaque_msg_ubuf_ops), and unless the evaluation
  * parameter turned it off. Anywhere else the body is spliced as before.
  */
 static bool io_opaque_sends_managed(const struct sock *sk)
@@ -4685,17 +4685,17 @@ atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_SEND_LOCKED_CALL()	atomic_long_inc(&io_opaque_send_locked_calls)
 /*
  * Called with the message of every part of a frame, just before it goes to TCP
- * (@owned) or to sock_sendmsg(), and the send's cursor, for a test to look at.
+ * (@owned) or to sock_sendmsg(), and the send's msg_ubuf, for a test to look at.
  */
 void (*io_opaque_send_part)(const struct msghdr *msg,
-			    const struct io_opaque_send_cursor *cursor, bool owned);
-#define IO_OPAQUE_SEND_PART(msg, cursor, owned)				\
+			    const struct io_opaque_msg_ubuf *mub, bool owned);
+#define IO_OPAQUE_SEND_PART(msg, mub, owned)				\
 	do {								\
 		if (io_opaque_send_part)				\
-			io_opaque_send_part((msg), (cursor), (owned));	\
+			io_opaque_send_part((msg), (mub), (owned));	\
 	} while (0)
 /*
- * A byte that a test fills the message and the cursor of a send with before they
+ * A byte that a test fills the message and the msg_ubuf of a send with before they
  * are set (-1: leave them), so that a field that is read before it is written
  * does not get away with a zero.
  */
@@ -4707,7 +4707,7 @@ int io_opaque_send_poison = -1;
 	} while (0)
 #else
 #define IO_OPAQUE_SEND_LOCKED_CALL()	((void)0)
-#define IO_OPAQUE_SEND_PART(msg, cursor, owned)	((void)(msg), (void)(cursor), (void)(owned))
+#define IO_OPAQUE_SEND_PART(msg, mub, owned)	((void)(msg), (void)(mub), (void)(owned))
 #define IO_OPAQUE_SEND_POISON(p)	((void)(p))
 #endif
 
@@ -4841,9 +4841,9 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct socket *sock = sock_from_file(req->file);
 	/*
 	 * Neither is zeroed on entry, as CONFIG_INIT_STACK_ALL_ZERO would: the message
-	 * is zeroed once below, and the cursor is set when a body is managed.
+	 * is zeroed once below, and the msg_ubuf is set when a body is managed.
 	 */
-	struct io_opaque_send_cursor cursor __uninitialized;
+	struct io_opaque_msg_ubuf mub __uninitialized;
 	struct msghdr msg __uninitialized;
 	struct sock *sk = NULL;
 	struct kvec vec;
@@ -4852,7 +4852,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	bool joined = false;
 	int ret, sec = 0;
 
-	IO_OPAQUE_SEND_POISON(&cursor);
+	IO_OPAQUE_SEND_POISON(&mub);
 	IO_OPAQUE_SEND_POISON(&msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
@@ -4949,10 +4949,10 @@ again:
 		splice = io_opaque_send_splices(op);
 		if (splice && owned && io_opaque_sends_managed(sk)) {
 			/* The ubuf_info is whole: its ops, no count and no flags. */
-			cursor.uarg = (struct ubuf_info) { .ops = &io_opaque_cursor_ops };
-			cursor.pool = READ_ONCE(op->store->ubuf_pool);
+			mub.uarg = (struct ubuf_info) { .ops = &io_opaque_msg_ubuf_ops };
+			mub.pool = READ_ONCE(op->store->ubuf_pool);
 			msg.msg_flags |= MSG_ZEROCOPY;
-			msg.msg_ubuf = &cursor.uarg;
+			msg.msg_ubuf = &mub.uarg;
 			msg.sg_from_iter = io_opaque_sg_from_iter;
 		} else if (splice) {
 			msg.msg_flags |= MSG_SPLICE_PAGES;
@@ -4967,14 +4967,14 @@ again:
 		iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &vec, 1, vec.iov_len);
 	if (owned) {
 		IO_OPAQUE_SEND_LOCKED_CALL();
-		IO_OPAQUE_SEND_PART(&msg, &cursor, true);
+		IO_OPAQUE_SEND_PART(&msg, &mub, true);
 		ret = tcp_sendmsg_locked(sk, &msg, iov_iter_count(&msg.msg_iter));
 		if (trace_sock_send_length_enabled())
 			trace_sock_send_length(sk, ret, 0);
 	} else {
 		/* io-wq may block in TCP; other requests must retain access to the ring. */
 		io_ring_submit_unlock(req->ctx, issue_flags);
-		IO_OPAQUE_SEND_PART(&msg, &cursor, false);
+		IO_OPAQUE_SEND_PART(&msg, &mub, false);
 		ret = sock_sendmsg(sock, &msg);
 		io_ring_submit_lock(req->ctx, issue_flags);
 	}

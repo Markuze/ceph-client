@@ -2046,7 +2046,7 @@ struct opaque_test_params {
 	bool copy_per_page;
 	bool send_managed;
 	int send_poison;
-	void (*send_part)(const struct msghdr *msg, const struct io_opaque_send_cursor *cursor,
+	void (*send_part)(const struct msghdr *msg, const struct io_opaque_msg_ubuf *mub,
 			  bool owned);
 };
 
@@ -3848,7 +3848,7 @@ struct opaque_send_case {
 
 /*
  * What each part of a frame was sent with, as io_opaque_send_part() saw it just
- * before the part went to TCP: the message, the cursor, and whether the socket
+ * before the part went to TCP: the message, the msg_ubuf, and whether the socket
  * was owned.
  */
 #define OPAQUE_PARTS_MAX	8
@@ -3857,12 +3857,12 @@ static struct {
 	unsigned int n;
 	struct {
 		struct msghdr msg;
-		struct io_opaque_send_cursor cursor;
+		struct io_opaque_msg_ubuf mub;
 		bool own_ubuf, owned;
 	} part[OPAQUE_PARTS_MAX];
 } opaque_parts;
 
-static void opaque_test_part(const struct msghdr *msg, const struct io_opaque_send_cursor *cursor,
+static void opaque_test_part(const struct msghdr *msg, const struct io_opaque_msg_ubuf *mub,
 			     bool owned)
 {
 	unsigned int n = opaque_parts.n++;
@@ -3870,8 +3870,8 @@ static void opaque_test_part(const struct msghdr *msg, const struct io_opaque_se
 	if (n >= OPAQUE_PARTS_MAX)
 		return;
 	opaque_parts.part[n].msg = *msg;
-	opaque_parts.part[n].cursor = *cursor;
-	opaque_parts.part[n].own_ubuf = msg->msg_ubuf == &cursor->uarg;
+	opaque_parts.part[n].mub = *mub;
+	opaque_parts.part[n].own_ubuf = msg->msg_ubuf == &mub->uarg;
 	opaque_parts.part[n].owned = owned;
 }
 
@@ -3955,12 +3955,12 @@ static void opaque_parts_expect(struct kunit *test, const struct opaque_part_wan
 		KUNIT_EXPECT_EQ_MSG(test, opaque_parts.part[i].own_ubuf, managed,
 				    "part %u of %u", i, n);
 		if (managed) {
-			const struct io_opaque_send_cursor *cursor = &opaque_parts.part[i].cursor;
+			const struct io_opaque_msg_ubuf *mub = &opaque_parts.part[i].mub;
 
-			/* The cursor as TCP has it: its ops, no count and no flags. */
-			KUNIT_EXPECT_PTR_EQ(test, cursor->uarg.ops, &io_opaque_cursor_ops);
-			KUNIT_EXPECT_EQ(test, refcount_read(&cursor->uarg.refcnt), 0);
-			KUNIT_EXPECT_EQ(test, cursor->uarg.flags, (u8)0);
+			/* The msg_ubuf as TCP has it: its ops, no count and no flags. */
+			KUNIT_EXPECT_PTR_EQ(test, mub->uarg.ops, &io_opaque_msg_ubuf_ops);
+			KUNIT_EXPECT_EQ(test, refcount_read(&mub->uarg.refcnt), 0);
+			KUNIT_EXPECT_EQ(test, mub->uarg.flags, (u8)0);
 		}
 	}
 }
@@ -12267,7 +12267,7 @@ static void opaque_managed_boundary(struct kunit *test)
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
-	struct ubuf_info cursor = { .ops = &io_opaque_ubuf_ops };
+	struct ubuf_info uarg = { .ops = &io_opaque_ubuf_ops };
 	struct bio_vec *bv = kunit_kcalloc(test, 40, sizeof(*bv), GFP_KERNEL);
 	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
 	u8 *got = kunit_kmalloc(test, 40000, GFP_KERNEL);
@@ -12302,7 +12302,7 @@ static void opaque_managed_boundary(struct kunit *test)
 	}
 	sk = w->tx->sk;
 	msg.msg_flags = MSG_ZEROCOPY;
-	msg.msg_ubuf = &cursor;
+	msg.msg_ubuf = &uarg;
 	msg.sg_from_iter = opaque_test_spy_fill;
 	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bv, 40, 40000);
 	memset(&opaque_fill_spy, 0, sizeof(opaque_fill_spy));
@@ -12392,20 +12392,20 @@ static void opaque_ubuf_complete_atomic(struct kunit *test)
 	}
 }
 
-/* The cursor of a send as io_opaque_send() sets it where a body is managed: its ops. */
-static struct io_opaque_send_cursor opaque_new_cursor(void)
+/* The msg_ubuf of a send as io_opaque_send() sets it where a body is managed: its ops. */
+static struct io_opaque_msg_ubuf opaque_new_msg_ubuf(void)
 {
-	return (struct io_opaque_send_cursor) { .uarg.ops = &io_opaque_cursor_ops };
+	return (struct io_opaque_msg_ubuf) { .uarg.ops = &io_opaque_msg_ubuf_ops };
 }
 
 /*
- * The pool of ubufs that a store keeps. A test makes a pool and the cursor of a send that names
+ * The pool of ubufs that a store keeps. A test makes a pool and the msg_ubuf of a send that names
  * it, as io_opaque_send() hands one to TCP, and closes the pool as the store would unless the
- * test has done so already. The skbs of a test are linked to a ubuf through that cursor.
+ * test has done so already. The skbs of a test are linked to a ubuf through that msg_ubuf.
  */
 struct opaque_pool {
 	struct io_opaque_ubuf_pool *pool;
-	struct io_opaque_send_cursor cursor;
+	struct io_opaque_msg_ubuf mub;
 	bool closed;
 };
 
@@ -12424,8 +12424,8 @@ static struct opaque_pool *opaque_pool_new(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, p);
 	p->pool = io_opaque_ubuf_pool_new();
 	KUNIT_ASSERT_NOT_NULL(test, p->pool);
-	p->cursor = opaque_new_cursor();
-	p->cursor.pool = p->pool;
+	p->mub = opaque_new_msg_ubuf();
+	p->mub.pool = p->pool;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_pool_close_action, p), 0);
 	return p;
 }
@@ -12436,14 +12436,14 @@ static void opaque_pool_close(struct opaque_pool *p)
 	io_opaque_ubuf_pool_close(p->pool);
 }
 
-/* A skb with a ubuf, as TCP has link_skb() give it one for the cursor of a send. */
+/* A skb with a ubuf, as TCP has link_skb() give it one for the msg_ubuf of a send. */
 static struct sk_buff *opaque_pool_skb(struct kunit *test, struct opaque_pool *p)
 {
 	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, skb);
 	skb->ip_summed = CHECKSUM_PARTIAL;
-	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, &p->cursor.uarg), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, &p->mub.uarg), 0);
 	KUNIT_ASSERT_NOT_NULL(test, skb_zcopy(skb));
 	return skb;
 }
@@ -12504,7 +12504,7 @@ static unsigned int opaque_pool_held(struct io_opaque_ubuf_pool *pool, unsigned 
 
 /*
  * A skb gets the ubuf of one that completed, and gets it whole, as a ubuf made new is: one
- * reference, no folios, none of the cursor of the send that had it before, the flags and the ops
+ * reference, no folios, none of the msg_ubuf of the send that had it before, the flags and the ops
  * of one of ours. The cache is not asked while the pool has one: the ubufs made stay as many as
  * the skbs that are in use at once, however many skbs there are, and the counter says which
  * were reused.
@@ -12842,7 +12842,7 @@ static void opaque_ubuf_pool_store(struct kunit *test)
 		/* Ignored: any value registers, which kernels before this change refused. */
 		.max_requests = U32_MAX,
 	};
-	struct io_opaque_send_cursor cursor = opaque_new_cursor();
+	struct io_opaque_msg_ubuf mub = opaque_new_msg_ubuf();
 	struct opaque_pool_snap before, after;
 	struct sk_buff *skb[3];
 	struct io_opaque_store *store;
@@ -12858,12 +12858,12 @@ static void opaque_ubuf_pool_store(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, store->ubuf_pool);
 	opaque_pool_read(&after);
 	KUNIT_EXPECT_EQ(test, after.pools - before.pools, 1L);
-	/* The cursor of a send of this store, as io_opaque_send() sets it. */
-	cursor.pool = READ_ONCE(store->ubuf_pool);
+	/* The msg_ubuf of a send of this store, as io_opaque_send() sets it. */
+	mub.pool = READ_ONCE(store->ubuf_pool);
 	for (i = 0; i < ARRAY_SIZE(skb); i++) {
 		skb[i] = alloc_skb(0, GFP_KERNEL);
 		KUNIT_ASSERT_NOT_NULL(test, skb[i]);
-		KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb[i], &cursor.uarg), 0);
+		KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb[i], &mub.uarg), 0);
 	}
 	/* One of three completes and is the pool's; the store goes with the other two. */
 	kfree_skb(skb[0]);
@@ -13034,7 +13034,7 @@ static int opaque_race_taker(void *data)
 			continue;
 		}
 		skb->ip_summed = CHECKSUM_PARTIAL;
-		if (io_opaque_link_skb(skb, &r->p->cursor.uarg)) {
+		if (io_opaque_link_skb(skb, &r->p->mub.uarg)) {
 			kfree_skb(skb);
 			atomic_long_inc(&r->bad);
 			continue;

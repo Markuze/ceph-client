@@ -397,11 +397,12 @@ struct io_opaque_ubuf_pool {
 };
 
 /*
- * What msg_ubuf points at during one managed tcp_sendmsg_locked(): the ops that
+ * What a managed send hands to link_skb() through msg_ubuf: the ops, which
  * skb_zerocopy_iter_stream() finds link_skb() through, and the pool of the send's
- * store, for the ubufs of its skbs.
+ * store, for the ubufs of the skbs that link_skb() makes. It lives on the stack of
+ * io_opaque_send() for one tcp_sendmsg_locked(), and no skb is ever linked to it.
  */
-struct io_opaque_send_cursor {
+struct io_opaque_msg_ubuf {
 	struct ubuf_info uarg;
 	/* The pool of the send's store, for the ubufs of its skbs; or none. */
 	struct io_opaque_ubuf_pool *pool;
@@ -645,7 +646,7 @@ void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
 extern const struct ubuf_info_ops io_opaque_ubuf_ops;
-extern const struct ubuf_info_ops io_opaque_cursor_ops;
+extern const struct ubuf_info_ops io_opaque_msg_ubuf_ops;
 extern atomic_long_t io_opaque_ubufs_live;
 extern atomic_long_t io_opaque_ubuf_pools_live;
 struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
@@ -658,7 +659,7 @@ int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
 			    const struct io_opaque_req *op);
 extern atomic_long_t io_opaque_send_locked_calls;
 extern void (*io_opaque_send_part)(const struct msghdr *msg,
-				   const struct io_opaque_send_cursor *cursor,
+				   const struct io_opaque_msg_ubuf *mub,
 				   bool owned);
 extern int io_opaque_send_poison;
 int io_opaque_create_build(struct io_opaque_req *op);
