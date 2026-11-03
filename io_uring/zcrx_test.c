@@ -1093,6 +1093,188 @@ static void zcrx_maio_net_iov_frag(struct kunit *test)
 	zt_env_exit(test, &env);
 }
 
+#define ZT_CONDENSE_LEN	100
+
+/*
+ * An skb with room in its head for 4 * ZT_CONDENSE_LEN bytes and one frag of
+ * ZT_CONDENSE_LEN bytes of @fill in @page. The skb takes over the reference
+ * that the caller holds on @page. @mark makes the skb hold pool references, as
+ * the skb of a driver does.
+ */
+static struct sk_buff *zt_condense_skb(struct kunit *test, struct page *page,
+				       u8 fill, bool mark)
+{
+	struct sk_buff *skb = alloc_skb(4 * ZT_CONDENSE_LEN, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	memset(page_address(page), fill, PAGE_SIZE);
+	skb_add_rx_frag(skb, 0, page, 0, ZT_CONDENSE_LEN, PAGE_SIZE);
+	if (mark)
+		skb_mark_for_recycle(skb);
+	return skb;
+}
+
+/* Put @child in the frag list of @head, as GRO or the reassembly of fragments does. */
+static void zt_condense_chain(struct sk_buff *head, struct sk_buff *child)
+{
+	skb_shinfo(head)->frag_list = child;
+	head->len += child->len;
+	head->data_len += child->len;
+	head->truesize += child->truesize;
+}
+
+/* The bytes are in the head, and no frag and no list is left. */
+static void zt_expect_condensed(struct kunit *test, struct sk_buff *skb,
+				u8 first, u8 second, unsigned int len)
+{
+	u8 want[2 * ZT_CONDENSE_LEN];
+
+	memset(want, first, ZT_CONDENSE_LEN);
+	memset(want + ZT_CONDENSE_LEN, second, ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_EQ(test, skb->data_len, 0U);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 0);
+	KUNIT_EXPECT_NULL(test, skb_shinfo(skb)->frag_list);
+	KUNIT_EXPECT_EQ(test, skb_headlen(skb), len);
+	if (skb_headlen(skb) == len)
+		KUNIT_EXPECT_MEMEQ(test, skb->data, want, len);
+}
+
+/* Nothing was pulled: the head is empty and the frag still holds @page. */
+static void zt_expect_kept(struct kunit *test, struct sk_buff *skb,
+			   struct page *page)
+{
+	KUNIT_EXPECT_EQ(test, skb_headlen(skb), 0U);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 1);
+	if (skb_shinfo(skb)->nr_frags)
+		KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(&skb_shinfo(skb)->frags[0]), page);
+}
+
+/*
+ * skb_condense() pulls the bytes of an skb into its head, if they fit, and
+ * frees the frags. A MAIO instance receives a page of its pools by reference,
+ * so the pull would turn the reference into a copy. The skb keeps such a frag,
+ * also in the frag list. There each skb has a mark of its own: the head may
+ * have none, and the skb that carries the page has one. Every other page goes
+ * the usual way. An skb without the mark holds a pool page by a plain
+ * reference at most, which does not pin the pool, so the function does not
+ * look at the page. The instance copies such a page anyway, see
+ * io_zcrx_maio_page_slot().
+ */
+static void zcrx_maio_condense(struct kunit *test)
+{
+	struct page *plain, *slot, *slot2, *pooled;
+	struct sk_buff *skb, *child;
+	struct page_pool *ordinary;
+	struct io_zcrx_slot s = {};
+	struct zt_env env;
+	u64 off;
+
+	zt_env_init(test, &env, 16, 1);
+	ordinary = zt_pool(test, env.dev, 1, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_ASSERT_NULL(test, ordinary->mp_ops);
+
+	/* A page that no pool owns is pulled. */
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	skb = zt_condense_skb(test, plain, 0x11, false);
+	skb_condense(skb);
+	zt_expect_condensed(test, skb, 0x11, 0, ZT_CONDENSE_LEN);
+	consume_skb(skb);
+
+	/* So is a page of a pool without a provider, in an skb that is marked. */
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	skb = zt_condense_skb(test, pooled, 0x11, true);
+	skb_condense(skb);
+	zt_expect_condensed(test, skb, 0x11, 0, ZT_CONDENSE_LEN);
+	consume_skb(skb);
+
+	/* A slot of the area, in a pool of the instance, stays where it is. */
+	slot = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	KUNIT_ASSERT_TRUE(test, io_zcrx_maio_page_off(env.ifq, slot, &off));
+	KUNIT_ASSERT_TRUE(test, io_zcrx_maio_page_owned(env.ifq, slot));
+	skb = zt_condense_skb(test, slot, 0x11, true);
+	skb_condense(skb);
+	zt_expect_kept(test, skb, slot);
+	KUNIT_EXPECT_EQ(test, skb->data_len, (unsigned int)ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(env.ifq, slot, 0, ZT_CONDENSE_LEN, true,
+						       &s));
+	consume_skb(skb);
+
+	/* An skb that holds the slot by a plain reference gets it pulled. */
+	slot = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	get_page(slot);
+	skb = zt_condense_skb(test, slot, 0x11, false);
+	skb_condense(skb);
+	zt_expect_condensed(test, skb, 0x11, 0, ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_slot(env.ifq, slot, 0, ZT_CONDENSE_LEN, false,
+							&s));
+	consume_skb(skb);
+	zt_free(env.pp[0], slot);
+
+	/* The slot sits in the frag list, and the head has no mark: it stays. */
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	slot = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	skb = zt_condense_skb(test, plain, 0x11, false);
+	child = zt_condense_skb(test, slot, 0x22, true);
+	zt_condense_chain(skb, child);
+	skb_condense(skb);
+	KUNIT_EXPECT_PTR_EQ(test, skb_shinfo(skb)->frag_list, child);
+	KUNIT_EXPECT_EQ(test, skb->data_len, 2U * ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, 1);
+	if (skb_shinfo(skb)->frag_list == child)
+		zt_expect_kept(test, child, slot);
+	consume_skb(skb);
+
+	/* The head is marked and holds a page of an ordinary pool: the same. */
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	slot = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	skb = zt_condense_skb(test, pooled, 0x11, true);
+	child = zt_condense_skb(test, slot, 0x22, true);
+	zt_condense_chain(skb, child);
+	skb_condense(skb);
+	KUNIT_EXPECT_PTR_EQ(test, skb_shinfo(skb)->frag_list, child);
+	KUNIT_EXPECT_EQ(test, skb->data_len, 2U * ZT_CONDENSE_LEN);
+	if (skb_shinfo(skb)->frag_list == child)
+		zt_expect_kept(test, child, slot);
+	consume_skb(skb);
+
+	/* A list of ordinary pages is pulled whole, the pages of both skbs. */
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	skb = zt_condense_skb(test, plain, 0x11, false);
+	child = zt_condense_skb(test, pooled, 0x22, true);
+	zt_condense_chain(skb, child);
+	skb_condense(skb);
+	zt_expect_condensed(test, skb, 0x11, 0x22, 2 * ZT_CONDENSE_LEN);
+	consume_skb(skb);
+
+	/* The slot in an unmarked skb of the list is pulled, like the plain reference above. */
+	slot2 = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot2);
+	get_page(slot2);
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	skb = zt_condense_skb(test, plain, 0x11, false);
+	child = zt_condense_skb(test, slot2, 0x22, false);
+	zt_condense_chain(skb, child);
+	skb_condense(skb);
+	zt_expect_condensed(test, skb, 0x11, 0x22, 2 * ZT_CONDENSE_LEN);
+	consume_skb(skb);
+	zt_free(env.pp[0], slot2);
+
+	page_pool_destroy(ordinary);
+	zt_env_exit(test, &env);
+}
+
 /*
  * A pool and a copy share one exhaustion episode. The first allocation that
  * finds the area empty counts it, whoever it is. A retry does not count again.
@@ -1860,6 +2042,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_copy_refill),
 	KUNIT_CASE(zcrx_maio_page_slot),
 	KUNIT_CASE(zcrx_maio_net_iov_frag),
+	KUNIT_CASE(zcrx_maio_condense),
 	KUNIT_CASE(zcrx_maio_copy_episode),
 	KUNIT_CASE(zcrx_maio_queues),
 	KUNIT_CASE(zcrx_maio_queues_down),

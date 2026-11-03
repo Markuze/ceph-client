@@ -10,7 +10,6 @@
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
@@ -96,6 +95,49 @@ static void require(bool ok, const char *what)
 {
 	if (!ok)
 		ksft_exit_fail_msg("%s: errno=%d (%s)\n", what, errno, strerror(errno));
+}
+
+/* The seconds that one wait for the network may take. */
+#define WAIT_LIMIT	120
+#define STR_(x)		#x
+#define STR(x)		STR_(x)
+
+static const char *volatile test_name;	/* the test that main() runs */
+static const char *volatile wait_name;	/* the wait that the alarm watches */
+
+static void say(const char *text)
+{
+	ssize_t n = write(STDOUT_FILENO, text, strlen(text));
+
+	(void)n;
+}
+
+/*
+ * The default action of SIGALRM kills the process without a word. Name the
+ * test that waited too long, and the wait, in the words that TAP has for a
+ * test that cannot go on, and end the run.
+ */
+static void wait_timeout(int signal_number)
+{
+	(void)signal_number;
+	say("Bail out! ");
+	say(test_name ? test_name : "?");
+	say(": ");
+	say(wait_name ? wait_name : "?");
+	say(" took more than " STR(WAIT_LIMIT) " s\n");
+	_exit(KSFT_FAIL);
+}
+
+/* Let the alarm watch a wait for the network. @what names the wait. */
+static void wait_begin(const char *what)
+{
+	wait_name = what;
+	alarm(WAIT_LIMIT);
+}
+
+static void wait_end(void)
+{
+	alarm(0);
 }
 
 static int ring_init(struct ring *r, unsigned int flags)
@@ -718,14 +760,14 @@ static void recv_stream(int fd, uint64_t pos, size_t len, unsigned int seed)
 	size_t done = 0;
 
 	require(buf, "buffer for the stream");
-	alarm(120);
+	wait_begin(__func__);
 	while (done < len) {
 		ssize_t n = recv(fd, buf + done, len - done, 0);
 
 		require(n > 0, "receive the stream with recv");
 		done += n;
 	}
-	alarm(0);
+	wait_end();
 	require(check_stream(buf, pos, len, seed), "recv gets the bytes that the peer sent");
 	free(buf);
 }
@@ -791,7 +833,7 @@ static void rx_drain(struct ring *r, struct rx *rx)
 /* Run the ring until @bytes bytes arrived or the request ended. */
 static void rx_wait(struct ring *r, struct rx *rx, uint64_t bytes)
 {
-	alarm(120);
+	wait_begin(__func__);
 	for (;;) {
 		rx_drain(r, rx);
 		if (rx->bytes >= bytes || rx->done)
@@ -801,7 +843,7 @@ static void rx_wait(struct ring *r, struct rx *rx, uint64_t bytes)
 	/* Run the deferred work that is left, so that the event CQEs are in. */
 	enter(r, 0);
 	rx_drain(r, rx);
-	alarm(0);
+	wait_end();
 }
 
 /* Close the sending side and wait for the CQE that ends the request. */
@@ -1038,36 +1080,39 @@ static int sysfs_write(const char *path, const char *text)
 	return ret;
 }
 
+/* The tests run in a network namespace of their own, see own_netns(). */
+static bool own_ns;
+
 /*
- * Create a netdevsim device with one port. Return the index of its interface,
- * or 0. udev can rename the interface at any time after this, also while it is
- * up, so the tests address it by index and never by name.
+ * Create a netdevsim device with one port, in the network namespace of the
+ * calling thread. Return the index of the interface of the port, or 0. The
+ * port is the interface that the namespace did not have before: the net
+ * directory of the device in sysfs lists the interfaces of the namespace that
+ * mounted /sys, and no others. The tests address the interface by index and
+ * never by name.
  */
 static unsigned int nsim_create(unsigned int id, unsigned int queues)
 {
-	char path[128], text[64], name[IFNAMSIZ];
+	struct if_nameindex *before, *after, *a, *b;
 	unsigned int ifindex = 0;
-	struct dirent *de;
-	DIR *dir;
-	int i;
+	char text[64];
 
-	snprintf(text, sizeof(text), "%u 1 %u", id, queues);
-	if (sysfs_write("/sys/bus/netdevsim/new_device", text))
+	if (!own_ns)
 		return 0;
-	snprintf(path, sizeof(path), "/sys/bus/netdevsim/devices/netdevsim%u/net", id);
-	/* A rename between the listing and the lookup hides the name: list again. */
-	for (i = 0; i < 10 && !ifindex; i++) {
-		dir = opendir(path);
-		if (!dir)
-			return 0;
-		name[0] = 0;
-		while ((de = readdir(dir)))
-			if (de->d_name[0] != '.')
-				snprintf(name, IFNAMSIZ, "%.*s", IFNAMSIZ - 1, de->d_name);
-		closedir(dir);
-		if (name[0])
-			ifindex = if_nametoindex(name);
+	before = if_nameindex();
+	if (!before)
+		return 0;
+	snprintf(text, sizeof(text), "%u 1 %u", id, queues);
+	after = sysfs_write("/sys/bus/netdevsim/new_device", text) ? NULL : if_nameindex();
+	for (a = after; a && a->if_index && !ifindex; a++) {
+		for (b = before; b->if_index && b->if_index != a->if_index; b++)
+			;
+		if (!b->if_index)
+			ifindex = a->if_index;
 	}
+	if (after)
+		if_freenameindex(after);
+	if_freenameindex(before);
 	return ifindex;
 }
 
@@ -1111,6 +1156,29 @@ static int link_up(unsigned int ifindex)
 		ret = if_ioctl(ifindex, SIOCSIFFLAGS, &ifr);
 	}
 	return ret;
+}
+
+/*
+ * Run in a network namespace of our own, with its loopback device up. In the
+ * namespace of the host, a port that a test creates is not ours alone: udev
+ * and the network manager of the host act on it. systemd-networkd, with a
+ * .network file that matches every device (the fallback that dracut writes
+ * has DHCP=yes), removes the address that the test gave the port, some tens
+ * of milliseconds later. The frames of the peer then reach no local address,
+ * and the test waits for bytes that never come. Nothing else sees a port in a
+ * namespace of our own.
+ *
+ * Without the privilege to unshare, the tests that need a port skip.
+ */
+static void own_netns(void)
+{
+	if (unshare(CLONE_NEWNET)) {
+		ksft_print_msg("no network namespace of our own, the netdevsim tests skip: %s\n",
+			       strerror(errno));
+		return;
+	}
+	require(!link_up(if_nametoindex("lo")), "bring up the loopback device");
+	own_ns = true;
 }
 
 static int set_channels(unsigned int ifindex, unsigned int combined)
@@ -1438,12 +1506,12 @@ static int connect_peer(struct pair *pr, int idx, int listener, uint16_t port)
 	int fd;
 
 	inet_pton(AF_INET, LOCAL_ADDR, &addr.sin_addr);
-	alarm(120);
+	wait_begin(__func__);
 	require(!connect(pr->peer.socks[idx], (void *)&addr, sizeof(addr)),
 		"connect the peer to port A");
 	fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
 	require(fd >= 0, "accept the connection of the peer");
-	alarm(0);
+	wait_end();
 	return fd;
 }
 
@@ -1543,10 +1611,10 @@ static void test_netdevsim_rx(void)
 	require(!rx.nr_event[ZCRX_EVENT_ALLOC_FAIL], "no allocation failure event");
 	/*
 	 * The frames pass by reference, so no fragment is copied. The counters
-	 * and the event see the copy of a fragment only. A copy from the linear
-	 * part of an skb is not counted. The check of the reuse below and the
-	 * check of the offset in the page, for the second ring, tell a copy
-	 * from a reference too.
+	 * and the event see every copy, also the copy from the linear part of
+	 * an skb: io_zcrx_copy_chunk() counts both. The check of the reuse
+	 * below and the check of the offset in the page, for the second ring,
+	 * tell a copy from a reference too.
 	 */
 	require(!stat_read(&st->copy_count) && !stat_read(&st->copy_bytes),
 		"no fragment is copied");
@@ -2078,6 +2146,13 @@ static void test_memlock(void)
 	ksft_test_result_pass("the area counts against the memory limit, a failure releases it\n");
 }
 
+/* Run a test, and keep its name for the message of the alarm. */
+#define RUN(test, ...)						\
+	do {							\
+		test_name = #test;				\
+		test(__VA_ARGS__);				\
+	} while (0)
+
 int main(void)
 {
 	struct rlimit lim = { RLIM_INFINITY, RLIM_INFINITY };
@@ -2092,7 +2167,9 @@ int main(void)
 
 	page_size = sysconf(_SC_PAGESIZE);
 	ksft_print_header();
+	signal(SIGALRM, wait_timeout);
 	setrlimit(RLIMIT_MEMLOCK, &lim);
+	own_netns();
 	ret = ring_init(&r, IORING_SETUP_CQE32);
 	if (ret)
 		ksft_exit_skip("io_uring unavailable: %s\n", strerror(-ret));
@@ -2102,26 +2179,26 @@ int main(void)
 		ksft_exit_skip("MAIO mode is unavailable\n");
 	ksft_set_plan(PLAN);
 
-	test_register_map(&r);
-	test_two_instances(&r);
-	test_flag_validation(&r);
-	test_refill_ring(&r);
-	test_add_area(&r);
-	test_capability();
-	test_recv_copy(&r);
-	test_recv_exhaust(&r);
-	test_loopback(&r);
-	test_large_area(&r);
-	test_memlock();
-	test_device();
-	test_device_removal();
-	test_netdevsim_rx();
-	test_netdevsim_foreign();
-	test_netdevsim_exhaust();
-	test_netdevsim_head();
-	test_charge_last_user();
+	RUN(test_register_map, &r);
+	RUN(test_two_instances, &r);
+	RUN(test_flag_validation, &r);
+	RUN(test_refill_ring, &r);
+	RUN(test_add_area, &r);
+	RUN(test_capability);
+	RUN(test_recv_copy, &r);
+	RUN(test_recv_exhaust, &r);
+	RUN(test_loopback, &r);
+	RUN(test_large_area, &r);
+	RUN(test_memlock);
+	RUN(test_device);
+	RUN(test_device_removal);
+	RUN(test_netdevsim_rx);
+	RUN(test_netdevsim_foreign);
+	RUN(test_netdevsim_exhaust);
+	RUN(test_netdevsim_head);
+	RUN(test_charge_last_user);
 	/* The last test closes the first ring. */
-	test_export_import(&r);
+	RUN(test_export_import, &r);
 
 	ksft_finished();
 }
