@@ -40,6 +40,8 @@
 #define IO_OPAQUE_SEEK_STRIDE	16
 /* Slots of the table of handles that a policy change walks while it holds tables. */
 #define IO_OPAQUE_POLICY_CHUNK	256
+/* Backings that one call of the actor leaves undecided; more settle at once. */
+#define IO_OPAQUE_PENDING_MAX	64
 
 /* What io_opaque_tx_join() returns besides an error. */
 /* Queued behind another frame and parked, with its references taken. */
@@ -51,22 +53,48 @@
 
 struct io_zcrx_ifq;
 
+/*
+ * What a backing holds of its page, which is how the last release gives it
+ * back. The unit is one reference of that kind.
+ */
+enum io_opaque_ref {
+	/*
+	 * Nothing yet: capture has not decided whether the skb passes its
+	 * reference on or the backing takes one. No backing is released in
+	 * this state.
+	 */
+	IO_OPAQUE_REF_PENDING,
+	/* A page reference, dropped with folio_put_refs(). */
+	IO_OPAQUE_REF_PAGE,
+	/*
+	 * A page pool fragment reference, as the stack takes for an skb marked
+	 * for recycling. The last one hands the page back to its pool.
+	 */
+	IO_OPAQUE_REF_PP,
+	/*
+	 * A pool reference of the MAIO instance that the store binds. The
+	 * last one goes through io_zcrx_maio_page_put().
+	 */
+	IO_OPAQUE_REF_MAIO,
+	/* A destination unit of compaction or CREATE, which the unit cache may keep. */
+	IO_OPAQUE_REF_UNIT,
+};
+
 struct io_opaque_backing {
 	refcount_t refs;
+	u32 filled;
 	struct page *page;
 	u64 charge;
-	u32 filled;
+	/* How many references of kind @ref the backing holds on the page. */
+	u16 units;
+	/* An enum io_opaque_ref. */
+	u8 ref;
+	/* While @ref is pending, the kind of reference that settles it. */
+	u8 want;
 	bool copied;
 	bool accounted;
-	/* Compaction or CREATE destination the unit cache may keep. */
-	bool owned;
 	/* The page is in the area of the MAIO instance that the store binds. */
 	bool area;
-	/*
-	 * The reference to the page is a pool reference of that instance. The
-	 * last release goes through io_zcrx_maio_page_put(), not put_page().
-	 */
-	bool pool;
 };
 
 struct io_opaque_extent {
@@ -78,11 +106,38 @@ struct io_opaque_extent {
 	bool embedded;
 };
 
-/* One allocation for the common capture; splits allocate only an extent. */
+struct io_opaque_block;
+
+/* The common capture: a backing and its first extent. A split allocates only an extent. */
 struct io_opaque_chunk {
 	struct io_opaque_backing backing;
 	struct io_opaque_extent extent;
+	struct io_opaque_block *block;
 };
+
+/*
+ * Chunks are allocated in blocks, so that a stream that keeps a page per
+ * fragment allocates once per IO_OPAQUE_BLOCK_CHUNKS pages and not once per
+ * page. @live counts what keeps the block: a chunk until its backing is
+ * released, and in the current block of a stream the chunks that are still to
+ * be handed out and the hold of the stream. The last to let go frees the block.
+ * A chunk of CREATE or compaction is a block of its own.
+ */
+struct io_opaque_block {
+	refcount_t live;
+	u32 nr;
+	/* Chunks handed out; changed by the stream that owns the block, under its lock. */
+	u32 used;
+	struct io_opaque_chunk chunk[];
+};
+
+/*
+ * Chunks, and so backings, that a stream allocates at a time: as many as fit in
+ * an object of 4 KiB with the header of the block. A smaller block leaves part of
+ * the object unused, and the next size class is twice as large.
+ */
+#define IO_OPAQUE_BLOCK_CHUNKS \
+	((int)((SZ_4K - sizeof(struct io_opaque_block)) / sizeof(struct io_opaque_chunk)))
 
 struct io_opaque_data {
 	refcount_t refs;
@@ -173,6 +228,31 @@ struct io_opaque_vec {
 	struct bio_vec *bv;
 };
 
+/*
+ * Where the bytes of a capture come from, when the pass that captures them may
+ * take over the reference of the skb to the page: the skb, which is the one
+ * that TCP handed to the actor or a child on its frag_list, the index of the
+ * fragment in it, or -1 for its head, and whether the fragment lies wholly at or
+ * after the offset at which the pass began.
+ */
+struct io_opaque_src {
+	struct sk_buff *skb;
+	s16 frag;
+	bool from_entry;
+};
+
+/*
+ * A backing that a pass created or joined, and the fragment it did so for. The
+ * pass settles them when it has consumed what it came for, see
+ * io_opaque_actor().
+ */
+struct io_opaque_pending {
+	struct io_opaque_backing *backing;
+	struct io_opaque_src src;
+	/* Settled: the reference of the skb to the fragment passed to the backing. */
+	bool moved;
+};
+
 struct io_opaque_stream {
 	refcount_t refs;
 	/* Extents, range decisions and collector state. */
@@ -181,6 +261,8 @@ struct io_opaque_stream {
 	struct file *file;
 	struct sock_rx_owner owner;
 	struct list_head extents;
+	/* The block that capture takes its next chunk from, or NULL. */
+	struct io_opaque_block *block;
 	struct list_head reads;
 	struct rb_root_cached decisions;
 	struct io_opaque_req *collector;
@@ -193,6 +275,17 @@ struct io_opaque_stream {
 	bool closed;
 	/* Collection pass may not take undecided bytes off the socket. */
 	bool hold_undecided;
+	/*
+	 * The call of the actor that is under way, if any: the references that
+	 * its captures have still to settle. Attaching the stream allocates the
+	 * room for IO_OPAQUE_PENDING_MAX of them, and the last put frees it. Under
+	 * lock, as everything else of the capture.
+	 */
+	bool in_call;
+	/* The offset in the skb at which the call began. */
+	u32 call_entry;
+	u32 nr_pending;
+	struct io_opaque_pending *pending;
 };
 
 /*
@@ -243,6 +336,12 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_COMPACT_BYTES,
 	IO_OPAQUE_STAT_FRAMING_COPIED,
 	IO_OPAQUE_STAT_BODY_COPIED,
+	/* Pages that capture got by the reference of the skb, by its own reference, by a copy. */
+	IO_OPAQUE_STAT_PAGES_STOLEN,
+	IO_OPAQUE_STAT_PAGES_HELD,
+	IO_OPAQUE_STAT_PAGES_COPIED,
+	/* Blocks of chunks that streams allocated. */
+	IO_OPAQUE_STAT_CHUNK_BLOCKS,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -367,6 +466,41 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 #define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store already */
 #define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
 
+/*
+ * How the capture holds the page of a new backing. AREA and POOL exist only for
+ * a store that binds a MAIO instance, and PP only for one that does not.
+ */
+enum io_opaque_hold {
+	/* A page reference, taken here. */
+	IO_OPAQUE_HOLD_PAGE,
+	/*
+	 * A page pool fragment reference, taken here, to a page that a page
+	 * pool owns, in an skb that is marked for recycling.
+	 */
+	IO_OPAQUE_HOLD_PP,
+	/*
+	 * A page reference to an area page, taken here, when no pool reference
+	 * is possible. Either no pool of the instance owns the page, or the skb
+	 * holds only a page reference to it. The page is an outsider page for
+	 * the area. For example, the process may have passed it to a send as
+	 * user memory, and the send came back over loopback. The bytes are
+	 * visible through the mapping, so the backing counts as in the area.
+	 * If a pool owns the page when it returns, the instance parks the page
+	 * in limbo until this reference ends.
+	 */
+	IO_OPAQUE_HOLD_AREA,
+	/*
+	 * A pool reference to an area page, taken here. A pool of the instance
+	 * owns the page.
+	 */
+	IO_OPAQUE_HOLD_POOL,
+	/*
+	 * A copy page. The reference of the caller passes to the backing. The
+	 * page is a page of the area if the store binds an instance.
+	 */
+	IO_OPAQUE_HOLD_COPY,
+};
+
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 					      struct page *page, u32 offset,
 					      u32 length, u64 start,
@@ -395,6 +529,13 @@ int io_opaque_compact_start(struct io_opaque_req *op);
 int io_opaque_set_policy(struct io_opaque_req *op);
 
 #if IS_ENABLED(CONFIG_KUNIT)
+unsigned int io_opaque_hold_flags(enum io_opaque_hold hold);
+struct io_opaque_extent *io_opaque_stream_extent_new(struct io_opaque_stream *stream,
+						     struct page *page, u32 offset,
+						     u32 length, u64 start,
+						     unsigned int flags);
+void io_opaque_block_retire(struct io_opaque_stream *stream);
+void io_opaque_capture_release(struct io_opaque_stream *stream);
 void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation);
 void io_opaque_extent_free(struct io_opaque_store *store,
 			   struct io_opaque_extent *extent);
@@ -419,9 +560,8 @@ void io_opaque_budget_wait(struct io_opaque_req *op, int error);
 void io_opaque_stream_close(struct io_opaque_stream *stream);
 void io_opaque_stream_put(struct io_opaque_stream *stream);
 int io_opaque_attach(struct io_opaque_req *op);
-int io_opaque_capture(struct io_opaque_stream *stream,
-		      const struct sk_buff *skb, u32 offset, u32 len,
-		      bool shared);
+int io_opaque_capture(struct io_opaque_stream *stream, struct sk_buff *skb,
+		      u32 offset, u32 len, bool shared);
 int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 		    unsigned int offset, size_t length);
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);

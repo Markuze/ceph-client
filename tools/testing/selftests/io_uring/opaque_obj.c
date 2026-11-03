@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/ethtool.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/opaque.h>
 #include <linux/sockios.h>
@@ -6043,6 +6045,263 @@ static void test_maio_device_small(struct io_uring_opaque_config cfg)
 	ksft_test_result_pass("store on a port: a full area makes an object wait for a free\n");
 }
 
+/*
+ * The collector of a stream runs in the ring that attached the socket, and with
+ * DEFER_TASKRUN its work waits until that ring is entered. Keep the ring of the
+ * collector going while another ring of the store waits for a completion.
+ */
+static struct event wait_tag_pumped(struct ring *collector, struct ring *r, uint64_t tag)
+{
+	struct timespec start, now;
+	struct event event;
+	unsigned int i;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		enter(collector, 0);
+		enter(r, 0);
+		for (i = 0; i < r->nr_saved; i++) {
+			if (r->saved[i].tag == tag) {
+				event = r->saved[i];
+				r->saved[i] = r->saved[--r->nr_saved];
+				return event;
+			}
+		}
+		while (peek(r, &event)) {
+			if (event.tag == tag)
+				return event;
+			require(r->nr_saved < 64, "pumped completion stash");
+			r->saved[r->nr_saved++] = event;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		require((now.tv_sec - start.tv_sec) * 1000 +
+			(now.tv_nsec - start.tv_nsec) / 1000000 < 10000, "pumped CQ wait deadline");
+		usleep(1000);
+	}
+}
+
+/*
+ * A store that two rings share. The collector runs in the first ring, and the
+ * second names the stream in a RECV_OBJECT, so the completion is task work of the
+ * second ring: it publishes the object there, and the application reads and
+ * frees it there. Rounds alternate between a range that waits for the bytes and
+ * bytes that wait for the range. The captured pages have to be the object's by
+ * the time the second ring completes it, and come back to the store when it is
+ * freed, whichever ring completes the range.
+ */
+static void test_shared_stream(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 3 * 4096 + 100;
+	unsigned char *data = malloc(2 * length), *got = data + length;
+	struct io_uring_opaque_stat stat;
+	uint64_t stream, tag, handle, cursor = 0;
+	uint32_t first, second;
+	struct ring a, b;
+	struct event event;
+	int pair[2], fd;
+	unsigned int round, j;
+
+	require(data && !ring_init(&a, IORING_SETUP_CQE32) && !register_store(&a, &cfg, &first),
+		"shared stream store");
+	tcp_pair(pair);
+	stream = attach(&a, first, pair[1], next_tag++);
+	fd = export_store(&a, first);
+	require(fd >= 0 && !ring_init(&b, IORING_SETUP_CQE32) && !import_store(&b, fd, &second),
+		"second ring of the shared store");
+	close(fd);
+	for (round = 0; round < 16; round++) {
+		for (j = 0; j < length; j++)
+			data[j] = (round * 31 + j) % 251;
+		tag = cmd_stage(&b, second, IORING_OPAQUE_RECV_OBJECT, stream, cursor,
+				length, NULL);
+		if (round & 1) {
+			/* The bytes are captured first; the second ring starts the range. */
+			write_all(pair[0], data, length);
+			enter(&a, 0);
+		} else {
+			/* The range waits in the stream; the collector completes it. */
+			enter(&b, 0);
+			write_all(pair[0], data, length);
+		}
+		event = wait_tag_pumped(&a, &b, tag);
+		require(event.res == (int)length && event.extra[0],
+			"object completed in the second ring");
+		handle = event.extra[0];
+		cursor += length;
+		require(command(&b, second, IORING_OPAQUE_READ_OBJECT, handle, 0, length,
+				got).res == (int)length && !memcmp(got, data, length),
+			"bytes of the object in the second ring");
+		require(!command(&b, second, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"free in the second ring");
+	}
+	ring_exit(&b);
+	require(!command(&a, first, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"shared stream close");
+	require(!command(&a, first, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.backing_bytes && !stat.extents && !stat.objects,
+		"the objects of the second ring are gone, with their backing");
+	ring_exit(&a);
+	close(pair[0]);
+	close(pair[1]);
+	free(data);
+	ksft_test_result_pass("a range completed in the second ring of a shared store\n");
+}
+
+/* A counter of the module, which the kernel exports read-only; -1 if there is none. */
+static long long module_stat(const char *name)
+{
+	char path[128], text[32];
+	ssize_t n;
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/module/io_uring_opaque/parameters/stat_%s", name);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	text[n] = 0;
+	return strtoll(text, NULL, 10);
+}
+
+/*
+ * An skb that anyone else shares or clones is not the collector's to take apart.
+ * A packet socket on the loopback device keeps a clone of every segment until
+ * it is read, so the segments that reach the collector are cloned. It copies
+ * their bytes, takes none of their references, and leaves the skbs as they are:
+ * no page is taken over, and the stream arrives intact.
+ */
+static void test_capture_cloned(struct io_uring_opaque_config cfg)
+{
+	struct sockaddr_ll ll = { .sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_ALL) };
+	const size_t length = 32768;
+	struct io_uring_opaque_stat stat;
+	unsigned char *data = malloc(2 * length), *got = data + length;
+	long long stolen = module_stat("pages_stolen"), copied = module_stat("pages_copied");
+	uint64_t stream, handle, tag, cursor = 0;
+	int pair[2], pkt, big = 64 << 20, i;
+	struct event event;
+	struct ring r;
+	uint32_t context;
+
+	if (stolen < 0 || copied < 0) {
+		ksft_test_result_skip("the module exports no page counters\n");
+		free(data);
+		return;
+	}
+	pkt = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+	if (pkt < 0) {
+		ksft_test_result_skip("no packet socket: %s\n", strerror(errno));
+		free(data);
+		return;
+	}
+	ll.sll_ifindex = if_nametoindex("lo");
+	require(data && ll.sll_ifindex && !bind(pkt, (void *)&ll, sizeof(ll)),
+		"packet socket on the loopback device");
+	/* The clones stay queued while the test runs: the socket never reads. */
+	if (setsockopt(pkt, SOL_SOCKET, SO_RCVBUFFORCE, &big, sizeof(big)))
+		setsockopt(pkt, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+	require(!ring_init(&r, IORING_SETUP_CQE32) && !register_store(&r, &cfg, &context),
+		"cloned segments store");
+	tcp_pair(pair);
+	stream = attach(&r, context, pair[1], next_tag++);
+	for (i = 0; i < 3; i++) {
+		memset(data, 'p' + i, length);
+		tag = cmd_stage(&r, context, IORING_OPAQUE_RECV_OBJECT, stream, cursor, length,
+				NULL);
+		write_all(pair[0], data, length);
+		event = wait_tag(&r, tag);
+		require(event.res == (int)length && event.extra[0], "object of cloned segments");
+		handle = event.extra[0];
+		cursor += length;
+		require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handle, 0, length,
+				got).res == (int)length && !memcmp(got, data, length),
+			"bytes of cloned segments");
+		require(!command(&r, context, IORING_OPAQUE_FREE, handle, 0, 0, NULL).res,
+			"free the object of cloned segments");
+	}
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
+		"cloned segments store stat");
+	require(stat.copied_bytes == 3 * length, "every byte of a cloned segment is copied");
+	require(module_stat("pages_stolen") == stolen, "no page of a cloned segment is taken over");
+	require(module_stat("pages_copied") > copied, "the bytes are copied into pages");
+	require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
+		"cloned segments stream close");
+	ring_exit(&r);
+	close(pair[0]);
+	close(pair[1]);
+	close(pkt);
+	free(data);
+	ksft_test_result_pass("cloned segments are copied, and no page is taken over\n");
+}
+
+/*
+ * The skbs of a port with an instance are the driver's own: not shared, not cloned,
+ * and the pool pages in them are held by the pool references of the skbs. The
+ * collector takes those references over when it consumes an skb to its end, so
+ * the counter of pages taken over grows, and not a byte is copied.
+ */
+static void test_maio_device_stolen(struct io_uring_opaque_config cfg)
+{
+	const size_t length = 16384;
+	struct io_uring_opaque_extent vec[64];
+	struct io_uring_opaque_stat stat;
+	long long stolen = module_stat("pages_stolen"), copied = module_stat("pages_copied");
+	unsigned char *data, *got;
+	uint64_t stream, handle, cursor = 0;
+	unsigned int round;
+	struct event event;
+	uint16_t port;
+	uint32_t bound;
+	struct maio z;
+	struct ring r;
+	struct pair pr;
+	int sock, listener;
+
+	if (stolen < 0 || copied < 0) {
+		ksft_test_result_skip("the module exports no page counters\n");
+		return;
+	}
+	if (!maio_port(&pr, &r, &z, 128, cfg, &bound))
+		return;
+	data = malloc(2 * length);
+	require(data, "buffers");
+	got = data + length;
+	listener = listen_local(&port);
+	sock = connect_peer(&pr, 0, listener, port);
+	stream = attach(&r, bound, sock, next_tag++);
+	for (round = 0; round < 32; round++) {
+		uint64_t tag;
+
+		maio_pattern(data, length, 700 + round);
+		tag = cmd_stage(&r, bound, IORING_OPAQUE_RECV_OBJECT, stream, cursor, length, NULL);
+		submit_only(&r);
+		write_all(pr.peer.socks[0], data, length);
+		require(maio_poll(&r, tag, 20000, &event) && event.res == (int)length,
+			"object from the port");
+		cursor += length;
+		handle = event.extra[0];
+		maio_gather(&r, bound, &z, handle, length, got, vec, ARRAY_SIZE(vec));
+		require(!memcmp(got, data, length), "bytes through the mapping");
+		maio_end(&r, bound, IORING_OPAQUE_FREE, handle);
+	}
+	require(!cmd_res(&r, bound, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat), "store stat");
+	require(!stat.copied_bytes, "no byte is copied");
+	require(module_stat("pages_stolen") > stolen, "the references of the skbs are taken over");
+	require(module_stat("pages_copied") == copied, "no page is copied");
+	maio_end(&r, bound, IORING_OPAQUE_STREAM_CLOSE, stream);
+	maio_drained(&r, bound);
+	maio_unmap(&z);
+	ring_exit(&r);
+	close(sock);
+	close(listener);
+	pair_destroy(&pr);
+	free(data);
+	ksft_test_result_pass("store on a port: the references of the skbs are taken over\n");
+}
+
 int main(void)
 {
 	struct ring r, imported;
@@ -6087,7 +6346,7 @@ int main(void)
 		maio_ok = !maio_err;
 		ring_exit(&probe);
 	}
-	ksft_set_plan(121);
+	ksft_set_plan(124);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	test_create(cfg);
 	test_create_quota(cfg);
@@ -6372,5 +6631,8 @@ int main(void)
 	test_maio_store_first(cfg);
 	test_maio_device(cfg);
 	test_maio_device_small(cfg);
+	test_capture_cloned(cfg);
+	test_maio_device_stolen(cfg);
+	test_shared_stream(cfg);
 	ksft_finished();
 }

@@ -93,7 +93,8 @@ compact backing or cancel pending work to make capacity available; eligible
 collectors resume automatically after release. No replacement COLLECT is needed.
 Collection follows the application's capture policy. When collection is
 permitted, one pass may take everything that has arrived, bounded by the
-256 KiB batch and the store quota. Undecided bytes stay in their original
+256 KiB batch, which a pass exceeds by the rest of the receive buffer it is in,
+and the store quota. Undecided bytes stay in their original
 receive buffers: the policy never copies them, and only INSPECT copies the
 requested header bytes to userspace. The copy fallback described under
 "Backing and memory management" still applies. While a stream holds
@@ -500,15 +501,32 @@ version. FREE drops the table reference; SEND_LAST transfers it into the send;
 compaction replaces that reference. Old versions remain charged until their
 store references disappear.
 
-Capture combines backing and initial extent metadata in one allocation and
-coalesces adjacent compatible extents. Successive captures from the same
+Capture allocates the backing and initial extent metadata of a few dozen
+pages at a time, in one block of 4 KiB that lives until the last of those
+backings is released,
+and coalesces adjacent compatible extents. Successive captures from the same
 compound allocation share its backing and charge even when another socket's
 data separates their physical offsets. Splits also share the backing reference
 and charge. Independent captures can still conservatively charge the same
 physical allocation more than once. A retained compound allocation is charged
 in full. Retained RX allocations also carry an explicit charge to the store
 owner's memory cgroup until the final backing reference is released; the
-original network allocation's accounting is independent. Owned copy and
+original network allocation's accounting is independent. A page that a page
+pool owns, in a socket buffer marked for page pool recycling, is held by a page
+pool fragment reference, as the socket buffer holds it, and goes back to its
+pool when the last holder lets go. Any other page is held by a page reference.
+A page pool page that an object holds keeps its pool alive until the object is
+freed. After the device is removed, or when its driver creates its pools again,
+for example after a change of the ring sizes, the old pool stays until the
+objects that hold its pages are freed, and the kernel warns of a stalled pool
+shutdown every minute meanwhile. Free the objects of a device that goes away.
+When a pass consumes a receive buffer to its end, and nothing shares or clones
+the buffer, the backings take over the references that the buffer holds to its
+fragments from the offset at which the pass began, instead of taking new ones,
+and TCP frees the buffer without them. The head of the buffer, the fragment in
+which the pass began, and every buffer that a pass leaves before its end are
+held by references of the backings' own.
+Owned copy and
 compaction pages already use accounted allocation and are not charged twice.
 Copy fallback appends into unused space in the previous owned page;
 it does not allocate a whole page for every small fragment.
@@ -547,8 +565,8 @@ The protected allowance permits bounded framed and generated-only replies
 even when payload capacity is full. A stream that holds undecided bytes
 cannot refill capacity freed by the application; it stays held until the
 application decides those bytes. Any stream whose collection is permitted
-can still take one pass of up to 256 KiB, which can fill a small store
-before a reply is admitted; that is what ``reply_reserve`` is for.
+can still take one pass of up to 256 KiB, and the rest of the receive buffer it
+is in, which can fill a small store before a reply is admitted; that is what ``reply_reserve`` is for.
 Concurrent snapshots can still exhaust the reply reserve once capture capacity
 is full, and allocation or request admission can fail independently. Framing
 cannot consume compaction headroom. With a zero reply reserve, snapshots share
@@ -779,6 +797,15 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
 ``stat_framing_copied``, ``stat_body_copied``
     Prefix and suffix bytes copied from user memory into request storage, and
     body bytes TCP copied under ``send_copy_max``.
+``stat_pages_stolen``, ``stat_pages_held``, ``stat_pages_copied``
+    Pages of received bytes that capture kept by taking over the reference of
+    the skb that carried them, by taking a reference of its own, and by
+    copying the bytes into a page of its own. A page that more bytes join
+    counts once.
+``stat_chunk_blocks``
+    Blocks of extent records that streams allocated. A stream allocates a block
+    of 4 KiB for every few dozen pages it keeps by reference or by copy, and not
+    one record per page.
 
 Stores in the area of a MAIO instance
 =====================================

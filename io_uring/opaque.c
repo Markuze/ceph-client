@@ -10,9 +10,11 @@
 #include <linux/rbtree.h>
 #include <linux/sched/mm.h>
 #include <linux/skbuff.h>
+#include <linux/skbuff_ref.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/page_pool/helpers.h>
 #include <net/rps.h>
 #include <net/tcp.h>
 #include <trace/events/sock.h>
@@ -329,10 +331,77 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 #endif
 }
 
-struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
-					      struct page *page, u32 offset,
-					      u32 length, u64 start,
-					      unsigned int flags)
+/* Let go of @refs of what keeps @block; the last frees it. */
+static void io_opaque_block_put(struct io_opaque_block *block, unsigned int refs)
+{
+	if (refcount_sub_and_test(refs, &block->live))
+		kfree(block);
+}
+
+/*
+ * The stream hands out no more chunks of its current block: it lets go of the
+ * ones that are left and of its hold. The chunks handed out keep the block.
+ */
+VISIBLE_IF_KUNIT void io_opaque_block_retire(struct io_opaque_stream *stream)
+{
+	struct io_opaque_block *block = stream->block;
+
+	if (!block)
+		return;
+	stream->block = NULL;
+	io_opaque_block_put(block, block->nr - block->used + 1);
+}
+
+/* Let go of everything that capture keeps in @stream: the block, and the room for a call. */
+VISIBLE_IF_KUNIT void io_opaque_capture_release(struct io_opaque_stream *stream)
+{
+	io_opaque_block_retire(stream);
+	kfree(stream->pending);
+	stream->pending = NULL;
+}
+
+/* The next chunk of the current block of @stream, in a new block if that is used up. */
+static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *stream)
+{
+	struct io_opaque_block *block = stream->block;
+	struct io_opaque_chunk *chunk;
+
+	if (!block) {
+		block = kzalloc_flex(*block, chunk, IO_OPAQUE_BLOCK_CHUNKS, GFP_KERNEL_ACCOUNT);
+		if (!block)
+			return NULL;
+		block->nr = IO_OPAQUE_BLOCK_CHUNKS;
+		/* Every chunk, to be handed out or released, and the hold of the stream. */
+		refcount_set(&block->live, block->nr + 1);
+		stream->block = block;
+		io_opaque_count(IO_OPAQUE_STAT_CHUNK_BLOCKS, 1);
+	}
+	chunk = &block->chunk[block->used++];
+	chunk->block = block;
+	if (block->used == block->nr)
+		io_opaque_block_retire(stream);
+	return chunk;
+}
+
+/* A chunk in a block of its own, for the callers that make one extent at a time. */
+static struct io_opaque_chunk *io_opaque_chunk_alone(void)
+{
+	struct io_opaque_block *block = kzalloc_flex(*block, chunk, 1, GFP_KERNEL_ACCOUNT);
+
+	if (!block)
+		return NULL;
+	block->nr = 1;
+	block->used = 1;
+	refcount_set(&block->live, 1);
+	block->chunk[0].block = block;
+	return &block->chunk[0];
+}
+
+static struct io_opaque_extent *io_opaque_extent_make(struct io_opaque_store *store,
+						      struct io_opaque_stream *stream,
+						      struct page *page, u32 offset,
+						      u32 length, u64 start,
+						      unsigned int flags)
 {
 	bool reserved = flags & IO_OPAQUE_EXT_RESERVED;
 	/* The memory cgroup pays for a page only if no other owner does. */
@@ -346,7 +415,7 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 		goto no_space;
 	if (memcg && io_opaque_memcg_charge(store, charge))
 		goto no_memory;
-	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
+	chunk = stream ? io_opaque_chunk_take(stream) : io_opaque_chunk_alone();
 	if (!chunk) {
 		if (memcg)
 			io_opaque_memcg_uncharge(store, charge);
@@ -355,6 +424,9 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 	refcount_set(&chunk->backing.refs, 1);
 	chunk->backing.page = compound_head(page);
 	chunk->backing.charge = charge;
+	/* The reference of the caller passes to the backing; the caller may set another kind. */
+	chunk->backing.ref = IO_OPAQUE_REF_PAGE;
+	chunk->backing.units = 1;
 	chunk->backing.accounted = memcg && store->objcg;
 	chunk->extent.backing = &chunk->backing;
 	chunk->extent.start = start;
@@ -373,6 +445,76 @@ no_space:
 	return ERR_PTR(-ENOBUFS);
 }
 
+struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
+					      struct page *page, u32 offset,
+					      u32 length, u64 start,
+					      unsigned int flags)
+{
+	return io_opaque_extent_make(store, NULL, page, offset, length, start, flags);
+}
+
+/* As io_opaque_extent_new(), for capture: the chunk comes from a block of the stream. */
+VISIBLE_IF_KUNIT struct io_opaque_extent *
+io_opaque_stream_extent_new(struct io_opaque_stream *stream, struct page *page,
+			    u32 offset, u32 length, u64 start, unsigned int flags)
+{
+	return io_opaque_extent_make(stream->store, stream, page, offset, length, start, flags);
+}
+
+/*
+ * Drop the @units references of a page pool page, the way napi_pp_put_page()
+ * drops the one of an skb fragment: the last one hands the page back to its
+ * pool, which recycles it unless somebody else still holds a page reference.
+ */
+static void io_opaque_pp_put(struct page *page, unsigned int units)
+{
+	netmem_ref netmem = page_to_netmem(page);
+
+	if (!IS_ENABLED(CONFIG_PAGE_POOL)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	if (page_pool_unref_netmem(netmem, units))
+		return;
+	page_pool_put_unrefed_netmem(netmem_get_pp(netmem), netmem, -1, false);
+}
+
+/*
+ * Give back what a backing holds of its page, as its kind says. The last
+ * extent of the backing is gone, so nobody reads the page through it any more.
+ */
+static void io_opaque_backing_put(struct io_opaque_store *store,
+				  struct io_opaque_backing *backing)
+{
+	unsigned int units = backing->units;
+
+	switch (backing->ref) {
+	case IO_OPAQUE_REF_PAGE:
+		/* An outsider reference to a page of the area is a page reference too. */
+		folio_put_refs(page_folio(backing->page), units);
+		break;
+	case IO_OPAQUE_REF_PP:
+		io_opaque_pp_put(backing->page, units);
+		break;
+	case IO_OPAQUE_REF_MAIO:
+		/*
+		 * A pool reference of a bound store ends in the instance. The
+		 * store holds its own reference to the instance until every
+		 * backing is gone, so the call is valid here.
+		 */
+		while (units--)
+			io_zcrx_maio_page_put(store->maio, backing->page);
+		break;
+	case IO_OPAQUE_REF_UNIT:
+		/* A cached unit leaves the object charge; it is not payload held. */
+		io_opaque_unit_put(store, backing->page);
+		break;
+	default:
+		/* A pending backing holds nothing: the skb still owns its reference. */
+		WARN_ON_ONCE(1);
+	}
+}
+
 /*
  * Let go of @extent, and of its backing if it was the last to use it. Returns
  * the charge of the backing that went, for the caller to give back to the
@@ -389,25 +531,22 @@ static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opa
 		kfree(extent);
 	atomic_dec(&store->extents);
 	if (refcount_dec_and_test(&backing->refs)) {
-		charge = backing->charge;
+		struct io_opaque_chunk *chunk;
 
+		charge = backing->charge;
 		if (backing->accounted)
 			io_opaque_memcg_uncharge(store, charge);
 		/*
-		 * A pool reference of a bound store ends in the instance. The
-		 * store holds its own reference to the instance until every
-		 * backing is gone, so the call is valid here. A cached unit
-		 * leaves the object charge; it is not payload held. Any other
-		 * page, an outsider reference to the area included, is an
-		 * ordinary page reference.
+		 * A call of the actor has not settled a pending backing yet, and it
+		 * will. Nobody else may release one. If it happens, leak the chunk and
+		 * the page reference that the call will give it, rather than free the
+		 * chunk under the call.
 		 */
-		if (backing->pool)
-			io_zcrx_maio_page_put(store->maio, backing->page);
-		else if (backing->owned)
-			io_opaque_unit_put(store, backing->page);
-		else
-			put_page(backing->page);
-		kfree(container_of(backing, struct io_opaque_chunk, backing));
+		if (WARN_ON_ONCE(backing->ref == IO_OPAQUE_REF_PENDING))
+			return charge;
+		io_opaque_backing_put(store, backing);
+		chunk = container_of(backing, struct io_opaque_chunk, backing);
+		io_opaque_block_put(chunk->block, 1);
 	}
 	return charge;
 }
@@ -611,6 +750,7 @@ VISIBLE_IF_KUNIT void io_opaque_stream_put(struct io_opaque_stream *stream)
 {
 	if (stream && refcount_dec_and_test(&stream->refs)) {
 		io_opaque_extents_free(stream->store, &stream->extents);
+		io_opaque_capture_release(stream);
 		fput(stream->file);
 		mutex_destroy(&stream->lock);
 		kfree(stream);
@@ -1256,42 +1396,36 @@ static struct io_opaque_extent *io_opaque_capture_tail(struct io_opaque_stream *
 }
 
 /*
- * How the capture holds the page of a new backing. The last two kinds exist
- * only for a store that binds a MAIO instance.
+ * Whether the reference that @skb holds to @page is a page pool fragment
+ * reference. That is what the stack drops for a page pool page of an skb that is
+ * marked for recycling, see skb_page_unref(). It takes any other page of the
+ * skb by a page reference.
  */
-enum io_opaque_hold {
-	/* A page reference, taken here. */
-	IO_OPAQUE_HOLD_PAGE,
-	/*
-	 * A page reference to an area page, taken here, when no pool reference
-	 * is possible. Either no pool of the instance owns the page, or the skb
-	 * holds only a page reference to it. The page is an outsider page for
-	 * the area. For example, the process may have passed it to a send as
-	 * user memory, and the send came back over loopback. The bytes are
-	 * visible through the mapping, so the backing counts as in the area.
-	 * If a pool owns the page when it returns, the instance parks the page
-	 * in limbo until this reference ends.
-	 */
-	IO_OPAQUE_HOLD_AREA,
-	/*
-	 * A pool reference to an area page, taken here. A pool of the instance
-	 * owns the page.
-	 */
-	IO_OPAQUE_HOLD_POOL,
-	/*
-	 * A copy page. The reference of the caller passes to the backing. The
-	 * page is a page of the area if the store binds an instance.
-	 */
-	IO_OPAQUE_HOLD_COPY,
-};
+static bool io_opaque_pp_page(const struct sk_buff *skb, struct page *page)
+{
+	return IS_ENABLED(CONFIG_PAGE_POOL) && skb->pp_recycle &&
+	       page_pool_page_is_pp(compound_head(page));
+}
 
 /*
  * Decide how a store holds a page that an skb carries. Return false if the
  * capture must copy the bytes.
  *
- * A store without an instance holds every page by a page reference. A store
- * with an instance keeps all the bytes that it captures in the area, so that
- * the process sees them through its mapping:
+ * A store without an instance holds a page pool page of an skb that is marked
+ * for recycling by a page pool fragment reference, and every other page by a
+ * page reference. The skb holds a reference of the same kind, and its pool
+ * reference keeps the pool fields of the page stable while the store takes its
+ * own. The last release hands the page back to its pool, wherever the skb is by
+ * then. A page reference would make the pool give the page up when the skb is
+ * freed before the store lets go.
+ *
+ * A reference of the pool keeps the pool alive for as long as an object holds
+ * it. After the device is removed, or when its driver creates its pools again,
+ * the old pool stays until the objects that hold its pages are freed, and the
+ * page pool code warns of a stalled shutdown every minute meanwhile.
+ *
+ * A store with an instance keeps all the bytes that it captures in the area, so
+ * that the process sees them through its mapping:
  *
  * - A page outside the area is copied. This includes a fallback page, which
  *   a pool of the instance got from the page allocator.
@@ -1316,7 +1450,7 @@ static bool io_opaque_retain(struct io_opaque_store *store,
 	u64 off;
 
 	if (!store->maio) {
-		*hold = IO_OPAQUE_HOLD_PAGE;
+		*hold = io_opaque_pp_page(skb, page) ? IO_OPAQUE_HOLD_PP : IO_OPAQUE_HOLD_PAGE;
 		return true;
 	}
 	if (!io_zcrx_maio_page_off(store->maio, page, &off))
@@ -1326,6 +1460,188 @@ static bool io_opaque_retain(struct io_opaque_store *store,
 	else
 		*hold = IO_OPAQUE_HOLD_AREA;
 	return true;
+}
+
+/* The kind of reference that a backing holds on a page that the capture got this way. */
+static enum io_opaque_ref io_opaque_hold_ref(const struct io_opaque_store *store,
+					     enum io_opaque_hold hold)
+{
+	if (hold == IO_OPAQUE_HOLD_PP)
+		return IO_OPAQUE_REF_PP;
+	/* A copy page of a bound store has a pool reference, of the area. */
+	if (hold == IO_OPAQUE_HOLD_POOL || (hold == IO_OPAQUE_HOLD_COPY && store->maio))
+		return IO_OPAQUE_REF_MAIO;
+	return IO_OPAQUE_REF_PAGE;
+}
+
+/*
+ * What the memory cgroup of the store pays for. The caller charged a copy page.
+ * The memory cgroup does not pay for an area page, because the area was
+ * allocated and accounted when the instance was registered. It pays for every
+ * other page the store holds.
+ */
+VISIBLE_IF_KUNIT unsigned int io_opaque_hold_flags(enum io_opaque_hold hold)
+{
+	if (hold == IO_OPAQUE_HOLD_COPY)
+		return IO_OPAQUE_EXT_RESERVED;
+	if (hold == IO_OPAQUE_HOLD_AREA || hold == IO_OPAQUE_HOLD_POOL)
+		return IO_OPAQUE_EXT_NO_MEMCG;
+	return 0;
+}
+
+/* The kind of reference a backing holds, or the kind that settles it if it is pending. */
+static enum io_opaque_ref io_opaque_backing_kind(const struct io_opaque_backing *backing)
+{
+	return backing->ref == IO_OPAQUE_REF_PENDING ? backing->want : backing->ref;
+}
+
+/* Take a reference of the kind of @backing to its page. */
+static void io_opaque_ref_take(struct io_opaque_store *store, struct io_opaque_backing *backing)
+{
+	switch (backing->ref) {
+	case IO_OPAQUE_REF_PP:
+		page_pool_ref_netmem(page_to_netmem(backing->page));
+		break;
+	case IO_OPAQUE_REF_MAIO:
+		io_zcrx_maio_page_get(store->maio, backing->page);
+		break;
+	default:
+		get_page(backing->page);
+	}
+}
+
+/*
+ * Give @backing the reference that an entry of the pass needs. The skb holds a
+ * reference of the kind of the backing to every fragment it carries. If @move,
+ * that reference passes to the backing, and nothing is taken. Otherwise the
+ * backing takes a reference of its own, unless it holds one already: the page
+ * is pinned then, and its units do not depend on the fragment. Return whether
+ * the reference of the skb passed. The counters count pages: a backing counts
+ * once, however many fragments of its page it holds.
+ */
+static bool io_opaque_settle_ref(struct io_opaque_store *store, struct io_opaque_backing *backing,
+				 bool move)
+{
+	if (backing->ref == IO_OPAQUE_REF_PENDING) {
+		backing->ref = backing->want;
+		backing->units = 1;
+		if (!move) {
+			io_opaque_ref_take(store, backing);
+			io_opaque_count(IO_OPAQUE_STAT_PAGES_HELD, 1);
+			return false;
+		}
+		io_opaque_count(IO_OPAQUE_STAT_PAGES_STOLEN, 1);
+		return true;
+	}
+	if (move && backing->units < U16_MAX) {
+		backing->units++;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Settle the oldest @n entries of the pass at once, each with a reference of its
+ * own: the pass has more fragments to remember than the stream has room for.
+ * Their fragments stay with the skb, which drops its references to them as it
+ * would have.
+ */
+static void io_opaque_settle_oldest(struct io_opaque_stream *stream, u32 n)
+{
+	u32 i;
+
+	for (i = 0; i < n; i++)
+		io_opaque_settle_ref(stream->store, stream->pending[i].backing, false);
+	stream->nr_pending -= n;
+	memmove(stream->pending, stream->pending + n,
+		stream->nr_pending * sizeof(*stream->pending));
+}
+
+/* Remember that @backing holds, or will hold, bytes of the fragment @src. */
+static void io_opaque_note(struct io_opaque_stream *stream, struct io_opaque_backing *backing,
+			   const struct io_opaque_src *src)
+{
+	struct io_opaque_pending *last = stream->nr_pending ?
+					 &stream->pending[stream->nr_pending - 1] : NULL;
+
+	/* More bytes of the fragment and the backing that the last entry names. */
+	if (last && last->backing == backing && last->src.skb == src->skb &&
+	    last->src.frag == src->frag)
+		return;
+	if (stream->nr_pending == IO_OPAQUE_PENDING_MAX)
+		io_opaque_settle_oldest(stream, IO_OPAQUE_PENDING_MAX / 2);
+	stream->pending[stream->nr_pending++] = (struct io_opaque_pending) {
+		.backing = backing, .src = *src,
+	};
+}
+
+/*
+ * Settle the entries @n of one skb. @take says the pass may pass on the references
+ * of the skb: it consumed the skb to its end, so TCP frees it as soon as the actor
+ * returns, and nobody else can read the skb in the meantime.
+ *
+ * Only a fragment gives its reference away, and only the first backing that
+ * names it, and only when the fragment lies wholly at or after the offset at
+ * which the pass began. The skb ends at the first fragment that it gave away:
+ * the references to the later ones that no backing took go back now, as the
+ * free of the skb would drop them, and the skb forgets all of them. The
+ * length of the skb and its accounting stay as they are.
+ */
+static void io_opaque_settle_skb(struct io_opaque_stream *stream, struct io_opaque_pending *entry,
+				 u32 n, bool take)
+{
+	struct sk_buff *skb = entry->src.skb;
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int cut = -1, previous = -2;
+	u32 i, f;
+
+	for (i = 0; i < n; i++) {
+		struct io_opaque_pending *p = &entry[i];
+		bool first = p->src.frag != previous;
+
+		previous = p->src.frag;
+		p->moved = io_opaque_settle_ref(stream->store, p->backing,
+						take && first && p->src.frag >= 0 &&
+						p->src.from_entry);
+		if (p->moved && cut < 0)
+			cut = p->src.frag;
+	}
+	if (cut < 0)
+		return;
+	i = 0;
+	for (f = cut; f < shinfo->nr_frags; f++) {
+		bool moved = false;
+
+		for (; i < n && entry[i].src.frag <= (int)f; i++)
+			moved |= entry[i].src.frag == (int)f && entry[i].moved;
+		if (!moved)
+			__skb_frag_unref(&shinfo->frags[f], skb->pp_recycle);
+	}
+	shinfo->nr_frags = cut;
+}
+
+/*
+ * The actor has consumed @consumed bytes of @skb from @entry on. Settle every
+ * reference that the call left open.
+ */
+static void io_opaque_settle_call(struct io_opaque_stream *stream, struct sk_buff *skb,
+				  u32 entry, u32 consumed)
+{
+	bool whole = (u64)entry + consumed == skb->len;
+	u32 i = 0;
+
+	stream->in_call = false;
+	while (i < stream->nr_pending) {
+		struct sk_buff *part = stream->pending[i].src.skb;
+		u32 j = i;
+
+		while (j < stream->nr_pending && stream->pending[j].src.skb == part)
+			j++;
+		io_opaque_settle_skb(stream, &stream->pending[i], j - i,
+				     whole && !skb_zcopy(part));
+		i = j;
+	}
+	stream->nr_pending = 0;
 }
 
 /*
@@ -1351,10 +1667,19 @@ static void io_opaque_copy_page_put(struct io_opaque_store *store,
 		put_page(page);
 }
 
+/*
+ * Keep @length bytes of @page at @offset in the stream, in a backing that holds
+ * the page. @src says where they come from, if the pass may take the reference of
+ * the skb over: the backing is then left pending, and the pass settles it. Without
+ * @src the backing takes its reference now.
+ */
 static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
-			    u32 offset, u32 length, enum io_opaque_hold hold)
+			    u32 offset, u32 length, enum io_opaque_hold hold,
+			    const struct io_opaque_src *src)
 {
 	bool copied = hold == IO_OPAQUE_HOLD_COPY;
+	enum io_opaque_ref kind = io_opaque_hold_ref(stream->store, hold);
+	bool defer = src && stream->in_call;
 	struct io_opaque_req *op = io_opaque_capture_keep(stream);
 	struct list_head *list = &stream->extents;
 	struct io_opaque_extent *extent, *tail;
@@ -1368,7 +1693,13 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	tail = list_last_entry_or_null(list, struct io_opaque_extent, list);
 	offset += (page - compound_head(page)) * PAGE_SIZE;
 	page = compound_head(page);
-	if (tail && tail->backing->page == page) {
+	/*
+	 * Bytes of a page that a backing holds join it, if what the backing holds
+	 * is what this capture would hold: units of another kind do not add up.
+	 */
+	if (tail && (tail->backing->page != page || io_opaque_backing_kind(tail->backing) != kind))
+		tail = NULL;
+	if (tail) {
 		if (tail->start + tail->length == start &&
 		    tail->offset + tail->length == offset) {
 			tail->length += length;
@@ -1379,7 +1710,7 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	stream->need_bytes = page_size(page);
 	if (atomic_read(&stream->store->extents) >= stream->store->config.max_extents - 2)
 		return -ENOBUFS;
-	if (tail && tail->backing->page == page) {
+	if (tail) {
 		if (!io_opaque_extent_reserve(stream->store))
 			return -ENOBUFS;
 		extent = kmalloc_obj(*extent, GFP_KERNEL_ACCOUNT);
@@ -1395,37 +1726,37 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
 		bool bound = !!stream->store->maio;
-		unsigned int flags = 0;
+		unsigned int flags = io_opaque_hold_flags(hold);
 
 		/* Leave room for dense copies of a private KEEP's remaining bytes. */
 		if (!copied && op && op->data->charge + stream->need_bytes + left >
 		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
-		/*
-		 * The caller charged a copy page. The memory cgroup of the
-		 * store does not pay for an area page, because the area was
-		 * allocated and accounted when the instance was registered.
-		 */
-		if (copied)
-			flags = IO_OPAQUE_EXT_RESERVED;
-		else if (hold != IO_OPAQUE_HOLD_PAGE)
-			flags = IO_OPAQUE_EXT_NO_MEMCG;
-		extent = io_opaque_extent_new(stream->store, page, offset, length, start, flags);
+		extent = io_opaque_stream_extent_new(stream, page, offset, length, start, flags);
 		if (IS_ERR(extent))
 			return PTR_ERR(extent);
-		if (hold == IO_OPAQUE_HOLD_POOL)
-			io_zcrx_maio_page_get(stream->store->maio, page);
-		else if (!copied)
-			get_page(page);
 		extent->backing->copied = copied;
 		/* A bound store copies every byte outside the area into it. */
 		extent->backing->area = hold == IO_OPAQUE_HOLD_AREA ||
 					hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
-		extent->backing->pool = hold == IO_OPAQUE_HOLD_POOL || (copied && bound);
+		extent->backing->ref = kind;
+		if (defer) {
+			/* The reference is the skb's until the pass has consumed the skb. */
+			extent->backing->ref = IO_OPAQUE_REF_PENDING;
+			extent->backing->want = kind;
+			extent->backing->units = 0;
+		} else if (!copied) {
+			io_opaque_ref_take(stream->store, extent->backing);
+			io_opaque_count(IO_OPAQUE_STAT_PAGES_HELD, 1);
+		} else {
+			io_opaque_count(IO_OPAQUE_STAT_PAGES_COPIED, 1);
+		}
 		new_backing = true;
 	}
 	list_add_tail(&extent->list, list);
 accounted:
+	if (defer)
+		io_opaque_note(stream, extent->backing, src);
 	if (op) {
 		op->progress += length;
 		op->data->length += length;
@@ -1441,13 +1772,17 @@ accounted:
 	return length;
 }
 
-VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
-				       const struct sk_buff *skb, u32 offset, u32 len,
-				       bool shared)
+/*
+ * @base is where @skb begins in the skb that TCP handed to the actor, which is
+ * not 0 for a child on its frag_list.
+ */
+static int io_opaque_capture_part(struct io_opaque_stream *stream, struct sk_buff *skb,
+				  u32 offset, u32 len, bool shared, u32 base)
 {
 	u32 consumed = 0, head = skb_headlen(skb), start = head;
 	bool copy_frags;
 	struct sk_buff *child;
+	struct io_opaque_src src = { .skb = skb };
 	u64 retain_limit = io_opaque_rx_limit(stream->store);
 	enum io_opaque_hold hold;
 	u32 chunk;
@@ -1467,8 +1802,9 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 			if (page_size(compound_head(page)) > retain_limit ||
 			    !io_opaque_retain(stream->store, skb, page, &hold))
 				goto copy;
+			src.frag = -1;
 			ret = io_opaque_append(stream, page, offset_in_page(data),
-					       chunk, hold);
+					       chunk, hold, &src);
 		} else {
 			goto copy;
 		}
@@ -1488,8 +1824,10 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit ||
 		    !io_opaque_retain(stream->store, skb, skb_frag_page(frag), &hold))
 			goto copy;
+		src.frag = i;
+		src.from_entry = base + start >= stream->call_entry;
 		ret = io_opaque_append(stream, skb_frag_page(frag),
-				       skb_frag_off(frag) + offset - start, chunk, hold);
+				       skb_frag_off(frag) + offset - start, chunk, hold, &src);
 		if (ret == -ENOBUFS)
 			goto copy;
 		goto head_done;
@@ -1499,8 +1837,9 @@ VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream,
 			start += child->len;
 			continue;
 		}
-		return io_opaque_capture(stream, child, offset - start,
-					 min(start + child->len - offset, len), copy_frags);
+		return io_opaque_capture_part(stream, child, offset - start,
+					      min(start + child->len - offset, len),
+					      copy_frags, base + start);
 	}
 	return -EFAULT;
 copy:
@@ -1537,7 +1876,7 @@ copy:
 		ret = skb_copy_bits(skb, offset, mapped + pos, chunk);
 		kunmap_local(mapped);
 		if (!ret)
-			ret = io_opaque_append(stream, page, pos, chunk, IO_OPAQUE_HOLD_COPY);
+			ret = io_opaque_append(stream, page, pos, chunk, IO_OPAQUE_HOLD_COPY, NULL);
 		if (ret < 0 && allocated) {
 			io_opaque_copy_page_put(stream->store, page);
 			io_opaque_uncharge(stream->store, PAGE_SIZE);
@@ -1549,15 +1888,51 @@ head_done:
 	return consumed ?: ret;
 }
 
+/*
+ * Capture up to @len bytes of @skb from @offset on, from one fragment, or from the
+ * head, or copied. Outside a call of the actor the backings take the references
+ * they need at once.
+ */
+VISIBLE_IF_KUNIT int io_opaque_capture(struct io_opaque_stream *stream, struct sk_buff *skb,
+				       u32 offset, u32 len, bool shared)
+{
+	return io_opaque_capture_part(stream, skb, offset, len, shared, 0);
+}
+
+/*
+ * The sk_read_actor_t of a collector pass. A call consumes the rest of @skb from
+ * @offset on, unless a decision, a budget or a gate stops it. The batch of the
+ * pass is soft: a call that begins with batch left finishes its skb, and the
+ * pass ends after it with none, so that the call can take over the references to
+ * the fragments of the skb. One that begins without any consumes nothing.
+ *
+ * While the call runs, the backings it creates hold nothing, because the
+ * reference of the skb to the fragment is the one that they will hold, if the call
+ * consumes the skb to its end. TCP frees the skb at once then, with its
+ * fragments, and the call has taken them out of the skb before it returns: those
+ * that a backing holds are no longer the skb's to drop, see io_opaque_settle_skb().
+ * Otherwise the backings take references of their own.
+ */
 VISIBLE_IF_KUNIT int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 				     unsigned int offset, size_t length)
 {
 	struct io_opaque_stream *stream = desc->arg.data;
+	struct io_opaque_req *ready, *next;
+	unsigned int entry = offset;
+	LIST_HEAD(done);
 	u32 consumed = 0;
 	int ret = 0;
 
-	length = min(length, desc->count);
 	length = min_t(u64, length, U64_MAX - stream->next);
+	if (!desc->count)
+		length = 0;
+	/*
+	 * A stream that attached has the room for the call. One without it, which
+	 * only a test makes, takes the references at once.
+	 */
+	stream->in_call = !!stream->pending;
+	stream->call_entry = entry;
+	stream->nr_pending = 0;
 	while (length) {
 		struct io_opaque_req *op = io_opaque_next_decision(stream);
 		u32 chunk = length;
@@ -1590,12 +1965,25 @@ consumed:
 		consumed += ret;
 		offset += ret;
 		length -= ret;
-		desc->count -= ret;
+		desc->count -= min_t(size_t, desc->count, ret);
 		if (op && op->progress == op->length) {
 			rb_erase_cached(&op->decision, &stream->decisions);
 			RB_CLEAR_NODE(&op->decision);
-			io_opaque_queue_ready(op, op->length);
+			/* Reported below, when nothing the range holds is pending. */
+			list_add_tail(&op->read, &done);
 		}
+	}
+	io_opaque_settle_call(stream, skb, entry, consumed);
+	/*
+	 * The completion of a range is task work of the ring of its request. That
+	 * can be another ring than the one that runs the pass, if the store is
+	 * shared, and then it runs at once, on another CPU, and does not take the
+	 * lock of the stream: it publishes the object, and the application may
+	 * free it. The backings of the range must have their references by then.
+	 */
+	list_for_each_entry_safe(ready, next, &done, read) {
+		list_del_init(&ready->read);
+		io_opaque_queue_ready(ready, ready->length);
 	}
 	if (!length && stream->next == U64_MAX)
 		stream->error = -EOVERFLOW;
@@ -1616,6 +2004,8 @@ VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream)
 	write_unlock_bh(&sock->sk->sk_callback_lock);
 	release_sock(sock->sk);
 	io_opaque_extents_free(stream->store, &stream->extents);
+	/* No capture will follow: the chunks that are left in the block can go. */
+	io_opaque_block_retire(stream);
 	stream->undecided = 0;
 	io_opaque_stream_process(stream);
 	wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN | EPOLLHUP);
@@ -1665,6 +2055,13 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	stream = kzalloc_obj(*stream, GFP_KERNEL_ACCOUNT);
 	if (!stream)
 		return -ENOMEM;
+	/* The room that a call of the actor remembers its backings in, see io_opaque_actor(). */
+	stream->pending = kmalloc_objs(*stream->pending, IO_OPAQUE_PENDING_MAX,
+				       GFP_KERNEL_ACCOUNT);
+	if (!stream->pending) {
+		kfree(stream);
+		return -ENOMEM;
+	}
 	refcount_set(&stream->refs, 1);
 	mutex_init(&stream->lock);
 	INIT_LIST_HEAD(&stream->extents);
@@ -2309,7 +2706,7 @@ VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 		}
 		op->create_reserved -= page_size(page);
 		extent->backing->copied = true;
-		extent->backing->owned = true;
+		extent->backing->ref = IO_OPAQUE_REF_UNIT;
 		list_add_tail(&extent->list, &op->data->extents);
 		while (written < chunk) {
 			u32 bytes = min_t(u32, chunk - written, PAGE_SIZE);
