@@ -906,6 +906,7 @@ void io_opaque_stop(struct io_opaque_store *store)
 			io_opaque_stream_close(stream);
 			io_opaque_stream_put(stream);
 		}
+		cond_resched();
 	}
 	for (i = 0; i < store->config.max_objects; i++) {
 		struct io_opaque_data *data;
@@ -914,6 +915,7 @@ void io_opaque_stop(struct io_opaque_store *store)
 		data = io_opaque_detach(store, &store->objects[i]);
 		spin_unlock(&store->tables);
 		io_opaque_data_put(store, data);
+		cond_resched();
 	}
 	io_opaque_wake_budget(store);
 }
