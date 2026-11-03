@@ -3632,11 +3632,16 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
  * last reference frees the version, every extent of it, and that is not for
  * the lock to wait out. A version whose count is one has left the table, but
  * a lookup in RCU that read it before it did can still take a reference on it
- * (io_opaque_pin()). Then the one put after the socket is not the last, and
- * the send of that lookup puts the last, after its own socket: a decrement
- * never takes a count from one to zero. A vector's entries that were put are
- * cleared, so that the rest cannot put them again. A send that consumed its
- * object does not call it (see io_opaque_send()).
+ * (io_opaque_pin()). Then the one put after the socket is not the last. The
+ * last is put by the send of that lookup, when it gives its references back:
+ * after it has released its socket, if it ends owning it as this one does, or
+ * in its cleanup, since a lookup puts nothing, a single range that fails holds
+ * no reference, and a vector that fails leaves what it pinned for its cleanup
+ * (io_opaque_vec_acquire()). A frame that joins a queue which fails meanwhile
+ * gives its references back as it joins (io_opaque_tx_settle()), with the socket
+ * as its caller has it. A decrement never takes a count from one to zero. A
+ * vector's entries that were put are cleared, so that the rest cannot put them
+ * again. A send that consumed its object does not call it (see io_opaque_send()).
  */
 static bool io_opaque_send_unpin_cheap(struct io_opaque_req *op)
 {
