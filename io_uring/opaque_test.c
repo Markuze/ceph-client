@@ -17357,7 +17357,7 @@ static void opaque_borrow_vec_send(struct kunit *test)
 		{ .off = 100, .len = 1000 },
 	};
 	u8 *got = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	struct io_opaque_req *op, *head, hold;
+	struct io_opaque_req *op, hold;
 	unsigned long user;
 	unsigned int mode, round, tries;
 	struct sock *sk;
@@ -17425,7 +17425,7 @@ static void opaque_borrow_vec_send(struct kunit *test)
 	/* A vector that waits behind a head: canceled there, and issued from io-wq in its turn. */
 	opaque_wire_sndbuf(sk, SZ_32K);
 	for (round = 0; round < 2; round++) {
-		head = opaque_wire_prep(test, w, 1, 0, a->handle, 0, 80000, 0);
+		opaque_wire_prep(test, w, 1, 0, a->handle, 0, 80000, 0);
 		KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 1, false), -EAGAIN);
 		op = opaque_wire_prep(test, w, 0, IORING_OPAQUE_SEND_VECTOR, user, 0, 3, 0);
 		KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, false), IOU_ISSUE_SKIP_COMPLETE);
