@@ -1611,7 +1611,7 @@ static void opaque_fail_ready(struct io_opaque_req *op, int result)
 	opaque_fail_hook.queued = max(opaque_fail_hook.queued, queued);
 
 	if (walk == IO_OPAQUE_WAKE_BATCH - 1) {
-		/* The first batch is woken and the second not looked at: the walk is out of tx_lock. */
+		/* The first batch is woken and the second not looked at: the walk left tx_lock. */
 		opaque_fail_hook.inside = true;
 		KUNIT_EXPECT_TRUE(test, fx->tx->failed);
 		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 1U);
@@ -1619,7 +1619,7 @@ static void opaque_fail_ready(struct io_opaque_req *op, int result)
 		opaque_test_tx_op(&j, fx->store);
 		KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&j, fx->sk), -ECANCELED);
 		KUNIT_EXPECT_PTR_EQ(test, j.tx, NULL);
-		/* A cancellation finds a follower that the walk has not got to, and wakes it itself. */
+		/* A cancellation finds a follower that the walk has not reached, and wakes it. */
 		cd.data = OPAQUE_FAIL_CUT + 1;
 		KUNIT_EXPECT_EQ(test, io_opaque_cancel(fx->ctx, &cd, IO_URING_F_UNLOCKED), 0);
 		KUNIT_EXPECT_EQ(test, atomic_read(&fx->woken[OPAQUE_FAIL_CUT]), 1);
@@ -1628,8 +1628,9 @@ static void opaque_fail_ready(struct io_opaque_req *op, int result)
 		KUNIT_EXPECT_EQ(test, io_opaque_cancel(fx->ctx, &cd, IO_URING_F_UNLOCKED), -ENOENT);
 		KUNIT_EXPECT_EQ(test, atomic_read(&fx->woken[0]), 1);
 		/*
-		 * The batch is cleaned up, each as the first of the queue. The last has the walk next
-		 * to it, and the followers it has not looked at behind that: none may be promoted.
+		 * The batch is cleaned up, each as the first of the queue. The last has the walk
+		 * next to it, and the followers it has not looked at behind that: none may be
+		 * promoted.
 		 */
 		for (k = 0; k < IO_OPAQUE_WAKE_BATCH; k++)
 			if (opaque_fail_end(fx, k))
@@ -1693,13 +1694,13 @@ static void opaque_tx_failed_long(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, opaque_fail_hook.promoted, 0U);
 
 		if (drain) {
-			/* The walk was the last one out: the queue is idle and forgets the failure. */
+			/* The walk was last out: the queue is idle and forgets the failure. */
 			KUNIT_EXPECT_FALSE(test, fx->tx->failed);
 			KUNIT_EXPECT_TRUE(test, list_empty(&fx->tx->requests));
 			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(fx->store), 0U);
 			KUNIT_EXPECT_EQ(test, fx->store->nr_txs_idle, 1U);
 		} else {
-			/* The followers that are still queued keep the queue failed, in the tree. */
+			/* The followers still queued keep the queue failed, in the tree. */
 			left = OPAQUE_FAIL_NR - IO_OPAQUE_WAKE_BATCH - 1;
 			KUNIT_EXPECT_TRUE(test, fx->tx->failed);
 			KUNIT_EXPECT_EQ(test, list_count_nodes(&fx->tx->requests), left);
@@ -1932,8 +1933,10 @@ static void opaque_tx_failed_smp(struct kunit *test)
 			return;
 		}
 	}
-	kunit_info(test, "%u rounds of %u followers on %u CPUs: %u woken by a cancellation, %u frames refused",
-		   OPAQUE_FAIL_SMP_ROUNDS, OPAQUE_FAIL_SMP_NR, num_online_cpus(), canceled, refused);
+	kunit_info(test,
+		   "%u rounds of %u followers on %u CPUs: %u woken by a cancellation, %u frames refused",
+		   OPAQUE_FAIL_SMP_ROUNDS, OPAQUE_FAIL_SMP_NR, num_online_cpus(), canceled,
+		   refused);
 	KUNIT_EXPECT_GT(test, canceled, 0U);
 }
 
@@ -2007,7 +2010,8 @@ static void opaque_lock_held_check(struct kunit *test)
 	bool held;
 
 	if (opaque_test_lock_state(&store->tables) == OPAQUE_LOCK_UNKNOWN)
-		kunit_skip(test, "no lockdep, and a spinlock has no state to read: uniprocessor without CONFIG_DEBUG_SPINLOCK");
+		kunit_skip(test,
+			   "no lockdep, and a spinlock has no state to read: uniprocessor without CONFIG_DEBUG_SPINLOCK");
 	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	spin_lock(&store->tables);
 	/* A failed expectation allocates, which a spinlock does not allow: look after the hold. */
@@ -4674,7 +4678,8 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	 * LAST holds the table's reference, and its put frees the object: after the socket, as is
 	 * the put of the extra reference of each further entry of a vector.
 	 */
-	opaque_put_spy_expect(test, c->last && !c->frame_only ? (c->vector ? ARRAY_SIZE(ent) : 1) : 0,
+	opaque_put_spy_expect(test,
+			      c->last && !c->frame_only ? (c->vector ? ARRAY_SIZE(ent) : 1) : 0,
 			      c->last && !c->frame_only ? 1 : 0);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
 	KUNIT_EXPECT_EQ(test, !!(w->req[0].cqe.flags & IORING_CQE_F_OPAQUE_CONSUMED), c->last);
@@ -5243,7 +5248,7 @@ static void opaque_send_locked_last_versions(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3500);
 	KUNIT_EXPECT_TRUE(test, op->consumed);
-	/* A's first reference, B's only one and A's last one: B and A are freed, after the socket. */
+	/* A's first reference, B's only one and A's last: B and A are freed after the socket. */
 	opaque_put_spy_expect(test, 3, 2);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
 	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
@@ -11820,7 +11825,7 @@ static void opaque_send_managed_prefix_fallback(struct kunit *test)
 	opaque_managed_read(&after);
 	/* Once: the skb the prefix started is full, and the next fill is not let into it. */
 	KUNIT_EXPECT_EQ(test, after.fallback - before.fallback, 1ULL);
-	/* The prefix and limit - 1 extents fill the first skb; the other 21 - (limit - 1) are managed. */
+	/* The prefix and limit - 1 extents fill the first skb; 21 - (limit - 1) are managed. */
 	KUNIT_EXPECT_EQ(test, after.refs - before.refs, (u64)(21 - (limit - 1)));
 	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 2ULL);
 	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
@@ -12171,7 +12176,7 @@ static void opaque_managed_fill_limits(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, shared);
 	KUNIT_ASSERT_NOT_NULL(test, next);
 	opaque_splice_setup(test, &f);
-	/* One page, 2000 bytes each: a fragment each, four more than the limit lets one skb have. */
+	/* One page, 2000 bytes each: a fragment each, four more than one skb may have. */
 	segs = opaque_segs_new(test, limit + 4, 2000);
 	total = 2000 * segs->nr;
 	iov_iter_bvec(&iter, ITER_SOURCE, segs->bv, segs->nr, total);
@@ -13372,7 +13377,7 @@ static void opaque_ubuf_pool_store(struct kunit *test)
 		.hard_limit = 64 * PAGE_SIZE, .compact_headroom = 4 * OPAQUE_TEST_UNIT,
 		.max_object_size = SZ_64K, .max_objects = 4, .max_streams = 1,
 		.max_extents = 64,
-		/* Ignored: any value registers, which earlier versions of this interface refused. */
+		/* Ignored: any value registers, which earlier versions of the interface refused. */
 		.max_requests = U32_MAX,
 	};
 	struct io_opaque_msg_ubuf mub = opaque_new_msg_ubuf();

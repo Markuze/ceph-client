@@ -19,7 +19,7 @@
 #define IO_OPAQUE_RX_BATCH	SZ_256K
 #define IO_OPAQUE_MAX_ORDER	(PAGE_SHIFT < 16 ? 16 - PAGE_SHIFT : 0)
 #define IO_OPAQUE_ALLOC_RETRY_MS	50
-/* Waiters looked at in one hold of wait_lock, or the followers of a failed queue in one of tx_lock. */
+/* Waiters looked at in one hold of wait_lock, or followers of a failed queue in one of tx_lock. */
 #define IO_OPAQUE_WAKE_BATCH	32
 #define IO_OPAQUE_INDEX_BITS	14
 #define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
