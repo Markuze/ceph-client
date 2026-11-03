@@ -2030,7 +2030,6 @@ struct opaque_test_params {
 	unsigned int send_copy_max;
 	bool copy_per_page;
 	bool send_managed;
-	bool send_prepay;
 	int send_poison;
 	void (*send_part)(const struct msghdr *msg, const struct io_opaque_send_cursor *cursor,
 			  bool owned);
@@ -2046,7 +2045,6 @@ static void opaque_test_params_restore(void *arg)
 	io_opaque_send_copy_max = saved->send_copy_max;
 	io_opaque_copy_per_page = saved->copy_per_page;
 	io_opaque_send_managed = saved->send_managed;
-	io_opaque_send_prepay = saved->send_prepay;
 	io_opaque_send_poison = saved->send_poison;
 	io_opaque_send_part = saved->send_part;
 }
@@ -2063,7 +2061,6 @@ static void opaque_test_params_save(struct kunit *test)
 	saved->send_copy_max = io_opaque_send_copy_max;
 	saved->copy_per_page = io_opaque_copy_per_page;
 	saved->send_managed = io_opaque_send_managed;
-	saved->send_prepay = io_opaque_send_prepay;
 	saved->send_poison = io_opaque_send_poison;
 	saved->send_part = io_opaque_send_part;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_params_restore,
@@ -2940,7 +2937,6 @@ static void opaque_params_sysfs(struct kunit *test)
 	const struct kernel_param *hits = opaque_test_param("io_uring_opaque.stat_cache_hits");
 	const struct kernel_param *copy_max = opaque_test_param("io_uring_opaque.send_copy_max");
 	const struct kernel_param *managed = opaque_test_param("io_uring_opaque.send_managed");
-	const struct kernel_param *prepay = opaque_test_param("io_uring_opaque.send_prepay");
 	const struct kernel_param *body_copied =
 		opaque_test_param("io_uring_opaque.stat_body_copied");
 	static const char * const send_stats[] = {
@@ -2948,7 +2944,6 @@ static void opaque_params_sysfs(struct kunit *test)
 		"io_uring_opaque.stat_send_folio_refs",
 		"io_uring_opaque.stat_send_frag_fallback",
 		"io_uring_opaque.stat_send_ubuf_copied",
-		"io_uring_opaque.stat_send_folio_gets",
 		"io_uring_opaque.stat_send_admit_fast",
 		"io_uring_opaque.stat_send_admit_slow",
 		"io_uring_opaque.stat_send_ubuf_reused",
@@ -2971,13 +2966,11 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, opaque_test_param("io_uring_opaque.stat_compact_bytes"));
 	KUNIT_ASSERT_NOT_NULL(test, copy_max);
 	KUNIT_ASSERT_NOT_NULL(test, managed);
-	KUNIT_ASSERT_NOT_NULL(test, prepay);
 	KUNIT_ASSERT_NOT_NULL(test, body_copied);
 	KUNIT_ASSERT_NOT_NULL(test, framing_copied);
 	KUNIT_EXPECT_EQ(test, order->perm, (u16)0644);
 	KUNIT_EXPECT_EQ(test, copy_max->perm, (u16)0644);
 	KUNIT_EXPECT_EQ(test, managed->perm, (u16)0644);
-	KUNIT_EXPECT_EQ(test, prepay->perm, (u16)0644);
 	KUNIT_EXPECT_EQ(test, hits->perm, (u16)0444);
 	KUNIT_EXPECT_EQ(test, body_copied->perm, (u16)0444);
 	KUNIT_EXPECT_EQ(test, framing_copied->perm, (u16)0444);
@@ -2993,10 +2986,6 @@ static void opaque_params_sysfs(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, io_opaque_send_managed);
 	KUNIT_EXPECT_EQ(test, managed->ops->set("N", managed), 0);
 	KUNIT_EXPECT_FALSE(test, io_opaque_send_managed);
-	/* Prepaid references are off by default, and on for the next send once it is said. */
-	KUNIT_EXPECT_FALSE(test, io_opaque_send_prepay);
-	KUNIT_EXPECT_EQ(test, prepay->ops->set("Y", prepay), 0);
-	KUNIT_EXPECT_TRUE(test, io_opaque_send_prepay);
 	/* The copy threshold takes effect at the next send; its counters are read-only. */
 	KUNIT_EXPECT_EQ(test, copy_max->ops->set("2048", copy_max), 0);
 	KUNIT_EXPECT_EQ(test, io_opaque_send_copy_max, 2048U);
@@ -3833,7 +3822,6 @@ struct opaque_send_case {
 	bool unlocked;		/* issued as io-wq does, else inline under the ring lock */
 	bool frame_only;	/* a reply made of the frame alone */
 	bool unmanaged;		/* send_managed is N: a body that is not copied is spliced */
-	bool prepay;		/* send_prepay is Y */
 	bool prep;		/* the request is made by prep, from an SQE, and cleaned up after */
 	u32 prefix, suffix;
 };
@@ -3949,13 +3937,10 @@ static void opaque_parts_expect(struct kunit *test, const struct opaque_part_wan
 		if (managed) {
 			const struct io_opaque_send_cursor *cursor = &opaque_parts.part[i].cursor;
 
-			/* The cursor as TCP has it: its ops, and a count that prepay set. */
+			/* The cursor as TCP has it: its ops, no count and no flags. */
 			KUNIT_EXPECT_PTR_EQ(test, cursor->uarg.ops, &io_opaque_cursor_ops);
 			KUNIT_EXPECT_EQ(test, refcount_read(&cursor->uarg.refcnt), 0);
 			KUNIT_EXPECT_EQ(test, cursor->uarg.flags, (u8)0);
-			KUNIT_EXPECT_LE(test, cursor->nr, (u8)IO_OPAQUE_PREPAY_FOLIOS);
-			if (!io_opaque_send_prepay)
-				KUNIT_EXPECT_EQ(test, cursor->nr, (u8)0);
 		}
 	}
 }
@@ -4067,7 +4052,6 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 
 	io_opaque_send_copy_max = c->copy ? SZ_1M : 0;
 	io_opaque_send_managed = !c->unmanaged;
-	io_opaque_send_prepay = c->prepay;
 	memset(&opaque_parts, 0, sizeof(opaque_parts));
 	WRITE_ONCE(io_opaque_send_part, opaque_test_part);
 	opaque_put_spy_start(test, w->tx->sk);
@@ -4180,8 +4164,8 @@ static void opaque_send_locked_path(struct kunit *test)
  * MSG_SPLICE_PAGES); and nothing of the part before it, so the prefix and the suffix have no
  * ubuf, no fill and no zerocopy flag after a managed body, and no field of any part but the
  * flags and the data is set. The three ways of sending a body, ranged and vectored, with
- * and without a prefix and a suffix, prepaying or not, with the stack of the send full of
- * 0xa5 and without: opaque_wire_send() holds the message of each part to the last byte
+ * and without a prefix and a suffix, with the stack of the send full of 0xa5 and
+ * without: opaque_wire_send() holds the message of each part to the last byte
  * (opaque_parts_expect()), and the security hook's, which the issue shares with them, to
  * its flags alone.
  */
@@ -4199,10 +4183,7 @@ static void opaque_send_msghdr_parts(struct kunit *test)
 		{ .prefix = 24, .suffix = 8, .unmanaged = true },
 		{ .prefix = 24, .suffix = 8, .vector = true, .unmanaged = true },
 		{ .suffix = 8, .unmanaged = true },
-		{ .prefix = 24, .suffix = 8, .prepay = true },
-		{ .prefix = 24, .suffix = 8, .vector = true, .prepay = true },
-		{ .vector = true, .prepay = true },
-		{ .prepay = true },
+		{ .vector = true },
 		{ .prefix = 16, .suffix = 16, .frame_only = true },
 		{ .prefix = 16, .frame_only = true, .unlocked = true },
 		{ .prefix = 24, .unlocked = true },
@@ -4213,11 +4194,10 @@ static void opaque_send_msghdr_parts(struct kunit *test)
 		{ .prep = true, .prefix = 24, .suffix = 8 },
 		{ .prep = true, .prefix = 24, .suffix = 8, .unmanaged = true },
 		{ .prep = true, .prefix = 24, .suffix = 8, .copy = true, .unlocked = true },
-		{ .prep = true, .prefix = 24, .suffix = 8, .prepay = true },
 		{ .prep = true, .prefix = 16, .frame_only = true },
 		{ .prep = true, .vector = true },
 		{ .prep = true, .vector = true, .last = true, .unlocked = true },
-		{ .prep = true, .vector = true, .prefix = 24, .suffix = 8, .prepay = true },
+		{ .prep = true, .vector = true, .prefix = 24, .suffix = 8 },
 	};
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
@@ -11124,7 +11104,7 @@ static void opaque_hold_flags(struct kunit *test)
 
 /* The counters of managed sends, as a test sees them move. */
 struct opaque_managed {
-	u64 skbs, refs, fallback, copied, body, gets;
+	u64 skbs, refs, fallback, copied, body;
 };
 
 static void opaque_managed_read(struct opaque_managed *m)
@@ -11134,7 +11114,6 @@ static void opaque_managed_read(struct opaque_managed *m)
 	m->fallback = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_FRAG_FALLBACK);
 	m->copied = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_UBUF_COPIED);
 	m->body = io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED);
-	m->gets = io_opaque_stat_read(IO_OPAQUE_STAT_SEND_FOLIO_GETS);
 }
 
 /* Wait for the peer to have acknowledged everything that @sk sent. */
@@ -11213,8 +11192,6 @@ static void opaque_send_managed_loopback(struct kunit *test)
 		KUNIT_EXPECT_LE(test, after.refs - before.refs,
 				cases[i].folios + (after.skbs - before.skbs) - 1);
 		KUNIT_EXPECT_EQ(test, after.fallback, before.fallback);
-		/* No prepayment: the fill took every reference itself. */
-		KUNIT_EXPECT_EQ(test, after.gets - before.gets, after.refs - before.refs);
 		/* Nobody copied the data on its way in, at the peer, or in TCP. */
 		KUNIT_EXPECT_EQ(test, after.copied, before.copied);
 		KUNIT_EXPECT_EQ(test, after.body, before.body);
@@ -11235,7 +11212,7 @@ static void opaque_send_managed_loopback(struct kunit *test)
  * ubuf is released only with the last skb of the data. A unit is taken again
  * only when the peer has read.
  */
-static void opaque_holds_unit_run(struct kunit *test, bool prepay)
+static void opaque_send_managed_holds_unit(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_data *data = opaque_sparse_data(test, store);
@@ -11253,7 +11230,6 @@ static void opaque_holds_unit_run(struct kunit *test, bool prepay)
 	KUNIT_ASSERT_NOT_NULL(test, got);
 	opaque_test_params_save(test);
 	io_opaque_send_managed = true;
-	io_opaque_send_prepay = prepay;
 	io_opaque_send_copy_max = 0;
 	opaque_test_cache(test, store, 4);
 	opaque_test_copy(data, source);
@@ -11302,17 +11278,6 @@ static void opaque_holds_unit_run(struct kunit *test, bool prepay)
 		io_opaque_unit_put(store, taken[1]);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
-}
-
-static void opaque_send_managed_holds_unit(struct kunit *test)
-{
-	opaque_holds_unit_run(test, false);
-}
-
-/* The same with the references prepaid: the units are let go of when the peer has read. */
-static void opaque_send_prepay_holds_unit(struct kunit *test)
-{
-	opaque_holds_unit_run(test, true);
 }
 
 /*
@@ -11654,8 +11619,6 @@ static void opaque_managed_fill_runs(struct kunit *test)
 	opaque_managed_read(&after);
 	KUNIT_EXPECT_EQ(test, after.skbs - before.skbs, 1ULL);
 	KUNIT_EXPECT_EQ(test, after.refs - before.refs, 2ULL);
-	/* The fill had no cursor: both references were its own. */
-	KUNIT_EXPECT_EQ(test, after.gets - before.gets, 2ULL);
 	/* The skb let go of the data: the ubuf completes, and gives the folios back. */
 	kfree_skb(f.skb);
 	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
@@ -12417,709 +12380,6 @@ static void opaque_managed_boundary(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
-/*
- * Prepaid folio references. A managed send may take the references that its ubufs
- * will want before TCP allocates its first skb (send_prepay), and its fill gives them
- * out from the send's cursor, one for each folio of each ubuf; what the ubufs did not
- * take goes back when TCP is done. The tests look at what is prepaid and what is not,
- * at the hand-out in the fill, at the references that are left in the pages after
- * sends that end in each way a send ends, and at the counter of the references that
- * the fill took itself.
- */
-
-/* The pages' counts, less the one that the object holds on each. */
-static long opaque_pages_held(struct page **pages, unsigned int nr)
-{
-	long held = 0;
-	unsigned int i;
-
-	for (i = 0; i < nr; i++)
-		held += page_count(pages[i]) - 1;
-	return held;
-}
-
-static struct io_opaque_send_cursor opaque_new_cursor(void)
-{
-	return (struct io_opaque_send_cursor) { .uarg.ops = &io_opaque_cursor_ops };
-}
-
-/* What a folio of @segs segments and @bytes bytes is credited with. */
-static unsigned int opaque_credit(unsigned int segs, size_t bytes)
-{
-	unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
-
-	return 1 + max_t(unsigned int, DIV_ROUND_UP(segs, limit), DIV_ROUND_UP(bytes, SZ_16K));
-}
-
-/*
- * What a send prepays: nothing with the knob off, nothing for a body that is not
- * a bvec cursor, nothing for one that lies in more folios or more segments than a
- * send prepays for; else every folio a reference for the skb the send joins and
- * for every skb that its segments, or its bytes, can fill, taken at once. The
- * cursor is counted from where it stands to where it ends.
- */
-static void opaque_managed_prepay_selection(struct kunit *test)
-{
-	struct io_opaque_send_cursor cursor = opaque_new_cursor();
-	struct bio_vec bv[IO_OPAQUE_PREPAY_SEGS + 2];
-	const size_t unit2 = 80000 - 2 * OPAQUE_TEST_UNIT;
-	struct kvec kv = { .iov_base = &cursor, .iov_len = 1 };
-	struct io_opaque_data *sparse;
-	struct opaque_splice f;
-	struct iov_iter iter;
-	unsigned int i;
-
-	opaque_test_params_save(test);
-	opaque_splice_setup(test, &f);
-
-	/* The knob is off: nothing is taken, and nothing is given back. */
-	io_opaque_send_prepay = false;
-	io_opaque_cursor_prepay(&cursor, &f.iter);
-	KUNIT_EXPECT_EQ(test, cursor.nr, 0);
-	io_opaque_cursor_refund(&cursor);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1);
-
-	/* The whole object: three folios, a segment each. */
-	io_opaque_send_prepay = true;
-	io_opaque_cursor_prepay(&cursor, &f.iter);
-	KUNIT_ASSERT_EQ(test, cursor.nr, 3);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_PTR_EQ(test, cursor.folio[i], page_folio(f.units[i]));
-	KUNIT_EXPECT_EQ(test, cursor.credit[0], opaque_credit(1, OPAQUE_TEST_UNIT));
-	KUNIT_EXPECT_EQ(test, cursor.credit[1], opaque_credit(1, OPAQUE_TEST_UNIT));
-	KUNIT_EXPECT_EQ(test, cursor.credit[2], opaque_credit(1, unit2));
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1 + (int)cursor.credit[i]);
-	/* Nobody took any: it all goes back, and what has gone back cannot go back again. */
-	io_opaque_cursor_refund(&cursor);
-	KUNIT_EXPECT_EQ(test, cursor.nr, 0);
-	io_opaque_cursor_refund(&cursor);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1);
-
-	/* A cursor that is begun and cut short counts only what is left of it. */
-	iter = f.iter;
-	iov_iter_advance(&iter, OPAQUE_TEST_UNIT + 5);
-	iov_iter_truncate(&iter, 1000);
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_ASSERT_EQ(test, cursor.nr, 1);
-	KUNIT_EXPECT_PTR_EQ(test, cursor.folio[0], page_folio(f.units[1]));
-	KUNIT_EXPECT_EQ(test, cursor.credit[0], opaque_credit(1, 1000));
-	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1 + (int)cursor.credit[0]);
-	io_opaque_cursor_refund(&cursor);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 1);
-
-	/* As many segments as a send prepays for, in one folio: a skb for every limit of them. */
-	for (i = 0; i < IO_OPAQUE_PREPAY_SEGS; i++)
-		bvec_set_page(&bv[i], f.units[0], 100, i * 200);
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, IO_OPAQUE_PREPAY_SEGS, IO_OPAQUE_PREPAY_SEGS * 100);
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_ASSERT_EQ(test, cursor.nr, 1);
-	KUNIT_EXPECT_EQ(test, cursor.credit[0],
-			opaque_credit(IO_OPAQUE_PREPAY_SEGS, IO_OPAQUE_PREPAY_SEGS * 100));
-	io_opaque_cursor_refund(&cursor);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
-	/* One more is too many, and nothing is taken. */
-	bvec_set_page(&bv[IO_OPAQUE_PREPAY_SEGS], f.units[0], 100, IO_OPAQUE_PREPAY_SEGS * 200);
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, IO_OPAQUE_PREPAY_SEGS + 1,
-		      (IO_OPAQUE_PREPAY_SEGS + 1) * 100);
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_EXPECT_EQ(test, cursor.nr, 0);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
-	/* A segment with nothing in it is not a segment. */
-	bvec_set_page(&bv[IO_OPAQUE_PREPAY_SEGS], f.units[2], 0, 0);
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, IO_OPAQUE_PREPAY_SEGS + 1,
-		      IO_OPAQUE_PREPAY_SEGS * 100);
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_EXPECT_EQ(test, cursor.nr, 1);
-	io_opaque_cursor_refund(&cursor);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 1);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 1);
-
-	/* As many folios as a send prepays for, a segment in each: all. One more: none. */
-	sparse = opaque_sparse_data(test, f.store);
-	for (i = 0; i <= IO_OPAQUE_PREPAY_FOLIOS; i++)
-		bv[i] = sparse->bvec[i];
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, IO_OPAQUE_PREPAY_FOLIOS,
-		      2000 * IO_OPAQUE_PREPAY_FOLIOS);
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_EXPECT_EQ(test, cursor.nr, IO_OPAQUE_PREPAY_FOLIOS);
-	for (i = 0; i < IO_OPAQUE_PREPAY_FOLIOS; i++)
-		KUNIT_EXPECT_EQ(test, page_count(bv[i].bv_page), 1 + (int)cursor.credit[i]);
-	io_opaque_cursor_refund(&cursor);
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, IO_OPAQUE_PREPAY_FOLIOS + 1,
-		      2000 * (IO_OPAQUE_PREPAY_FOLIOS + 1));
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_EXPECT_EQ(test, cursor.nr, 0);
-	for (i = 0; i <= IO_OPAQUE_PREPAY_FOLIOS; i++)
-		KUNIT_EXPECT_EQ(test, page_count(bv[i].bv_page), 1);
-	io_opaque_data_put(f.store, sparse);
-
-	/* Only a bvec cursor is prepaid. */
-	iov_iter_kvec(&iter, ITER_SOURCE, &kv, 1, 1);
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_EXPECT_EQ(test, cursor.nr, 0);
-	kfree_skb(f.skb);
-	opaque_splice_done(&f);
-}
-
-/*
- * The fill gives the ubufs the references of the send's cursor, and takes its own
- * for what the cursor has none of or no more of: a folio that was not prepaid, and
- * a folio whose credit the ubufs before have used up. Each of the fill's is counted
- * once. The pointer that link_skb() leaves in the ubuf is gone when the fill has run,
- * whatever the fill did, and the references that nobody took are given back.
- */
-static void opaque_managed_prepay_fill(struct kunit *test)
-{
-	struct io_opaque_send_cursor cursor = opaque_new_cursor();
-	struct opaque_managed before, after;
-	struct sk_buff *skb2 = alloc_skb(0, GFP_KERNEL);
-	struct io_opaque_ubuf *u, *v;
-	struct page *prefix = alloc_page(GFP_KERNEL);
-	struct opaque_splice f;
-	struct iov_iter iter;
-	struct bio_vec bv[2];
-	unsigned int i;
-
-	KUNIT_ASSERT_NOT_NULL(test, skb2);
-	KUNIT_ASSERT_NOT_NULL(test, prefix);
-	opaque_test_params_save(test);
-	io_opaque_send_prepay = true;
-	opaque_splice_setup(test, &f);
-
-	/* Everything prepaid: the three folios of the object, and no atomic in the fill. */
-	iter = f.iter;
-	io_opaque_cursor_prepay(&cursor, &iter);
-	KUNIT_ASSERT_EQ(test, cursor.nr, 3);
-	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(f.skb, &cursor.uarg), 0);
-	u = container_of(skb_zcopy(f.skb), struct io_opaque_ubuf, uarg);
-	KUNIT_EXPECT_PTR_EQ(test, u->cursor, &cursor);
-	opaque_managed_read(&before);
-	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 80000), 0);
-	opaque_managed_read(&after);
-	KUNIT_EXPECT_PTR_EQ(test, u->cursor, NULL);
-	KUNIT_EXPECT_EQ(test, after.refs - before.refs, 3ULL);
-	KUNIT_EXPECT_EQ(test, after.gets - before.gets, 0ULL);
-	KUNIT_EXPECT_EQ(test, u->nr, 3);
-	/* The object's reference, the ubuf's, and what the cursor still has. */
-	KUNIT_EXPECT_EQ(test, cursor.credit[0], opaque_credit(1, OPAQUE_TEST_UNIT) - 1);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 2 + (int)cursor.credit[i]);
-	io_opaque_cursor_refund(&cursor);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 2);
-	kfree_skb(f.skb);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1);
-
-	/*
-	 * A cursor with one reference for unit 0 and none for unit 1: the first skb takes the
-	 * reference for unit 0, the folio that was not prepaid is the fill's, and so is the
-	 * unit 0 of the second skb, whose credit is spent. The fill counts those two.
-	 */
-	cursor = opaque_new_cursor();
-	cursor.nr = 1;
-	cursor.folio[0] = page_folio(f.units[0]);
-	cursor.credit[0] = 1;
-	folio_ref_add(cursor.folio[0], 1);
-	bvec_set_page(&bv[0], f.units[0], 100, 0);
-	bvec_set_page(&bv[1], f.units[1], 100, 0);
-	f.skb = alloc_skb(0, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, f.skb);
-	opaque_managed_read(&before);
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, 2, 200);
-	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(f.skb, &cursor.uarg), 0);
-	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 200), 0);
-	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb2, &cursor.uarg), 0);
-	v = container_of(skb_zcopy(skb2), struct io_opaque_ubuf, uarg);
-	KUNIT_EXPECT_PTR_EQ(test, v->cursor, &cursor);
-	iov_iter_bvec(&iter, ITER_SOURCE, bv, 1, 100);
-	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(skb2, &iter, 100), 0);
-	KUNIT_EXPECT_PTR_EQ(test, v->cursor, NULL);
-	opaque_managed_read(&after);
-	KUNIT_EXPECT_EQ(test, after.refs - before.refs, 3ULL);
-	KUNIT_EXPECT_EQ(test, after.gets - before.gets, 2ULL);
-	KUNIT_EXPECT_EQ(test, cursor.credit[0], 0U);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 3);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[1]), 2);
-	io_opaque_cursor_refund(&cursor);
-	KUNIT_EXPECT_EQ(test, page_count(f.units[0]), 3);
-	kfree_skb(f.skb);
-	kfree_skb(skb2);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1);
-
-	/*
-	 * A skb that cannot be managed gets the fallback, which takes page references of its
-	 * own and none of the cursor's. The pointer in its ubuf is gone just the same.
-	 */
-	cursor = opaque_new_cursor();
-	io_opaque_cursor_prepay(&cursor, &f.iter);
-	KUNIT_ASSERT_EQ(test, cursor.nr, 3);
-	f.skb = alloc_skb(0, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, f.skb);
-	skb_add_rx_frag(f.skb, 0, prefix, 0, 24, 24);
-	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(f.skb, &cursor.uarg), 0);
-	u = container_of(skb_zcopy(f.skb), struct io_opaque_ubuf, uarg);
-	KUNIT_EXPECT_PTR_EQ(test, u->cursor, &cursor);
-	iter = f.iter;
-	opaque_managed_read(&before);
-	KUNIT_ASSERT_EQ(test, io_opaque_sg_from_iter(f.skb, &iter, 6000), 0);
-	opaque_managed_read(&after);
-	KUNIT_EXPECT_PTR_EQ(test, u->cursor, NULL);
-	KUNIT_EXPECT_EQ(test, after.fallback - before.fallback, 1ULL);
-	KUNIT_EXPECT_EQ(test, after.refs, before.refs);
-	KUNIT_EXPECT_EQ(test, after.gets, before.gets);
-	KUNIT_EXPECT_EQ(test, cursor.credit[0], opaque_credit(1, OPAQUE_TEST_UNIT));
-	io_opaque_cursor_refund(&cursor);
-	kfree_skb(f.skb);
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_EQ(test, page_count(f.units[i]), 1);
-	opaque_splice_done(&f);
-}
-
-/*
- * An object of three units, compacted from the sparse one and published as (0, 9): the
- * shape of object that a send prepays for. Its pages go to @units and its bytes to
- * @source.
- */
-static void opaque_units_object(struct kunit *test, struct io_opaque_store *store, u8 *source,
-				struct page **units)
-{
-	struct io_opaque_data *data = opaque_sparse_data(test, store);
-	struct io_opaque_req compact = {
-		.store = store, .data = data, .handle = io_opaque_handle(0, 9),
-	};
-
-	opaque_test_cache(test, store, 4);
-	opaque_test_copy(data, source);
-	opaque_test_publish(store, 0, 9, data);
-	refcount_inc(&data->refs); /* compaction worker */
-	KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
-	KUNIT_ASSERT_EQ(test, opaque_test_pages(compact.replacement, units, 3), 3U);
-	KUNIT_ASSERT_EQ(test, io_opaque_compact_publish(&compact), 0);
-	io_opaque_data_put(store, compact.data);
-	io_opaque_compact_end(&compact);
-}
-
-/* Free the object that is published as (0, 9). */
-static void opaque_object_free(struct io_opaque_store *store)
-{
-	mutex_lock(&store->tables);
-	io_opaque_data_put(store, io_opaque_detach(store, &store->objects[0]));
-	mutex_unlock(&store->tables);
-}
-
-/*
- * The peer reads everything that is queued for it, up to @room bytes into @buf, until
- * TCP has all of it acknowledged and the peer has nothing more; then every unit has no
- * reference but the object's. Returns how much the peer read.
- */
-static u32 opaque_units_settle(struct kunit *test, struct opaque_wire *w, struct page **units,
-			       u8 *buf, u32 room)
-{
-	struct tcp_sock *tp = tcp_sk(w->tx->sk);
-	u32 done = 0, n;
-	unsigned int idle = 0, i;
-
-	while (idle < 100) {
-		n = opaque_wire_drain(w, buf + done, room - done);
-		done += n;
-		if (n) {
-			idle = 0;
-			continue;
-		}
-		if (READ_ONCE(tp->snd_una) == READ_ONCE(tp->write_seq))
-			break;
-		idle++;
-		msleep(20);
-	}
-	for (i = 0; i < 3; i++)
-		KUNIT_EXPECT_TRUE(test, opaque_wire_unit_free(units[i]));
-	return done;
-}
-
-/* One send of the prepay tests: a range or a vector of eight, with or without a frame. */
-struct opaque_prepay_case {
-	bool vector;
-	u32 off, len;		/* the range */
-	u32 prefix, suffix;
-	/* The references the ubufs take, at least; none where the prefix's skb takes the body. */
-	u32 refs;
-};
-
-/*
- * Build the request for @c as request 0 of the fixture, and the bytes the peer should read
- * into @want, from @source and a frame of 0xc0 and up; returns how many.
- */
-static u32 opaque_prepay_request(struct kunit *test, struct opaque_wire *w,
-				 struct io_opaque_store *store, const struct opaque_prepay_case *c,
-				 const u8 *source, u8 *frame, u8 *want)
-{
-	struct io_uring_opaque_send_entry ent[8];
-	struct io_opaque_req *op;
-	u32 body = 0, at, i;
-
-	for (i = 0; i < c->prefix + c->suffix; i++)
-		frame[i] = 0xc0 + i;
-	memcpy(want, frame, c->prefix);
-	at = c->prefix;
-	if (c->vector) {
-		/* Eight ranges of 1000 bytes, four in the first unit and four in the second. */
-		for (i = 0; i < ARRAY_SIZE(ent); i++) {
-			ent[i] = (struct io_uring_opaque_send_entry) {
-				.handle = io_opaque_handle(0, 9), .off = 9000 * i + 100,
-				.len = 1000,
-			};
-			memcpy(want + at, source + ent[i].off, ent[i].len);
-			at += ent[i].len;
-			body += ent[i].len;
-		}
-		op = opaque_wire_vec(test, w, store, 0, ent, ARRAY_SIZE(ent), 0);
-	} else {
-		op = opaque_wire_req(test, w, store, 0, 0, c->off, c->len);
-		memcpy(want + at, source + c->off, c->len);
-		at += c->len;
-		body = c->len;
-	}
-	memcpy(want + at, frame + c->prefix, c->suffix);
-	if (c->prefix || c->suffix) {
-		op->framing = frame;
-		op->prefix_length = c->prefix;
-		op->suffix_length = c->suffix;
-		op->total_length = c->prefix + body + c->suffix;
-		op->resolved = true;
-	}
-	memset(&w->req[0].cqe, 0, sizeof(w->req[0].cqe));
-	return c->prefix + body + c->suffix;
-}
-
-/*
- * Sends of an object of three units, a range or a vector, with and without a frame, with
- * the knob off and on, and of an object of many folios with the knob on. With the knob
- * off the fill takes every reference itself. With it on and few folios it takes none,
- * and in the other case it takes all, because a send that lies in too many folios is not
- * prepaid. Either way the pages hold what the ubufs took and nothing else when the send
- * returns, so that nothing the send prepaid is left over, and every count is back to the
- * object's when the peer has read.
- */
-static void opaque_send_prepay_balance(struct kunit *test)
-{
-	static const struct opaque_prepay_case cases[] = {
-		{ .off = 4196, .len = 40000, .refs = 1 },
-		{ .off = 0, .len = 80000, .refs = 1 },
-		{ .vector = true, .refs = 1 },
-		/* A body that the prefix's skb can take whole is spliced into it: no reference. */
-		{ .off = 4196, .len = 40000, .prefix = 24, .suffix = 8 },
-		{ .vector = true, .prefix = 24, .suffix = 8 },
-		/* One that it cannot take whole goes on in managed skbs. */
-		{ .off = 0, .len = 80000, .prefix = 24, .suffix = 8, .refs = 1 },
-	};
-	struct io_opaque_store *store = opaque_test_store(test);
-	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	u8 *frame = kunit_kmalloc(test, 64, GFP_KERNEL);
-	u8 *want = kunit_kmalloc(test, 80100, GFP_KERNEL);
-	u8 *got = kunit_kmalloc(test, 80100, GFP_KERNEL);
-	struct page *units[3];
-	unsigned int c, prepay;
-
-	KUNIT_ASSERT_NOT_NULL(test, w);
-	KUNIT_ASSERT_NOT_NULL(test, source);
-	KUNIT_ASSERT_NOT_NULL(test, frame);
-	KUNIT_ASSERT_NOT_NULL(test, want);
-	KUNIT_ASSERT_NOT_NULL(test, got);
-	opaque_test_params_save(test);
-	io_opaque_send_managed = true;
-	io_opaque_send_copy_max = 0;
-	opaque_wire_init(test, w);
-	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
-	opaque_units_object(test, store, source, units);
-
-	/*
-	 * The cursor of the send is not zeroed, and what it holds when prepay finds it is what
-	 * was on the stack: the second round has 0xa5 in every byte of it.
-	 */
-	for (prepay = 0; prepay < 4; prepay++) {
-		io_opaque_send_prepay = prepay & 1;
-		io_opaque_send_poison = prepay & 2 ? 0xa5 : -1;
-		for (c = 0; c < ARRAY_SIZE(cases); c++) {
-			bool framed = cases[c].prefix || cases[c].suffix;
-			struct opaque_managed before, after;
-			u64 refs, gets;
-			u32 total;
-
-			total = opaque_prepay_request(test, w, store, &cases[c], source, frame,
-						      want);
-			opaque_managed_read(&before);
-			KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, true), IOU_COMPLETE);
-			opaque_managed_read(&after);
-			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
-			refs = after.refs - before.refs;
-			gets = after.gets - before.gets;
-			/* Knob off: every reference is the fill's. On: none, for so few folios. */
-			KUNIT_EXPECT_EQ_MSG(test, gets, prepay & 1 ? 0ULL : refs,
-					    "case %u prepay %u", c, prepay);
-			KUNIT_EXPECT_GE_MSG(test, refs, (u64)cases[c].refs, "case %u prepay %u",
-					    c, prepay);
-			if (!framed) {
-				/* The ubufs hold what they took, and nobody holds anything else. */
-				KUNIT_EXPECT_EQ(test, opaque_pages_held(units, 3), (long)refs);
-			}
-			opaque_wire_read(test, w, got, 0, total);
-			KUNIT_EXPECT_MEMEQ(test, got, want, total);
-			opaque_units_settle(test, w, units, got, total);
-		}
-	}
-	opaque_object_free(store);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
-}
-
-/*
- * An object that lies in too many folios to be prepaid sends as it always did with the knob
- * on: the fill takes every reference, counts them, and leaves the pages as it found them.
- */
-static void opaque_send_prepay_many(struct kunit *test)
-{
-	struct io_opaque_store *store = opaque_test_store(test);
-	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	struct io_opaque_data *data = opaque_sparse_data(test, store);
-	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	u8 *got = kunit_kmalloc(test, 40000, GFP_KERNEL);
-	struct opaque_page_refs *pages;
-	struct opaque_managed before, after;
-
-	KUNIT_ASSERT_NOT_NULL(test, w);
-	KUNIT_ASSERT_NOT_NULL(test, source);
-	KUNIT_ASSERT_NOT_NULL(test, got);
-	opaque_test_params_save(test);
-	io_opaque_send_managed = true;
-	io_opaque_send_copy_max = 0;
-	io_opaque_send_prepay = true;
-	opaque_wire_init(test, w);
-	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
-	opaque_test_publish(store, 0, 9, data);
-	opaque_test_copy(data, source);
-	pages = opaque_page_refs_take(test, data);
-
-	opaque_managed_read(&before);
-	opaque_managed_send(test, w, store, 4196, 40000, 0);
-	opaque_managed_read(&after);
-	KUNIT_EXPECT_GE(test, after.refs - before.refs, 21ULL);
-	KUNIT_EXPECT_EQ(test, after.gets - before.gets, after.refs - before.refs);
-	opaque_wire_read(test, w, got, 0, 40000);
-	KUNIT_EXPECT_MEMEQ(test, got, source + 4196, 40000);
-	opaque_wire_acked(w->tx->sk);
-	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, true));
-	opaque_object_free(store);
-	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, false));
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-}
-
-/*
- * A send that queues part of a body and returns EAGAIN has given back what it prepaid:
- * the pages hold what the ubufs of the queued skbs took. The next issue prepays for what
- * is left of the body, from the middle of a segment, and so on until the peer has read it
- * all; then the counts are the object's.
- */
-static void opaque_send_prepay_eagain(struct kunit *test)
-{
-	struct io_opaque_store *store = opaque_test_store(test);
-	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	u8 *got = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	struct opaque_managed before, after;
-	struct io_opaque_req *op;
-	unsigned int tries, done = 0;
-	struct page *units[3];
-	int ret;
-
-	KUNIT_ASSERT_NOT_NULL(test, w);
-	KUNIT_ASSERT_NOT_NULL(test, source);
-	KUNIT_ASSERT_NOT_NULL(test, got);
-	opaque_test_params_save(test);
-	io_opaque_send_managed = true;
-	io_opaque_send_copy_max = 0;
-	io_opaque_send_prepay = true;
-	opaque_wire_init(test, w);
-	opaque_units_object(test, store, source, units);
-	/* A buffer far below the body: one issue cannot queue it. */
-	opaque_wire_sndbuf(w->tx->sk, SZ_32K);
-	op = opaque_wire_req(test, w, store, 0, 0, 0, 80000);
-
-	opaque_managed_read(&before);
-	ret = opaque_wire_issue(w, 0, false);
-	opaque_managed_read(&after);
-	KUNIT_ASSERT_EQ(test, ret, -EAGAIN);
-	KUNIT_EXPECT_GT(test, op->progress, 0ULL);
-	KUNIT_EXPECT_LT(test, op->progress, 80000ULL);
-	KUNIT_EXPECT_GE(test, after.refs - before.refs, 1ULL);
-	KUNIT_EXPECT_EQ(test, after.gets - before.gets, 0ULL);
-	/* Nothing the call prepaid is left in the pages: the ubufs of the queued skbs hold them. */
-	KUNIT_EXPECT_EQ(test, opaque_pages_held(units, 3), (long)(after.refs - before.refs));
-
-	for (tries = 0; tries < 4000; tries++) {
-		ret = opaque_wire_issue(w, 0, false);
-		if (ret == IOU_COMPLETE)
-			break;
-		KUNIT_ASSERT_EQ(test, ret, -EAGAIN);
-		done += opaque_wire_drain(w, got + done, 80000 - done);
-		usleep_range(500, 1000);
-	}
-	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
-	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 80000);
-	opaque_wire_read(test, w, got, done, 80000);
-	KUNIT_EXPECT_MEMEQ(test, got, source, 80000);
-	opaque_units_settle(test, w, units, got, 80000);
-	opaque_object_free(store);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-}
-
-/*
- * A send that fails before it has queued anything, the write side being shut, has given
- * back every reference it prepaid, and took none in the fill.
- */
-static void opaque_send_prepay_error(struct kunit *test)
-{
-	struct io_opaque_store *store = opaque_test_store(test);
-	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	struct opaque_managed before, after;
-	struct io_opaque_req *op;
-	struct page *units[3];
-	unsigned int vector;
-
-	KUNIT_ASSERT_NOT_NULL(test, w);
-	KUNIT_ASSERT_NOT_NULL(test, source);
-	opaque_test_params_save(test);
-	io_opaque_send_managed = true;
-	io_opaque_send_copy_max = 0;
-	io_opaque_send_prepay = true;
-	opaque_wire_init(test, w);
-	opaque_units_object(test, store, source, units);
-	KUNIT_ASSERT_EQ(test, kernel_sock_shutdown(w->tx, SHUT_WR), 0);
-
-	for (vector = 0; vector < 2; vector++) {
-		const struct opaque_prepay_case c = { .vector = vector, .off = 4196, .len = 40000 };
-		u8 *frame = kunit_kmalloc(test, 64, GFP_KERNEL);
-		u8 *want = kunit_kmalloc(test, 80100, GFP_KERNEL);
-
-		KUNIT_ASSERT_NOT_NULL(test, frame);
-		KUNIT_ASSERT_NOT_NULL(test, want);
-		op = NULL;
-		opaque_prepay_request(test, w, store, &c, source, frame, want);
-		op = w->req[0].async_data;
-		opaque_managed_read(&before);
-		KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, true), IOU_COMPLETE);
-		opaque_managed_read(&after);
-		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, -EPIPE);
-		KUNIT_EXPECT_EQ(test, op->progress, 0ULL);
-		KUNIT_EXPECT_EQ(test, after.refs, before.refs);
-		KUNIT_EXPECT_EQ(test, after.gets, before.gets);
-		KUNIT_EXPECT_EQ(test, opaque_pages_held(units, 3), 0L);
-		KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
-	}
-	opaque_object_free(store);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-}
-
-/*
- * A send that sleeps in TCP for room, with its references prepaid, and wakes to a socket
- * error: whatever it had queued is the peer's to read, the next issue meets the error, and
- * when the peer has read all there is, no page has more than the object's reference or
- * less.
- */
-static struct {
-	struct delayed_work work;
-	struct sock *sk;
-} opaque_killer;
-
-static void opaque_killer_fn(struct work_struct *work)
-{
-	struct sock *sk = opaque_killer.sk;
-
-	lock_sock(sk);
-	WRITE_ONCE(sk->sk_err, ECONNRESET);
-	release_sock(sk);
-	sk_error_report(sk);
-}
-
-static void opaque_killer_cancel(void *arg)
-{
-	cancel_delayed_work_sync(&opaque_killer.work);
-}
-
-static void opaque_send_prepay_sockerr(struct kunit *test)
-{
-	struct io_uring_opaque_send_entry ent[6];
-	struct io_opaque_store *store = opaque_test_store(test);
-	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
-	u8 *got = kunit_kmalloc(test, 6 * 80000, GFP_KERNEL);
-	struct opaque_managed before, after;
-	struct io_opaque_req *op;
-	struct page *units[3];
-	unsigned int i;
-	u32 done;
-	int ret;
-
-	KUNIT_ASSERT_NOT_NULL(test, w);
-	KUNIT_ASSERT_NOT_NULL(test, source);
-	KUNIT_ASSERT_NOT_NULL(test, got);
-	opaque_test_params_save(test);
-	io_opaque_send_managed = true;
-	io_opaque_send_copy_max = 0;
-	io_opaque_send_prepay = true;
-	opaque_wire_init(test, w);
-	opaque_units_object(test, store, source, units);
-	/* Far more than the buffers on both sides will take before the peer reads. */
-	opaque_wire_sndbuf(w->tx->sk, SZ_32K);
-	for (i = 0; i < ARRAY_SIZE(ent); i++)
-		ent[i] = (struct io_uring_opaque_send_entry) {
-			.handle = io_opaque_handle(0, 9), .off = 0, .len = 80000,
-		};
-	op = opaque_wire_vec(test, w, store, 0, ent, ARRAY_SIZE(ent), 0);
-	memset(&opaque_killer, 0, sizeof(opaque_killer));
-	opaque_killer.sk = w->tx->sk;
-	INIT_DELAYED_WORK(&opaque_killer.work, opaque_killer_fn);
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_killer_cancel, NULL), 0);
-	schedule_delayed_work(&opaque_killer.work, msecs_to_jiffies(150));
-
-	opaque_managed_read(&before);
-	/* The first issue sleeps in TCP until the error, and ends with what it queued. */
-	ret = opaque_wire_issue(w, 0, true);
-	opaque_managed_read(&after);
-	KUNIT_EXPECT_TRUE(test, ret == -EAGAIN || ret == IOU_COMPLETE);
-	KUNIT_EXPECT_GE(test, after.refs - before.refs, 1ULL);
-	if (ret == -EAGAIN) {
-		KUNIT_EXPECT_GT(test, op->progress, 0ULL);
-		/* The error is there for the next issue, which ends the request with what went. */
-		ret = opaque_wire_issue(w, 0, true);
-		KUNIT_EXPECT_EQ(test, ret, IOU_COMPLETE);
-	}
-	KUNIT_EXPECT_TRUE(test, w->req[0].flags & REQ_F_FAIL);
-	KUNIT_EXPECT_GT(test, w->req[0].cqe.res, 0);
-	KUNIT_EXPECT_LT(test, w->req[0].cqe.res, 6 * 80000);
-	KUNIT_EXPECT_EQ(test, (u64)w->req[0].cqe.res, op->progress);
-	KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
-	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
-	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
-	/* The peer reads what was queued, and it is the object's bytes, range after range. */
-	done = opaque_units_settle(test, w, units, got, 6 * 80000);
-	KUNIT_EXPECT_EQ(test, done, (u32)w->req[0].cqe.res);
-	for (i = 0; i < done; i++)
-		if (got[i] != source[i % 80000])
-			break;
-	KUNIT_EXPECT_EQ(test, i, done);
-	opaque_object_free(store);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
-}
-
 struct opaque_atomic {
 	struct tasklet_struct tasklet;
 	struct completion done;
@@ -13181,6 +12441,12 @@ static void opaque_ubuf_complete_atomic(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, page_count(f.units[2]), 1);
 		opaque_splice_done(&f);
 	}
+}
+
+/* The cursor of a send as io_opaque_send() sets it where a body is managed: its ops. */
+static struct io_opaque_send_cursor opaque_new_cursor(void)
+{
+	return (struct io_opaque_send_cursor) { .uarg.ops = &io_opaque_cursor_ops };
 }
 
 /*
@@ -13333,7 +12599,6 @@ static void opaque_ubuf_pool_reuse(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, u, first);
 		KUNIT_EXPECT_EQ(test, refcount_read(&u->uarg.refcnt), 1U);
 		KUNIT_EXPECT_EQ(test, u->nr, 0);
-		KUNIT_EXPECT_PTR_EQ(test, u->cursor, NULL);
 		KUNIT_EXPECT_PTR_EQ(test, u->uarg.ops, &io_opaque_ubuf_ops);
 		KUNIT_EXPECT_EQ(test, u->uarg.flags, io_opaque_ubuf_flags());
 		KUNIT_EXPECT_PTR_EQ(test, u->pool, p->pool);
@@ -13824,7 +13089,7 @@ static int opaque_race_taker(void *data)
 			continue;
 		}
 		u = opaque_skb_ubuf(skb);
-		if (u->nr || u->cursor || u->pool != r->p->pool ||
+		if (u->nr || u->pool != r->p->pool ||
 		    u->uarg.ops != &io_opaque_ubuf_ops || refcount_read(&u->uarg.refcnt) != 1)
 			atomic_long_inc(&r->bad);
 		switch (xa_insert(&r->inuse, (unsigned long)u >> 3, skb, GFP_KERNEL)) {
@@ -14406,14 +13671,6 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_managed_link),
 	KUNIT_CASE(opaque_managed_link_full),
 	KUNIT_CASE(opaque_managed_boundary),
-	KUNIT_CASE(opaque_managed_prepay_selection),
-	KUNIT_CASE(opaque_managed_prepay_fill),
-	KUNIT_CASE(opaque_send_prepay_balance),
-	KUNIT_CASE(opaque_send_prepay_many),
-	KUNIT_CASE(opaque_send_prepay_holds_unit),
-	KUNIT_CASE(opaque_send_prepay_eagain),
-	KUNIT_CASE(opaque_send_prepay_error),
-	KUNIT_CASE(opaque_send_prepay_sockerr),
 	KUNIT_CASE(opaque_ubuf_complete_atomic),
 	KUNIT_CASE(opaque_ubuf_pool_reuse),
 	KUNIT_CASE(opaque_ubuf_pool_share),

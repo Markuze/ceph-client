@@ -4265,12 +4265,12 @@ atomic_long_t io_opaque_ubuf_pools_live = ATOMIC_LONG_INIT(0);
  * KASAN. A ubuf in the pool is poisoned, as an entry of io_alloc_cache is, so that an
  * access through a pointer that an skb kept to a ubuf that has completed is reported
  * where it happens. It is poisoned before it is pushed, which is when the send side
- * may take it, and unpoisoned when it is taken out or freed. The link is not: it
- * shares its storage with the cursor, and the lists are read and written while the
- * ubufs on them are poisoned. KASAN keeps the track of the free in the first bytes of
- * the object, where the count is: a ubuf in the pool has a count of zero only in a
- * build without KASAN, and with it the access that would have read the count is
- * reported first. Without KASAN none of this is code.
+ * may take it, and unpoisoned when it is taken out or freed. The link is not: the
+ * lists are read and written while the ubufs on them are poisoned. KASAN keeps the
+ * track of the free in the first bytes of the object, where the count is: a ubuf in
+ * the pool has a count of zero only in a build without KASAN, and with it the access
+ * that would have read the count is reported first. Without KASAN none of this is
+ * code.
  */
 #define IO_OPAQUE_UBUF_POOL_CLOSED	((struct llist_node *)1UL)
 
@@ -4459,11 +4459,6 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * to do the same. A range that would have extended the last fragment starts
  * the next skb instead.
  *
- * A send that has folio references to hand out leaves its cursor in the ubuf
- * for the fill that follows, which takes it and clears it: the cursor is on
- * the send's stack, and the pointer lives from here to the next statement of
- * skb_zerocopy_iter_stream().
- *
  * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
  * the cursor names the pool and has one, else the cache's. TCP does not set
  * skb->sk on a skb of its write queue, so the allocation has no socket to take
@@ -4471,24 +4466,17 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  */
 VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 {
-	struct io_opaque_send_cursor *cursor = NULL;
 	struct io_opaque_ubuf_pool *pool = NULL;
 	struct ubuf_info *cur = skb_zcopy(skb);
 	struct io_opaque_ubuf *u;
 
 	/* TCP passes the send's cursor; a caller that is not a send passes none. */
-	if (uarg && uarg->ops == &io_opaque_cursor_ops) {
-		cursor = container_of(uarg, struct io_opaque_send_cursor, uarg);
-		pool = cursor->pool;
-		if (!cursor->nr)
-			cursor = NULL;
-	}
+	if (uarg && uarg->ops == &io_opaque_cursor_ops)
+		pool = container_of(uarg, struct io_opaque_send_cursor, uarg)->pool;
 	if (cur) {
 		if (cur->ops != &io_opaque_ubuf_ops ||
 		    skb_shinfo(skb)->nr_frags >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
 			return -EEXIST;
-		if (cursor)
-			container_of(cur, struct io_opaque_ubuf, uarg)->cursor = cursor;
 		return 0;
 	}
 	u = pool ? io_opaque_ubuf_pool_get(pool) : NULL;
@@ -4508,7 +4496,6 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 	u->uarg.flags = io_opaque_ubuf_flags();
 	refcount_set(&u->uarg.refcnt, 1);
 	u->nr = 0;
-	u->cursor = cursor;
 	skb_zcopy_init(skb, &u->uarg);
 	io_opaque_count(IO_OPAQUE_STAT_SEND_MANAGED_SKBS, 1);
 	return 0;
@@ -4567,102 +4554,6 @@ static inline struct page *io_opaque_seg_page(const struct bio_vec *bv)
 }
 
 /*
- * Take, before TCP allocates its first skb, the folio references that the
- * ubufs of its skbs will want, for the fill to give them without an atomic of
- * its own. In the fill the first locked instruction after TCP has initialised
- * a new skb, and link_skb() its ubuf, is a folio_get(), and it waits for those
- * stores; here the call pays an atomic each way for a folio and nothing waits.
- *
- * A folio is credited with a reference for the skb that the call joins, which
- * may not have it yet, and for each skb that the call can fill with it: one for
- * every fragment limit's worth of its segments, and one for every 16 KiB of its
- * bytes, which a skb that TCP fills to its size goal has when the device does
- * segmentation offload. That is an estimate, and where it falls short the fill
- * takes its own reference, which stat_send_folio_gets counts. Only a call whose
- * bytes lie in IO_OPAQUE_PREPAY_FOLIOS folios and IO_OPAQUE_PREPAY_SEGS segments
- * is prepaid: a longer one makes the fill's atomics a small part of its cost,
- * and the scan below is not free.
- *
- * What the ubufs did not take goes back in io_opaque_cursor_refund() when TCP
- * is done. The folios are alive all the while: the send holds its pin on the
- * version, and the version's extents hold the pages. Off unless send_prepay is
- * set.
- */
-VISIBLE_IF_KUNIT void io_opaque_cursor_prepay(struct io_opaque_send_cursor *cursor,
-					      const struct iov_iter *iter)
-{
-	unsigned int limit = max(READ_ONCE(net_hotdata.sysctl_max_skb_frags), 1);
-	const struct bio_vec *bv = iter->bvec;
-	size_t left = iov_iter_count(iter), skip = iter->iov_offset;
-	unsigned long segs = iter->nr_segs;
-	struct page *head[IO_OPAQUE_PREPAY_FOLIOS];
-	size_t bytes[IO_OPAQUE_PREPAY_FOLIOS] = {};
-	unsigned int count[IO_OPAQUE_PREPAY_FOLIOS] = {};
-	unsigned int i, nr = 0, seen = 0;
-
-	cursor->nr = 0;
-	if (!READ_ONCE(io_opaque_send_prepay) || !iov_iter_is_bvec(iter))
-		return;
-	for (; left && segs; bv++, segs--, skip = 0) {
-		size_t part = min_t(size_t, bv->bv_len - skip, left);
-		struct page *page;
-
-		if (!part)
-			continue;
-		if (++seen > IO_OPAQUE_PREPAY_SEGS)
-			return;
-		page = io_opaque_seg_page(bv);
-		for (i = 0; i < nr && head[i] != page; i++)
-			;
-		if (i == nr) {
-			if (nr == IO_OPAQUE_PREPAY_FOLIOS)
-				return;
-			head[nr++] = page;
-		}
-		count[i]++;
-		bytes[i] += part;
-		left -= part;
-	}
-	for (i = 0; i < nr; i++) {
-		struct folio *folio = page_folio(head[i]);
-
-		cursor->folio[i] = folio;
-		cursor->credit[i] = 1 + max_t(unsigned int, DIV_ROUND_UP(count[i], limit),
-					      DIV_ROUND_UP(bytes[i], SZ_16K));
-		VM_WARN_ON_ONCE_FOLIO(folio_ref_zero_or_close_to_overflow(folio), folio);
-		folio_ref_add(folio, cursor->credit[i]);
-	}
-	cursor->nr = nr;
-}
-
-/* Give back what the ubufs of the call did not take. */
-VISIBLE_IF_KUNIT void io_opaque_cursor_refund(struct io_opaque_send_cursor *cursor)
-{
-	unsigned int i;
-
-	for (i = 0; i < cursor->nr; i++)
-		if (cursor->credit[i])
-			folio_put_refs(cursor->folio[i], cursor->credit[i]);
-	cursor->nr = 0;
-}
-
-/* One of the call's prepaid references on @folio, if it has one left. */
-static bool io_opaque_cursor_take(struct io_opaque_send_cursor *cursor, const struct folio *folio)
-{
-	unsigned int i;
-
-	for (i = 0; i < cursor->nr; i++) {
-		if (cursor->folio[i] != folio)
-			continue;
-		if (!cursor->credit[i])
-			break;
-		cursor->credit[i]--;
-		return true;
-	}
-	return false;
-}
-
-/*
  * Add the bytes of @from to @skb as managed fragments, at most @length of
  * them: what a splice would add, with a folio's reference taken once for the
  * ubuf and not once for each fragment, and no page reference in the skb. A
@@ -4681,10 +4572,6 @@ static bool io_opaque_cursor_take(struct io_opaque_send_cursor *cursor, const st
  * list. The cursor is advanced here, as io_sg_from_iter() advances it, and not
  * walked again by iov_iter_advance().
  *
- * The reference for a new folio is one of the send's prepaid ones when it has
- * any left for the folio (io_opaque_cursor_prepay()), else a folio_get(),
- * which is counted.
- *
  * A skb that has fragments of its own cannot be managed: the fill takes a
  * reference for each, as a splice does (a framed send's prefix is copied into
  * the skb first). Returns 0 with the bytes added, or -EMSGSIZE if the skb
@@ -4696,12 +4583,11 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	struct ubuf_info *uarg = skb_zcopy(skb);
 	unsigned int limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
-	unsigned int nr = shinfo->nr_frags, refs = 0, gets = 0;
+	unsigned int nr = shinfo->nr_frags, refs = 0;
 	const struct bio_vec *bv = from->bvec;
 	unsigned long segs = from->nr_segs;
 	size_t skip = from->iov_offset;
 	size_t left = min(from->count, length), added = 0;
-	struct io_opaque_send_cursor *cursor;
 	struct page *held = NULL;
 	skb_frag_t *last = NULL;
 	struct io_opaque_ubuf *u;
@@ -4709,11 +4595,6 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 
 	if (WARN_ON_ONCE(!uarg || uarg->ops != &io_opaque_ubuf_ops || !iov_iter_is_bvec(from)))
 		return -EFAULT;
-	u = container_of(uarg, struct io_opaque_ubuf, uarg);
-	/* The send's, if link_skb() left one: it is good for this call only. */
-	cursor = u->cursor;
-	if (cursor)
-		u->cursor = NULL;
 	if (nr && !skb_zcopy_managed(skb)) {
 		ssize_t spliced;
 
@@ -4724,6 +4605,7 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 		/* TCP takes -EFAULT as the end of the send, and no other error is worth more. */
 		return spliced < 0 ? -EFAULT : 0;
 	}
+	u = container_of(uarg, struct io_opaque_ubuf, uarg);
 	if (!nr) {
 		shinfo->flags |= SKBFL_MANAGED_FRAG_REFS;
 	} else {
@@ -4767,10 +4649,7 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 						ret = -EMSGSIZE;
 						break;
 					}
-					if (!cursor || !io_opaque_cursor_take(cursor, folio)) {
-						folio_get(folio);
-						gets++;
-					}
+					folio_get(folio);
 					u->folio[u->nr++] = folio;
 					refs++;
 				}
@@ -4797,8 +4676,6 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 	from->count -= added;
 	if (refs)
 		io_opaque_count(IO_OPAQUE_STAT_SEND_FOLIO_REFS, refs);
-	if (gets)
-		io_opaque_count(IO_OPAQUE_STAT_SEND_FOLIO_GETS, gets);
 	return ret;
 }
 
@@ -5010,7 +4887,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct sock *sk = NULL;
 	struct kvec vec;
 	u32 body_end;
-	bool body = false, splice = false, managed, fresh = false, left, owned = false;
+	bool body = false, splice = false, fresh = false, left, owned = false;
 	bool joined = false;
 	int ret, sec = 0;
 
@@ -5096,7 +4973,6 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	}
 
 again:
-	managed = false;
 	body_end = op->prefix_length + op->length;
 	body = op->length && op->progress >= op->prefix_length &&
 	       op->progress < body_end;
@@ -5110,13 +4986,8 @@ again:
 	} else if (body) {
 		msg.msg_iter = op->iter;
 		splice = io_opaque_send_splices(op);
-		managed = splice && owned && io_opaque_sends_managed(sk);
-		if (managed) {
-			/*
-			 * The ubuf_info is whole, as it was. Of the rest io_opaque_cursor_prepay()
-			 * sets the count of folios before anything reads it, and the folios and
-			 * their credits are read below that count only.
-			 */
+		if (splice && owned && io_opaque_sends_managed(sk)) {
+			/* The ubuf_info is whole: its ops, no count and no flags. */
 			cursor.uarg = (struct ubuf_info) { .ops = &io_opaque_cursor_ops };
 			cursor.pool = READ_ONCE(op->store->ubuf_pool);
 			msg.msg_flags |= MSG_ZEROCOPY;
@@ -5135,13 +5006,8 @@ again:
 		iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &vec, 1, vec.iov_len);
 	if (owned) {
 		IO_OPAQUE_SEND_LOCKED_CALL();
-		if (managed)
-			io_opaque_cursor_prepay(&cursor, &msg.msg_iter);
 		IO_OPAQUE_SEND_PART(&msg, &cursor, true);
 		ret = tcp_sendmsg_locked(sk, &msg, iov_iter_count(&msg.msg_iter));
-		/* However the call ended, what the ubufs did not take goes back. */
-		if (managed)
-			io_opaque_cursor_refund(&cursor);
 		if (trace_sock_send_length_enabled())
 			trace_sock_send_length(sk, ret, 0);
 	} else {

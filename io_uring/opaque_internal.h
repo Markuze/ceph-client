@@ -336,7 +336,6 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_FOLIO_REFS,
 	IO_OPAQUE_STAT_SEND_FRAG_FALLBACK,
 	IO_OPAQUE_STAT_SEND_UBUF_COPIED,
-	IO_OPAQUE_STAT_SEND_FOLIO_GETS,
 	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
 	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
 	IO_OPAQUE_STAT_SEND_UBUF_REUSED,
@@ -356,8 +355,6 @@ static inline void io_opaque_count(enum io_opaque_stat_item item, u64 delta)
 
 u64 io_opaque_stat_read(enum io_opaque_stat_item item);
 
-struct io_opaque_send_cursor;
-
 /*
  * The ubuf_info of the skbs that carry a send's managed fragments (see
  * io_opaque_link_skb()): one per skb, shared by the skbs that are derived from it.
@@ -366,19 +363,11 @@ struct io_opaque_ubuf {
 	struct ubuf_info uarg;
 	/* Entries of folio[]. */
 	u8 nr;
-	union {
-		/*
-		 * The send whose link_skb() has just been called, if it has folio
-		 * references to hand out; the fill that follows takes it and clears it,
-		 * so that it never outlives the call.
-		 */
-		struct io_opaque_send_cursor *cursor;
-		/*
-		 * Link in the pool of a ubuf that has completed and is waiting for a skb.
-		 * KASAN poisons a ubuf in the pool but for this (io_opaque_ubuf_poison()).
-		 */
-		struct llist_node node;
-	};
+	/*
+	 * Link in the pool of a ubuf that has completed and is waiting for a skb.
+	 * KASAN poisons a ubuf in the pool but for this (io_opaque_ubuf_poison()).
+	 */
+	struct llist_node node;
 	/* Where the ubuf goes when its last skb is freed; none for one that is only freed. */
 	struct io_opaque_ubuf_pool *pool;
 	/* The distinct folios of the fragments of the skbs that share the ubuf. */
@@ -408,27 +397,14 @@ struct io_opaque_ubuf_pool {
 };
 
 /*
- * A managed send prepays its folio references when it is short of folios and of
- * segments, as many as these (io_opaque_cursor_prepay()).
- */
-#define IO_OPAQUE_PREPAY_FOLIOS	4
-#define IO_OPAQUE_PREPAY_SEGS	32
-
-/*
  * What msg_ubuf points at during one managed tcp_sendmsg_locked(): the ops that
- * skb_zerocopy_iter_stream() finds link_skb() through, and the folio references
- * that the send took before TCP allocated any skb, for the fill to give the
- * ubufs of the skbs without an atomic of its own.
+ * skb_zerocopy_iter_stream() finds link_skb() through, and the pool of the send's
+ * store, for the ubufs of its skbs.
  */
 struct io_opaque_send_cursor {
 	struct ubuf_info uarg;
 	/* The pool of the send's store, for the ubufs of its skbs; or none. */
 	struct io_opaque_ubuf_pool *pool;
-	/* Entries of folio[] and credit[]. */
-	u8 nr;
-	struct folio *folio[IO_OPAQUE_PREPAY_FOLIOS];
-	/* References on folio[] that the send holds and no ubuf has taken. */
-	unsigned int credit[IO_OPAQUE_PREPAY_FOLIOS];
 };
 
 /* Evaluation tunables; module parameters, not ABI. */
@@ -438,7 +414,6 @@ extern unsigned int io_opaque_inline_compact_max;
 extern bool io_opaque_copy_per_page;
 extern unsigned int io_opaque_send_copy_max;
 extern bool io_opaque_send_managed;
-extern bool io_opaque_send_prepay;
 
 struct io_opaque_store {
 	refcount_t refs;
@@ -681,8 +656,6 @@ struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool)
 u8 io_opaque_ubuf_flags(void);
 int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
 int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);
-void io_opaque_cursor_prepay(struct io_opaque_send_cursor *cursor, const struct iov_iter *iter);
-void io_opaque_cursor_refund(struct io_opaque_send_cursor *cursor);
 int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
 			    const struct io_opaque_req *op);
 extern atomic_long_t io_opaque_send_locked_calls;

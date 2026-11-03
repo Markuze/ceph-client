@@ -65,11 +65,6 @@ module_param_named(send_managed, io_opaque_send_managed, bool, 0644);
 MODULE_PARM_DESC(send_managed,
 		 "Send a spliced body as managed fragments, held by one completion for each skb (default), or with a page reference for each fragment");
 
-bool io_opaque_send_prepay;
-module_param_named(send_prepay, io_opaque_send_prepay, bool, 0644);
-MODULE_PARM_DESC(send_prepay,
-		 "Take the folio references of a managed send before TCP allocates its skbs, for its ubufs to take without an atomic, or when the fill needs them (default)");
-
 DEFINE_PER_CPU(struct io_opaque_stats, io_opaque_stats);
 
 u64 io_opaque_stat_read(enum io_opaque_stat_item item)
@@ -133,7 +128,6 @@ IO_OPAQUE_STAT_PARAM(stat_send_managed_skbs, IO_OPAQUE_STAT_SEND_MANAGED_SKBS);
 IO_OPAQUE_STAT_PARAM(stat_send_folio_refs, IO_OPAQUE_STAT_SEND_FOLIO_REFS);
 IO_OPAQUE_STAT_PARAM(stat_send_frag_fallback, IO_OPAQUE_STAT_SEND_FRAG_FALLBACK);
 IO_OPAQUE_STAT_PARAM(stat_send_ubuf_copied, IO_OPAQUE_STAT_SEND_UBUF_COPIED);
-IO_OPAQUE_STAT_PARAM(stat_send_folio_gets, IO_OPAQUE_STAT_SEND_FOLIO_GETS);
 IO_OPAQUE_STAT_PARAM(stat_send_admit_fast, IO_OPAQUE_STAT_SEND_ADMIT_FAST);
 IO_OPAQUE_STAT_PARAM(stat_send_admit_slow, IO_OPAQUE_STAT_SEND_ADMIT_SLOW);
 IO_OPAQUE_STAT_PARAM(stat_send_ubuf_reused, IO_OPAQUE_STAT_SEND_UBUF_REUSED);
