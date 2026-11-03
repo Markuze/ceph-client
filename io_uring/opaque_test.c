@@ -13905,7 +13905,7 @@ static struct {
 	/* Whether the window ran in an RCU read-side section, as it must. */
 	bool rcu;
 	/* What the act got, and the count of @watch before it and after. */
-	int ret;
+	int ret, reuse_ret;
 	u64 flags;
 	struct io_opaque_data *watch;
 	int before, refs;
@@ -14008,6 +14008,24 @@ static void opaque_lk_reuse(void)
 	opaque_lk.ret = io_opaque_slot_reserve(opaque_lk.reuse);
 	if (!opaque_lk.ret)
 		opaque_lk.ret = io_opaque_publish(opaque_lk.reuse, &opaque_lk.flags);
+}
+
+/*
+ * The compaction is published and its old version loses the references of the compaction and of
+ * the table, so that no one holds it; the replacement is then freed too, and with @reuse the
+ * slot is taken by a new object. Nothing in the table is left for the handle of the old version.
+ */
+static void opaque_lk_compact_free(void)
+{
+	opaque_lk.ret = io_opaque_compact_publish(opaque_lk.compact);
+	io_opaque_data_put(opaque_lk.store, opaque_lk.compact->data);
+	opaque_lk.compact->data = NULL;
+	opaque_test_free(opaque_lk.store, 0);
+	if (opaque_lk.reuse) {
+		opaque_lk.reuse_ret = io_opaque_slot_reserve(opaque_lk.reuse);
+		if (!opaque_lk.reuse_ret)
+			opaque_lk.reuse_ret = io_opaque_publish(opaque_lk.reuse, &opaque_lk.flags);
+	}
 }
 
 /*
@@ -14438,6 +14456,67 @@ static void opaque_pin_reused(struct kunit *test)
 }
 
 /*
+ * A compaction is published in the window, the old version is put by everyone, and the
+ * replacement is freed as well, and the slot taken by another object in one case: the lookup
+ * read a version that has gone with all it was replaced by. It is told by the table that the
+ * handle is stale, and takes nothing; the other object, which has the slot under the next
+ * generation, is not looked at, and nothing is left behind: not the extents, not the charge that
+ * the compaction made.
+ */
+static void opaque_pin_slow_free(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	unsigned int reuse;
+
+	for (reuse = 0; reuse < 2; reuse++) {
+		struct io_opaque_data *data = opaque_sparse_data(test, store);
+		struct io_opaque_data *other = reuse ? opaque_sparse_data(test, store) : NULL;
+		const u64 generation = 9 + 2 * reuse;
+		struct io_opaque_req compact = {
+			.store = store, .data = data, .handle = io_opaque_handle(0, generation),
+		};
+		struct io_opaque_req nreq = {
+			.store = store, .data = other, .length = other ? other->length : 0,
+		};
+		struct io_opaque_req send = {
+			.store = store, .handle = compact.handle, .offset = 100, .length = 1000,
+		};
+		long slow = atomic_long_read(&io_opaque_pin_slow);
+		int ret;
+
+		opaque_test_publish(store, 0, generation, data);
+		store->object_cursor = 0;
+		refcount_inc(&data->refs); /* compaction worker */
+		KUNIT_ASSERT_EQ(test, io_opaque_compact_build(&compact), 0);
+		opaque_lk_open(test, store, opaque_lk_compact_free, 0);
+		opaque_lk.compact = &compact;
+		opaque_lk.reuse = reuse ? &nreq : NULL;
+		ret = opaque_test_acquire(store, &send);
+		opaque_lk_close();
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_lk.rcu);
+		KUNIT_EXPECT_EQ(test, opaque_lk.ret, 0);
+		if (reuse)
+			KUNIT_EXPECT_EQ(test, opaque_lk.reuse_ret, (int)other->length);
+		KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+		KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow) - slow, 1L);
+		io_opaque_compact_end(&compact);
+		if (reuse) {
+			/* The slot is the other object's, which no one has looked at. */
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), other);
+			KUNIT_EXPECT_EQ(test, refcount_read(&other->refs), 1);
+			opaque_test_free(store, 0);
+		}
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
+		kvfree_rcu_barrier();
+	}
+	opaque_expect_lockdep(test, store);
+}
+
+/*
  * The entries of a vector that name one handle are a run: the first pins the version, and the
  * rest use that pin and do not read the slot, which may hold another version by then. Here a
  * compaction is published in the window of the first lookup, so the slot holds the
@@ -14812,6 +14891,10 @@ enum opaque_pin_mode {
 	OPAQUE_PIN_COMPACT,
 	/* Four objects, until the store stops. */
 	OPAQUE_PIN_STOP,
+	/* Vectors read two objects, a new one each round, the one before it freed. */
+	OPAQUE_PIN_VEC_FREE,
+	/* Vectors read two objects, whose versions the writer replaces by compaction. */
+	OPAQUE_PIN_VEC_COMPACT,
 };
 
 struct opaque_pin_race;
@@ -14845,6 +14928,8 @@ struct opaque_pin_race {
 	unsigned int rounds;
 	struct opaque_pin_task task[OPAQUE_PIN_TASKS];
 	struct completion done[OPAQUE_PIN_TASKS];
+	/* The requests of the readers of the vector modes. */
+	struct io_opaque_req vreq[OPAQUE_PIN_READERS];
 };
 
 /*
@@ -15057,7 +15142,11 @@ static int opaque_pin_compactor(void *arg)
 
 	opaque_pin_start(r);
 	for (n = 0; n < OPAQUE_PIN_ROUNDS / 3 && !atomic_read(&r->stop); n++) {
-		struct io_opaque_req compact = { .store = store, .handle = r->handle };
+		/* Two objects take turns, if there are two. */
+		const bool other = r->mode == OPAQUE_PIN_VEC_COMPACT && (n & 1);
+		struct io_opaque_req compact = {
+			.store = store, .handle = other ? r->prev : r->handle,
+		};
 		struct io_opaque_slot *slot;
 		int ret;
 
@@ -15087,6 +15176,147 @@ static int opaque_pin_compactor(void *arg)
 }
 
 /*
+ * What the readers of the vector modes ask for: the newest handle (0) and the one before it (1).
+ * The second entry names the handle of the first, and runs on its reference; the third names
+ * the other, and the fourth names the first again, which is looked up afresh, and may find the
+ * replacement of a compaction that was published since. The second spans two extents, and
+ * the vector five segments for its four entries, so that every vector grows its block once.
+ */
+#define OPAQUE_PIN_VEC_NR	4
+#define OPAQUE_PIN_VEC_SEGS	5
+#define OPAQUE_PIN_VEC_BYTES	3000
+
+static const struct {
+	u8 handle;
+	u32 off, len;
+} opaque_pin_vec_shape[OPAQUE_PIN_VEC_NR] = {
+	{ 0, 100, 1000 }, { 0, 1500, 1000 }, { 1, 0, 500 }, { 0, 2500, 500 },
+};
+
+/*
+ * An admitted vector is what it was asked to be: each entry has the version of its handle, and the
+ * segments are the bytes of the ranges. How many there are depends on the versions, five when
+ * all are as they were made and fewer where a compaction has made one dense.
+ */
+static bool opaque_pin_vec_whole(const struct io_opaque_req *op)
+{
+	const struct io_opaque_vec *vec = op->vec;
+	u32 i, bytes = 0;
+
+	if (op->consumed || vec->pinned != OPAQUE_PIN_VEC_NR ||
+	    vec->nr_segs < OPAQUE_PIN_VEC_NR || vec->nr_segs > OPAQUE_PIN_VEC_SEGS ||
+	    iov_iter_count(&op->iter) != op->length)
+		return false;
+	for (i = 0; i < OPAQUE_PIN_VEC_NR; i++)
+		if (vec->pin[i]->handle != vec->ent[i].handle ||
+		    vec->pin[i]->length != OPAQUE_PIN_BYTES)
+			return false;
+	for (i = 0; i < vec->nr_segs; i++)
+		bytes += vec->bv[i].bv_len;
+	return bytes == OPAQUE_PIN_VEC_BYTES && vec->pin[1] == vec->pin[0];
+}
+
+/*
+ * Admission of vectors, as fast as it goes, over the newest handle and the one before it, in a
+ * block that is made short each time. A vector that is admitted is whole, and holds references
+ * that its cleanup gives back; one that is not has an ESTALE for a handle that was freed or
+ * whose slot was taken, and holds the references it had taken, which its cleanup gives back
+ * as well. When no handle is ever freed, no vector fails.
+ */
+static int opaque_pin_vec_reader(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	struct io_opaque_req *op = &r->vreq[t->id];
+	unsigned long n = 0;
+
+	op->store = r->store;
+	op->send_flags = IORING_OPAQUE_SEND_VECTOR;
+	opaque_pin_start(r);
+	while (!atomic_read(&r->stop)) {
+		const u64 handle[2] = { READ_ONCE(r->handle), READ_ONCE(r->prev) };
+		bool whole;
+		int ret;
+		u32 i;
+
+		kvfree(op->vec);
+		op->vec = NULL;
+		if (io_opaque_vec_grow(op, OPAQUE_PIN_VEC_NR, OPAQUE_PIN_VEC_NR, 0)) {
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		for (i = 0; i < OPAQUE_PIN_VEC_NR; i++)
+			op->vec->ent[i] = (struct io_uring_opaque_send_entry) {
+				.handle = handle[opaque_pin_vec_shape[i].handle],
+				.off = opaque_pin_vec_shape[i].off,
+				.len = opaque_pin_vec_shape[i].len,
+			};
+		io_opaque_vec_commit(op, OPAQUE_PIN_VEC_NR, OPAQUE_PIN_VEC_BYTES, 1000);
+		op->consumed = false;
+		ret = io_opaque_vec_finish(op, io_opaque_send_acquire(op));
+		whole = !ret && opaque_pin_vec_whole(op);
+		if (ret == -ESTALE && r->mode == OPAQUE_PIN_VEC_FREE)
+			atomic_long_inc(&r->stale);
+		else if (whole)
+			atomic_long_inc(&r->ok);
+		else
+			atomic_long_inc(&r->bad);
+		/* Request cleanup, which also gives back what a vector that failed had taken. */
+		io_opaque_vec_release(op);
+		if (op->vec->pinned)
+			atomic_long_inc(&r->bad);
+		if (!(++n & 63))
+			cond_resched();
+	}
+	kvfree(op->vec);
+	op->vec = NULL;
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+/*
+ * Two objects at a time: a new one is published and told to the readers, the one before it is
+ * freed a moment later, in the slot that the one before that had left. The readers ask for the
+ * newest and the previous, so a vector can have both for a while, and its entries are freed or
+ * have their slots taken while it is admitted.
+ */
+static int opaque_pin_vec_writer(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	struct io_opaque_store *store = r->store;
+	u64 old = READ_ONCE(r->handle);
+	unsigned int n;
+
+	opaque_pin_start(r);
+	for (n = 0; n < OPAQUE_PIN_ROUNDS && !atomic_read(&r->stop); n++) {
+		struct io_opaque_data *data = opaque_pin_object(store);
+		u64 h;
+
+		if (!data) {
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		h = opaque_pin_publish(store, data);
+		if (!h) {
+			io_opaque_data_put(store, data);
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		WRITE_ONCE(r->prev, old);
+		WRITE_ONCE(r->handle, h);
+		/* Long enough for a vector to have both, and sometimes not. */
+		udelay(get_random_u32_below(6) * 6);
+		opaque_test_free(store, old & IO_OPAQUE_INDEX_MASK);
+		old = h;
+		r->rounds = n + 1;
+	}
+	opaque_test_free(store, old & IO_OPAQUE_INDEX_MASK);
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+/*
  * Make the readers and, if there is one, the @writer, and let them go when all are running. They
  * are made before any is woken, so that one that cannot be made takes the others down before
  * they have run.
@@ -15100,8 +15330,9 @@ static bool opaque_pin_launch(struct opaque_pin_race *r, int (*writer)(void *))
 	for (i = 0; i < r->nr; i++) {
 		r->task[i] = (struct opaque_pin_task) { .r = r, .id = i };
 		init_completion(&r->done[i]);
-		task[i] = kthread_create(i < OPAQUE_PIN_READERS ? opaque_pin_reader : writer,
-					 &r->task[i], "opaque_pin%u", i);
+		task[i] = kthread_create(i >= OPAQUE_PIN_READERS ? writer :
+					 r->mode >= OPAQUE_PIN_VEC_FREE ? opaque_pin_vec_reader :
+					 opaque_pin_reader, &r->task[i], "opaque_pin%u", i);
 		if (IS_ERR(task[i])) {
 			while (i--)
 				kthread_stop(task[i]);
@@ -15301,6 +15532,75 @@ static void opaque_pin_smp_stop(struct kunit *test)
 	KUNIT_EXPECT_GE(test, atomic_long_read(&io_opaque_pin_slow) - slow,
 			(long)OPAQUE_PIN_READERS);
 	opaque_pin_expect(test, r, slow);
+}
+
+/*
+ * Vectors against objects that are freed and whose slots are taken by the next: two at a time,
+ * the one before the newest freed a moment after the newest is published, and the vectors name
+ * both. A vector whose entries are all there is whole, with the version that each handle names
+ * and a reference that its cleanup gives back, never a version of the object that took a slot
+ * over; any other is told ESTALE and gives back what it had taken. At the end nothing is
+ * charged. It needs two CPUs to race on.
+ */
+static void opaque_pin_smp_vec_free(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	struct io_opaque_data *data;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_VEC_FREE);
+	r->store->config.max_objects = 2;
+	data = opaque_pin_object(r->store);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	r->handle = opaque_pin_publish(r->store, data);
+	KUNIT_ASSERT_NE(test, r->handle, 0ULL);
+	r->prev = r->handle;
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_vec_writer));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&io_opaque_pin_slow), slow);
+	opaque_pin_expect(test, r, slow);
+}
+
+/*
+ * Vectors against two objects whose versions are replaced by compaction over and over, one and
+ * then the other. Neither handle is freed, so no vector may fail, whichever versions its entries
+ * find: all four are the versions of the handles they name, and the entry that returns to a handle
+ * after the other may find a replacement that the run before it did not. Every version, old and
+ * new, ends at a count of zero. It needs two CPUs to race on.
+ */
+static void opaque_pin_smp_vec_compact(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	u64 handle[2];
+	u32 i;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_VEC_COMPACT);
+	r->store->config.max_objects = 2;
+	for (i = 0; i < ARRAY_SIZE(handle); i++) {
+		struct io_opaque_data *data = opaque_pin_object(r->store);
+
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		handle[i] = opaque_pin_publish(r->store, data);
+		KUNIT_ASSERT_NE(test, handle[i], 0ULL);
+	}
+	r->handle = handle[0];
+	r->prev = handle[1];
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_compactor));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS / 3);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->compactions), (s64)r->rounds);
+	opaque_test_free(r->store, 0);
+	opaque_test_free(r->store, 1);
+	opaque_pin_expect(test, r, slow);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->transient), 0LL);
 }
 
 /*
@@ -15653,6 +15953,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_pin_stop_window),
 	KUNIT_CASE(opaque_pin_compacted),
 	KUNIT_CASE(opaque_pin_reused),
+	KUNIT_CASE(opaque_pin_slow_free),
 	KUNIT_CASE(opaque_pin_vec_run),
 	KUNIT_CASE(opaque_pin_vec_failed),
 	KUNIT_CASE(opaque_pin_vec_owned),
@@ -15714,6 +16015,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE_SLOW(opaque_pin_smp_free),
 	KUNIT_CASE_SLOW(opaque_pin_smp_compact),
 	KUNIT_CASE_SLOW(opaque_pin_smp_stop),
+	KUNIT_CASE_SLOW(opaque_pin_smp_vec_free),
+	KUNIT_CASE_SLOW(opaque_pin_smp_vec_compact),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}
