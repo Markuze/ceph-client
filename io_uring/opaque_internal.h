@@ -399,14 +399,21 @@ struct io_opaque_ubuf_pool {
 
 /*
  * What a managed send hands to link_skb() through msg_ubuf: the ops, which
- * skb_zerocopy_iter_stream() finds link_skb() through, and the pool of the send's
- * store, for the ubufs of the skbs that link_skb() makes. It lives on the stack of
- * io_opaque_send() for one tcp_sendmsg_locked(), and no skb is ever linked to it.
+ * skb_zerocopy_iter_stream() finds link_skb() through, and what the send's store
+ * gives the ubufs of the skbs that link_skb() makes: its pool and its flags. It
+ * lives on the stack of io_opaque_send() for one tcp_sendmsg_locked(). No skb is
+ * ever linked to it, and its own ubuf_info has no flags.
  */
 struct io_opaque_msg_ubuf {
 	struct ubuf_info uarg;
 	/* The pool of the send's store, for the ubufs of its skbs; or none. */
 	struct io_opaque_ubuf_pool *pool;
+	/*
+	 * What the store adds to the flags of every ubuf (io_opaque_ubuf_flags()):
+	 * SKBFL_SHARED_FRAG if it binds a MAIO instance, else none. It is not the pool's,
+	 * because a store may have no pool.
+	 */
+	u8 flags;
 };
 
 /* Evaluation tunables; module parameters, not ABI. */
@@ -654,6 +661,7 @@ struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
 void io_opaque_ubuf_pool_close(struct io_opaque_ubuf_pool *pool);
 struct io_opaque_ubuf *io_opaque_ubuf_pool_get(struct io_opaque_ubuf_pool *pool);
 u8 io_opaque_ubuf_flags(void);
+u8 io_opaque_send_ubuf_flags(const struct io_opaque_store *store);
 int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg);
 int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter *from, size_t length);
 int io_opaque_send_security(struct socket *sock, struct msghdr *msg,

@@ -842,10 +842,13 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     prefix starts, which took a page reference for each fragment instead.
 ``stat_send_ubuf_copied``
     Ubufs let go of because somebody copied the data of an skb
-    (``skb_copy_ubufs()``) instead of holding it. A consumer on the receive
-    path that holds a clone, such as a packet socket or a socket of this host,
-    does not copy it, and neither does the transmit path, so it stays at zero;
-    a count means that something copied the data of a managed send.
+    (``skb_copy_ubufs()``, or the stack pulling its last fragment into the
+    head) instead of holding it. A consumer on the receive path that holds a
+    clone, such as a packet socket or a socket of this host, does not copy it.
+    Neither does the transmit path, but for the skb of a bound store that the
+    stack sums in software, on a device without checksum offload: it copies the
+    fragments first (see "Writes"). Otherwise it stays at zero; a count means
+    that something copied the data of a managed send.
 ``stat_send_ubuf_reused``
     Skbs of ``stat_send_managed_skbs`` that were given a ubuf which an earlier
     skb had finished with and the store had kept, instead of one allocated for
@@ -1021,10 +1024,14 @@ The process can write the bytes of an object through the mapping. A write is
 visible to every holder of the page. The holders are other objects that share
 it, sends in flight, and sockets whose segments reference it. A send transmits
 the bytes that are present when TCP builds the segment. A write that races a
-send is a race of the application, as with ``SEND_ZC`` buffers. On a device
-without checksum offload, TCP can sum the bytes when it builds the segment. A
-write after that makes the sum wrong, and the peer drops the segment. This
-race does not affect the safety of the kernel.
+send is a race of the application, as with ``SEND_ZC`` buffers. The skbs of a
+bound store are marked as having fragments that can change
+(``SKBFL_SHARED_FRAG``), as every skb with spliced pages is, whether their
+fragments are managed or not, and so are the skbs that the stack makes from
+them. On a device without checksum offload, the stack copies the bytes of such
+an skb before it sums them, so that the sum is that of the bytes it sends. A
+device that sums them needs no copy. This race does not affect the safety of
+the kernel.
 
 Compaction
 ----------

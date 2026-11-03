@@ -4205,10 +4205,22 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
  */
 
 /*
- * The flags of the ubuf. Not SKBFL_SHARED_FRAG: the pages cannot change. And
- * not SKBFL_MANAGED_FRAG_REFS, which belongs to the shinfo and is set by the
- * fill: were it the ubuf's, an skb derived from this one with
- * skb_zerocopy_clone() would take no references of its own.
+ * The flags of the ubuf of every store. Not SKBFL_MANAGED_FRAG_REFS, which belongs
+ * to the shinfo and is set by the fill: were it the ubuf's, an skb derived from
+ * this one with skb_zerocopy_clone() would take no references of its own.
+ *
+ * And not SKBFL_SHARED_FRAG, which the stack takes to mean that someone else may
+ * write the fragments while the skb is queued, as after vmsplice() or sendfile(),
+ * and so copies them before it sums them in software or changes them in place
+ * (skb_checksum_help(), skb_segment(), ESP). The pages of an ordinary store cannot
+ * change once their object is published, and no process maps them. The pages of a
+ * store that binds a MAIO instance are the area's, which a process maps read-write
+ * and may write at any time, and the splice path that took them before managed
+ * fragments (tcp_sendmsg_locked()) marked every page it took. So the skbs of such
+ * a store get the flag as well, io_opaque_send_ubuf_flags(): a copy where the
+ * stack sums in software, and nothing where the device does. It is the store's
+ * and not the object's: an object that CREATE or compaction made in a bound store
+ * is in ordinary pages, and is marked too.
  */
 #define IO_OPAQUE_UBUF_FLAGS \
 	(SKBFL_ZEROCOPY_ENABLE | SKBFL_DONT_ORPHAN | SKBFL_DONT_ORPHAN_RX)
@@ -4222,6 +4234,16 @@ VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
 {
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_ubuf_flags);
 	return IO_OPAQUE_UBUF_FLAGS;
+}
+
+/*
+ * What a store adds to those flags for the ubufs of its sends. The binding is set
+ * when the store is made and never changes, so every ubuf of a store gets the same,
+ * whether it is made new or is one that the store's pool kept.
+ */
+VISIBLE_IF_KUNIT u8 io_opaque_send_ubuf_flags(const struct io_opaque_store *store)
+{
+	return store->maio ? SKBFL_SHARED_FRAG : 0;
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
@@ -4442,7 +4464,11 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
 	struct io_opaque_ubuf *u = container_of(uarg, struct io_opaque_ubuf, uarg);
 	unsigned int i;
 
-	/* Told by skb_copy_ubufs() that the data was copied: a consumer did not wait. */
+	/*
+	 * Told by skb_copy_ubufs() that the data was copied: a consumer did not wait. Or by
+	 * __pskb_pull_tail(), which says it when the last fragment of an skb is pulled into the
+	 * head, as the stack does to sum the skb of a bound store in software.
+	 */
 	if (!success)
 		io_opaque_count(IO_OPAQUE_STAT_SEND_UBUF_COPIED, 1);
 	if (!refcount_dec_and_test(&uarg->refcnt))
@@ -4474,21 +4500,34 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * the next skb instead.
  *
  * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
- * the msg_ubuf names the pool and has one, else the cache's. TCP does not set
- * skb->sk on a skb of its write queue, so the allocation has no socket to take
- * its mask from. GFP_KERNEL is what a user's socket allocates its skbs with.
+ * the msg_ubuf names the pool and has one, else the cache's. Its flags are set here
+ * whichever way it was got: those of every ubuf, and what the msg_ubuf adds, which
+ * is SKBFL_SHARED_FRAG for a bound store. A skb of ours is joined only by a send
+ * that adds the same, so that the fragments of a bound store are never in a skb
+ * that is not marked, nor those of another store in one that is: when a bound
+ * store and another store send on one socket, the skb is a boundary, as another
+ * provider's is. TCP does not set skb->sk on a skb of its write queue, so the
+ * allocation has no socket to take its mask from. GFP_KERNEL is what a user's
+ * socket allocates its skbs with.
  */
 VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *uarg)
 {
 	struct io_opaque_ubuf_pool *pool = NULL;
 	struct ubuf_info *cur = skb_zcopy(skb);
 	struct io_opaque_ubuf *u;
+	u8 flags = 0;
 
 	/* TCP passes the msg_ubuf of the send; a caller that is not a send passes none. */
-	if (uarg && uarg->ops == &io_opaque_msg_ubuf_ops)
-		pool = container_of(uarg, struct io_opaque_msg_ubuf, uarg)->pool;
+	if (uarg && uarg->ops == &io_opaque_msg_ubuf_ops) {
+		const struct io_opaque_msg_ubuf *mub =
+			container_of(uarg, struct io_opaque_msg_ubuf, uarg);
+
+		pool = mub->pool;
+		flags = mub->flags;
+	}
 	if (cur) {
 		if (cur->ops != &io_opaque_ubuf_ops ||
+		    ((cur->flags ^ flags) & SKBFL_SHARED_FRAG) ||
 		    skb_shinfo(skb)->nr_frags >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
 			return -EEXIST;
 		return 0;
@@ -4507,7 +4546,7 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 		u->pool = pool;
 	}
 	u->uarg.ops = &io_opaque_ubuf_ops;
-	u->uarg.flags = io_opaque_ubuf_flags();
+	u->uarg.flags = io_opaque_ubuf_flags() | flags;
 	refcount_set(&u->uarg.refcnt, 1);
 	u->nr = 0;
 	skb_zcopy_init(skb, &u->uarg);
@@ -5004,6 +5043,7 @@ again:
 			/* The ubuf_info is whole: its ops, no count and no flags. */
 			mub.uarg = (struct ubuf_info) { .ops = &io_opaque_msg_ubuf_ops };
 			mub.pool = READ_ONCE(op->store->ubuf_pool);
+			mub.flags = io_opaque_send_ubuf_flags(op->store);
 			msg.msg_flags |= MSG_ZEROCOPY;
 			msg.msg_ubuf = &mub.uarg;
 			msg.sg_from_iter = io_opaque_sg_from_iter;
