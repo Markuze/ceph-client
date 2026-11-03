@@ -1454,8 +1454,9 @@ static void io_opaque_note_area_page(struct io_opaque_store *store, struct page 
  * reference keeps the pool fields of the page stable while the store takes its
  * own. The last release hands the page back to its pool, wherever the skb is by
  * then. A page reference would make the pool give the page up when the skb is
- * freed before the store lets go. If the pool is that of a MAIO instance, the page
- * is one that the process that maps the area can write, and the store notes it.
+ * freed before the store lets go. A page of the area of a MAIO instance, which a
+ * pool of the instance owns, is one that the process that maps the area can write,
+ * and the store notes it (io_opaque_note_area_page()).
  *
  * A reference of the pool keeps the pool alive for as long as an object holds
  * it. After the device is removed, or when its driver creates its pools again,
