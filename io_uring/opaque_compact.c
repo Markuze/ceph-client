@@ -497,7 +497,7 @@ int io_opaque_compact_publish(struct io_opaque_req *op)
 	struct io_opaque_data *old;
 	int ret = -ESTALE;
 
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	slot = io_opaque_lookup(store, op->handle);
 	if (slot && slot->data == op->data && !store->dead &&
 	    !READ_ONCE(op->canceled)) {
@@ -512,7 +512,7 @@ int io_opaque_compact_publish(struct io_opaque_req *op)
 	} else {
 		old = NULL;
 	}
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	io_opaque_data_put(store, old);
 	return ret;
 }
@@ -543,7 +543,7 @@ void io_opaque_compact_work(struct work_struct *work)
 	}
 	io_opaque_auto_compact(store);
 	/* Keep automatic scans paced even when manual requests wake us early. */
-	guard(mutex)(&store->tables);
+	guard(spinlock)(&store->tables);
 	now = jiffies;
 	if (!store->dead && (store->policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) &&
 	    !list_empty(&store->candidates))
@@ -570,7 +570,7 @@ static int io_opaque_compact_inline(struct io_opaque_req *op)
 	ret = io_opaque_compact_build(op);
 	if (!ret)
 		ret = io_opaque_compact_publish(op);
-	scoped_guard(mutex, &store->tables) {
+	scoped_guard(spinlock, &store->tables) {
 		slot = io_opaque_lookup(store, op->handle);
 		if (slot && slot->data == op->data)
 			slot->compacting = false;
@@ -589,7 +589,7 @@ int io_opaque_compact_start(struct io_opaque_req *op)
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_slot *slot;
 
-	scoped_guard(mutex, &store->tables) {
+	scoped_guard(spinlock, &store->tables) {
 		if (store->dead)
 			return -ESHUTDOWN;
 		slot = io_opaque_lookup(store, op->handle);
@@ -650,9 +650,9 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 	bool automatic = policy->flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
 	u32 i, seq;
 
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	if (store->dead) {
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		return -ESHUTDOWN;
 	}
 	store->policy = *policy;
@@ -672,16 +672,16 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 		}
 		if ((i + 1) % IO_OPAQUE_POLICY_CHUNK_SLOTS || i + 1 == store->config.max_objects)
 			continue;
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		IO_OPAQUE_POLICY_BETWEEN(store);
 		cond_resched();
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		if (store->dead) {
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			return -ESHUTDOWN;
 		}
 		if (store->policy_seq != seq) {
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			return 0;
 		}
 	}
@@ -693,7 +693,7 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 		if (list_empty(&store->copies))
 			cancel_delayed_work(&store->compact_work);
 	}
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	return 0;
 }
 
@@ -731,7 +731,7 @@ static void io_opaque_auto_compact(struct io_opaque_store *store)
 	unsigned int scanned = 0;
 	int ret;
 
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	policy = store->policy;
 	if (store->dead || !(policy.flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT) ||
 	    time_before(jiffies, store->auto_at))
@@ -776,20 +776,20 @@ static void io_opaque_auto_compact(struct io_opaque_store *store)
 		break;
 	}
 unlock:
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	if (op.data) {
 		io_opaque_count(IO_OPAQUE_STAT_COMPACT_AUTO, 1);
 		ret = io_opaque_compact_build(&op);
 		if (!ret)
 			ret = io_opaque_compact_publish(&op);
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		slot = io_opaque_lookup(store, op.handle);
 		if (slot && slot->data == op.data) {
 			slot->compacting = false;
 			if (ret)
 				slot->retry = jiffies + HZ;
 		}
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		io_opaque_data_put(store, op.data);
 		io_opaque_data_put(store, op.replacement);
 		io_opaque_compact_end(&op);

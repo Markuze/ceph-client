@@ -728,7 +728,7 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 	struct io_opaque_slot *slot;
 	u32 index;
 
-	guard(mutex)(&store->tables);
+	guard(spinlock)(&store->tables);
 	for (;;) {
 		index = io_opaque_find_slot(store->object_used, store->config.max_objects,
 					    &store->object_cursor);
@@ -782,8 +782,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	    !cfg.max_object_size || cfg.max_object_size > INT_MAX ||
 	    !cfg.max_objects || cfg.max_objects > 16384 ||
 	    !cfg.max_streams || cfg.max_streams > 1024 ||
-	    cfg.max_extents < 4 || cfg.max_extents > 65536 ||
-	    !cfg.max_requests || cfg.max_requests > 4096)
+	    cfg.max_extents < 4 || cfg.max_extents > 65536)
 		return ERR_PTR(-EINVAL);
 	if (!IS_ALIGNED(cfg.reply_reserve, PAGE_SIZE) ||
 	    cfg.reply_reserve >= cfg.hard_limit - cfg.compact_headroom ||
@@ -845,7 +844,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 		set_active_memcg(old);
 	}
 #endif
-	mutex_init(&store->tables);
+	spin_lock_init(&store->tables);
 	spin_lock_init(&store->wait_lock);
 	spin_lock_init(&store->tx_lock);
 	spin_lock_init(&store->transient_lock);
@@ -881,7 +880,7 @@ void io_opaque_stop(struct io_opaque_store *store)
 	if (!store)
 		return;
 	/* Close enrollment before draining the compaction dispatcher. */
-	scoped_guard(mutex, &store->tables) {
+	scoped_guard(spinlock, &store->tables) {
 		guard(spinlock)(&store->wait_lock);
 
 		if (store->dead)
@@ -895,26 +894,28 @@ void io_opaque_stop(struct io_opaque_store *store)
 	for (i = 0; i < store->config.max_streams; i++) {
 		struct io_opaque_stream *stream;
 
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		stream = store->streams[i].stream;
 		store->streams[i].stream = NULL;
 		if (stream) {
 			store->nr_streams--;
 			io_opaque_release_slot(store->stream_used, i, store->streams[i].generation);
 		}
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		if (stream) {
 			io_opaque_stream_close(stream);
 			io_opaque_stream_put(stream);
 		}
+		cond_resched();
 	}
 	for (i = 0; i < store->config.max_objects; i++) {
 		struct io_opaque_data *data;
 
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		data = io_opaque_detach(store, &store->objects[i]);
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 		io_opaque_data_put(store, data);
+		cond_resched();
 	}
 	io_opaque_wake_budget(store);
 }
@@ -941,7 +942,6 @@ void io_opaque_free(struct io_opaque_store *store)
 	io_opaque_stop(store);
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
 	WARN_ON_ONCE(atomic_read(&store->extents));
-	WARN_ON_ONCE(atomic_read(&store->requests));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_opaque_txs_free(store);
 	io_opaque_ubuf_pool_close(store->ubuf_pool);
@@ -963,7 +963,6 @@ void io_opaque_free(struct io_opaque_store *store)
 	bitmap_free(store->stream_used);
 	kvfree(store->objects);
 	kvfree(store->streams);
-	mutex_destroy(&store->tables);
 	kfree(store);
 }
 
@@ -986,38 +985,29 @@ void io_opaque_put(struct io_opaque_store *store)
 }
 
 /*
- * A request from the ring's cache, or a new one, that counts against the store's
- * limit unless it is a control request, and has nothing set but the flag that
- * the core cleans it up: a recycled one is what the last request left. The caller
- * sets what it reads, all of the request but its block of a vector in
+ * A request from the ring's cache, or a new one, with nothing set but the flag
+ * that the core cleans it up: a recycled one is what the last request left. The
+ * caller sets what it reads, all of the request but its block of a vector in
  * io_opaque_req_alloc(), only what the opcode reads in io_opaque_send_prep().
  */
 static struct io_opaque_req *io_opaque_req_get(struct io_kiocb *req,
-					       struct io_opaque_store *store, bool control)
+					       struct io_opaque_store *store)
 {
 	struct io_opaque_req *op;
 
 	if (READ_ONCE(store->dead))
 		return ERR_PTR(-ESHUTDOWN);
-	if (!control && atomic_inc_return(&store->requests) > store->config.max_requests) {
-		atomic_dec(&store->requests);
-		return ERR_PTR(-EAGAIN);
-	}
 	op = io_uring_alloc_async_data(&req->ctx->opaque_cache, req);
-	if (!op) {
-		if (!control)
-			atomic_dec(&store->requests);
+	if (!op)
 		return ERR_PTR(-ENOMEM);
-	}
 	req->flags |= REQ_F_NEED_CLEANUP;
 	return op;
 }
 
 static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
-						 struct io_opaque_store *store,
-						 bool control)
+						 struct io_opaque_store *store)
 {
-	struct io_opaque_req *op = io_opaque_req_get(req, store, control);
+	struct io_opaque_req *op = io_opaque_req_get(req, store);
 
 	if (IS_ERR(op))
 		return op;
@@ -1026,7 +1016,6 @@ static struct io_opaque_req *io_opaque_req_alloc(struct io_kiocb *req,
 	op->op = U16_MAX;
 	op->req = req;
 	op->store = store;
-	op->counted = !control;
 	op->retry_at = jiffies;
 	INIT_LIST_HEAD(&op->wait);
 	INIT_LIST_HEAD(&op->cancel);
@@ -1042,23 +1031,6 @@ static void io_opaque_req_free(struct io_ring_ctx *ctx, struct io_opaque_req *op
 	if (!io_alloc_cache_put(&ctx->opaque_cache, op)) {
 		kvfree(op->vec);
 		kvfree(op);
-	}
-}
-
-/*
- * Give back a request's place in the store's count of requests, once: the flag
- * says whether it still has one. A send that ends with its socket owned gives it
- * back there, where the locked decrement is part of the stretch in which the
- * socket is not waited for. Cleanup gives it back for every request that has not,
- * the sends that never got so far among them. Needs neither the ring lock nor the
- * socket.
- */
-VISIBLE_IF_KUNIT void io_opaque_req_uncount(struct io_opaque_req *op)
-{
-	KUNIT_STATIC_STUB_REDIRECT(io_opaque_req_uncount, op);
-	if (op->counted) {
-		op->counted = false;
-		atomic_dec(&op->store->requests);
 	}
 }
 
@@ -2070,7 +2042,7 @@ int io_opaque_recv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    (flags & ~IORING_RECVSEND_POLL_FIRST) ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FORCE_ASYNC)))
 		return -EINVAL;
-	op = io_opaque_req_alloc(req, store, false);
+	op = io_opaque_req_alloc(req, store);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	op->op = U16_MAX - 1;
@@ -2116,7 +2088,7 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	stream->owner.data = stream;
 	stream->collector = op;
 	lock_sock(sock->sk);
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	if (sock->sk->sk_rx_owner || sock->sk->sk_prot != sock->sk->sk_prot_creator ||
 	    tcp_sk(sock->sk)->repair || tcp_sk(sock->sk)->urg_data) {
 		ret = -EBUSY;
@@ -2165,7 +2137,7 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 		break;
 	}
 unlock:
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	release_sock(sock->sk);
 	if (!ret)
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
@@ -2379,7 +2351,7 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_slot *slot = &store->objects[op->slot];
 
-	guard(mutex)(&store->tables);
+	guard(spinlock)(&store->tables);
 	if (store->dead || READ_ONCE(op->canceled))
 		return -ECANCELED;
 	if (!slot->reserved ||
@@ -2429,14 +2401,14 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (op->op == IORING_OPAQUE_COMPACT) {
 		if (ret >= 0)
 			ret = io_opaque_compact_publish(op);
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		{
 			struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
 
 			if (slot)
 				slot->compacting = false;
 		}
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 	}
 	if (ret < 0 && op->op == IORING_OPAQUE_RECV_OBJECT) {
 		mutex_lock(&op->stream->lock);
@@ -2474,7 +2446,6 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	struct io_opaque_req *op;
 	u64 end;
 	u16 cmd = READ_ONCE(sqe->ioprio);
-	bool control;
 
 	if (!store)
 		return -ENXIO;
@@ -2483,9 +2454,7 @@ int io_opaque_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    cmd > IORING_OPAQUE_OBJECT_EXTENTS ||
 	    (req->flags & (REQ_F_CQE_SKIP | REQ_F_FIXED_FILE)))
 		return -EINVAL;
-	control = cmd == IORING_OPAQUE_FREE || cmd == IORING_OPAQUE_STAT ||
-		  cmd == IORING_OPAQUE_STREAM_CLOSE || cmd == IORING_OPAQUE_SET_POLICY;
-	op = io_opaque_req_alloc(req, store, control);
+	op = io_opaque_req_alloc(req, store);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	op->op = cmd;
@@ -2559,7 +2528,7 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 
 	if (op->resolved)
 		return 0;
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	if (io_opaque_stream_op(cmd)) {
 		u32 index = io_opaque_index(op->handle);
 
@@ -2586,7 +2555,7 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 				ret = -ERANGE;
 		}
 	}
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	if (ret)
 		return ret;
 	if (cmd == IORING_OPAQUE_INSPECT || cmd == IORING_OPAQUE_RECV_OBJECT) {
@@ -2704,7 +2673,6 @@ static int io_opaque_stat(struct io_opaque_req *op)
 		.compacted_bytes = atomic64_read(&store->compacted),
 		.compact_count = atomic64_read(&store->compactions),
 		.extents = atomic_read(&store->extents),
-		.requests = atomic_read(&store->requests),
 		.framing_bytes = atomic64_read(&store->framing),
 		.framing_copied_bytes = atomic64_read(&store->framing_copied),
 		.memory_mode = io_opaque_memory_mode(store),
@@ -2712,10 +2680,10 @@ static int io_opaque_stat(struct io_opaque_req *op)
 
 	/* Framing in the reply reserve is charged outside bytes. */
 	stat.backing_bytes += atomic64_read(&store->reserve_framing);
-	mutex_lock(&store->tables);
+	spin_lock(&store->tables);
 	stat.objects = store->nr_objects;
 	stat.streams = store->nr_streams;
-	mutex_unlock(&store->tables);
+	spin_unlock(&store->tables);
 	return io_opaque_stat_copy(op, &stat, sizeof(stat));
 }
 
@@ -2845,13 +2813,13 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		ret = io_opaque_copy(op->data, op->offset, op->length, op->addr);
 		break;
 	case IORING_OPAQUE_FREE:
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		{
 			struct io_opaque_data *data = io_opaque_detach(store,
 						io_opaque_lookup(store, op->handle));
 
 			ret = data ? 0 : -ESTALE;
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			io_opaque_data_put(store, data);
 		}
 		break;
@@ -2873,11 +2841,11 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_FORWARD_ONLY;
 			if (op->data->mapped)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_MAPPED;
-			mutex_lock(&store->tables);
+			spin_lock(&store->tables);
 			slot = io_opaque_lookup(store, op->handle);
 			if (slot && slot->compacting)
 				stat.flags |= IORING_OPAQUE_OBJECT_F_COMPACTING;
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			ret = io_opaque_stat_copy(op, &stat, sizeof(stat));
 		}
 		break;
@@ -2898,18 +2866,18 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		}
 		break;
 	case IORING_OPAQUE_STREAM_CLOSE:
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		if (store->streams[io_opaque_index(op->handle)].stream == op->stream) {
 			store->streams[io_opaque_index(op->handle)].stream = NULL;
 			store->nr_streams--;
 			io_opaque_release_slot(store->stream_used, io_opaque_index(op->handle),
 					       op->handle >> IO_OPAQUE_INDEX_BITS);
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			io_opaque_stream_close(op->stream);
 			io_opaque_stream_put(op->stream);
 			ret = 0;
 		} else {
-			mutex_unlock(&store->tables);
+			spin_unlock(&store->tables);
 			ret = -ESTALE;
 		}
 		break;
@@ -3056,11 +3024,11 @@ void io_opaque_cleanup(struct io_kiocb *req)
 			io_opaque_stream_close(op->stream);
 	}
 	if (op->slot_reserved) {
-		mutex_lock(&store->tables);
+		spin_lock(&store->tables);
 		store->objects[op->slot].reserved = false;
 		io_opaque_release_slot(store->object_used, op->slot,
 				       store->objects[op->slot].generation);
-		mutex_unlock(&store->tables);
+		spin_unlock(&store->tables);
 	}
 	if (unlikely(op->vec))
 		io_opaque_vec_cleanup(op);
@@ -3074,8 +3042,6 @@ void io_opaque_cleanup(struct io_kiocb *req)
 	}
 	if (op->stream)
 		io_opaque_stream_put(op->stream);
-	if (op->counted)
-		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
@@ -3084,11 +3050,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
 /*
  * Request cleanup of a send, which holds only what a send can hold: a place in
  * a queue, a frame and its charge, references (a version, and those of a vector in
- * its block), a place in the count of requests, and the block. A send that ended
- * with its socket owned has given back all but the frame and the decision about
- * the block (io_opaque_send()); any other has all of them to give back here, once,
- * and each is given back only if it is there: a call that is made to find that
- * out is a call for nothing.
+ * its block), and the block. A send that ended with its socket owned has given
+ * back all but the frame and the decision about the block (io_opaque_send()); any
+ * other has all of them to give back here, once, and each is given back only if it
+ * is there: a call that is made to find that out is a call for nothing.
  *
  * A send is on neither list that a waker walks under wait_lock, budget_waits and
  * copies, so it has no waker to wait out, and takes the lock only if its entry is
@@ -3120,8 +3085,6 @@ void io_opaque_send_cleanup(struct io_kiocb *req)
 		io_opaque_vec_cleanup(op);
 	if (op->data)
 		io_opaque_data_put(store, op->data);
-	if (op->counted)
-		io_opaque_req_uncount(op);
 	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
@@ -3534,7 +3497,8 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
  * the lock to wait out. Nobody can take a reference on a version whose count
  * is one, which is not in the table, so the last one is still the last then.
  * A vector's entries that were put are cleared, so that the rest cannot put
- * them again.
+ * them again. A send that consumed its object does not call it (see
+ * io_opaque_send()).
  */
 static bool io_opaque_send_unpin_cheap(struct io_opaque_req *op)
 {
@@ -3730,7 +3694,7 @@ VISIBLE_IF_KUNIT int io_opaque_vec_finish(struct io_opaque_req *op, int ret)
 		ret = io_opaque_vec_grow(op, op->vec->nr, ret, op->vec->nr);
 		if (ret)
 			return ret;
-		scoped_guard(mutex, &op->store->tables)
+		scoped_guard(spinlock, &op->store->tables)
 			ret = io_opaque_send_acquire(op);
 	}
 	if (!ret)
@@ -3764,7 +3728,7 @@ static int io_opaque_send_vec_prep(struct io_opaque_req *op)
 #if IS_ENABLED(CONFIG_KUNIT)
 /*
  * Fill the request of a send with the poison of the test (io_opaque_send_poison)
- * before the send sets what it reads, as the message and the cursor are filled
+ * before the send sets what it reads, as the message and the msg_ubuf are filled
  * in io_opaque_send(), so that a field that is read before it is written does not
  * get away with what the last request left, or with zero. Not the block of a
  * vector, which a request brings along.
@@ -3806,7 +3770,7 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    READ_ONCE(sqe->buf_index) || READ_ONCE(sqe->__pad2[0]) ||
 	    (msg_flags & ~(MSG_MORE | MSG_DONTWAIT)))
 		return -EINVAL;
-	op = io_opaque_req_get(req, store, false);
+	op = io_opaque_req_get(req, store);
 	if (IS_ERR(op))
 		return PTR_ERR(op);
 	IO_OPAQUE_SEND_POISON_REQ(op);
@@ -3820,7 +3784,6 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	op->op = U16_MAX;
 	op->phase = IO_OPAQUE_IDLE;
 	op->canceled = false;
-	op->counted = true;
 	op->consumed = false;
 	op->resolved = false;
 	op->tx = NULL;
@@ -3930,7 +3893,7 @@ static int io_opaque_tx_acquire(struct io_opaque_req *op)
 {
 	int ret;
 
-	scoped_guard(mutex, &op->store->tables)
+	scoped_guard(spinlock, &op->store->tables)
 		ret = io_opaque_send_acquire(op);
 	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
 		ret = io_opaque_vec_finish(op, ret);
@@ -4076,10 +4039,72 @@ VISIBLE_IF_KUNIT int io_opaque_tx_settle_head(struct io_opaque_req *op)
 }
 
 /*
+ * Cancel and wake the frames admitted behind @op, a head that attempted TCP and
+ * ended short. @op has left @tx, which has failed already, and goes back in for
+ * the walk. At most IO_OPAQUE_WAKE_BATCH followers are looked at in a hold of
+ * tx_lock, and they are woken after it: how many there are is up to the process,
+ * and every socket and ring of the store takes tx_lock.
+ *
+ * The followers stay in the queue and leave it as they always did, each when its
+ * request is cleaned up, so the queue stays failed until the last has gone. @op
+ * is where the walk has got to. It moves behind each batch and leaves with the
+ * last, and nobody else moves it: the followers after it have not been looked at,
+ * whoever leaves meanwhile. It is not parked, and a release hands the queue only
+ * to a parked follower, so a canceled follower that is released as the first of
+ * the queue cannot promote one that is not canceled yet.
+ *
+ * A follower is touched in a hold of tx_lock, where it cannot be cleaned up, for
+ * its cleanup leaves the queue first. After the hold the walk touches only those
+ * it made queued: nobody else will wake them, and a request ends only once it is
+ * woken. A follower that was queued before is a cancellation's to wake. It is
+ * marked here, as it always was, and left alone.
+ */
+static noinline_for_stack void io_opaque_tx_fail(struct io_opaque_store *store,
+						 struct io_opaque_tx *tx,
+						 struct io_opaque_req *op)
+{
+	struct io_opaque_req *woken[IO_OPAQUE_WAKE_BATCH];
+
+	lockdep_assert_held(&store->tx_lock);
+	op->tx = tx;
+	list_add(&op->send, &tx->requests);
+	while (op->send.next != &tx->requests) {
+		struct list_head *pos = op->send.next;
+		unsigned int seen, nr = 0, i;
+
+		for (seen = 0; seen < IO_OPAQUE_WAKE_BATCH && pos != &tx->requests; seen++) {
+			struct io_opaque_req *next = list_entry(pos, struct io_opaque_req, send);
+			bool queue;
+
+			scoped_guard(spinlock, &store->wait_lock) {
+				WRITE_ONCE(next->canceled, true);
+				queue = next->phase == IO_OPAQUE_SEND_WAIT;
+				if (queue)
+					next->phase = IO_OPAQUE_QUEUED;
+			}
+			if (queue)
+				woken[nr++] = next;
+			pos = pos->next;
+		}
+		/* Behind the ones looked at: what follows is what is left to do. */
+		list_move(&op->send, pos->prev);
+		spin_unlock(&store->tx_lock);
+		for (i = 0; i < nr; i++)
+			io_opaque_queue_ready(woken[i], -ECANCELED);
+		spin_lock(&store->tx_lock);
+	}
+	list_del_init(&op->send);
+	op->tx = NULL;
+	/* The followers may all have gone while the walk was out of the lock. */
+	io_opaque_tx_unused(store, tx);
+}
+
+/*
  * Remove @op from its queue. A head that attempted TCP and ended short fails
- * the queue: every follower is canceled and woken, and nothing is returned.
- * Otherwise the follower that becomes head is returned with its phase already
- * queued, for the caller to wake. Only the failure wakeups reach an io_kiocb.
+ * the queue: every follower is canceled and woken (io_opaque_tx_fail()), and
+ * nothing is returned. Otherwise the follower that becomes head is returned with
+ * its phase already queued, for the caller to wake. Only the failure wakeups
+ * reach an io_kiocb.
  */
 VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op)
 {
@@ -4101,18 +4126,7 @@ VISIBLE_IF_KUNIT struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req
 	/* Only a send that attempted TCP can break the following frames. */
 	if (op->tx_started && op->progress != op->total_length) {
 		tx->failed = true;
-		list_for_each_entry(next, &tx->requests, send) {
-			bool queue;
-
-			scoped_guard(spinlock, &store->wait_lock) {
-				WRITE_ONCE(next->canceled, true);
-				queue = next->phase == IO_OPAQUE_SEND_WAIT;
-				if (queue)
-					next->phase = IO_OPAQUE_QUEUED;
-			}
-			if (queue)
-				io_opaque_queue_ready(next, -ECANCELED);
-		}
+		io_opaque_tx_fail(store, tx, op);
 		return NULL;
 	}
 	next = io_opaque_tx_head(tx);
@@ -4202,7 +4216,7 @@ static void io_opaque_tx_put(struct io_opaque_req *op)
 static struct kmem_cache *io_opaque_ubuf_cache __ro_after_init;
 
 VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops;
-VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_cursor_ops;
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_msg_ubuf_ops;
 
 VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
 {
@@ -4460,7 +4474,7 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  * the next skb instead.
  *
  * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
- * the cursor names the pool and has one, else the cache's. TCP does not set
+ * the msg_ubuf names the pool and has one, else the cache's. TCP does not set
  * skb->sk on a skb of its write queue, so the allocation has no socket to take
  * its mask from. GFP_KERNEL is what a user's socket allocates its skbs with.
  */
@@ -4470,9 +4484,9 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 	struct ubuf_info *cur = skb_zcopy(skb);
 	struct io_opaque_ubuf *u;
 
-	/* TCP passes the send's cursor; a caller that is not a send passes none. */
-	if (uarg && uarg->ops == &io_opaque_cursor_ops)
-		pool = container_of(uarg, struct io_opaque_send_cursor, uarg)->pool;
+	/* TCP passes the msg_ubuf of the send; a caller that is not a send passes none. */
+	if (uarg && uarg->ops == &io_opaque_msg_ubuf_ops)
+		pool = container_of(uarg, struct io_opaque_msg_ubuf, uarg)->pool;
 	if (cur) {
 		if (cur->ops != &io_opaque_ubuf_ops ||
 		    skb_shinfo(skb)->nr_frags >= READ_ONCE(net_hotdata.sysctl_max_skb_frags))
@@ -4508,20 +4522,20 @@ VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_ubuf_ops = {
 
 /*
  * The ops of what msg_ubuf points at during a managed send, a struct
- * io_opaque_send_cursor on the stack of io_opaque_send(), for
+ * io_opaque_msg_ubuf on the stack of io_opaque_send(), for
  * skb_zerocopy_iter_stream() to find link_skb through. TCP never links it to
  * an skb, because link_skb has given each skb its own, and it must not: it
  * lives for the one call. The one path that would is fast open, whose SYN
  * takes the msg_ubuf of its first send; a socket that could take that path is
  * not sent managed, and a send never has MSG_FASTOPEN.
  */
-static void io_opaque_cursor_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
+static void io_opaque_msg_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg, bool success)
 {
 	WARN_ON_ONCE(1);
 }
 
-VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_cursor_ops = {
-	.complete	= io_opaque_cursor_complete,
+VISIBLE_IF_KUNIT const struct ubuf_info_ops io_opaque_msg_ubuf_ops = {
+	.complete	= io_opaque_msg_ubuf_complete,
 	.link_skb	= io_opaque_link_skb,
 };
 
@@ -4682,7 +4696,7 @@ VISIBLE_IF_KUNIT int io_opaque_sg_from_iter(struct sk_buff *skb, struct iov_iter
 /*
  * Whether a body that is spliced goes out as managed fragments: when the
  * send calls tcp_sendmsg_locked() itself, not on a socket that TCP fast open
- * could take (see io_opaque_cursor_ops), and unless the evaluation
+ * could take (see io_opaque_msg_ubuf_ops), and unless the evaluation
  * parameter turned it off. Anywhere else the body is spliced as before.
  */
 static bool io_opaque_sends_managed(const struct sock *sk)
@@ -4724,17 +4738,17 @@ atomic_long_t io_opaque_send_locked_calls = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_SEND_LOCKED_CALL()	atomic_long_inc(&io_opaque_send_locked_calls)
 /*
  * Called with the message of every part of a frame, just before it goes to TCP
- * (@owned) or to sock_sendmsg(), and the send's cursor, for a test to look at.
+ * (@owned) or to sock_sendmsg(), and the send's msg_ubuf, for a test to look at.
  */
 void (*io_opaque_send_part)(const struct msghdr *msg,
-			    const struct io_opaque_send_cursor *cursor, bool owned);
-#define IO_OPAQUE_SEND_PART(msg, cursor, owned)				\
+			    const struct io_opaque_msg_ubuf *mub, bool owned);
+#define IO_OPAQUE_SEND_PART(msg, mub, owned)				\
 	do {								\
 		if (io_opaque_send_part)				\
-			io_opaque_send_part((msg), (cursor), (owned));	\
+			io_opaque_send_part((msg), (mub), (owned));	\
 	} while (0)
 /*
- * A byte that a test fills the message and the cursor of a send with before they
+ * A byte that a test fills the message and the msg_ubuf of a send with before they
  * are set (-1: leave them), so that a field that is read before it is written
  * does not get away with a zero.
  */
@@ -4746,7 +4760,7 @@ int io_opaque_send_poison = -1;
 	} while (0)
 #else
 #define IO_OPAQUE_SEND_LOCKED_CALL()	((void)0)
-#define IO_OPAQUE_SEND_PART(msg, cursor, owned)	((void)(msg), (void)(cursor), (void)(owned))
+#define IO_OPAQUE_SEND_PART(msg, mub, owned)	((void)(msg), (void)(mub), (void)(owned))
 #define IO_OPAQUE_SEND_POISON(p)	((void)(p))
 #endif
 
@@ -4880,9 +4894,9 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	struct socket *sock = sock_from_file(req->file);
 	/*
 	 * Neither is zeroed on entry, as CONFIG_INIT_STACK_ALL_ZERO would: the message
-	 * is zeroed once below, and the cursor is set when a body is managed.
+	 * is zeroed once below, and the msg_ubuf is set when a body is managed.
 	 */
-	struct io_opaque_send_cursor cursor __uninitialized;
+	struct io_opaque_msg_ubuf mub __uninitialized;
 	struct msghdr msg __uninitialized;
 	struct sock *sk = NULL;
 	struct kvec vec;
@@ -4891,7 +4905,7 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	bool joined = false;
 	int ret, sec = 0;
 
-	IO_OPAQUE_SEND_POISON(&cursor);
+	IO_OPAQUE_SEND_POISON(&mub);
 	IO_OPAQUE_SEND_POISON(&msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
@@ -4988,10 +5002,10 @@ again:
 		splice = io_opaque_send_splices(op);
 		if (splice && owned && io_opaque_sends_managed(sk)) {
 			/* The ubuf_info is whole: its ops, no count and no flags. */
-			cursor.uarg = (struct ubuf_info) { .ops = &io_opaque_cursor_ops };
-			cursor.pool = READ_ONCE(op->store->ubuf_pool);
+			mub.uarg = (struct ubuf_info) { .ops = &io_opaque_msg_ubuf_ops };
+			mub.pool = READ_ONCE(op->store->ubuf_pool);
 			msg.msg_flags |= MSG_ZEROCOPY;
-			msg.msg_ubuf = &cursor.uarg;
+			msg.msg_ubuf = &mub.uarg;
 			msg.sg_from_iter = io_opaque_sg_from_iter;
 		} else if (splice) {
 			msg.msg_flags |= MSG_SPLICE_PAGES;
@@ -5006,14 +5020,14 @@ again:
 		iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &vec, 1, vec.iov_len);
 	if (owned) {
 		IO_OPAQUE_SEND_LOCKED_CALL();
-		IO_OPAQUE_SEND_PART(&msg, &cursor, true);
+		IO_OPAQUE_SEND_PART(&msg, &mub, true);
 		ret = tcp_sendmsg_locked(sk, &msg, iov_iter_count(&msg.msg_iter));
 		if (trace_sock_send_length_enabled())
 			trace_sock_send_length(sk, ret, 0);
 	} else {
 		/* io-wq may block in TCP; other requests must retain access to the ring. */
 		io_ring_submit_unlock(req->ctx, issue_flags);
-		IO_OPAQUE_SEND_PART(&msg, &cursor, false);
+		IO_OPAQUE_SEND_PART(&msg, &mub, false);
 		ret = sock_sendmsg(sock, &msg);
 		io_ring_submit_lock(req->ctx, issue_flags);
 	}
@@ -5062,15 +5076,18 @@ finish:
 	/* The frame is queued or abandoned: the next send goes now, not at cleanup. */
 	io_opaque_tx_put(op);
 	/*
-	 * The references go with the socket, the last of a version after it, and so does
-	 * the request's place in the store's count: what cleanup is left to give back for
-	 * this send is the request itself.
+	 * The references go with the socket, the last of a version after it: what cleanup
+	 * is left to give back for this send is the request itself. A send that consumed its
+	 * object (LAST) has nothing for the socket to wait out. It holds the table's reference,
+	 * which is the last one unless a send or a copy of the version is still under way, and
+	 * an extra one for each entry of a vector that names a handle again, whose decrement
+	 * frees nothing and is as good after the socket. All of them are for
+	 * io_opaque_send_unpin(), and the call that would find the count at one and drop
+	 * nothing is not made.
 	 */
 	left = false;
-	if (owned) {
-		left = io_opaque_send_unpin_cheap(op);
-		io_opaque_req_uncount(op);
-	}
+	if (owned)
+		left = op->consumed || io_opaque_send_unpin_cheap(op);
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*

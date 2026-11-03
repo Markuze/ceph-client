@@ -27,6 +27,7 @@ struct io_uring_opaque_config {
 	__u32 max_objects;
 	__u32 max_streams;
 	__u32 max_extents;
+	/* Ignored. Earlier versions of this interface required 1 to 4096. */
 	__u32 max_requests;
 	__u32 flags;			/* IORING_OPAQUE_CFG_* */
 	__u64 __resv[2];
@@ -179,6 +180,7 @@ struct io_uring_opaque_stat {
 	__u32 objects;
 	__u32 streams;
 	__u32 extents;
+	/* Always 0. */
 	__u32 requests;
 	__u64 framing_bytes;
 	__u64 framing_copied_bytes;

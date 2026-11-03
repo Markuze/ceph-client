@@ -19,6 +19,7 @@
 #define IO_OPAQUE_RX_BATCH	SZ_256K
 #define IO_OPAQUE_MAX_ORDER	(PAGE_SHIFT < 16 ? 16 - PAGE_SHIFT : 0)
 #define IO_OPAQUE_ALLOC_RETRY_MS	50
+/* Waiters looked at in one hold of wait_lock, or the followers of a failed queue in one of tx_lock. */
 #define IO_OPAQUE_WAKE_BATCH	32
 #define IO_OPAQUE_INDEX_BITS	14
 #define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
@@ -397,11 +398,12 @@ struct io_opaque_ubuf_pool {
 };
 
 /*
- * What msg_ubuf points at during one managed tcp_sendmsg_locked(): the ops that
+ * What a managed send hands to link_skb() through msg_ubuf: the ops, which
  * skb_zerocopy_iter_stream() finds link_skb() through, and the pool of the send's
- * store, for the ubufs of its skbs.
+ * store, for the ubufs of the skbs that link_skb() makes. It lives on the stack of
+ * io_opaque_send() for one tcp_sendmsg_locked(), and no skb is ever linked to it.
  */
-struct io_opaque_send_cursor {
+struct io_opaque_msg_ubuf {
 	struct ubuf_info uarg;
 	/* The pool of the send's store, for the ubufs of its skbs; or none. */
 	struct io_opaque_ubuf_pool *pool;
@@ -420,16 +422,16 @@ struct io_opaque_store {
 	refcount_t users;
 	struct io_uring_opaque_config config;
 	/*
-	 * Handles and candidates; never held during copies or I/O, and for a time
-	 * that the request bounds: what admission does under it is a lookup per
-	 * entry, the segments its ranges span up to the limit, which it counts and
-	 * stores in the request's block, and for each range a walk that the
-	 * version's anchors keep to about two strides and a binary search. Attach
-	 * and the admission of a send take it with the socket owned, so nothing
-	 * may take a socket lock while holding it, or wait for anything that holds
-	 * one for long.
+	 * Handles and candidates. A spinlock: nothing under it sleeps or allocates, and
+	 * a version is put, a copy made and a socket locked only after it is dropped. It
+	 * is held for a time that the request bounds: what admission does under it is a
+	 * lookup per entry, the segments its ranges span up to the limit, which it counts
+	 * and stores in the request's block, and for each range a walk that the version's
+	 * anchors keep to about two strides and a binary search. Attach and the admission
+	 * of a send take it with the socket owned, so a socket lock is never taken while
+	 * holding it.
 	 */
-	struct mutex tables;
+	spinlock_t tables;
 	struct io_opaque_slot *objects;
 	struct io_opaque_stream_slot *streams;
 	unsigned long *object_used;
@@ -470,7 +472,6 @@ struct io_opaque_store {
 	spinlock_t transient_lock;
 	seqcount_spinlock_t transient_seq;
 	atomic_t extents;
-	atomic_t requests;
 	atomic_t memory_mode;
 	/* Completed ubufs of managed sends, for the next skbs; none if there was no memory. */
 	struct io_opaque_ubuf_pool *ubuf_pool;
@@ -640,14 +641,13 @@ extern atomic_long_t io_opaque_vec_counted;
 extern atomic_long_t io_opaque_budget_wakes;
 int io_opaque_tx_join(struct io_opaque_req *op, struct sock *sk);
 int io_opaque_tx_settle_head(struct io_opaque_req *op);
-void io_opaque_req_uncount(struct io_opaque_req *op);
 int io_opaque_tx_admit(struct io_opaque_req *op, struct sock *sk);
 struct io_opaque_req *io_opaque_tx_release(struct io_opaque_req *op);
 void io_opaque_txs_free(struct io_opaque_store *store);
 bool io_opaque_send_splices(const struct io_opaque_req *op);
 bool io_opaque_send_direct(const struct sock *sk);
 extern const struct ubuf_info_ops io_opaque_ubuf_ops;
-extern const struct ubuf_info_ops io_opaque_cursor_ops;
+extern const struct ubuf_info_ops io_opaque_msg_ubuf_ops;
 extern atomic_long_t io_opaque_ubufs_live;
 extern atomic_long_t io_opaque_ubuf_pools_live;
 struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
@@ -660,7 +660,7 @@ int io_opaque_send_security(struct socket *sock, struct msghdr *msg,
 			    const struct io_opaque_req *op);
 extern atomic_long_t io_opaque_send_locked_calls;
 extern void (*io_opaque_send_part)(const struct msghdr *msg,
-				   const struct io_opaque_send_cursor *cursor,
+				   const struct io_opaque_msg_ubuf *mub,
 				   bool owned);
 extern int io_opaque_send_poison;
 int io_opaque_create_build(struct io_opaque_req *op);
