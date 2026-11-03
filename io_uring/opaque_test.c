@@ -13720,6 +13720,133 @@ static void opaque_managed_shared_frag(struct kunit *test)
 	opaque_shared_frag_one(test, opaque_test_store(test));
 }
 
+#define OPAQUE_SHARED_CSUM_AT	6
+
+/*
+ * The skb of opaque_shared_skb() as a single segment for a device without checksum offload: the
+ * header stays in the head, with the field of the sum at the end of it, and the sum is left to
+ * skb_checksum_help().
+ */
+static struct sk_buff *opaque_shared_csum_skb(struct kunit *test, struct io_opaque_store *store,
+					      const struct opaque_segs *segs)
+{
+	struct sk_buff *skb = opaque_shared_skb(test, store, segs);
+
+	skb_push(skb, OPAQUE_SHARED_HDR);
+	skb_shinfo(skb)->gso_size = 0;
+	skb->csum_start = skb_headroom(skb);
+	skb->csum_offset = OPAQUE_SHARED_CSUM_AT;
+	memset(skb->data + OPAQUE_SHARED_CSUM_AT, 0, sizeof(__sum16));
+	return skb;
+}
+
+/*
+ * What TCP hands to a device that cannot sum a segment: a clone of the skb in its write queue, and
+ * a copy of its head if the skb is cloned already, as for a retransmission while the first clone is
+ * still below. skb_checksum_help() sums it there. For a marked skb it copies the fragments into the
+ * head of the clone first, so that the sum is that of the bytes that go out, and a write to the
+ * pages after that cannot make it wrong. The skb in the queue keeps its fragments and its ubuf
+ * for the next transmission, and every reference taken on the way is given back, in whichever
+ * order the skbs go.
+ */
+static void opaque_shared_csum_one(struct kunit *test, struct io_opaque_store *store)
+{
+	const bool marked = opaque_store_marked(store);
+	const u32 len = OPAQUE_SHARED_HDR + OPAQUE_SHARED_PAGES * 2000;
+	struct opaque_segs *segs = opaque_segs_new(test, OPAQUE_SHARED_PAGES, 2000);
+	u8 *want = kunit_kmalloc(test, len, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, len, GFP_KERNEL);
+	struct opaque_pool_snap before, after;
+	struct sk_buff *skb, *derived[2];
+	struct ubuf_info *uarg;
+	unsigned int order, i, j;
+	__sum16 sum;
+	void *mapped;
+
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	for (order = 0; order < 2; order++) {
+		opaque_pool_read(&before);
+		/* Every byte of a page differs from its neighbours, and a pass from the last. */
+		for (i = 0; i < segs->nr; i++) {
+			mapped = kmap_local_page(segs->bv[i].bv_page);
+			for (j = 0; j < 2000; j++)
+				((u8 *)mapped)[j] = i * 31 + j * 7 + order;
+			kunmap_local(mapped);
+		}
+		skb = opaque_shared_csum_skb(test, store, segs);
+		KUNIT_ASSERT_EQ(test, skb->len, len);
+		uarg = skb_zcopy(skb);
+		KUNIT_ASSERT_NOT_NULL(test, uarg);
+
+		/* What should go out: the packet, with the sum of it in its field. */
+		KUNIT_ASSERT_EQ(test, skb_copy_bits(skb, 0, want, len), 0);
+		sum = csum_fold(csum_partial(want, len, 0)) ?: CSUM_MANGLED_0;
+		memcpy(want + OPAQUE_SHARED_CSUM_AT, &sum, sizeof(sum));
+
+		derived[0] = skb_clone(skb, GFP_KERNEL);
+		derived[1] = pskb_copy(skb, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, derived[0]);
+		KUNIT_ASSERT_NOT_NULL(test, derived[1]);
+		for (i = 0; i < 2; i++) {
+			struct sk_buff *d = derived[i];
+
+			KUNIT_EXPECT_EQ(test, skb_checksum_help(d), 0);
+			KUNIT_EXPECT_TRUE(test, d->ip_summed == CHECKSUM_NONE);
+			KUNIT_ASSERT_EQ(test, d->len, len);
+			KUNIT_ASSERT_EQ(test, skb_copy_bits(d, 0, got, len), 0);
+			KUNIT_EXPECT_MEMEQ_MSG(test, got, want, len, "skb %u", i);
+			/* A marked skb is copied into its head, and lets go of its ubuf. */
+			KUNIT_EXPECT_EQ(test, skb_is_nonlinear(d), !marked);
+			KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(d), marked ? NULL : uarg);
+		}
+
+		/* The skb in the queue is as it was, and the ubuf has a reference per holder. */
+		KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, OPAQUE_SHARED_PAGES);
+		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), uarg);
+		KUNIT_EXPECT_EQ(test, skb_has_shared_frag(skb), marked);
+		KUNIT_EXPECT_EQ(test, refcount_read(&uarg->refcnt), marked ? 1U : 3U);
+
+		if (marked) {
+			/* The process writes the pages after the sum. The copy is not hit. */
+			for (i = 0; i < segs->nr; i++) {
+				mapped = kmap_local_page(segs->bv[i].bv_page);
+				memset(mapped, 0xee, 2000);
+				kunmap_local(mapped);
+			}
+			for (i = 0; i < 2; i++) {
+				KUNIT_ASSERT_EQ(test, skb_copy_bits(derived[i], 0, got, len), 0);
+				KUNIT_EXPECT_MEMEQ_MSG(test, got, want, len, "skb %u", i);
+				/* The sum of a packet with its own sum in it is zero. */
+				sum = csum_fold(csum_partial(got, len, 0));
+				KUNIT_EXPECT_EQ(test, (__force u16)sum, (u16)0);
+			}
+		}
+
+		if (order) {
+			kfree_skb(skb);
+			consume_skb(derived[0]);
+			consume_skb(derived[1]);
+		} else {
+			consume_skb(derived[0]);
+			consume_skb(derived[1]);
+			kfree_skb(skb);
+		}
+		/* Balanced: ubufs and pages are back, and the counter saw a copy for each skb. */
+		opaque_pool_read(&after);
+		KUNIT_EXPECT_EQ(test, after.live, before.live);
+		KUNIT_EXPECT_EQ(test, after.copied - before.copied, marked ? 2ULL : 0ULL);
+		for (i = 0; i < segs->nr; i++)
+			KUNIT_EXPECT_EQ_MSG(test, page_count(segs->bv[i].bv_page), 1,
+					    "order %u page %u", order, i);
+	}
+}
+
+static void opaque_managed_shared_csum(struct kunit *test)
+{
+	opaque_shared_csum_one(test, opaque_test_store(test));
+}
+
 /*
  * A send joins the skb at the tail of a socket's queue only if it would have given it the flags it
  * has. Two stores can send on one socket: were a bound store's fragments added to an skb that an
@@ -13869,6 +13996,101 @@ static void opaque_send_managed_shared_frag(struct kunit *test)
 	opaque_wire_shared_frag(test, opaque_test_store(test));
 }
 
+/*
+ * The skbs in the queue of the peer that have fragments and no ubuf of ours, and how many of them
+ * say that the fragments may change. A managed send leaves none: they are the skbs that TCP made
+ * of its own, as the probe of the path MTU is.
+ */
+static void opaque_wire_queue_bare(struct opaque_wire *w, unsigned int *skbs,
+				   unsigned int *shared)
+{
+	struct sk_buff_head *queue = &w->rx->sk->sk_receive_queue;
+	struct sk_buff *skb;
+
+	*skbs = *shared = 0;
+	spin_lock_bh(&queue->lock);
+	skb_queue_walk(queue, skb) {
+		if (!skb_shinfo(skb)->nr_frags || skb_zcopy(skb))
+			continue;
+		(*skbs)++;
+		*shared += skb_has_shared_frag(skb);
+	}
+	spin_unlock_bh(&queue->lock);
+}
+
+static void opaque_probing_restore(void *arg)
+{
+	WRITE_ONCE(init_net.ipv4.sysctl_tcp_mtu_probing, (unsigned long)arg);
+}
+
+/*
+ * The probe of the path MTU. With probing on, a connection begins with a small MSS, and when its
+ * window of congestion has grown and it has more queued than a probe needs, TCP takes the payload
+ * of the skbs at the head of its write queue into one skb of fragments that point where theirs
+ * do (tcp_clone_payload()). That skb has a page reference of its own for each, no ubuf, and the
+ * mark of theirs: were the mark lost on the way, the pages of a marked store would be summed in
+ * software as the pages of an ordinary one are. The first send of the connection grows the window,
+ * a later one finds a probe due. The peer's queue holds the probe, as a tap on the way would; the
+ * bytes are the object's, and every page reference is given back when the peer has read.
+ */
+static void opaque_wire_probe(struct kunit *test, struct io_opaque_store *store)
+{
+	const bool marked = opaque_store_marked(store);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	u8 *source = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	u8 *got = kunit_kmalloc(test, 40000, GFP_KERNEL);
+	unsigned int round, skbs, shared, probes = 0, marks = 0;
+	struct opaque_pool_snap before, after;
+	struct io_opaque_extent *extent;
+	struct tcp_sock *tp;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, source);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	io_opaque_send_copy_max = 0;
+	io_opaque_send_managed = true;
+	/* tcp_mtup_init() reads the setting when the connection is made. */
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_probing_restore,
+			(void *)(unsigned long)READ_ONCE(init_net.ipv4.sysctl_tcp_mtu_probing)), 0);
+	WRITE_ONCE(init_net.ipv4.sysctl_tcp_mtu_probing, 2);
+	opaque_wire_init(test, w);
+	opaque_wire_sndbuf(w->tx->sk, SZ_1M);
+	KUNIT_ASSERT_TRUE(test, inet_csk(w->tx->sk)->icsk_mtup.enabled);
+	tp = tcp_sk(w->tx->sk);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_test_copy(data, source);
+	opaque_pool_read(&before);
+
+	for (round = 0; round < 4 && !probes; round++) {
+		opaque_managed_send(test, w, store, 4196, 40000, 0);
+		opaque_wire_acked(w->tx->sk);
+		opaque_wire_queue_bare(w, &skbs, &shared);
+		probes += skbs;
+		marks += shared;
+		opaque_wire_read(test, w, got, 0, 40000);
+		KUNIT_EXPECT_MEMEQ_MSG(test, got, source + 4196, 40000, "round %u", round);
+	}
+	KUNIT_EXPECT_GE_MSG(test, probes, 1U, "no probe in %u rounds, window %u", round,
+			    tcp_snd_cwnd(tp));
+	KUNIT_EXPECT_NE(test, tp->mtu_probe.probe_seq_end, 0U);
+	KUNIT_EXPECT_EQ(test, marks, marked ? probes : 0U);
+
+	/* The peer has read everything, and the sender has everything acknowledged. */
+	opaque_wire_acked(w->tx->sk);
+	list_for_each_entry(extent, &data->extents, list)
+		KUNIT_EXPECT_EQ(test, page_count(extent->backing->page), 1);
+	opaque_pool_read(&after);
+	KUNIT_EXPECT_EQ(test, after.live, before.live);
+	opaque_test_free(store, 0);
+}
+
+static void opaque_send_managed_probe(struct kunit *test)
+{
+	opaque_wire_probe(test, opaque_test_store(test));
+}
+
 #ifdef CONFIG_IO_URING_ZCRX_KUNIT_TEST
 /* The same for a store that binds an instance: see opaque_maio_store(). */
 static void opaque_maio_managed_shared_frag(struct kunit *test)
@@ -13938,6 +14160,21 @@ static void opaque_maio_send_managed_two_stores(struct kunit *test)
 		opaque_test_free(store[i], 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store[i]->bytes), 0LL);
 	}
+}
+
+/* The same for a bound store: its skbs are summed in software as a copy, and are not hit. */
+static void opaque_maio_managed_shared_csum(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+
+	opaque_shared_csum_one(test, opaque_maio_store(test, ifq));
+}
+
+static void opaque_maio_send_managed_probe(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+
+	opaque_wire_probe(test, opaque_maio_store(test, ifq));
 }
 
 /*
@@ -14072,6 +14309,20 @@ static void opaque_maio_unbound_send_managed_shared_frag(struct kunit *test)
 	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
 
 	opaque_wire_shared_frag(test, opaque_maio_unbound_store(test, ifq));
+}
+
+static void opaque_maio_unbound_managed_shared_csum(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+
+	opaque_shared_csum_one(test, opaque_maio_unbound_store(test, ifq));
+}
+
+static void opaque_maio_unbound_send_managed_probe(struct kunit *test)
+{
+	struct io_zcrx_ifq *ifq = io_zcrx_maio_test_ifq(test, 16);
+
+	opaque_wire_probe(test, opaque_maio_unbound_store(test, ifq));
 }
 
 /*
@@ -14780,9 +15031,13 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_maio_managed_shared_frag),
 	KUNIT_CASE(opaque_maio_send_managed_shared_frag),
 	KUNIT_CASE(opaque_maio_send_managed_two_stores),
+	KUNIT_CASE(opaque_maio_managed_shared_csum),
+	KUNIT_CASE(opaque_maio_send_managed_probe),
 	KUNIT_CASE(opaque_maio_unbound_flag),
 	KUNIT_CASE(opaque_maio_unbound_managed_shared_frag),
 	KUNIT_CASE(opaque_maio_unbound_send_managed_shared_frag),
+	KUNIT_CASE(opaque_maio_unbound_managed_shared_csum),
+	KUNIT_CASE(opaque_maio_unbound_send_managed_probe),
 	KUNIT_CASE(opaque_maio_unbound_send_managed_flip),
 #endif
 	KUNIT_CASE(opaque_send_managed_loopback),
@@ -14806,8 +15061,10 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_managed_link_full),
 	KUNIT_CASE(opaque_managed_boundary),
 	KUNIT_CASE(opaque_managed_shared_frag),
+	KUNIT_CASE(opaque_managed_shared_csum),
 	KUNIT_CASE(opaque_managed_link_binding),
 	KUNIT_CASE(opaque_send_managed_shared_frag),
+	KUNIT_CASE(opaque_send_managed_probe),
 	KUNIT_CASE(opaque_ubuf_complete_atomic),
 	KUNIT_CASE(opaque_ubuf_pool_reuse),
 	KUNIT_CASE(opaque_ubuf_pool_share),
