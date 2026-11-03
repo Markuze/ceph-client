@@ -52,6 +52,8 @@ void io_opaque_cache_free(struct io_ring_ctx *ctx)
 static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_vec_cleanup(struct io_opaque_req *op);
+static bool io_opaque_send_borrows(const struct io_opaque_req *op);
+VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream);
 static void io_opaque_tx_put(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT struct io_opaque_ubuf_pool *io_opaque_ubuf_pool_new(void);
@@ -3067,7 +3069,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
  * other has all of them to give back here, once, and each is given back only if it
  * is there: a call that is made to find that out is a call for nothing. A vector
  * whose admission failed, with the socket owned or not, is one of those: it left the
- * references it had taken for this (io_opaque_vec_acquire()).
+ * references it had taken for this (io_opaque_vec_acquire()). So is a send that
+ * borrowed a version from its ring and ended in an issue that did not hold the ring
+ * lock, which cleanup does: it gives the borrow back (io_opaque_send_return()), and
+ * puts the ring's reference if that was the last borrow of the version.
  *
  * A send is on neither list that a waker walks under wait_lock, budget_waits and
  * copies, so it has no waker to wait out, and takes the lock only if its entry is
@@ -3095,11 +3100,13 @@ void io_opaque_send_cleanup(struct io_kiocb *req)
 		kfree(op->framing);
 	if (op->frame_charge)
 		io_opaque_uncharge_frame(store, op->frame_charge, op->frame_reserved);
+	lockdep_assert_held(&req->ctx->uring_lock);
+	if (unlikely(io_opaque_send_borrows(op)))
+		io_opaque_send_return(op);
 	if (unlikely(op->vec))
 		io_opaque_vec_cleanup(op);
 	if (op->data)
 		io_opaque_data_put(store, op->data);
-	lockdep_assert_held(&req->ctx->uring_lock);
 	io_opaque_req_free(req->ctx, op);
 	io_req_async_data_clear(req, 0);
 }
@@ -3556,6 +3563,118 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
 }
 
 /*
+ * The borrows of a ring. A send that keeps its object holds the version it sends until it ends.
+ * The sends of one ring that are in flight on one version at the same time, as the evaluation's
+ * senders have eight of the same objects, each took a reference on it and gave one back: two
+ * atomic operations a send, for a hold that the ring can keep once for all of them.
+ * ctx->opaque_borrow is that hold: an entry for each version the ring has a reference on, with
+ * the number of its sends that borrow it.
+ *
+ * The first send of a version that finds the ring without an entry for it takes a reference as
+ * a send always did, and the ring keeps it in an entry with a count of one: the send borrows it.
+ * A send that comes while the entry is there raises the count and takes nothing. A send that ends
+ * gives its borrow back, and the one that gives back the last drops the ring's reference, and the
+ * entry goes. Nothing is kept for a send that has not come: the entries are the versions that
+ * sends of the ring are in flight on, and a version is held for as long as one is, as it was when
+ * every send held a reference of its own. Nothing that userspace can see differs.
+ *
+ * A version is looked for by its address. The version that a slot holds is the one the ring has
+ * an entry for if the two are the same, since a version that the ring holds a reference on is not
+ * freed, and so its address is not another version's.
+ *
+ * The table is under the ring lock. An inline issue holds that from end to end, and an io-wq
+ * issue does not: it drops the lock for the socket, and does not take it again before it ends.
+ * So only an inline issue borrows (op->may_borrow), and a borrow is given back where the ring
+ * lock is held, which is the end of an inline issue, the cleanup of the request, and a frame that
+ * joins a queue that has failed. A send that holds a borrow and ends in an issue that does not
+ * hold the lock leaves it for its cleanup. A send with LAST takes the table's reference, a send
+ * of a version that finds the table full takes one of its own, and so does one that is not
+ * inline, as they all did.
+ */
+
+/* The entry of the ring for @data, or NULL. */
+static struct io_opaque_borrow *io_opaque_borrow_find(struct io_ring_ctx *ctx,
+						      const struct io_opaque_data *data)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&ctx->uring_lock);
+	for (i = 0; i < ctx->opaque_borrow_nr; i++)
+		if (ctx->opaque_borrow[i].data == data)
+			return &ctx->opaque_borrow[i];
+	return NULL;
+}
+
+/* Borrow @data if the ring has an entry for it, taking and putting nothing. */
+static bool io_opaque_borrow_take(struct io_ring_ctx *ctx, const struct io_opaque_data *data)
+{
+	struct io_opaque_borrow *b = io_opaque_borrow_find(ctx, data);
+
+	if (!b)
+		return false;
+	b->borrows++;
+	return true;
+}
+
+/*
+ * The ring keeps the reference that a send has taken on @data in an entry of its own, and the
+ * send borrows it. False if the table is full: the reference stays the send's.
+ */
+static bool io_opaque_borrow_add(struct io_ring_ctx *ctx, struct io_opaque_data *data)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	if (ctx->opaque_borrow_nr >= IO_OPAQUE_BORROW_MAX)
+		return false;
+	ctx->opaque_borrow[ctx->opaque_borrow_nr++] = (struct io_opaque_borrow) {
+		.data = data, .borrows = 1,
+	};
+	return true;
+}
+
+/*
+ * Give back a borrow of @data. True if it was the last: the entry is gone, and the ring's
+ * reference is the caller's to put, as the send's own would be.
+ */
+static bool io_opaque_borrow_return(struct io_ring_ctx *ctx, const struct io_opaque_data *data)
+{
+	struct io_opaque_borrow *b = io_opaque_borrow_find(ctx, data);
+
+	/* A borrow with no entry is a bug, and a reference left is better than one put twice. */
+	if (WARN_ON_ONCE(!b))
+		return false;
+	if (--b->borrows)
+		return false;
+	*b = ctx->opaque_borrow[--ctx->opaque_borrow_nr];
+	return true;
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Run by io_opaque_borrows_exit() before it looks, for a test to read what the ring holds when
+ * its registrations are undone.
+ */
+void (*io_opaque_borrows_exit_hook)(struct io_ring_ctx *ctx);
+#define IO_OPAQUE_BORROWS_EXIT(ctx)					\
+	do {								\
+		if (io_opaque_borrows_exit_hook)			\
+			io_opaque_borrows_exit_hook(ctx);		\
+	} while (0)
+#else
+#define IO_OPAQUE_BORROWS_EXIT(ctx)	((void)(ctx))
+#endif
+
+/*
+ * The ring is going. Every send has been cleaned up, and gave back what it borrowed in its
+ * cleanup, so no version is borrowed: the references of the entries would be left with the store.
+ */
+void io_opaque_borrows_exit(struct io_ring_ctx *ctx)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	IO_OPAQUE_BORROWS_EXIT(ctx);
+	WARN_ON(ctx->opaque_borrow_nr);
+}
+
+/*
  * Take a reference on the version that @handle names, for a send that does not consume it and
  * wants @len bytes of it from @off, without taking tables. The slot is read in RCU, and the
  * count raised if it is not zero. What is read is the version that the slot held. A FREE, a LAST
@@ -3583,13 +3702,22 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
  * after that and before the slot is read: it sets dead under tables and detaches its objects
  * later, and the lookup that finds one detached is told so. A range outside the version that is
  * the handle's is the answer without tables.
+ *
+ * A send that may borrow (@borrowed is not NULL, and the issue holds the ring lock throughout)
+ * takes no reference when the ring has an entry for the version the slot holds: it borrows that,
+ * and sets *@borrowed. The version is then held by the reference of the entry, which is not the
+ * send's to put, and which the entry keeps for as long as it has a borrow. Without an entry it
+ * takes a reference as above, and the ring keeps it in one if the table has room for it, and
+ * the send borrows it. A reference that the table settled is the send's own.
  */
-static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 handle,
-					    u64 off, u32 len)
+static struct io_opaque_data *io_opaque_pin(struct io_opaque_req *op, u64 handle, u64 off,
+					    u32 len, bool *borrowed)
 {
+	struct io_opaque_store *store = op->store;
+	struct io_ring_ctx *ctx = borrowed && op->may_borrow ? op->req->ctx : NULL;
 	u32 index = io_opaque_index(handle);
 	struct io_opaque_data *data;
-	bool taken = false;
+	bool taken = false, hit = false;
 	int ret = 0;
 
 	if (!handle || index >= store->config.max_objects)
@@ -3600,8 +3728,10 @@ static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 h
 	IO_OPAQUE_LOOKUP_BETWEEN(store);
 	if (data && data->handle == handle) {
 		ret = io_opaque_send_range(data, off, len);
-		if (!ret)
-			taken = refcount_inc_not_zero(&data->refs);
+		if (!ret) {
+			hit = ctx && io_opaque_borrow_take(ctx, data);
+			taken = hit || refcount_inc_not_zero(&data->refs);
+		}
 	}
 	rcu_read_unlock();
 	if (ret)
@@ -3610,15 +3740,52 @@ static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 h
 		data = io_opaque_pin_locked(store, handle, off, len);
 		if (IS_ERR(data))
 			return data;
+	} else if (ctx && !hit) {
+		*borrowed = io_opaque_borrow_add(ctx, data);
 	}
-	io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
+	if (hit) {
+		*borrowed = true;
+		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_BORROWED, 1);
+	} else {
+		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
+	}
 	IO_OPAQUE_LOOKUP_AFTER(store);
 	return data;
 }
 
-/* Drop the references a send took at admission; a no-op when it took none. */
+/* Whether the send holds a version by a borrow, which only the ring lock lets it give back. */
+static bool io_opaque_send_borrows(const struct io_opaque_req *op)
+{
+	return op->borrowed;
+}
+
+/*
+ * Give back the borrows of the send, with the ring lock held. A borrow that is not the last of
+ * its version leaves the send with nothing to put. The last leaves it with the ring's reference,
+ * as its own: the send puts that as it would one it took, which for a send that owns its socket is
+ * after the socket is released (io_opaque_send_unpin_cheap()).
+ */
+VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op)
+{
+	struct io_ring_ctx *ctx;
+
+	if (!op->borrowed)
+		return;
+	ctx = op->req->ctx;
+	lockdep_assert_held(&ctx->uring_lock);
+	op->borrowed = false;
+	if (!io_opaque_borrow_return(ctx, op->data))
+		op->data = NULL;
+}
+
+/*
+ * Drop the references a send took at admission, giving back what it borrowed first (with the
+ * ring lock held, see io_opaque_send_return()); a no-op when it took none.
+ */
 static void io_opaque_send_unpin(struct io_opaque_req *op)
 {
+	if (unlikely(io_opaque_send_borrows(op)))
+		io_opaque_send_return(op);
 	if (op->send_flags & IORING_OPAQUE_SEND_VECTOR)
 		io_opaque_vec_release(op);
 	io_opaque_data_put(op->store, op->data);
@@ -3643,11 +3810,19 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
  * as its caller has it. A decrement never takes a count from one to zero. A
  * vector's entries that were put are cleared, so that the rest cannot put them
  * again. A send that consumed its object does not call it (see io_opaque_send()).
+ *
+ * A borrow is given back first, with the ring lock held (io_opaque_send_return()), and a borrow
+ * that is not the last of its version leaves nothing to drop. The last leaves the reference of
+ * the ring, which is dropped as the send's own would be: by a decrement here, if the version has
+ * other holders, and else after the socket. So a send that borrows puts nothing with the socket
+ * owned either.
  */
 static bool io_opaque_send_unpin_cheap(struct io_opaque_req *op)
 {
 	bool left = false;
 
+	if (unlikely(io_opaque_send_borrows(op)))
+		io_opaque_send_return(op);
 	if (op->send_flags & IORING_OPAQUE_SEND_VECTOR) {
 		struct io_opaque_vec *vec = op->vec;
 		u32 i;
@@ -3753,7 +3928,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 			/* Pinned before the block grew. */
 			data = vec->pin[i];
 		} else if (io_opaque_vec_owns(op, i)) {
-			data = io_opaque_pin(store, ent->handle, ent->off, ent->len);
+			data = io_opaque_pin(op, ent->handle, ent->off, ent->len, NULL);
 			if (IS_ERR(data))
 				return PTR_ERR(data);
 		}
@@ -3821,8 +3996,9 @@ static void io_opaque_send_cursor(struct io_opaque_req *op)
 /*
  * A send of one range. A LAST send takes the table's reference, which also removes the handle,
  * under tables; any other sends the version that the handle names now, and takes a reference
- * of its own without tables (io_opaque_pin()), which has checked the range by then and holds
- * nothing if it refuses it. The cursor is made once the version is held.
+ * of its own without tables, or borrows one of its ring's (io_opaque_pin()), which has checked
+ * the range by then and holds nothing if it refuses it. The cursor is made once the version is
+ * held.
  */
 static int io_opaque_send_acquire_one(struct io_opaque_req *op)
 {
@@ -3851,10 +4027,13 @@ static int io_opaque_send_acquire_one(struct io_opaque_req *op)
 		op->consumed = true;
 		io_opaque_count(IO_OPAQUE_STAT_SEND_REFS_TAKEN, 1);
 	} else {
-		data = io_opaque_pin(store, op->handle, op->offset, op->length);
+		bool borrowed = false;
+
+		data = io_opaque_pin(op, op->handle, op->offset, op->length, &borrowed);
 		if (IS_ERR(data))
 			return PTR_ERR(data);
 		op->data = data;
+		op->borrowed = borrowed;
 	}
 	io_opaque_send_cursor(op);
 	return 0;
@@ -4006,6 +4185,8 @@ int io_opaque_send_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	op->suffix_length = 0;
 	op->total_length = 0;
 	op->tx_started = false;
+	op->may_borrow = false;
+	op->borrowed = false;
 	op->send_flags = send_flags;
 	op->handle = READ_ONCE(sqe->addr);
 	op->offset = READ_ONCE(sqe->off);
@@ -5124,6 +5305,8 @@ int io_opaque_send(struct io_kiocb *req, unsigned int issue_flags)
 	IO_OPAQUE_SEND_POISON(&mub);
 	IO_OPAQUE_SEND_POISON(&msg);
 	io_ring_submit_lock(req->ctx, issue_flags);
+	/* An issue borrows from the ring only if it keeps the ring lock to its end. */
+	op->may_borrow = !(issue_flags & IO_URING_F_UNLOCKED);
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP) {
 		ret = -EOPNOTSUPP;
 		goto finish;
@@ -5300,10 +5483,20 @@ finish:
 	 * frees nothing and is as good after the socket. All of them are for
 	 * io_opaque_send_unpin(), and the call that would find the count at one and drop
 	 * nothing is not made.
+	 *
+	 * What the send borrowed from its ring is given back where the ring lock is held, which
+	 * an inline issue does and an io-wq issue that owns the socket does not: it leaves its
+	 * borrows, and with them all it holds, for the cleanup of the request. The borrow that
+	 * is the last of its version leaves the send with the ring's reference, and that is
+	 * dropped as any is, the last after the socket.
 	 */
 	left = false;
-	if (owned)
-		left = op->consumed || io_opaque_send_unpin_cheap(op);
+	if (owned) {
+		if (op->consumed)
+			left = true;
+		else if (op->may_borrow || !io_opaque_send_borrows(op))
+			left = io_opaque_send_unpin_cheap(op);
+	}
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*

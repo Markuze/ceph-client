@@ -360,6 +360,8 @@ enum io_opaque_stat_item {
 	 * took on the version, or the table's own that a send with LAST took over.
 	 */
 	IO_OPAQUE_STAT_SEND_REFS_TAKEN,
+	/* Versions that a send borrowed from its ring, taking no reference (io_opaque_pin()). */
+	IO_OPAQUE_STAT_SEND_REFS_BORROWED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -655,6 +657,7 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 void io_opaque_send_resolve(struct io_opaque_req *op);
 int io_opaque_send_acquire(struct io_opaque_req *op);
+void io_opaque_send_return(struct io_opaque_req *op);
 int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
 void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total, u32 longest);
 int io_opaque_vec_copy_in(struct io_opaque_req *op,
@@ -669,6 +672,7 @@ extern void (*io_opaque_lookup_before)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 extern atomic_long_t io_opaque_pin_slow;
+extern void (*io_opaque_borrows_exit_hook)(struct io_ring_ctx *ctx);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;

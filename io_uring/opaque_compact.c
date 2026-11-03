@@ -132,6 +132,7 @@ IO_OPAQUE_STAT_PARAM(stat_send_admit_fast, IO_OPAQUE_STAT_SEND_ADMIT_FAST);
 IO_OPAQUE_STAT_PARAM(stat_send_admit_slow, IO_OPAQUE_STAT_SEND_ADMIT_SLOW);
 IO_OPAQUE_STAT_PARAM(stat_send_ubuf_reused, IO_OPAQUE_STAT_SEND_UBUF_REUSED);
 IO_OPAQUE_STAT_PARAM(stat_send_refs_taken, IO_OPAQUE_STAT_SEND_REFS_TAKEN);
+IO_OPAQUE_STAT_PARAM(stat_send_refs_borrowed, IO_OPAQUE_STAT_SEND_REFS_BORROWED);
 
 static void io_opaque_auto_compact(struct io_opaque_store *store);
 

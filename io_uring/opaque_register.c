@@ -145,6 +145,7 @@ void io_unregister_opaque(struct io_ring_ctx *ctx)
 	unsigned long index;
 
 	lockdep_assert_held(&ctx->uring_lock);
+	io_opaque_borrows_exit(ctx);
 	io_terminate_opaque(ctx);
 	xa_for_each(&ctx->opaque_stores, index, store)
 		io_opaque_put(store);

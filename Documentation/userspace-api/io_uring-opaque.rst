@@ -857,12 +857,19 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     block of a request is kept for the next, so a send is slow when its
     request is new or its ranges span more segments than any before it did. A
     send of one range is neither, and neither is a vector that fails.
-``stat_send_refs_taken``
-    Versions that sends have acquired, one for each version a send holds: the
-    reference that a send of one range takes on the version, one for each run
-    of entries of a vector that name the same handle, and, for SEND_LAST, the
-    table's reference that the send takes over, one for each entry of a
-    vector. A send that is refused takes none.
+``stat_send_refs_taken``, ``stat_send_refs_borrowed``
+    Versions that sends have acquired, one for each version a send holds: a
+    send of one range holds one, a vector one for each run of entries that
+    name the same handle, and a vector with SEND_LAST one for each entry.
+    *Taken* counts those for which the send took a reference on the version,
+    or, with SEND_LAST, took over the table's. *Borrowed* counts those held by
+    a reference that the ring took for sends of its own that were under way
+    on the same version: the ring takes one with the first of them and drops
+    it with the last, and the others take none, so that a version is held for
+    as long as a send is in flight on it, as it is when each takes its own.
+    A send that is not issued inline, a send with SEND_LAST, a vector, and a
+    send that finds the ring already borrowing eight other versions take a
+    reference. A send that is refused holds none.
 
 Stores in the area of a MAIO instance
 =====================================
