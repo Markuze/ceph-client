@@ -447,7 +447,7 @@ struct io_opaque_store {
 	 * owned, so a socket lock is never taken while holding it. Every change of a
 	 * slot's version is made with it held, and a send that does not consume its
 	 * object does not take it to read one (see io_opaque_pin()), but for the lookup
-	 * that finds the version it read already gone.
+	 * that finds no version to take.
 	 */
 	spinlock_t tables;
 	struct io_opaque_slot *objects;
@@ -660,6 +660,7 @@ int io_opaque_apply_policy(struct io_opaque_store *store,
 			   const struct io_uring_opaque_policy *policy);
 extern unsigned int io_opaque_policy_chunk;
 extern void (*io_opaque_policy_between)(struct io_opaque_store *store);
+extern void (*io_opaque_lookup_before)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 extern atomic_long_t io_opaque_pin_slow;

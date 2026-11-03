@@ -3482,6 +3482,17 @@ static int io_opaque_send_range(const struct io_opaque_data *data, u64 off, u32 
 
 #if IS_ENABLED(CONFIG_KUNIT)
 /*
+ * Run by io_opaque_pin() before it reads the slot, with no lock held and not in RCU, which is
+ * after its caller has looked at store->dead: for a test to stop the store, or to hold the
+ * lookup until it is stopped. It may sleep.
+ */
+void (*io_opaque_lookup_before)(struct io_opaque_store *store);
+#define IO_OPAQUE_LOOKUP_BEFORE(store)				\
+	do {							\
+		if (io_opaque_lookup_before)			\
+			io_opaque_lookup_before(store);		\
+	} while (0)
+/*
  * Run by io_opaque_pin() in the RCU section, after it has read the version from its slot and
  * before it takes a reference, for a test to change what the slot holds there.
  */
@@ -3506,16 +3517,21 @@ void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 atomic_long_t io_opaque_pin_slow = ATOMIC_LONG_INIT(0);
 #define IO_OPAQUE_PIN_SLOW()		atomic_long_inc(&io_opaque_pin_slow)
 #else
+#define IO_OPAQUE_LOOKUP_BEFORE(store)	((void)(store))
 #define IO_OPAQUE_LOOKUP_BETWEEN(store)	((void)(store))
 #define IO_OPAQUE_LOOKUP_AFTER(store)	((void)(store))
 #define IO_OPAQUE_PIN_SLOW()		((void)0)
 #endif
 
 /*
- * The lookup of io_opaque_pin() for a version that was read and has been put by everyone since:
- * ask the table, where nothing changes meanwhile. The handle names another version now, a
- * replacement of the one that was read for example, or none, and then an ESTALE is the
- * handle's. Like the lookup in RCU, this takes a reference or returns an error and holds none.
+ * The lookup of io_opaque_pin() that is settled with tables held, where nothing changes
+ * meanwhile: the slot was empty, or held a version of another handle, or a version that
+ * everyone has put since it was read. The handle names another version now, a replacement of the
+ * one that was read for example, or none. A store that has stopped is looked at first. It stops
+ * by setting dead with tables held and detaching its objects afterwards, so that a handle that
+ * was there when the send began can be gone by now, and is not stale: the send is ordered after
+ * the stop, and the answer it gets is the store's, as it is for a send that begins after it.
+ * Like the lookup in RCU, this takes a reference or returns an error and holds none.
  */
 static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store, u64 handle,
 						   u64 off, u32 len)
@@ -3526,6 +3542,8 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
 
 	IO_OPAQUE_PIN_SLOW();
 	guard(spinlock)(&store->tables);
+	if (store->dead)
+		return ERR_PTR(-ESHUTDOWN);
 	slot = io_opaque_lookup(store, handle);
 	data = slot ? io_opaque_slot_data(store, slot) : NULL;
 	if (!data)
@@ -3556,11 +3574,15 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
  * io_opaque_send_unpin_cheap()): admission runs with the socket, and the version may have left
  * the table since the reference was taken, so that giving it back would be the last put.
  *
- * A slot freed and taken by another object holds a version of another handle: ESTALE.
- * A count of zero says that the version has left the table and that everyone has put it. Its
- * extents and segments are freed and only the struct is left, so that the count can still be
- * read. The table is asked again with tables held, where it is settled as it always was
- * (io_opaque_pin_locked()).
+ * Whatever does not give a version to take is asked of the table with tables held, where the
+ * answer is the one it always was (io_opaque_pin_locked()): an empty slot, a version of another
+ * handle (the slot was freed and taken by another object), and a count of zero, which says that
+ * the version has left the table and that everyone has put it. Its extents and segments are
+ * freed and only the struct is left, so that the count can still be read. A store that has
+ * stopped is answered there too. The caller has looked at store->dead, and the store may stop
+ * after that and before the slot is read: it sets dead under tables and detaches its objects
+ * later, and the lookup that finds one detached is told so. A range outside the version that is
+ * the handle's is the answer without tables.
  */
 static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 handle,
 					    u64 off, u32 len)
@@ -3572,16 +3594,15 @@ static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 h
 
 	if (!handle || index >= store->config.max_objects)
 		return ERR_PTR(-ESTALE);
+	IO_OPAQUE_LOOKUP_BEFORE(store);
 	rcu_read_lock();
 	data = rcu_dereference(store->objects[index].data);
 	IO_OPAQUE_LOOKUP_BETWEEN(store);
-	if (!data || data->handle != handle) {
-		rcu_read_unlock();
-		return ERR_PTR(-ESTALE);
+	if (data && data->handle == handle) {
+		ret = io_opaque_send_range(data, off, len);
+		if (!ret)
+			taken = refcount_inc_not_zero(&data->refs);
 	}
-	ret = io_opaque_send_range(data, off, len);
-	if (!ret)
-		taken = refcount_inc_not_zero(&data->refs);
 	rcu_read_unlock();
 	if (ret)
 		return ERR_PTR(ret);
@@ -3802,6 +3823,10 @@ static int io_opaque_send_acquire_one(struct io_opaque_req *op)
 	struct io_opaque_data *data;
 	int ret;
 
+	/*
+	 * A send that consumes what it names looks under tables, and has the answer. Any other
+	 * is told again by its lookup, if it finds no version to take (io_opaque_pin()).
+	 */
 	if (READ_ONCE(store->dead))
 		return -ESHUTDOWN;
 	if (!op->length)

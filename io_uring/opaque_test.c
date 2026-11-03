@@ -2647,6 +2647,15 @@ static void opaque_test_cache(struct kunit *test, struct io_opaque_store *store,
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_drain, store), 0);
 }
 
+/* A store that io_opaque_stop() can stop: it has the work and the cache that the stop drains. */
+static void opaque_test_stoppable(struct kunit *test, struct io_opaque_store *store)
+{
+	INIT_LIST_HEAD(&store->copies);
+	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
+	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
+	opaque_test_cache(test, store, 2);
+}
+
 struct opaque_test_params {
 	unsigned long cache_bytes;
 	unsigned int unit_order;
@@ -13842,16 +13851,19 @@ static void opaque_ubuf_pool_smp_close(struct kunit *test)
  * io_opaque_lookup_between lets them reach, and then do the same from several CPUs. A hook runs
  * in the RCU section of the lookup, so it may take a spinlock and put, and it may not sleep
  * or make an expectation, which allocates when it fails: it records, and the test looks after.
- * io_opaque_lookup_after is reached by a lookup that holds its reference, outside RCU and with no
- * lock, where a hook may do what a context of its own does, such as another ring's FREE.
+ * io_opaque_lookup_before is reached before the slot is read, and io_opaque_lookup_after by a
+ * lookup that holds its reference: both outside RCU and with no lock, where a hook may do what a
+ * context of its own does, such as another ring's FREE, or the stop of the store.
  */
 enum {
+	OPAQUE_LK_BEFORE,
 	OPAQUE_LK_BETWEEN,
 	OPAQUE_LK_AFTER,
 };
 
 static void opaque_lookup_hook_reset(void *unused)
 {
+	WRITE_ONCE(io_opaque_lookup_before, NULL);
 	WRITE_ONCE(io_opaque_lookup_between, NULL);
 	WRITE_ONCE(io_opaque_lookup_after, NULL);
 }
@@ -13861,7 +13873,9 @@ static void opaque_lookup_hook_at(struct kunit *test, unsigned int where,
 				  void (*hook)(struct io_opaque_store *store))
 {
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_lookup_hook_reset, NULL), 0);
-	if (where == OPAQUE_LK_AFTER)
+	if (where == OPAQUE_LK_BEFORE)
+		WRITE_ONCE(io_opaque_lookup_before, hook);
+	else if (where == OPAQUE_LK_AFTER)
 		WRITE_ONCE(io_opaque_lookup_after, hook);
 	else
 		WRITE_ONCE(io_opaque_lookup_between, hook);
@@ -13913,7 +13927,8 @@ static void opaque_lk_window(struct io_opaque_store *store)
 
 /*
  * Start the window: run @act at @where in lookup number @at of this test. Lookups are counted
- * where the window is, so a window after the reference does not see the lookups that fail.
+ * where the window is, so a window after the reference does not see the lookups that fail, and
+ * one before the read sees the ones that the stop of a store leaves nothing to read for.
  */
 static void opaque_lk_open_at(struct kunit *test, struct io_opaque_store *store,
 			      unsigned int where, void (*act)(void), unsigned int at)
@@ -13934,8 +13949,7 @@ static void opaque_lk_open(struct kunit *test, struct io_opaque_store *store, vo
 
 static void opaque_lk_close(void)
 {
-	WRITE_ONCE(io_opaque_lookup_between, NULL);
-	WRITE_ONCE(io_opaque_lookup_after, NULL);
+	opaque_lookup_hook_reset(NULL);
 }
 
 /* The object is freed, and the put of the table's reference may be the last. */
@@ -13955,6 +13969,28 @@ static void opaque_lk_free_other(void)
 	kunit_deactivate_static_stub(test, io_opaque_data_put);
 	opaque_test_free(opaque_lk.store, 0);
 	kunit_activate_static_stub(test, io_opaque_data_put, opaque_test_data_put_spy);
+}
+
+/*
+ * What io_opaque_stop() does, as far as a window in RCU can do it: dead is set under tables, and
+ * the objects are detached and put afterwards, one at a time.
+ */
+static void opaque_lk_stop_like(void)
+{
+	struct io_opaque_store *store = opaque_lk.store;
+	u32 i;
+
+	spin_lock(&store->tables);
+	WRITE_ONCE(store->dead, 1);
+	spin_unlock(&store->tables);
+	for (i = 0; i < store->config.max_objects; i++)
+		opaque_test_free(store, i);
+}
+
+/* The store is stopped, as the ring that owns it does when its last user goes. */
+static void opaque_lk_stop(void)
+{
+	io_opaque_stop(opaque_lk.store);
 }
 
 /* The compaction is published; with @drop the old version loses the compaction's reference too. */
@@ -14058,8 +14094,12 @@ static void opaque_pin_handles(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 1);
 	WRITE_ONCE(store->dead, 0);
 
-	/* No lookup here met a version that was gone. */
-	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow);
+	/*
+	 * A lookup that found no version of its handle to take was asked of the table: the empty
+	 * slot, the two generations, and the slot that another object had taken. The names that no
+	 * slot can have, none and out of range, were refused at once.
+	 */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow + 4);
 
 	/*
 	 * A send that consumes its object takes tables itself, for it removes the handle, and
@@ -14195,6 +14235,78 @@ static void opaque_pin_retired_send(struct kunit *test)
 		kvfree_rcu_barrier();
 	}
 	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A store stops by setting dead under tables and detaching its objects afterwards, and a send
+ * that has looked at dead, found the store alive and not yet read its slot may meet the stop
+ * anywhere in that. It is told that the store has stopped, as a send that came after is, and not
+ * that its handle is stale: no handle was freed. That holds wherever the stop lands: after the
+ * slot was read and the version put by all (the lookup finds a count of zero), and before the
+ * slot was read (it finds nothing), for a single range and for the second entry of a vector,
+ * whose first has pinned already. A send that took its reference before the stop was ordered
+ * before it, and takes the version: here an earlier send holds the version, so the count is
+ * not zero when the lookup raises it.
+ */
+static void opaque_pin_stop_window(struct kunit *test)
+{
+	static const int errs[] = { -ESHUTDOWN, 0, -ESHUTDOWN, -ESHUTDOWN };
+	unsigned int kind;
+
+	for (kind = 0; kind < ARRAY_SIZE(errs); kind++) {
+		struct io_opaque_store *store = opaque_test_store(test);
+		struct io_opaque_data *a = opaque_sparse_data(test, store);
+		struct io_opaque_data *b = opaque_sparse_data(test, store);
+		struct io_uring_opaque_send_entry ent[2] = {
+			{ .handle = io_opaque_handle(0, 9), .off = 100, .len = 1000 },
+			{ .handle = io_opaque_handle(1, 7), .off = 100, .len = 1000 },
+		};
+		struct io_opaque_req send = {
+			.store = store, .handle = ent[0].handle, .offset = 100, .length = 1000,
+		};
+		struct io_opaque_req *op = NULL;
+		long slow = atomic_long_read(&io_opaque_pin_slow);
+		int ret;
+
+		opaque_test_stoppable(test, store);
+		opaque_test_publish(store, 0, 9, a);
+		opaque_test_publish(store, 1, 7, b);
+		if (kind == 3)
+			op = opaque_vec_new(test, store, ent, 2, 0);
+		if (kind == 1)
+			refcount_inc(&a->refs); /* an earlier send */
+		if (kind < 2)
+			opaque_lk_open(test, store, opaque_lk_stop_like, 0);
+		else
+			opaque_lk_open_at(test, store, OPAQUE_LK_BEFORE, opaque_lk_stop, kind - 2);
+		ret = op ? opaque_vec_admit(op) : opaque_test_acquire(store, &send);
+		opaque_lk_close();
+		KUNIT_EXPECT_EQ(test, ret, errs[kind]);
+		KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
+		KUNIT_EXPECT_EQ(test, opaque_lk.calls, kind == 3 ? 2U : 1U);
+		KUNIT_EXPECT_EQ(test, opaque_lk.rcu, kind < 2);
+		KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+		/* One that meets the stop is settled by the table; one with its reference, not. */
+		slow = atomic_long_read(&io_opaque_pin_slow) - slow;
+		KUNIT_EXPECT_EQ(test, slow, kind == 1 ? 0L : 1L);
+		if (kind == 1) {
+			KUNIT_ASSERT_PTR_EQ(test, send.data, a);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+			io_opaque_data_put(store, send.data);
+			io_opaque_data_put(store, a);
+		} else if (kind == 3) {
+			/* The pin of the first entry is the request's to give back. */
+			KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], a);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+			opaque_vec_failed(test, op, 1);
+		} else {
+			KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
+		}
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		kvfree_rcu_barrier();
+		opaque_expect_lockdep(test, store);
+	}
 }
 
 /*
@@ -14707,6 +14819,8 @@ struct opaque_pin_race;
 struct opaque_pin_task {
 	struct opaque_pin_race *r;
 	unsigned int id;
+	/* The lookup in progress was held by the test (opaque_pin_hold()). */
+	bool held;
 };
 
 struct opaque_pin_race {
@@ -14716,8 +14830,15 @@ struct opaque_pin_race {
 	u64 handle, prev;
 	unsigned int nr;
 	atomic_t ready, go, stop, stopped;
+	/*
+	 * The test holds the lookups of the readers before they read the table (hold), counts those
+	 * it held (parked), and lets them go when the store has stopped (release).
+	 */
+	atomic_t hold, parked, release;
 	/* Lookups that returned a version, found the handle stale, or the store stopped. */
 	atomic_long_t ok, stale, shutdown;
+	/* Those of the shutdown that had been held, and were told as a lookup that began after. */
+	atomic_long_t window;
 	/* Anything else, or a version that was not the one asked for. */
 	atomic_long_t bad;
 	/* Rounds the writer got through. */
@@ -14801,7 +14922,8 @@ static void opaque_pin_jitter(struct io_opaque_store *store)
  * Lookups of a send that does not consume what it names, as fast as they go: of the newest
  * handle and of the one before it, which names a slot the writer has taken over since. A lookup
  * that returns a version has the one it asked for, in full, and the range it asked for; one
- * that does not says that the handle is stale (or, once the store has stopped, that it has).
+ * that does not says that the handle is stale. When the store stops no handle is stale, for
+ * none is freed: a lookup is told that the store has stopped, or takes a version.
  */
 static int opaque_pin_reader(void *arg)
 {
@@ -14812,7 +14934,7 @@ static int opaque_pin_reader(void *arg)
 	opaque_pin_start(r);
 	while (!atomic_read(&r->stop)) {
 		/* If the store had stopped before this lookup began, it may only fail. */
-		bool after = atomic_read(&r->stopped);
+		bool after = atomic_read(&r->stopped), held;
 		u64 h = n & 1 ? READ_ONCE(r->prev) : READ_ONCE(r->handle);
 		struct io_opaque_req send = {
 			.store = r->store, .offset = 500, .length = 1000,
@@ -14823,17 +14945,22 @@ static int opaque_pin_reader(void *arg)
 			h = io_opaque_handle(n % 4, 9);
 		send.handle = h;
 		ret = io_opaque_send_acquire(&send);
+		held = t->held;
+		t->held = false;
 		if (!ret) {
-			if (after || send.consumed || send.data->handle != h ||
+			/* A lookup that was held while the store stopped has nothing to take. */
+			if (after || held || send.consumed || send.data->handle != h ||
 			    send.data->length != OPAQUE_PIN_BYTES ||
 			    iov_iter_count(&send.iter) != send.length)
 				atomic_long_inc(&r->bad);
 			io_opaque_data_put(r->store, send.data);
 			atomic_long_inc(&r->ok);
-		} else if (ret == -ESTALE) {
+		} else if (ret == -ESTALE && r->mode != OPAQUE_PIN_STOP) {
 			atomic_long_inc(&r->stale);
 		} else if (ret == -ESHUTDOWN && r->mode == OPAQUE_PIN_STOP) {
 			atomic_long_inc(&r->shutdown);
+			if (held)
+				atomic_long_inc(&r->window);
 		} else {
 			atomic_long_inc(&r->bad);
 		}
@@ -14842,6 +14969,29 @@ static int opaque_pin_reader(void *arg)
 	}
 	complete(&r->done[t->id]);
 	return 0;
+}
+
+/*
+ * Hold the lookup of a reader here when the test has asked for it, once: the reader has looked at
+ * dead and found the store alive, and has not read its table. It goes on when the test says that
+ * the store has stopped, and then finds its slot empty, which it must not call a stale handle.
+ */
+static void opaque_pin_hold(struct io_opaque_store *store)
+{
+	struct opaque_pin_task *t;
+	struct opaque_pin_race *r;
+
+	/* Only the readers, which the test made with opaque_pin_reader(). */
+	if (kthread_func(current) != opaque_pin_reader)
+		return;
+	t = kthread_data(current);
+	r = t->r;
+	if (!atomic_read(&r->hold) || t->held || READ_ONCE(store->dead))
+		return;
+	t->held = true;
+	atomic_inc(&r->parked);
+	while (!atomic_read(&r->release))
+		usleep_range(1000, 2000);
 }
 
 /*
@@ -15007,7 +15157,7 @@ static void opaque_pin_expect(struct kunit *test, struct opaque_pin_race *r, lon
 	struct io_opaque_store *store = r->store;
 
 	kunit_info(test,
-		   "%u rounds on %u CPUs: %ld lookups took a version, %ld found it stale, %ld were refused by the store, %ld met a version that was gone",
+		   "%u rounds on %u CPUs: %ld lookups took a version, %ld found it stale, %ld were refused by the store, %ld were settled by the table",
 		   r->rounds, num_online_cpus(), atomic_long_read(&r->ok),
 		   atomic_long_read(&r->stale), atomic_long_read(&r->shutdown),
 		   atomic_long_read(&io_opaque_pin_slow) - slow);
@@ -15099,9 +15249,14 @@ static void opaque_pin_smp_compact(struct kunit *test)
 
 /*
  * The store stops while lookups go on: its objects are detached and put, the free of a version
- * left to whichever lookup holds the last reference. Lookups that began after the stop was done
- * fail; the others take a version or fail, and none gets one that is not what it asked for.
- * Nothing is left behind. It needs two CPUs to race on.
+ * left to whichever lookup holds the last reference. A lookup that began after the stop was done
+ * fails; the others take a version or are told that the store has stopped, and none gets a
+ * version that is not what it asked for or is told that its handle is stale, for none is freed.
+ * A stop that lands where a lookup is the most likely to meet it is hard to hit by chance, since
+ * dead is set long before the first object is detached, and a reader looks at dead just before
+ * it reads the slot: so the test holds the readers there, between the one and the other, stops
+ * the store, and lets them go on to find their slots empty (opaque_pin_hold()). Both must have
+ * been held, and be told that the store stopped by the table. It needs two CPUs to race on.
  */
 static void opaque_pin_smp_stop(struct kunit *test)
 {
@@ -15114,28 +15269,37 @@ static void opaque_pin_smp_stop(struct kunit *test)
 		kunit_skip(test, "needs two CPUs to race on");
 	r = opaque_pin_race_new(test, OPAQUE_PIN_STOP);
 	r->store->config.max_objects = 4;
-	INIT_LIST_HEAD(&r->store->copies);
-	INIT_DELAYED_WORK(&r->store->compact_work, io_opaque_compact_work);
-	INIT_DELAYED_WORK(&r->store->retry_work, io_opaque_retry_work);
-	opaque_test_cache(test, r->store, 2);
+	opaque_test_stoppable(test, r->store);
 	for (i = 0; i < 4; i++) {
 		struct io_opaque_data *data = opaque_pin_object(r->store);
 
 		KUNIT_ASSERT_NOT_NULL(test, data);
 		opaque_test_publish(r->store, i, 9, data);
 	}
+	opaque_lookup_hook_at(test, OPAQUE_LK_BEFORE, opaque_pin_hold);
 	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, NULL));
 	until = jiffies + 10 * HZ;
 	while (atomic_long_read(&r->ok) < 2000 && time_before(jiffies, until))
 		usleep_range(100, 200);
+	/* Each reader that comes to its next lookup stays where it has found the store alive. */
+	atomic_set(&r->hold, 1);
+	until = jiffies + 10 * HZ;
+	while (atomic_read(&r->parked) < OPAQUE_PIN_READERS && time_before(jiffies, until))
+		usleep_range(100, 200);
+	KUNIT_EXPECT_EQ(test, atomic_read(&r->parked), OPAQUE_PIN_READERS);
 	io_opaque_stop(r->store);
 	atomic_set(&r->stopped, 1);
+	atomic_set(&r->release, 1);
 	seen = atomic_long_read(&r->shutdown);
 	until = jiffies + 10 * HZ;
 	while (atomic_long_read(&r->shutdown) < seen + 2000 && time_before(jiffies, until))
 		usleep_range(100, 200);
 	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
 	KUNIT_EXPECT_GE(test, atomic_long_read(&r->shutdown), seen + 2000);
+	/* The window was hit: the lookups that were held were told by the table, and only so. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->window), (long)OPAQUE_PIN_READERS);
+	KUNIT_EXPECT_GE(test, atomic_long_read(&io_opaque_pin_slow) - slow,
+			(long)OPAQUE_PIN_READERS);
 	opaque_pin_expect(test, r, slow);
 }
 
@@ -15486,6 +15650,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_pin_handles),
 	KUNIT_CASE(opaque_pin_retired),
 	KUNIT_CASE(opaque_pin_retired_send),
+	KUNIT_CASE(opaque_pin_stop_window),
 	KUNIT_CASE(opaque_pin_compacted),
 	KUNIT_CASE(opaque_pin_reused),
 	KUNIT_CASE(opaque_pin_vec_run),
