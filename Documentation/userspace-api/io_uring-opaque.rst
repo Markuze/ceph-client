@@ -867,9 +867,9 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     on the same version: the ring takes one with the first of them and drops
     it with the last, and the others take none, so that a version is held for
     as long as a send is in flight on it, as it is when each takes its own.
-    A send that is not issued inline, a send with SEND_LAST, a vector, and a
-    send that finds the ring already borrowing eight other versions take a
-    reference. A send that is refused holds none.
+    A send that is not issued inline, a send with SEND_LAST, and a send that
+    finds the ring already borrowing eight other versions take a reference.
+    A send that is refused holds none.
 
 Stores in the area of a MAIO instance
 =====================================

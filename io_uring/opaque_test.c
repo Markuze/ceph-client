@@ -4196,13 +4196,20 @@ static int opaque_vec_admit(struct io_opaque_req *op)
  * A vector whose admission failed (or that did not get so far as to be admitted) has not given back
  * what it pinned: @pinned entries of its block are set, each run of entries that name one handle
  * holding a reference, and no cursor was made (io_opaque_vec_acquire()). The cleanup of the request
- * gives them back, without the socket; this does what it does.
+ * gives them back, without the socket and with the ring lock; this does what it does.
  */
 static void opaque_vec_failed(struct kunit *test, struct io_opaque_req *op, u32 pinned)
 {
+	struct io_ring_ctx *ctx = op->req ? op->req->ctx : NULL;
+
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, pinned);
 	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
+	/* The cleanup of a request holds the ring lock, which a vector that borrowed needs. */
+	if (ctx)
+		mutex_lock(&ctx->uring_lock);
 	io_opaque_vec_release(op);
+	if (ctx)
+		mutex_unlock(&ctx->uring_lock);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
 }
 
@@ -5133,7 +5140,9 @@ static void opaque_send_locked_short(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_SEND_WAIT);
 	KUNIT_EXPECT_PTR_EQ(test, follower->tx, tx);
 	KUNIT_EXPECT_PTR_EQ(test, follower->data, data);
-	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 3);
+	/* The head's vector and the follower borrow the one reference of the ring's. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 2UL);
 	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
 
@@ -9042,7 +9051,8 @@ static void opaque_send_parked_under_socket(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 	KUNIT_EXPECT_EQ(test, follower->phase, IO_OPAQUE_SEND_WAIT);
 	KUNIT_EXPECT_EQ(test, opaque_wait_list_len(w->ctx), 1U);
-	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 3);
+	/* The head and the frame behind it borrow one reference of the ring's. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
 
 	/* The same from io-wq: no hook, no socket, and the ring lock back as it found it. */
 	hooks = opaque_hook_calls;
@@ -15043,11 +15053,16 @@ enum opaque_pin_mode {
 	OPAQUE_PIN_BORROW_FREE,
 	/* The same against the one object whose version the writer replaces by compaction. */
 	OPAQUE_PIN_BORROW_COMPACT,
+	/* Vectors of rings that borrow, against two objects, the one before the newest freed. */
+	OPAQUE_PIN_BORROW_VEC_FREE,
+	/* Vectors of rings that borrow, against two objects whose versions the writer replaces. */
+	OPAQUE_PIN_BORROW_VEC_COMPACT,
 };
 
 struct opaque_ring;
 struct opaque_pin_race;
 static int opaque_pin_borrow_reader(void *arg);
+static int opaque_pin_borrow_vec_reader(void *arg);
 
 struct opaque_pin_task {
 	struct opaque_pin_race *r;
@@ -15488,6 +15503,8 @@ static bool opaque_pin_launch(struct opaque_pin_race *r, int (*writer)(void *))
 		r->task[i] = (struct opaque_pin_task) { .r = r, .id = i };
 		init_completion(&r->done[i]);
 		task[i] = kthread_create(i >= OPAQUE_PIN_READERS ? writer :
+					 r->mode >= OPAQUE_PIN_BORROW_VEC_FREE ?
+					 opaque_pin_borrow_vec_reader :
 					 r->mode >= OPAQUE_PIN_BORROW_FREE ?
 					 opaque_pin_borrow_reader :
 					 r->mode >= OPAQUE_PIN_VEC_FREE ? opaque_pin_vec_reader :
@@ -17037,6 +17054,649 @@ static void opaque_borrow_refused(struct kunit *test)
 	opaque_expect_lockdep(test, store);
 }
 
+/* A vector of the ring's, as an inline issue admits it: the ring lock is held for the walk. */
+static struct io_opaque_req *opaque_ring_vec(struct kunit *test, struct opaque_ring *r,
+					     struct io_opaque_store *store,
+					     const struct io_uring_opaque_send_entry *ent, u32 nr,
+					     bool inline_issue)
+{
+	struct io_opaque_req *op = opaque_vec_new(test, store, ent, nr, 0);
+
+	op->req = &r->req;
+	op->may_borrow = inline_issue;
+	return op;
+}
+
+static int opaque_ring_admit(struct opaque_ring *r, struct io_opaque_req *op)
+{
+	int ret;
+
+	mutex_lock(&r->ctx.uring_lock);
+	ret = opaque_vec_admit(op);
+	mutex_unlock(&r->ctx.uring_lock);
+	return ret;
+}
+
+/* The vector ends as its cleanup does: its borrows go back with the ring lock held. */
+static void opaque_ring_end_vec(struct opaque_ring *r, struct io_opaque_req *op)
+{
+	mutex_lock(&r->ctx.uring_lock);
+	io_opaque_vec_release(op);
+	mutex_unlock(&r->ctx.uring_lock);
+}
+
+/* The entry of the ring of @ctx for @data, or NULL. */
+static const struct io_opaque_borrow *opaque_ring_entry_in(const struct io_ring_ctx *ctx,
+							   const struct io_opaque_data *data)
+{
+	unsigned int i;
+
+	for (i = 0; i < ctx->opaque_borrow_nr; i++)
+		if (ctx->opaque_borrow[i].data == data)
+			return &ctx->opaque_borrow[i];
+	return NULL;
+}
+
+static const struct io_opaque_borrow *opaque_ring_entry(const struct opaque_ring *r,
+							const struct io_opaque_data *data)
+{
+	return opaque_ring_entry_in(&r->ctx, data);
+}
+
+/*
+ * A vector borrows once for each run of entries that name one handle, as it took one reference
+ * for each: [A, A, B, A, B] is four borrows, of two versions, with the reference of the ring's on
+ * each, and the entry of a run that does not own the pin has none to give back. Another vector
+ * and a send of one range borrow the same versions with no reference taken. They end in turn; the
+ * versions are held until the last, and then put once each.
+ */
+static void opaque_borrow_vec(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_ring *r = opaque_ring_new(test);
+	struct io_opaque_data *a = opaque_sparse_data(test, store);
+	struct io_opaque_data *b = opaque_sparse_data(test, store);
+	struct io_uring_opaque_send_entry ent[5], pair[2];
+	struct io_opaque_req *first, *second, one;
+	u64 taken, borrowed;
+	u32 i;
+
+	opaque_test_publish(store, 0, 9, a);
+	opaque_test_publish(store, 1, 7, b);
+	for (i = 0; i < ARRAY_SIZE(ent); i++)
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = (i == 2 || i == 4) ? b->handle : a->handle,
+			.off = 100 + 4000 * i, .len = 500,
+		};
+	for (i = 0; i < ARRAY_SIZE(pair); i++)
+		pair[i] = (struct io_uring_opaque_send_entry) {
+			.handle = i ? b->handle : a->handle, .off = 100, .len = 500,
+		};
+	first = opaque_ring_vec(test, r, store, ent, ARRAY_SIZE(ent), true);
+	second = opaque_ring_vec(test, r, store, pair, ARRAY_SIZE(pair), true);
+	taken = opaque_refs_taken();
+	borrowed = opaque_refs_borrowed();
+
+	KUNIT_ASSERT_EQ(test, opaque_ring_admit(r, first), 0);
+	KUNIT_EXPECT_EQ(test, first->vec->pinned, 5U);
+	KUNIT_EXPECT_EQ(test, first->vec->nr_borrowed, 4U);
+	for (i = 0; i < ARRAY_SIZE(ent); i++)
+		KUNIT_EXPECT_EQ(test, first->vec->borrowed[i], (u8)(i != 1));
+	KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 2U);
+	KUNIT_ASSERT_NOT_NULL(test, opaque_ring_entry(r, a));
+	KUNIT_ASSERT_NOT_NULL(test, opaque_ring_entry(r, b));
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, a)->borrows, 2UL);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, b)->borrows, 2UL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 2ULL);
+	KUNIT_EXPECT_EQ(test, opaque_refs_borrowed() - borrowed, 2ULL);
+	opaque_vec_expect_cursor(test, first);
+
+	KUNIT_ASSERT_EQ(test, opaque_ring_admit(r, second), 0);
+	KUNIT_EXPECT_EQ(test, second->vec->nr_borrowed, 2U);
+	opaque_ring_send(r, &one, store, a->handle, true);
+	KUNIT_ASSERT_EQ(test, opaque_ring_acquire(r, &one), 0);
+	KUNIT_EXPECT_TRUE(test, one.borrowed);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, a)->borrows, 4UL);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, b)->borrows, 3UL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+	KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 2ULL);
+	KUNIT_EXPECT_EQ(test, opaque_refs_borrowed() - borrowed, 5ULL);
+
+	/* The first ends: the versions are held by the others. */
+	opaque_put_spy_start(test, NULL);
+	opaque_ring_end_vec(r, first);
+	opaque_put_spy_stop(test);
+	opaque_put_spy_expect(test, 0, 0);
+	KUNIT_EXPECT_EQ(test, first->vec->nr_borrowed, 0U);
+	KUNIT_EXPECT_EQ(test, first->vec->pinned, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, a)->borrows, 2UL);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, b)->borrows, 1UL);
+	opaque_ring_end(r, &one);
+	opaque_put_spy_start(test, NULL);
+	opaque_ring_end_vec(r, second);
+	opaque_put_spy_stop(test);
+	/* The last borrow of each version: the ring's reference of each is put, once. */
+	opaque_put_spy_expect(test, 2, 0);
+	KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+	opaque_test_free(store, 0);
+	opaque_test_free(store, 1);
+	opaque_store_empty(test, store);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+#define OPAQUE_BORROW_VEC_VERSIONS	(IO_OPAQUE_BORROW_MAX + 2)
+
+/*
+ * A vector of more versions than the table holds borrows the first eight and takes a reference
+ * of its own on the rest, which it records: those are put, and the borrows are given back. A second
+ * vector of the same borrows the same eight, takes its own of the others, and the table never
+ * holds more than it has room for.
+ */
+static void opaque_borrow_vec_full(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_wide_store(test, OPAQUE_BORROW_VEC_VERSIONS);
+	struct opaque_ring *r = opaque_ring_new(test);
+	struct io_opaque_data *data[OPAQUE_BORROW_VEC_VERSIONS];
+	struct io_uring_opaque_send_entry ent[OPAQUE_BORROW_VEC_VERSIONS];
+	struct io_opaque_req *op[2];
+	unsigned int i, round;
+
+	for (i = 0; i < ARRAY_SIZE(data); i++) {
+		data[i] = opaque_pin_object(store);
+		KUNIT_ASSERT_NOT_NULL(test, data[i]);
+		opaque_test_publish(store, i, 9, data[i]);
+		ent[i] = (struct io_uring_opaque_send_entry) {
+			.handle = data[i]->handle, .off = 100, .len = 500,
+		};
+	}
+	for (round = 0; round < 2; round++) {
+		op[round] = opaque_ring_vec(test, r, store, ent, ARRAY_SIZE(ent), true);
+		KUNIT_ASSERT_EQ(test, opaque_ring_admit(r, op[round]), 0);
+		KUNIT_EXPECT_EQ(test, op[round]->vec->pinned, (u32)ARRAY_SIZE(ent));
+		KUNIT_EXPECT_EQ(test, op[round]->vec->nr_borrowed, (u32)IO_OPAQUE_BORROW_MAX);
+		KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, (unsigned int)IO_OPAQUE_BORROW_MAX);
+		for (i = 0; i < ARRAY_SIZE(data); i++) {
+			const bool borrows = i < IO_OPAQUE_BORROW_MAX;
+
+			KUNIT_EXPECT_EQ(test, op[round]->vec->borrowed[i], (u8)borrows);
+			/* The ring's reference where there is an entry, one each for the rest. */
+			KUNIT_EXPECT_EQ(test, refcount_read(&data[i]->refs),
+					borrows ? 2 : 2 + round);
+		}
+	}
+	for (i = 0; i < IO_OPAQUE_BORROW_MAX; i++)
+		KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow[i].borrows, 2UL);
+	opaque_ring_end_vec(r, op[0]);
+	/* The ring's and the table's on those it borrowed; the table's and its own on the rest. */
+	for (i = 0; i < ARRAY_SIZE(data); i++)
+		KUNIT_EXPECT_EQ(test, refcount_read(&data[i]->refs), 2);
+	opaque_ring_end_vec(r, op[1]);
+	KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 0U);
+	for (i = 0; i < ARRAY_SIZE(data); i++) {
+		KUNIT_EXPECT_EQ(test, refcount_read(&data[i]->refs), 1);
+		opaque_test_free(store, i);
+	}
+	opaque_store_empty(test, store);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A vector that fails after it pinned holds its borrows, with its references, for its cleanup: an
+ * entry out of range, and a handle that is stale. One whose block is too short for its ranges
+ * grows it with the borrows on, and goes on with the versions it began with: the table is
+ * as it was before the block grew, not doubled, and the flags are those of the entries it kept.
+ */
+static void opaque_borrow_vec_failed(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_ring *r = opaque_ring_new(test);
+	struct io_opaque_data *a = opaque_sparse_data(test, store);
+	struct io_opaque_data *b = opaque_sparse_data(test, store);
+	/* The ranges of the first and of the second span two extents of 2000 bytes each. */
+	struct io_uring_opaque_send_entry ent[4] = {
+		{ .handle = 0, .off = 1500, .len = 1000 },
+		{ .handle = 0, .off = 5500, .len = 1000 },
+		{ .handle = 0, .off = 9500, .len = 1000 },
+		{ .handle = 0, .off = 13500, .len = 1000 },
+	};
+	static const int errs[] = { -ERANGE, -ESTALE };
+	struct io_opaque_req *op;
+	unsigned int kind, k;
+	u64 borrowed;
+
+	opaque_test_publish(store, 0, 9, a);
+	opaque_test_publish(store, 1, 7, b);
+	for (kind = 0; kind < ARRAY_SIZE(errs); kind++) {
+		for (k = 1; k < ARRAY_SIZE(ent); k++) {
+			unsigned int i, held;
+
+			/* Entries alternate between A and B, so that each is a run of its own. */
+			for (i = 0; i < ARRAY_SIZE(ent); i++)
+				ent[i].handle = i % 2 ? b->handle : a->handle;
+			op = opaque_ring_vec(test, r, store, ent, ARRAY_SIZE(ent), true);
+			if (kind == 0)
+				op->vec->ent[k].off = 79600;
+			else
+				op->vec->ent[k].handle = io_opaque_handle(2, 0);
+			opaque_vec_room(test, op, 16);
+			mutex_lock(&r->ctx.uring_lock);
+			KUNIT_ASSERT_EQ(test, opaque_test_acquire(store, op), errs[kind]);
+			mutex_unlock(&r->ctx.uring_lock);
+			/* The entries before the one that failed are pinned, each a borrow. */
+			KUNIT_EXPECT_EQ(test, op->vec->pinned, k);
+			KUNIT_EXPECT_EQ(test, op->vec->nr_borrowed, k);
+			held = 0;
+			for (i = 0; i < k; i++)
+				held += op->vec->borrowed[i];
+			KUNIT_EXPECT_EQ(test, held, k);
+			KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, k > 1 ? 2U : 1U);
+			opaque_ring_end_vec(r, op);
+			KUNIT_EXPECT_EQ(test, op->vec->nr_borrowed, 0U);
+			KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 0U);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+		}
+	}
+
+	/*
+	 * The block holds four segments and the ranges span eight: the first walk pins four runs,
+	 * the block grows, and the second walk goes on over the pins and borrows nothing again.
+	 */
+	for (k = 0; k < ARRAY_SIZE(ent); k++)
+		ent[k].handle = k % 2 ? b->handle : a->handle;
+	op = opaque_ring_vec(test, r, store, ent, ARRAY_SIZE(ent), true);
+	KUNIT_EXPECT_EQ(test, op->vec->cap_segs, (u32)ARRAY_SIZE(ent));
+	borrowed = opaque_refs_borrowed();
+	KUNIT_ASSERT_EQ(test, opaque_ring_admit(r, op), 0);
+	KUNIT_EXPECT_GE(test, op->vec->cap_segs, 8U);
+	KUNIT_EXPECT_EQ(test, op->vec->pinned, 4U);
+	KUNIT_EXPECT_EQ(test, op->vec->nr_borrowed, 4U);
+	for (k = 0; k < ARRAY_SIZE(ent); k++)
+		KUNIT_EXPECT_EQ(test, op->vec->borrowed[k], 1);
+	KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 2U);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, a)->borrows, 2UL);
+	KUNIT_EXPECT_EQ(test, opaque_ring_entry(r, b)->borrows, 2UL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+	/* Two of the four borrowed a version the ring held; the walk made again added none. */
+	KUNIT_EXPECT_EQ(test, opaque_refs_borrowed() - borrowed, 2ULL);
+	opaque_vec_expect_cursor(test, op);
+	opaque_ring_end_vec(r, op);
+	KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 0U);
+	opaque_test_free(store, 0);
+	opaque_test_free(store, 1);
+	opaque_store_empty(test, store);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * Vectors over TCP. An inline vector borrows its versions, one for each run of entries that name
+ * one handle, and an io-wq vector takes references of its own; both end with nothing in the ring
+ * and the versions the table's alone. With a send of the ring in flight on one of the versions, the
+ * vector shares the ring's reference on it. A vector that waits behind another send holds its
+ * borrows while it waits, and gives them back in its cleanup if it is canceled there, or, if it is
+ * issued from io-wq when its turn comes, ends there with the socket owned and without the ring
+ * lock, and leaves them to its cleanup.
+ */
+static void opaque_borrow_vec_send(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_data *a = opaque_sparse_data(test, store);
+	struct io_opaque_data *b = opaque_sparse_data(test, store);
+	struct io_uring_opaque_send_entry ent[3] = {
+		{ .off = 100, .len = 1000 }, { .off = 5100, .len = 1000 },
+		{ .off = 100, .len = 1000 },
+	};
+	u8 *got = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	struct io_opaque_req *op, *head, hold;
+	unsigned long user;
+	unsigned int mode, round, tries;
+	struct sock *sk;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_params_save(test);
+	opaque_test_publish(store, 0, 9, a);
+	opaque_test_publish(store, 1, 7, b);
+	ent[0].handle = ent[1].handle = a->handle;
+	ent[2].handle = b->handle;
+	user = opaque_uvec_map(test);
+	opaque_uvec_put(test, user, ent, sizeof(ent));
+	opaque_wire_init(test, w);
+	sk = w->tx->sk;
+	opaque_wire_prep_setup(test, w, store);
+	opaque_wire_sndbuf(sk, SZ_1M);
+	opaque_probe.ctx = w->ctx;
+	opaque_probe.data = a;
+	WRITE_ONCE(io_opaque_send_part, opaque_test_probe);
+
+	/* Inline, io-wq, and inline with another send of the ring on the same version. */
+	for (mode = 0; mode < 3; mode++) {
+		const bool unlocked = mode == 1;
+		u64 taken = opaque_refs_taken(), borrowed = opaque_refs_borrowed();
+
+		if (mode == 2)
+			opaque_wire_hold(test, w, &hold, store, a->handle);
+		op = opaque_wire_prep(test, w, 0, IORING_OPAQUE_SEND_VECTOR, user, 0, 3, 0);
+		memset(&opaque_probe.seen, 0, sizeof(opaque_probe.seen));
+		ret = opaque_wire_issue(w, 0, unlocked);
+		lockdep_assert_none_held_once();
+		KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+		KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3000);
+		KUNIT_ASSERT_EQ(test, opaque_probe.seen.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, opaque_probe.seen.owned[0]);
+		/* Two runs, two borrows of two versions; the send held by hand borrows A too. */
+		KUNIT_EXPECT_EQ_MSG(test, opaque_probe.seen.nr[0], unlocked ? 0U : 2U, "mode %u",
+				    mode);
+		KUNIT_EXPECT_EQ_MSG(test, opaque_probe.seen.borrows[0],
+				    unlocked ? 0UL : (mode == 2 ? 2UL : 1UL), "mode %u", mode);
+		KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
+		KUNIT_EXPECT_EQ(test, op->vec->nr_borrowed, 0U);
+		if (mode == 2) {
+			/* The ring's reference on A stays for the send that holds it. */
+			KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 1U);
+			KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 1UL);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+			KUNIT_EXPECT_EQ(test, opaque_refs_borrowed() - borrowed, 1ULL);
+			KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 2ULL);
+			opaque_wire_unhold(w, &hold);
+		} else {
+			KUNIT_EXPECT_EQ(test, opaque_refs_borrowed() - borrowed, 0ULL);
+			KUNIT_EXPECT_EQ(test, opaque_refs_taken() - taken, 2ULL);
+		}
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 0U);
+		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+		KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+		opaque_wire_read(test, w, got, 0, 3000);
+		opaque_wire_req_cleanup(w, 0);
+	}
+	WRITE_ONCE(io_opaque_send_part, NULL);
+
+	/* A vector that waits behind a head: canceled there, and issued from io-wq in its turn. */
+	opaque_wire_sndbuf(sk, SZ_32K);
+	for (round = 0; round < 2; round++) {
+		head = opaque_wire_prep(test, w, 1, 0, a->handle, 0, 80000, 0);
+		KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 1, false), -EAGAIN);
+		op = opaque_wire_prep(test, w, 0, IORING_OPAQUE_SEND_VECTOR, user, 0, 3, 0);
+		KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, false), IOU_ISSUE_SKIP_COMPLETE);
+		KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_SEND_WAIT);
+		KUNIT_EXPECT_EQ(test, op->vec->pinned, 3U);
+		KUNIT_EXPECT_EQ(test, op->vec->nr_borrowed, 2U);
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 2U);
+		KUNIT_EXPECT_EQ(test, opaque_ring_entry_in(w->ctx, a)->borrows, 2UL);
+		KUNIT_EXPECT_EQ(test, opaque_ring_entry_in(w->ctx, b)->borrows, 1UL);
+		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+		KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+		if (!round) {
+			/* The vector is canceled where it waits; the head fails after EAGAIN. */
+			mutex_lock(&w->ctx->uring_lock);
+			KUNIT_EXPECT_TRUE(test, io_opaque_cancel_all(w->ctx, NULL, true));
+			mutex_unlock(&w->ctx->uring_lock);
+			opaque_wire_canceled(w, 0);
+			KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 1U);
+			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+			req_set_fail(&w->req[1]);
+			io_opaque_fail(&w->req[1]);
+			opaque_wire_req_cleanup(w, 1);
+		} else {
+			for (tries = 0; tries < 4000; tries++) {
+				ret = opaque_wire_issue(w, 1, false);
+				if (ret == IOU_COMPLETE)
+					break;
+				KUNIT_ASSERT_EQ(test, ret, -EAGAIN);
+				opaque_wire_drain(w, got, 80000);
+				usleep_range(500, 1000);
+			}
+			KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+			KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 2U);
+			KUNIT_EXPECT_EQ(test, opaque_ring_entry_in(w->ctx, a)->borrows, 1UL);
+			/* The vector is next, from io-wq: no ring lock at its end, none go back. */
+			list_del_init(&op->cancel);
+			op->phase = IO_OPAQUE_IDLE;
+			opaque_put_spy_start(test, sk);
+			ret = opaque_wire_issue(w, 0, true);
+			opaque_put_spy_stop(test);
+			lockdep_assert_none_held_once();
+			KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3000);
+			opaque_put_spy_expect(test, 0, 0);
+			KUNIT_EXPECT_EQ(test, op->vec->pinned, 3U);
+			KUNIT_EXPECT_EQ(test, op->vec->nr_borrowed, 2U);
+			KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 2U);
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 2);
+			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+			/* Its cleanup gives them back, and puts the ring's reference on each. */
+			opaque_put_spy_start(test, sk);
+			opaque_wire_req_cleanup(w, 0);
+			opaque_put_spy_stop(test);
+			opaque_put_spy_expect(test, 2, 0);
+			opaque_wire_req_cleanup(w, 1);
+		}
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 0U);
+		KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
+		KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
+		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+		while (opaque_wire_drain(w, got, 80000))
+			;
+	}
+	opaque_test_free(store, 0);
+	opaque_test_free(store, 1);
+	opaque_store_empty(test, store);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+#define OPAQUE_BORROW_VECS	4
+
+/* Whether entry @k of the vector owns its pin (io_opaque_vec_owns()): the first of a run. */
+static bool opaque_vec_owner(const struct io_opaque_req *op, u32 k)
+{
+	const struct io_opaque_vec *vec = op->vec;
+
+	return (op->send_flags & IORING_OPAQUE_SEND_LAST) || !k ||
+	       vec->ent[k].handle != vec->ent[k - 1].handle;
+}
+
+/*
+ * The borrows that the live vectors of a ring hold are what its table says: for each entry, the
+ * pins of the vectors that are borrowed and own their pin, of that version, add up to its count,
+ * and the total is what the vectors say they borrow.
+ */
+static bool opaque_borrow_vec_matches(struct opaque_ring *ring, struct io_opaque_req *vop,
+				      unsigned int n)
+{
+	unsigned long total = 0, held = 0;
+	unsigned int i, j, k;
+
+	for (i = 0; i < ring->ctx.opaque_borrow_nr; i++) {
+		const struct io_opaque_borrow *e = &ring->ctx.opaque_borrow[i];
+		unsigned long count = 0;
+
+		for (j = 0; j < n; j++) {
+			struct io_opaque_vec *vec = vop[j].vec;
+
+			if (!vec->nr_borrowed)
+				continue;
+			for (k = 0; k < vec->pinned; k++)
+				count += vec->borrowed[k] && opaque_vec_owner(&vop[j], k) &&
+					 vec->pin[k] == e->data;
+		}
+		if (!e->borrows || count != e->borrows || refcount_read(&e->data->refs) < 1)
+			return false;
+		total += e->borrows;
+	}
+	for (j = 0; j < n; j++)
+		held += vop[j].vec->nr_borrowed;
+	return total == held;
+}
+
+/*
+ * Vectors of a ring that borrows, four in flight at a time, as fast as they go: each of four
+ * entries names the newest handle or the one before it (as opaque_pin_vec_reader() does), with
+ * a block that is too short, so that each vector grows its block with its borrows on. Every
+ * vector that is let in is whole, the others are told that a handle is stale, and the table is
+ * what the live vectors hold at each step; at the end of a round the ring has nothing borrowed.
+ */
+static int opaque_pin_borrow_vec_reader(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	struct opaque_ring *ring = r->ring[t->id];
+	struct io_opaque_req *vop = r->breq[t->id];
+	unsigned long n = 0;
+	unsigned int i, j;
+
+	for (i = 0; i < OPAQUE_BORROW_VECS; i++)
+		vop[i] = (struct io_opaque_req) {
+			.store = r->store, .req = &ring->req, .may_borrow = true,
+			.send_flags = IORING_OPAQUE_SEND_VECTOR,
+		};
+	opaque_pin_start(r);
+	while (!atomic_read(&r->stop)) {
+		const u64 handle[2] = { READ_ONCE(r->handle), READ_ONCE(r->prev) };
+
+		mutex_lock(&ring->ctx.uring_lock);
+		for (i = 0; i < OPAQUE_BORROW_VECS; i++) {
+			struct io_opaque_req *op = &vop[i];
+			bool whole;
+			int ret;
+
+			kvfree(op->vec);
+			op->vec = NULL;
+			if (io_opaque_vec_grow(op, OPAQUE_PIN_VEC_NR, OPAQUE_PIN_VEC_NR, 0)) {
+				atomic_long_inc(&r->bad);
+				op->vec = NULL;
+				break;
+			}
+			for (j = 0; j < OPAQUE_PIN_VEC_NR; j++)
+				op->vec->ent[j] = (struct io_uring_opaque_send_entry) {
+					.handle = handle[opaque_pin_vec_shape[j].handle],
+					.off = opaque_pin_vec_shape[j].off,
+					.len = opaque_pin_vec_shape[j].len,
+				};
+			io_opaque_vec_commit(op, OPAQUE_PIN_VEC_NR, OPAQUE_PIN_VEC_BYTES, 1000);
+			op->consumed = false;
+			ret = io_opaque_vec_finish(op, io_opaque_send_acquire(op));
+			whole = !ret && opaque_pin_vec_whole(op);
+			if (ret == -ESTALE && r->mode == OPAQUE_PIN_BORROW_VEC_FREE)
+				atomic_long_inc(&r->stale);
+			else if (whole)
+				atomic_long_inc(&r->ok);
+			else
+				atomic_long_inc(&r->bad);
+			if (op->vec->nr_borrowed && ring->ctx.opaque_borrow_nr)
+				for (j = 0; j < ring->ctx.opaque_borrow_nr; j++)
+					if (ring->ctx.opaque_borrow[j].borrows > 1) {
+						atomic_long_inc(&r->hits);
+						break;
+					}
+			if (!opaque_borrow_vec_matches(ring, vop, i + 1))
+				atomic_long_inc(&r->bad);
+		}
+		udelay(get_random_u32_below(8));
+		/* They end in an order that changes: the borrows go back, then the rest is put. */
+		for (i = 0; i < OPAQUE_BORROW_VECS; i++) {
+			struct io_opaque_req *op = &vop[(i + n) % OPAQUE_BORROW_VECS];
+
+			if (!op->vec)
+				continue;
+			io_opaque_vec_release(op);
+			if (op->vec->pinned || op->vec->nr_borrowed)
+				atomic_long_inc(&r->bad);
+		}
+		if (ring->ctx.opaque_borrow_nr)
+			atomic_long_inc(&r->bad);
+		mutex_unlock(&ring->ctx.uring_lock);
+		if (!(++n & 31))
+			cond_resched();
+	}
+	for (i = 0; i < OPAQUE_BORROW_VECS; i++) {
+		kvfree(vop[i].vec);
+		vop[i].vec = NULL;
+	}
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+/*
+ * Vectors of two rings that borrow, against two objects at a time of which the one before the
+ * newest is freed a moment after the newest is published, in the slot that the one before it had
+ * left. A vector whose entries are all there is whole, with the version of each of its handles;
+ * any other is told ESTALE and gives its borrows back in its release. At the end nothing is
+ * charged and no ring has anything borrowed. It needs two CPUs to race on.
+ */
+static void opaque_borrow_smp_vec_free(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	struct io_opaque_data *data;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_BORROW_VEC_FREE);
+	opaque_borrow_race_rings(test, r);
+	r->store->config.max_objects = 2;
+	data = opaque_pin_object(r->store);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	r->handle = opaque_pin_publish(r->store, data);
+	KUNIT_ASSERT_NE(test, r->handle, 0ULL);
+	r->prev = r->handle;
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_vec_writer));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->stale), 0L);
+	opaque_borrow_race_expect(test, r, slow);
+}
+
+/*
+ * The same against two objects whose versions are replaced by compaction over and over, one and
+ * then the other: neither handle is freed, so no vector may fail, whichever versions its entries
+ * find, and the entry that comes back to a handle after the other may find the replacement that
+ * a compaction published since. Every version, old and new, is gone at the end. It needs two
+ * CPUs to race on.
+ */
+static void opaque_borrow_smp_vec_compact(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	u64 handle[2];
+	u32 i;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs to race on");
+	r = opaque_pin_race_new(test, OPAQUE_PIN_BORROW_VEC_COMPACT);
+	opaque_borrow_race_rings(test, r);
+	r->store->config.max_objects = 2;
+	for (i = 0; i < ARRAY_SIZE(handle); i++) {
+		struct io_opaque_data *data = opaque_pin_object(r->store);
+
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		handle[i] = opaque_pin_publish(r->store, data);
+		KUNIT_ASSERT_NE(test, handle[i], 0ULL);
+	}
+	r->handle = handle[0];
+	r->prev = handle[1];
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_compactor));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_ROUNDS / 3);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->compactions), (s64)r->rounds);
+	opaque_test_free(r->store, 0);
+	opaque_test_free(r->store, 1);
+	opaque_borrow_race_expect(test, r, slow);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->transient), 0LL);
+}
+
 /*
  * SEND_ZC's notification and IORING_SEND_ZC_NO_RX_COPY, the counterpart of the managed sends
  * above that a registered-buffer send gets by asking for it. The notifications are built by
@@ -17466,6 +18126,12 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_borrow_refused),
 	KUNIT_CASE_SLOW(opaque_borrow_smp_free),
 	KUNIT_CASE_SLOW(opaque_borrow_smp_compact),
+	KUNIT_CASE(opaque_borrow_vec),
+	KUNIT_CASE(opaque_borrow_vec_full),
+	KUNIT_CASE(opaque_borrow_vec_failed),
+	KUNIT_CASE(opaque_borrow_vec_send),
+	KUNIT_CASE_SLOW(opaque_borrow_smp_vec_free),
+	KUNIT_CASE_SLOW(opaque_borrow_smp_vec_compact),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}

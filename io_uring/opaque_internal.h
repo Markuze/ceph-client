@@ -225,6 +225,8 @@ struct io_opaque_vec {
 	 * request, and when it needs a bigger block, which takes them over.
 	 */
 	u32 pinned;
+	/* Entries of pin[] that are borrowed from the ring, see borrowed[]. */
+	u32 nr_borrowed;
 	u32 cap_nr;
 	u32 cap_segs;
 	/* The largest entry; the copy threshold applies to it. */
@@ -232,6 +234,12 @@ struct io_opaque_vec {
 	struct io_uring_opaque_send_entry *ent;
 	struct io_opaque_data **pin;
 	struct bio_vec *bv;
+	/*
+	 * Whether the version of an entry that owns its pin (io_opaque_vec_owns()), among the
+	 * first @pinned, is held by a borrow from the ring (io_opaque_pin()) and not by a
+	 * reference of the send's own. Read only while @nr_borrowed is not zero.
+	 */
+	u8 *borrowed;
 };
 
 /*

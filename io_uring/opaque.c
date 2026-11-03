@@ -53,6 +53,7 @@ static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw);
 static void io_opaque_vec_cleanup(struct io_opaque_req *op);
 static bool io_opaque_send_borrows(const struct io_opaque_req *op);
+static void io_opaque_vec_return(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op);
 VISIBLE_IF_KUNIT void io_opaque_stream_close(struct io_opaque_stream *stream);
 static void io_opaque_tx_put(struct io_opaque_req *op);
@@ -3225,8 +3226,8 @@ static inline bool io_opaque_vec_fits(const struct io_opaque_vec *vec, u32 nr, u
 
 /*
  * Make room in the request's block for @nr entries and @segs segments, keeping its first @keep
- * entries and the references that admission took on them: the new block holds the versions
- * that the old one did, and admission walks the entries again over them (see
+ * entries and the references that admission took on them, and the borrows: the new block holds
+ * the versions that the old one did, and admission walks the entries again over them (see
  * io_opaque_vec_acquire()). A reference on an entry that is not kept would be lost, which is
  * what the warning says. A block that is big enough stays as it is, and a caller that can tell
  * (io_opaque_vec_fits()) does not call. This allocates, so tables must not be held.
@@ -3245,7 +3246,8 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 		segs = max(segs, old->cap_segs);
 	}
 	vec = kvmalloc(size_add(sizeof(*vec),
-				size_add(array_size(nr, sizeof(*vec->ent) + sizeof(*vec->pin)),
+				size_add(array_size(nr, sizeof(*vec->ent) + sizeof(*vec->pin) +
+						       sizeof(*vec->borrowed)),
 					 array_size(segs, sizeof(*vec->bv)))),
 		       GFP_KERNEL_ACCOUNT);
 	if (!vec)
@@ -3255,14 +3257,24 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 	vec->ent = (void *)(vec + 1);
 	vec->pin = (void *)(vec->ent + nr);
 	vec->bv = (void *)(vec->pin + nr);
+	vec->borrowed = (void *)(vec->bv + segs);
 	vec->nr_segs = 0;
 	vec->pinned = 0;
+	vec->nr_borrowed = 0;
 	if (old) {
 		vec->nr = old->nr;
 		vec->max_len = old->max_len;
 		memcpy(vec->ent, old->ent, array_size(keep, sizeof(*vec->ent)));
 		vec->pinned = min(old->pinned, keep);
 		memcpy(vec->pin, old->pin, array_size(vec->pinned, sizeof(*vec->pin)));
+		/* The borrows of the pins that are kept go with them. */
+		if (old->nr_borrowed) {
+			u32 i;
+
+			memcpy(vec->borrowed, old->borrowed, vec->pinned);
+			for (i = 0; i < vec->pinned; i++)
+				vec->nr_borrowed += vec->borrowed[i];
+		}
 		kvfree(old);
 	} else {
 		vec->nr = 0;
@@ -3285,6 +3297,7 @@ VISIBLE_IF_KUNIT void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32
 	vec->nr = nr;
 	vec->nr_segs = 0;
 	vec->pinned = 0;
+	vec->nr_borrowed = 0;
 	vec->max_len = longest;
 	op->handle = 0;
 	op->offset = 0;
@@ -3361,13 +3374,17 @@ static bool io_opaque_vec_owns(const struct io_opaque_req *op, u32 i)
  * Drop every version reference the send holds; one that took none drops none. This puts the
  * last reference of a version if it is the send's, and it is for a context that does not own the
  * socket: the end of a send, after the socket is released, and request cleanup. That includes
- * the references that a failed admission leaves in the block (io_opaque_vec_acquire()).
+ * the references that a failed admission leaves in the block (io_opaque_vec_acquire()). What the
+ * vector borrowed from its ring is given back first, which needs the ring lock
+ * (io_opaque_send_return()).
  */
 VISIBLE_IF_KUNIT void io_opaque_vec_release(struct io_opaque_req *op)
 {
 	struct io_opaque_vec *vec = op->vec;
 	u32 i;
 
+	if (unlikely(vec->nr_borrowed))
+		io_opaque_vec_return(op);
 	for (i = 0; i < vec->pinned; i++)
 		if (io_opaque_vec_owns(op, i))
 			io_opaque_data_put(op->store, vec->pin[i]);
@@ -3756,7 +3773,29 @@ static struct io_opaque_data *io_opaque_pin(struct io_opaque_req *op, u64 handle
 /* Whether the send holds a version by a borrow, which only the ring lock lets it give back. */
 static bool io_opaque_send_borrows(const struct io_opaque_req *op)
 {
+	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR))
+		return op->vec && op->vec->nr_borrowed;
 	return op->borrowed;
+}
+
+/* The borrows of a vector, as io_opaque_send_return() gives them back. */
+static void io_opaque_vec_return(struct io_opaque_req *op)
+{
+	struct io_ring_ctx *ctx = op->req->ctx;
+	struct io_opaque_vec *vec = op->vec;
+	u32 i;
+
+	lockdep_assert_held(&ctx->uring_lock);
+	for (i = 0; i < vec->pinned && vec->nr_borrowed; i++) {
+		if (!vec->borrowed[i] || !io_opaque_vec_owns(op, i))
+			continue;
+		vec->borrowed[i] = false;
+		vec->nr_borrowed--;
+		if (!io_opaque_borrow_return(ctx, vec->pin[i]))
+			vec->pin[i] = NULL;
+	}
+	WARN_ON_ONCE(vec->nr_borrowed);
+	vec->nr_borrowed = 0;
 }
 
 /*
@@ -3769,6 +3808,11 @@ VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op)
 {
 	struct io_ring_ctx *ctx;
 
+	if (unlikely(op->send_flags & IORING_OPAQUE_SEND_VECTOR)) {
+		if (op->vec && op->vec->nr_borrowed)
+			io_opaque_vec_return(op);
+		return;
+	}
 	if (!op->borrowed)
 		return;
 	ctx = op->req->ctx;
@@ -3887,7 +3931,8 @@ static void io_opaque_send_iter(struct io_opaque_req *op, const struct bio_vec *
  * Any other vector does not take tables and has no second pass. It pins each version as pass
  * one comes to it (io_opaque_pin()), for the walk reads the segments of the version and they
  * must not be freed under it, and it pins once for each run of entries that name the same
- * handle (see io_opaque_vec_owns()): eight ranges of one object cost one reference. The
+ * handle (see io_opaque_vec_owns()): eight ranges of one object cost one reference, or one
+ * borrow from the ring, which the entry that owns the pin records (@vec->borrowed). The
  * entries after the first of a run use its pin and do not look at the table. A handle that
  * returns after another one pins again, and may then find a replacement that a compaction has
  * published meanwhile, which has the same bytes.
@@ -3928,9 +3973,16 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 			/* Pinned before the block grew. */
 			data = vec->pin[i];
 		} else if (io_opaque_vec_owns(op, i)) {
-			data = io_opaque_pin(op, ent->handle, ent->off, ent->len, NULL);
+			bool borrowed = false;
+
+			data = io_opaque_pin(op, ent->handle, ent->off, ent->len, &borrowed);
 			if (IS_ERR(data))
 				return PTR_ERR(data);
+			vec->borrowed[i] = borrowed;
+			vec->nr_borrowed += borrowed;
+		} else {
+			/* An entry of a run uses the first's pin, which is not its to give back. */
+			vec->borrowed[i] = false;
 		}
 		/* A LAST vector takes the reference in pass two, and a repeated handle needs it. */
 		vec->pin[i] = data;
