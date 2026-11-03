@@ -15138,11 +15138,27 @@ struct opaque_pin_race {
 	struct io_opaque_req *breq[OPAQUE_PIN_READERS];
 	/* Sends of those that borrowed a version that another of the ring's sends was holding. */
 	atomic_long_t hits;
+	/*
+	 * The sends of the borrow modes as they end: all of them, those that found their version
+	 * freed, reused or changed (torn), and those whose end left them the last holder of their
+	 * version, which the put frees. A buffer for each reader to copy the bytes of a send into.
+	 */
+	atomic_long_t ends, torn, freed;
+	u8 *buf[OPAQUE_PIN_READERS];
 };
 
 /*
- * An object of two extents of 2000 bytes, made where an assertion cannot be used: NULL if
- * there was no memory or no room.
+ * The byte at @off of an object that opaque_pin_object() made, and of the copy that compaction
+ * makes of it: a different byte for each extent, so that bytes taken from the wrong place show.
+ */
+static u8 opaque_pin_pattern(u64 off)
+{
+	return off < 2000 ? 0xa5 : 0x5a;
+}
+
+/*
+ * An object of two extents of 2000 bytes, filled with opaque_pin_pattern(), made where an
+ * assertion cannot be used: NULL if there was no memory or no room.
  */
 static struct io_opaque_data *opaque_pin_object(struct io_opaque_store *store)
 {
@@ -15154,9 +15170,13 @@ static struct io_opaque_data *opaque_pin_object(struct io_opaque_store *store)
 	for (i = 0; i < 2; i++) {
 		struct page *page = alloc_page(GFP_KERNEL);
 		struct io_opaque_extent *extent;
+		void *mapped;
 
 		if (!page)
 			goto fail;
+		mapped = kmap_local_page(page);
+		memset(mapped, opaque_pin_pattern(i * 2000), 2000);
+		kunmap_local(mapped);
 		extent = io_opaque_extent_new(store, page, 0, 2000, i * 2000, 0);
 		if (IS_ERR(extent)) {
 			__free_page(page);
@@ -16852,13 +16872,94 @@ static bool opaque_borrow_matches(struct opaque_ring *ring, struct io_opaque_req
 	return total == held;
 }
 
+/* A range of an object that a send takes; a vector takes several, in the order of its entries. */
+struct opaque_pin_range {
+	u32 off, len;
+};
+
+/*
+ * A send holds its version until it ends, by a reference of its own or by a borrow of the ring's,
+ * whatever the other ring does to the object meanwhile: a FREE puts the table's reference, and a
+ * compaction replaces the version in the table. So the version is whole when the send ends: it has
+ * the handle it was published for, its length and its segments, and someone holds it. A version
+ * that was put by everyone has a count of zero until a grace period has passed, and then it is
+ * what its memory holds: another version, if it is reused, the poison of a kernel that poisons what
+ * it frees (slub_debug=P, init_on_free), or a report of KASAN. Nothing of the version beyond its
+ * count is read once that fails. The segments of a version made by opaque_pin_object() are two,
+ * and one for the dense copy that compaction makes.
+ */
+static bool opaque_pin_intact(const struct io_opaque_data *data, u64 handle)
+{
+	u64 bytes = 0;
+	u32 i;
+
+	if (refcount_read(&data->refs) < 1 || data->handle != handle ||
+	    data->length != OPAQUE_PIN_BYTES || !data->nr || data->nr > 2)
+		return false;
+	for (i = 0; i < data->nr; i++)
+		bytes += data->bvec[i].bv_len;
+	return bytes == OPAQUE_PIN_BYTES;
+}
+
+/*
+ * The bytes that the cursor @iter of a send is to send are those of the object in @range (@nr of
+ * them, the bytes of each after those of the one before it), as opaque_pin_object() filled them
+ * and compaction copied them. The cursor is copied and not moved. @buf has room for them: a page.
+ * A page that was freed under the send and zeroed, poisoned or taken by someone else does not
+ * have them.
+ */
+static bool opaque_pin_iter_ok(const struct iov_iter *iter, const struct opaque_pin_range *range,
+			       u32 nr, u8 *buf)
+{
+	struct iov_iter it = *iter;
+	u32 total = 0, i, j;
+
+	for (i = 0; i < nr; i++)
+		total += range[i].len;
+	if (total > PAGE_SIZE || iov_iter_count(&it) != total ||
+	    copy_from_iter(buf, total, &it) != total)
+		return false;
+	for (i = 0, total = 0; i < nr; i++)
+		for (j = 0; j < range[i].len; j++)
+			if (buf[total++] != opaque_pin_pattern(range[i].off + j))
+				return false;
+	return true;
+}
+
+/*
+ * End a send of a ring that borrows, as its cleanup does, after a look at what it holds: its
+ * version is the one it acquired, whole, and the cursor points at the bytes of its range. Then the
+ * borrow goes back with the ring lock held and what is left is put. The end is counted, and so is
+ * one that leaves the send the last holder of its version: the version is not in the table, no
+ * other send holds it, and the put frees it. A lookup that read the version before it left the
+ * table could still raise the count after it was read, and then the put is not the free, which
+ * is rare and only makes the count a little high.
+ */
+static void opaque_pin_borrow_end(struct opaque_pin_race *r, unsigned int id,
+				  struct io_opaque_req *s)
+{
+	static const struct opaque_pin_range range = { .off = 500, .len = 1000 };
+	const struct io_opaque_data *data = s->data;
+
+	if (!opaque_pin_intact(data, s->handle) || s->iter.bvec != data->bvec ||
+	    !opaque_pin_iter_ok(&s->iter, &range, 1, r->buf[id]))
+		atomic_long_inc(&r->torn);
+	atomic_long_inc(&r->ends);
+	io_opaque_send_return(s);
+	if (s->data && refcount_read(&s->data->refs) == 1)
+		atomic_long_inc(&r->freed);
+	io_opaque_data_put(r->store, s->data);
+	s->data = NULL;
+}
+
 /*
  * Sends of a ring that borrows, eight in flight at a time, as fast as they go: a round acquires
  * eight of the newest handle or the one before it, ends two of them, and ends the rest in an order
  * that changes, all with the ring lock held as an inline issue holds it, while the other ring frees
  * the object or replaces its version. Every send that gets a version has the one its handle named,
  * whole; the others are told that the handle is stale, which is a handle that was freed. At every
- * step the table is what the live sends hold, and when a round is over the ring has nothing
+ * step the table is what the live sends hold, each send ends with the version it acquired and the
+ * bytes it was to send (opaque_pin_borrow_end()), and when a round is over the ring has nothing
  * borrowed.
  */
 static int opaque_pin_borrow_reader(void *arg)
@@ -16914,9 +17015,7 @@ static int opaque_pin_borrow_reader(void *arg)
 				for (k = 0; k < 2; k++) {
 					if (!alive[k])
 						continue;
-					io_opaque_send_return(&send[k]);
-					io_opaque_data_put(r->store, send[k].data);
-					send[k].data = NULL;
+					opaque_pin_borrow_end(r, t->id, &send[k]);
 					alive[k] = false;
 				}
 			}
@@ -16928,9 +17027,7 @@ static int opaque_pin_borrow_reader(void *arg)
 
 			if (!alive[k])
 				continue;
-			io_opaque_send_return(&send[k]);
-			io_opaque_data_put(r->store, send[k].data);
-			send[k].data = NULL;
+			opaque_pin_borrow_end(r, t->id, &send[k]);
 			alive[k] = false;
 			if (!opaque_borrow_matches(ring, send, alive, OPAQUE_BORROW_DEPTH))
 				atomic_long_inc(&r->bad);
@@ -16955,6 +17052,8 @@ static void opaque_borrow_race_rings(struct kunit *test, struct opaque_pin_race 
 		r->breq[i] = kunit_kcalloc(test, OPAQUE_BORROW_DEPTH, sizeof(*r->breq[i]),
 					   GFP_KERNEL);
 		KUNIT_ASSERT_NOT_NULL(test, r->breq[i]);
+		r->buf[i] = kunit_kmalloc(test, PAGE_SIZE, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, r->buf[i]);
 	}
 }
 
@@ -16963,10 +17062,17 @@ static void opaque_borrow_race_expect(struct kunit *test, struct opaque_pin_race
 {
 	unsigned int i;
 
-	kunit_info(test, "%ld sends borrowed a version that another send of their ring held",
-		   atomic_long_read(&r->hits));
+	kunit_info(test,
+		   "%ld sends borrowed a version that another send of their ring held; %ld ended, %ld as the last holder of a version, and %ld found theirs torn",
+		   atomic_long_read(&r->hits), atomic_long_read(&r->ends),
+		   atomic_long_read(&r->freed), atomic_long_read(&r->torn));
 	/* The borrow path ran: a send found an entry, and the others created one. */
 	KUNIT_EXPECT_GT(test, atomic_long_read(&r->hits), 0L);
+	/* No send ended with a version that was freed, reused or changed under it. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->torn), 0L);
+	/* Sends ended as the last holder of a version: the look before them was at one at risk. */
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->ends), 0L);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->freed), 0L);
 	for (i = 0; i < OPAQUE_PIN_READERS; i++)
 		KUNIT_EXPECT_EQ(test, r->ring[i]->ctx.opaque_borrow_nr, 0U);
 	opaque_pin_expect(test, r, slow);
@@ -17651,11 +17757,74 @@ static bool opaque_borrow_vec_matches(struct opaque_ring *ring, struct io_opaque
 }
 
 /*
+ * The versions that the release of a vector frees, once its borrows have gone back: those for
+ * which the pins it is left with are all the holders there are. A pin that is not the first of
+ * its run, or that a borrow given back left as NULL, holds nothing.
+ */
+static unsigned int opaque_pin_vec_frees(const struct io_opaque_req *op)
+{
+	const struct io_opaque_vec *vec = op->vec;
+	unsigned int freed = 0;
+	u32 i, j;
+
+	for (i = 0; i < vec->pinned; i++) {
+		unsigned int holds = 0;
+
+		if (!vec->pin[i] || !opaque_vec_owner(op, i))
+			continue;
+		/* Once for a version, at the first of the pins that hold it. */
+		for (j = 0; j < i; j++)
+			if (vec->pin[j] == vec->pin[i] && opaque_vec_owner(op, j))
+				break;
+		if (j < i)
+			continue;
+		for (j = i; j < vec->pinned; j++)
+			holds += vec->pin[j] == vec->pin[i] && opaque_vec_owner(op, j);
+		freed += refcount_read(&vec->pin[i]->refs) == holds;
+	}
+	return freed;
+}
+
+/*
+ * End a vector of a ring that borrows as its cleanup does (opaque_pin_borrow_end()): every version
+ * it holds, borrowed or not, is the one of its entry and whole, and a vector that was let in
+ * (@admitted) has the bytes of its ranges under its cursor. Then the borrows go back, the versions
+ * that are left to it with no other holder are counted, and the rest is put.
+ */
+static void opaque_pin_borrow_vec_end(struct opaque_pin_race *r, unsigned int id,
+				      struct io_opaque_req *op, bool admitted)
+{
+	struct io_opaque_vec *vec = op->vec;
+	struct opaque_pin_range range[OPAQUE_PIN_VEC_NR];
+	bool torn = false;
+	u32 i;
+
+	for (i = 0; i < vec->pinned; i++)
+		torn |= !opaque_pin_intact(vec->pin[i], vec->ent[i].handle);
+	for (i = 0; i < OPAQUE_PIN_VEC_NR; i++)
+		range[i] = (struct opaque_pin_range) {
+			.off = opaque_pin_vec_shape[i].off, .len = opaque_pin_vec_shape[i].len,
+		};
+	/* The bytes are read from the pages of versions that are whole, and of no other. */
+	if (admitted && !torn)
+		torn = vec->pinned != OPAQUE_PIN_VEC_NR ||
+		       !opaque_pin_iter_ok(&op->iter, range, OPAQUE_PIN_VEC_NR, r->buf[id]);
+	if (torn)
+		atomic_long_inc(&r->torn);
+	atomic_long_inc(&r->ends);
+	io_opaque_send_return(op);
+	atomic_long_add(opaque_pin_vec_frees(op), &r->freed);
+	io_opaque_vec_release(op);
+}
+
+/*
  * Vectors of a ring that borrows, four in flight at a time, as fast as they go: each of four
  * entries names the newest handle or the one before it (as opaque_pin_vec_reader() does), with
  * a block that is too short, so that each vector grows its block with its borrows on. Every
  * vector that is let in is whole, the others are told that a handle is stale, and the table is
- * what the live vectors hold at each step; at the end of a round the ring has nothing borrowed.
+ * what the live vectors hold at each step; each ends with the versions it pinned and the bytes it
+ * was to send (opaque_pin_borrow_vec_end()), and at the end of a round the ring has nothing
+ * borrowed.
  */
 static int opaque_pin_borrow_vec_reader(void *arg)
 {
@@ -17663,6 +17832,7 @@ static int opaque_pin_borrow_vec_reader(void *arg)
 	struct opaque_pin_race *r = t->r;
 	struct opaque_ring *ring = r->ring[t->id];
 	struct io_opaque_req *vop = r->breq[t->id];
+	bool admitted[OPAQUE_BORROW_VECS];
 	unsigned long n = 0;
 	unsigned int i, j;
 
@@ -17675,6 +17845,7 @@ static int opaque_pin_borrow_vec_reader(void *arg)
 	while (!atomic_read(&r->stop)) {
 		const u64 handle[2] = { READ_ONCE(r->handle), READ_ONCE(r->prev) };
 
+		memset(admitted, 0, sizeof(admitted));
 		mutex_lock(&ring->ctx.uring_lock);
 		for (i = 0; i < OPAQUE_BORROW_VECS; i++) {
 			struct io_opaque_req *op = &vop[i];
@@ -17698,6 +17869,7 @@ static int opaque_pin_borrow_vec_reader(void *arg)
 			op->consumed = false;
 			ret = io_opaque_vec_finish(op, io_opaque_send_acquire(op));
 			whole = !ret && opaque_pin_vec_whole(op);
+			admitted[i] = !ret;
 			if (ret == -ESTALE && r->mode == OPAQUE_PIN_BORROW_VEC_FREE)
 				atomic_long_inc(&r->stale);
 			else if (whole)
@@ -17716,11 +17888,12 @@ static int opaque_pin_borrow_vec_reader(void *arg)
 		udelay(get_random_u32_below(8));
 		/* They end in an order that changes: the borrows go back, then the rest is put. */
 		for (i = 0; i < OPAQUE_BORROW_VECS; i++) {
-			struct io_opaque_req *op = &vop[(i + n) % OPAQUE_BORROW_VECS];
+			unsigned int k = (i + n) % OPAQUE_BORROW_VECS;
+			struct io_opaque_req *op = &vop[k];
 
 			if (!op->vec)
 				continue;
-			io_opaque_vec_release(op);
+			opaque_pin_borrow_vec_end(r, t->id, op, admitted[k]);
 			if (op->vec->pinned || op->vec->nr_borrowed)
 				atomic_long_inc(&r->bad);
 		}
