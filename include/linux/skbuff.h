@@ -525,12 +525,14 @@ enum {
 
 	/* The completion of the ubuf_info is not a notification that anyone
 	 * waits for: all it does is let go of the memory the frags point to,
-	 * and that memory does not change for as long as the ubuf_info is
+	 * and that memory is not reused for as long as the ubuf_info is
 	 * referenced. skb_orphan_frags_rx() then need not copy the frags of an
 	 * skb that loops to the receive path: its consumer may hold the skb,
 	 * and with it the ubuf_info and the memory, for as long as it likes,
 	 * as it may hold an skb whose pages were spliced. A provider whose
-	 * owner waits for the completion must not set it.
+	 * owner waits for the completion must not set it. Memory that its
+	 * owner may still write, as spliced pages may be written, needs
+	 * SKBFL_SHARED_FRAG as well.
 	 */
 	SKBFL_DONT_ORPHAN_RX = BIT(5),
 };

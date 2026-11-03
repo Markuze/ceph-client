@@ -6187,6 +6187,47 @@ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen)
 }
 EXPORT_SYMBOL(kfree_skb_partial);
 
+/*
+ * Tell whether @skb, or an skb on its frag list, carries a page of a page pool
+ * that has a memory provider. The consumer of the provider takes such a page by
+ * reference. Pulling its bytes into the head would only make the consumer copy
+ * them from there.
+ *
+ * Only an skb marked for recycling holds a pool reference on each pool page it
+ * carries. That reference keeps the page in the pool and the pool in existence,
+ * so the pool can be read. Any other skb holds a pool page by a plain reference
+ * at most, which pins neither, so its frags are not looked at. The mark belongs
+ * to the skb, not to the list: GRO of a frag list and the reassembly of IP
+ * fragments chain skbs without regard to it, so the list is walked also when
+ * @skb has no mark.
+ */
+static bool skb_frags_from_mp(const struct sk_buff *skb)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	struct sk_buff *iter;
+	int i;
+
+	if (!IS_ENABLED(CONFIG_PAGE_POOL) ||
+	    !static_branch_unlikely(&page_pool_mem_providers))
+		return false;
+
+	if (skb->pp_recycle) {
+		for (i = 0; i < shinfo->nr_frags; i++) {
+			netmem_ref netmem = skb_frag_netmem(&shinfo->frags[i]);
+
+			netmem = netmem_compound_head(netmem);
+			if (netmem_is_pp(netmem) && netmem_get_pp(netmem)->mp_ops)
+				return true;
+		}
+	}
+
+	skb_walk_frags(skb, iter)
+		if (skb_frags_from_mp(iter))
+			return true;
+
+	return false;
+}
+
 /**
  * skb_try_coalesce - try to merge skb to prior one
  * @to: prior buffer
@@ -6217,7 +6258,11 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 	if (skb_frags_readable(from) != skb_frags_readable(to))
 		return false;
 
-	if (len <= skb_tailroom(to) && skb_frags_readable(from)) {
+	/* The pages of a memory provider move as frags. Copied into the head,
+	 * their bytes would only be copied again by the provider's consumer.
+	 */
+	if (len <= skb_tailroom(to) && skb_frags_readable(from) &&
+	    !skb_frags_from_mp(from)) {
 		if (len)
 			BUG_ON(skb_copy_bits(from, 0, skb_put(to, len), len));
 		*delta_truesize = 0;
@@ -7106,47 +7151,6 @@ struct sk_buff *pskb_extract(struct sk_buff *skb, int off,
 	return clone;
 }
 EXPORT_SYMBOL(pskb_extract);
-
-/*
- * Tell whether @skb, or an skb on its frag list, carries a page of a page pool
- * that has a memory provider. The consumer of the provider takes such a page by
- * reference. Pulling its bytes into the head would only make the consumer copy
- * them from there.
- *
- * Only an skb marked for recycling holds a pool reference on each pool page it
- * carries. That reference keeps the page in the pool and the pool in existence,
- * so the pool can be read. Any other skb holds a pool page by a plain reference
- * at most, which pins neither, so its frags are not looked at. The mark belongs
- * to the skb, not to the list: GRO of a frag list and the reassembly of IP
- * fragments chain skbs without regard to it, so the list is walked also when
- * @skb has no mark.
- */
-static bool skb_frags_from_mp(const struct sk_buff *skb)
-{
-	const struct skb_shared_info *shinfo = skb_shinfo(skb);
-	struct sk_buff *iter;
-	int i;
-
-	if (!IS_ENABLED(CONFIG_PAGE_POOL) ||
-	    !static_branch_unlikely(&page_pool_mem_providers))
-		return false;
-
-	if (skb->pp_recycle) {
-		for (i = 0; i < shinfo->nr_frags; i++) {
-			netmem_ref netmem = skb_frag_netmem(&shinfo->frags[i]);
-
-			netmem = netmem_compound_head(netmem);
-			if (netmem_is_pp(netmem) && netmem_get_pp(netmem)->mp_ops)
-				return true;
-		}
-	}
-
-	skb_walk_frags(skb, iter)
-		if (skb_frags_from_mp(iter))
-			return true;
-
-	return false;
-}
 
 /**
  * skb_condense - try to get rid of fragments/frag_list if possible

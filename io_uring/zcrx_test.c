@@ -683,6 +683,73 @@ static void zcrx_maio_owned(struct kunit *test)
 }
 
 /*
+ * io_zcrx_maio_pool_area_page() names no instance, so an area page that a pool
+ * of any instance owns qualifies. A fallback page does not: it is not in the
+ * area, and nobody maps it. Nor does a copy page, which no pool owns, a page
+ * that no pool owns, or a page of a pool without the provider.
+ */
+static void zcrx_maio_pool_area_page(struct kunit *test)
+{
+	struct page *held[ZT_BATCH], *own, *theirs, *copy, *fallback, *plain, *pooled;
+	struct page_pool *ordinary;
+	struct zt_env env, other;
+	unsigned int n;
+	u64 off;
+
+	/* One batch for the pool and one page for a copy page; the other instance has four. */
+	zt_env_init(test, &env, ZT_BATCH + 1, 1);
+	zt_env_init(test, &other, 4, 1);
+	own = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, own);
+	theirs = zt_alloc(other.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, theirs);
+	copy = io_zcrx_maio_copy_page(env.ifq, &off);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	n = zt_drain_cache(test, env.pp[0], held, ARRAY_SIZE(held));
+
+	/* An area page of a pool, whichever instance's it is. */
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_pool_area_page(own));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_pool_area_page(theirs));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_owned(other.ifq, own));
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(other.ifq, theirs, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(other.ifq, own, &off));
+
+	/* A copy page is in the area and has no pool. */
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_off(env.ifq, copy, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(copy));
+
+	/* The area is empty, so the pool gets a page that is not in the area. */
+	fallback = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, fallback);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_owned(env.ifq, fallback));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_page_off(env.ifq, fallback, &off));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(fallback));
+
+	/* A page that no pool owns, and a page of a pool without the provider. */
+	plain = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(plain));
+	ordinary = zt_pool(test, env.dev, 1, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_EXPECT_NULL(test, ordinary->mp_ops);
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	KUNIT_EXPECT_TRUE(test, page_pool_page_is_pp(pooled));
+	KUNIT_EXPECT_FALSE(test, io_zcrx_maio_pool_area_page(pooled));
+
+	zt_free(ordinary, pooled);
+	page_pool_destroy(ordinary);
+	__free_page(plain);
+	zt_free(env.pp[0], fallback);
+	io_zcrx_maio_page_put(env.ifq, copy);
+	while (n--)
+		zt_free(env.pp[0], held[n]);
+	zt_free(env.pp[0], own);
+	zt_free(other.pp[0], theirs);
+	zt_env_exit(test, &other);
+	zt_env_exit(test, &env);
+}
+
+/*
  * A PTE of a user mapping holds one page reference and one map count. The
  * test imitates a PTE by hand. A page with only PTE references is ready, and
  * a page with an outsider on top of them is not.
@@ -1270,6 +1337,77 @@ static void zcrx_maio_condense(struct kunit *test)
 	zt_expect_condensed(test, skb, 0x11, 0x22, 2 * ZT_CONDENSE_LEN);
 	consume_skb(skb);
 	zt_free(env.pp[0], slot2);
+
+	page_pool_destroy(ordinary);
+	zt_env_exit(test, &env);
+}
+
+/* A linear skb marked for recycling: ZT_CONDENSE_LEN bytes of @fill, and room for more. */
+static struct sk_buff *zt_linear_skb(struct kunit *test, u8 fill)
+{
+	struct sk_buff *skb = alloc_skb(4 * ZT_CONDENSE_LEN, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, skb);
+	memset(skb_put(skb, ZT_CONDENSE_LEN), fill, ZT_CONDENSE_LEN);
+	skb_mark_for_recycle(skb);
+	return skb;
+}
+
+/*
+ * skb_try_coalesce() copies all of @from into the tail room of a linear @to
+ * when it fits, as TCP's receive queue and backlog ask it to. A MAIO instance
+ * receives a page of its pools by reference, so the copy would turn the
+ * reference into a copy (io_zcrx_recv_head()). Such a frag moves to @to as a
+ * frag instead, and its bytes stay in the slot. A page of an ordinary pool is
+ * still copied.
+ */
+static void zcrx_maio_coalesce(struct kunit *test)
+{
+	struct sk_buff *to, *from;
+	struct page_pool *ordinary;
+	struct io_zcrx_slot s = {};
+	struct page *slot, *pooled;
+	struct zt_env env;
+	int delta = 0;
+	bool stolen;
+	u8 want[2 * ZT_CONDENSE_LEN];
+
+	zt_env_init(test, &env, 16, 1);
+	ordinary = zt_pool(test, env.dev, 1, PP_FLAG_PRIVATE_HEADERS);
+	KUNIT_ASSERT_NULL(test, ordinary->mp_ops);
+
+	/* A page of a pool without a provider fits the tail room: it is copied. */
+	pooled = zt_alloc(ordinary);
+	KUNIT_ASSERT_NOT_NULL(test, pooled);
+	to = zt_linear_skb(test, 0x33);
+	from = zt_condense_skb(test, pooled, 0x11, true);
+	KUNIT_EXPECT_TRUE(test, skb_try_coalesce(to, from, &stolen, &delta));
+	KUNIT_EXPECT_EQ(test, to->data_len, 0U);
+	KUNIT_EXPECT_EQ(test, skb_headlen(to), 2U * ZT_CONDENSE_LEN);
+	memset(want, 0x33, ZT_CONDENSE_LEN);
+	memset(want + ZT_CONDENSE_LEN, 0x11, ZT_CONDENSE_LEN);
+	if (skb_headlen(to) == 2 * ZT_CONDENSE_LEN)
+		KUNIT_EXPECT_MEMEQ(test, to->data, want, 2 * ZT_CONDENSE_LEN);
+	kfree_skb_partial(from, stolen);
+	consume_skb(to);
+
+	/* A slot of the area moves to @to as a frag, and stays a slot. */
+	slot = zt_alloc(env.pp[0]);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	to = zt_linear_skb(test, 0x33);
+	from = zt_condense_skb(test, slot, 0x11, true);
+	KUNIT_EXPECT_TRUE(test, skb_try_coalesce(to, from, &stolen, &delta));
+	KUNIT_EXPECT_FALSE(test, stolen);
+	KUNIT_EXPECT_EQ(test, skb_headlen(to), (unsigned int)ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_EQ(test, to->data_len, (unsigned int)ZT_CONDENSE_LEN);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(to)->nr_frags, 1);
+	if (skb_shinfo(to)->nr_frags)
+		KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(&skb_shinfo(to)->frags[0]), slot);
+	KUNIT_EXPECT_EQ(test, skb_shinfo(from)->nr_frags, 0);
+	KUNIT_EXPECT_TRUE(test, io_zcrx_maio_page_slot(env.ifq, slot, 0, ZT_CONDENSE_LEN, true,
+						       &s));
+	kfree_skb_partial(from, stolen);
+	consume_skb(to);
 
 	page_pool_destroy(ordinary);
 	zt_env_exit(test, &env);
@@ -2032,6 +2170,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_refill_outsider),
 	KUNIT_CASE(zcrx_maio_copy_page),
 	KUNIT_CASE(zcrx_maio_owned),
+	KUNIT_CASE(zcrx_maio_pool_area_page),
 	KUNIT_CASE(zcrx_maio_mapped),
 	KUNIT_CASE(zcrx_maio_teardown),
 #ifdef CONFIG_MMU
@@ -2043,6 +2182,7 @@ static struct kunit_case zcrx_maio_cases[] = {
 	KUNIT_CASE(zcrx_maio_page_slot),
 	KUNIT_CASE(zcrx_maio_net_iov_frag),
 	KUNIT_CASE(zcrx_maio_condense),
+	KUNIT_CASE(zcrx_maio_coalesce),
 	KUNIT_CASE(zcrx_maio_copy_episode),
 	KUNIT_CASE(zcrx_maio_queues),
 	KUNIT_CASE(zcrx_maio_queues_down),

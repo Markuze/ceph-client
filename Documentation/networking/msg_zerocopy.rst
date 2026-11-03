@@ -247,17 +247,20 @@ includes looping onto packet sockets (e.g., tcpdump) and tun devices.
 
 A zerocopy provider whose completion is not a notification that anyone
 waits for has no latency to bound. If all its completion does is let go
-of the memory its skbs reference, and that memory does not change for as
+of the memory its skbs reference, and that memory is not reused for as
 long as the ubuf_info is referenced, it can set SKBFL_DONT_ORPHAN_RX in
 the flags of the ubuf_info. skb_orphan_frags_rx() then leaves its skbs
 alone, and a packet socket, a tun device or a local socket can hold the
 skb, and the memory, for as long as it likes, as it can hold an skb
-whose pages were added with MSG_SPLICE_PAGES. MSG_ZEROCOPY does not set
-the flag: its completion is the notification that the application waits
-for. An io_uring SEND_ZC request with a registered buffer can set it on
-its own account, with IORING_SEND_ZC_NO_RX_COPY: it then accepts that its
-notification waits for the consumer, however long that is, and leaves the
-buffer unchanged until the notification arrives.
+whose pages were added with MSG_SPLICE_PAGES. Memory that its owner may
+still write, as spliced pages may be written, needs SKBFL_SHARED_FRAG in
+the flags as well, so that the stack copies it before it sums it or
+changes it in place. MSG_ZEROCOPY does not set the flag: its completion
+is the notification that the application waits for. An io_uring SEND_ZC
+request with a registered buffer can set it on its own account, with
+IORING_SEND_ZC_NO_RX_COPY: it then accepts that its notification waits
+for the consumer, however long that is, and leaves the buffer unchanged
+until the notification arrives.
 
 For VSOCK:
 Data path sent to local sockets is the same as for non-local sockets.

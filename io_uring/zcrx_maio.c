@@ -922,3 +922,35 @@ bool io_zcrx_maio_page_owned(struct io_zcrx_ifq *ifq, struct page *page)
 	pp = netmem_get_pp(page_to_netmem(page));
 	return pp->mp_ops == &io_uring_pp_maio_ops && io_pp_to_ifq(pp) == ifq;
 }
+
+/**
+ * io_zcrx_maio_pool_area_page() - tell if a page pool owns a page of a MAIO area
+ * @page:	any page
+ *
+ * Tell whether @page is a page of the area of a MAIO instance that a page pool
+ * of that instance owns, whichever instance it is. A user that binds no instance
+ * asks this to learn that a page it keeps is one that the process that maps the
+ * area can write. A fallback page does not qualify: nobody maps it. Neither does
+ * a page of a pool without the provider of an instance, or a copy page, which no
+ * pool owns.
+ *
+ * The caller must hold a pool reference of the page, as for
+ * io_zcrx_maio_page_owned(). The reference keeps the pool, and the pool keeps
+ * the instance and its area, which the lookup reads. The function takes no lock
+ * and runs in any context.
+ *
+ * Return: true if a page pool that uses the provider of a MAIO instance owns
+ * @page and @page is in the area of that instance, false otherwise.
+ */
+bool io_zcrx_maio_pool_area_page(struct page *page)
+{
+	struct page_pool *pp;
+	u64 off;
+
+	if (!page_pool_page_is_pp(page))
+		return false;
+	pp = netmem_get_pp(page_to_netmem(page));
+	if (pp->mp_ops != &io_uring_pp_maio_ops)
+		return false;
+	return io_zcrx_maio_page_off(io_pp_to_ifq(pp), page, &off);
+}

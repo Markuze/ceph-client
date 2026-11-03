@@ -273,6 +273,7 @@ void io_zcrx_maio_page_get(struct io_zcrx_ifq *ifq, struct page *page);
 void io_zcrx_maio_page_put(struct io_zcrx_ifq *ifq, struct page *page);
 struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq, u64 *area_off);
 bool io_zcrx_maio_page_owned(struct io_zcrx_ifq *ifq, struct page *page);
+bool io_zcrx_maio_pool_area_page(struct page *page);
 
 #if IS_ENABLED(CONFIG_IO_URING_ZCRX_KUNIT_TEST)
 /*
@@ -319,6 +320,11 @@ static inline struct page *io_zcrx_maio_copy_page(struct io_zcrx_ifq *ifq,
 
 static inline bool io_zcrx_maio_page_owned(struct io_zcrx_ifq *ifq,
 					   struct page *page)
+{
+	return false;
+}
+
+static inline bool io_zcrx_maio_pool_area_page(struct page *page)
 {
 	return false;
 }
