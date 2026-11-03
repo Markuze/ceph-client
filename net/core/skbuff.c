@@ -7107,6 +7107,47 @@ struct sk_buff *pskb_extract(struct sk_buff *skb, int off,
 }
 EXPORT_SYMBOL(pskb_extract);
 
+/*
+ * Tell whether @skb, or an skb on its frag list, carries a page of a page pool
+ * that has a memory provider. The consumer of the provider takes such a page by
+ * reference. Pulling its bytes into the head would only make the consumer copy
+ * them from there.
+ *
+ * Only an skb marked for recycling holds a pool reference on each pool page it
+ * carries. That reference keeps the page in the pool and the pool in existence,
+ * so the pool can be read. Any other skb holds a pool page by a plain reference
+ * at most, which pins neither, so its frags are not looked at. The mark belongs
+ * to the skb, not to the list: GRO of a frag list and the reassembly of IP
+ * fragments chain skbs without regard to it, so the list is walked also when
+ * @skb has no mark.
+ */
+static bool skb_frags_from_mp(const struct sk_buff *skb)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	struct sk_buff *iter;
+	int i;
+
+	if (!IS_ENABLED(CONFIG_PAGE_POOL) ||
+	    !static_branch_unlikely(&page_pool_mem_providers))
+		return false;
+
+	if (skb->pp_recycle) {
+		for (i = 0; i < shinfo->nr_frags; i++) {
+			netmem_ref netmem = skb_frag_netmem(&shinfo->frags[i]);
+
+			netmem = netmem_compound_head(netmem);
+			if (netmem_is_pp(netmem) && netmem_get_pp(netmem)->mp_ops)
+				return true;
+		}
+	}
+
+	skb_walk_frags(skb, iter)
+		if (skb_frags_from_mp(iter))
+			return true;
+
+	return false;
+}
+
 /**
  * skb_condense - try to get rid of fragments/frag_list if possible
  * @skb: buffer
@@ -7118,12 +7159,15 @@ EXPORT_SYMBOL(pskb_extract);
  * Notes:
  *	We do not reallocate skb->head thus can not fail.
  *	Caller must re-evaluate skb->truesize if needed.
+ *	A packet with a frag from a page pool that has a memory provider is
+ *	left as it is: its consumer takes the page by reference.
  */
 void skb_condense(struct sk_buff *skb)
 {
 	if (skb->data_len) {
 		if (skb->data_len > skb->end - skb->tail ||
-		    skb_cloned(skb) || !skb_frags_readable(skb))
+		    skb_cloned(skb) || !skb_frags_readable(skb) ||
+		    skb_frags_from_mp(skb))
 			return;
 
 		/* Nice, we can free page frag(s) right now */
