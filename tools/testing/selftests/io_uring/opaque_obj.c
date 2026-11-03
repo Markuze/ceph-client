@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 #include <arpa/inet.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -5638,27 +5637,39 @@ static int sysfs_write(const char *path, const char *text)
 	return ret;
 }
 
+/* The tests run in a network namespace of their own, see own_netns(). */
+static bool own_ns;
+
+/*
+ * Create a netdevsim device with one port, in the network namespace of the
+ * calling thread, and put the name of the interface of the port in @name. The
+ * port is the interface that the namespace did not have before: the net
+ * directory of the device in sysfs lists the interfaces of the namespace that
+ * mounted /sys, and no others.
+ */
 static bool nsim_create(unsigned int id, unsigned int queues, char name[IFNAMSIZ])
 {
-	char path[128], text[64];
-	struct dirent *de;
-	DIR *dir;
-	int ret;
+	struct if_nameindex *before, *after, *a, *b;
+	unsigned int ifindex = 0;
+	char text[64];
 
+	if (!own_ns)
+		return false;
+	before = if_nameindex();
+	if (!before)
+		return false;
 	snprintf(text, sizeof(text), "%u 1 %u", id, queues);
-	ret = sysfs_write("/sys/bus/netdevsim/new_device", text);
-	if (ret)
-		return false;
-	snprintf(path, sizeof(path), "/sys/bus/netdevsim/devices/netdevsim%u/net", id);
-	dir = opendir(path);
-	if (!dir)
-		return false;
-	name[0] = 0;
-	while ((de = readdir(dir)))
-		if (de->d_name[0] != '.')
-			snprintf(name, IFNAMSIZ, "%.*s", IFNAMSIZ - 1, de->d_name);
-	closedir(dir);
-	return name[0];
+	after = sysfs_write("/sys/bus/netdevsim/new_device", text) ? NULL : if_nameindex();
+	for (a = after; a && a->if_index && !ifindex; a++) {
+		for (b = before; b->if_index && b->if_index != a->if_index; b++)
+			;
+		if (!b->if_index)
+			ifindex = a->if_index;
+	}
+	if (after)
+		if_freenameindex(after);
+	if_freenameindex(before);
+	return ifindex && if_indextoname(ifindex, name);
 }
 
 static void nsim_destroy(unsigned int id)
@@ -5683,6 +5694,29 @@ static int link_up(const char *name)
 	}
 	close(s);
 	return ret ? -errno : 0;
+}
+
+/*
+ * Run in a network namespace of our own, with its loopback device up. In the
+ * namespace of the host, a port that a test creates is not ours alone: udev
+ * and the network manager of the host act on it. systemd-networkd, with a
+ * .network file that matches every device (the fallback that dracut writes
+ * has DHCP=yes), removes the address that the test gave the port, some tens
+ * of milliseconds later. The frames of the peer then reach no local address,
+ * and the test waits for bytes that never come. Nothing else sees a port in a
+ * namespace of our own.
+ *
+ * Without the privilege to unshare, the tests that need a port skip.
+ */
+static void own_netns(void)
+{
+	if (unshare(CLONE_NEWNET)) {
+		ksft_print_msg("no network namespace of our own, the netdevsim tests skip: %s\n",
+			       strerror(errno));
+		return;
+	}
+	require(!link_up("lo"), "bring up the loopback device");
+	own_ns = true;
 }
 
 static int set_addr(const char *name, const char *addr)
@@ -6330,6 +6364,7 @@ int main(void)
 
 	set_test_timeout();
 	ksft_print_header();
+	own_netns();
 	ret = ring_init(&r, IORING_SETUP_CQE32);
 	if (ret)
 		ksft_exit_skip("io_uring unavailable: %s\n", strerror(-ret));
