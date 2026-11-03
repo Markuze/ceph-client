@@ -147,8 +147,13 @@ struct io_opaque_data {
 	refcount_t refs;
 	/*
 	 * The handle that names this version. Set before the version is published and
-	 * never changed, so that a lookup that holds a reference and not tables can tell
-	 * whether the slot it read the version from still holds what the handle names.
+	 * never changed, so that a lookup that holds neither tables nor a reference can
+	 * tell whether the slot it read the version from still holds what the handle
+	 * names. The lookup (io_opaque_pin()) reads it, and the length, in an RCU
+	 * read-side section before it takes a reference. Neither changes after
+	 * publication, and the struct outlives its last reference by a grace period
+	 * (@rcu), so what it reads is what the version was, even if it was put by
+	 * everyone since.
 	 */
 	u64 handle;
 	/* The struct outlives its last reference by a grace period, see io_opaque_data_put(). */

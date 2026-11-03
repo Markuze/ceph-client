@@ -615,8 +615,12 @@ void io_opaque_data_put(struct io_opaque_store *store,
 		/*
 		 * The extents and the segments go now, as they always did. Only the struct
 		 * waits for the grace period: a lookup that read the version from its slot
-		 * in RCU may still be about to find in the struct that its count is zero
-		 * (io_opaque_pin()), and reads nothing else of it until it holds a reference.
+		 * in RCU may still be about to look at it (io_opaque_pin()). It reads the
+		 * count, which may be zero by now, and the handle and the length, before it
+		 * holds a reference. Those two are set before the version is published and
+		 * never change, so they are what they were whenever the lookup reads them,
+		 * and the struct is there for it to read. It reads nothing else until it
+		 * holds a reference, and the segments are gone.
 		 */
 		kfree_rcu(data, rcu);
 	}
@@ -3236,6 +3240,7 @@ static inline bool io_opaque_vec_fits(const struct io_opaque_vec *vec, u32 nr, u
 VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep)
 {
 	struct io_opaque_vec *old = op->vec, *vec;
+	u32 i;
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_vec_grow, op, nr, segs, keep);
 	lockdep_assert_not_held(&op->store->tables);
@@ -3268,14 +3273,14 @@ VISIBLE_IF_KUNIT int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 se
 		memcpy(vec->ent, old->ent, array_size(keep, sizeof(*vec->ent)));
 		vec->pinned = min(old->pinned, keep);
 		memcpy(vec->pin, old->pin, array_size(vec->pinned, sizeof(*vec->pin)));
-		/* The borrows of the pins that are kept go with them. */
-		if (old->nr_borrowed) {
-			u32 i;
-
-			memcpy(vec->borrowed, old->borrowed, vec->pinned);
-			for (i = 0; i < vec->pinned; i++)
-				vec->nr_borrowed += vec->borrowed[i];
-		}
+		/*
+		 * The borrows of the pins that are kept go with them. The flags are copied
+		 * whether or not any is set, and the count is made from them: the new block
+		 * is not cleared, and a flag that was not copied is what the allocation held.
+		 */
+		memcpy(vec->borrowed, old->borrowed, vec->pinned);
+		for (i = 0; i < vec->pinned; i++)
+			vec->nr_borrowed += vec->borrowed[i];
 		kvfree(old);
 	} else {
 		vec->nr = 0;
@@ -3716,7 +3721,8 @@ void io_opaque_borrows_exit(struct io_ring_ctx *ctx)
  * answer is the one it always was (io_opaque_pin_locked()): an empty slot, a version of another
  * handle (the slot was freed and taken by another object), and a count of zero, which says that
  * the version has left the table and that everyone has put it. Its extents and segments are
- * freed and only the struct is left, so that the count can still be read. A store that has
+ * freed and only the struct is left, so that the count, the handle and the length can still be
+ * read. A store that has
  * stopped is answered there too. The caller has looked at store->dead, and the store may stop
  * after that and before the slot is read: it sets dead under tables and detaches its objects
  * later, and the lookup that finds one detached is told so. A range outside the version that is

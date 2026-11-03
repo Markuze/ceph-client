@@ -865,11 +865,15 @@ cumulative except ``stat_cached_bytes``. STAT and OBJECT_STAT are unchanged.
     or, with SEND_LAST, took over the table's. *Borrowed* counts those held by
     a reference that the ring took for sends of its own that were under way
     on the same version: the ring takes one with the first of them and drops
-    it with the last, and the others take none, so that a version is held for
-    as long as a send is in flight on it, as it is when each takes its own.
+    it with the last, and the others take none. A send ends when its issue
+    does if that is an issue that holds the ring lock, as an inline one does,
+    on a plain TCP socket. Any other send, such as one that ends in an issue
+    from io-wq after it borrowed in an inline one, ends when its request is
+    cleaned up, which follows its completion. A version is held until the
+    last of the sends that share it has ended.
     A send that is not issued inline, a send with SEND_LAST, and a send that
     finds the ring already borrowing eight other versions take a reference.
-    A send that is refused holds none.
+    A send whose lookup is refused holds none.
 
 Stores in the area of a MAIO instance
 =====================================
