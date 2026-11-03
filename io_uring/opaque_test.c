@@ -69,6 +69,23 @@ static struct io_opaque_store *opaque_test_store(struct kunit *test)
 }
 
 /*
+ * The start of a test that races two CPUs. Without CONFIG_SMP there is nothing to race on, and
+ * the test is skipped. With it and fewer than two CPUs online the suite was not run as it is
+ * meant to be: UML boots one CPU unless it is told ncpus= (and seccomp=on, for them to run), and
+ * a test that skipped there would let the suite report ok having raced nothing. That is a
+ * failure, and the message says what to boot with.
+ */
+static void opaque_race_needs_cpus(struct kunit *test)
+{
+	if (!IS_ENABLED(CONFIG_SMP))
+		kunit_skip(test, "needs two CPUs to race on");
+	if (num_online_cpus() < 2)
+		KUNIT_FAIL_AND_ABORT(test,
+				     "CONFIG_SMP=y with %u CPU online, and the race tests need two: boot with ncpus=4 seccomp=on (kunit.py: --kernel_args=ncpus=4 --kernel_args=seccomp=on)",
+				     num_online_cpus());
+}
+
+/*
  * io_opaque_send_acquire() as admission calls it, with no lock held: a send that consumes
  * its object takes tables itself, and any other reads the table in RCU.
  */
@@ -1892,8 +1909,7 @@ static void opaque_tx_failed_smp(struct kunit *test)
 	struct opaque_fail_smp *s;
 	unsigned int round, canceled = 0, refused = 0;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	fx = opaque_fail_new(test, OPAQUE_FAIL_SMP_NR);
 	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, s);
@@ -13922,8 +13938,7 @@ static void opaque_ubuf_pool_smp_stress(struct kunit *test)
 	unsigned int done, stocked;
 	struct opaque_race *r;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	opaque_pool_read(&before);
 	r = opaque_race_start(test, false);
 	KUNIT_ASSERT_NOT_NULL(test, r);
@@ -13965,8 +13980,7 @@ static void opaque_ubuf_pool_smp_close(struct kunit *test)
 {
 	unsigned int round;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	for (round = 0; round < 20; round++) {
 		struct opaque_pool_snap before, after;
 		unsigned long wait_until;
@@ -15600,9 +15614,6 @@ static void opaque_pin_expect(struct kunit *test, struct opaque_pin_race *r, lon
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	opaque_expect_lockdep(test, store);
-	/* It ran on the SMP configuration, as it says it needs: two CPUs at least. */
-	KUNIT_EXPECT_TRUE(test, IS_ENABLED(CONFIG_SMP));
-	KUNIT_EXPECT_GE(test, num_online_cpus(), 2U);
 	kvfree_rcu_barrier();
 }
 
@@ -15617,8 +15628,7 @@ static void opaque_pin_smp_last(struct kunit *test)
 	struct opaque_pin_race *r;
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_LAST);
 	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_writer));
 	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
@@ -15634,8 +15644,7 @@ static void opaque_pin_smp_free(struct kunit *test)
 	struct opaque_pin_race *r;
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_FREE);
 	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_writer));
 	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
@@ -15656,8 +15665,7 @@ static void opaque_pin_smp_compact(struct kunit *test)
 	struct opaque_pin_race *r;
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_COMPACT);
 	{
 		struct io_opaque_data *data = opaque_pin_object(r->store);
@@ -15696,8 +15704,7 @@ static void opaque_pin_smp_stop(struct kunit *test)
 	unsigned long until;
 	u32 i;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_STOP);
 	r->store->config.max_objects = 4;
 	opaque_test_stoppable(test, r->store);
@@ -15748,8 +15755,7 @@ static void opaque_pin_smp_vec_free(struct kunit *test)
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 	struct io_opaque_data *data;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_VEC_FREE);
 	r->store->config.max_objects = 2;
 	data = opaque_pin_object(r->store);
@@ -15779,8 +15785,7 @@ static void opaque_pin_smp_vec_compact(struct kunit *test)
 	u64 handle[2];
 	u32 i;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_VEC_COMPACT);
 	r->store->config.max_objects = 2;
 	for (i = 0; i < ARRAY_SIZE(handle); i++) {
@@ -16979,8 +16984,7 @@ static void opaque_borrow_smp_free(struct kunit *test)
 	struct opaque_pin_race *r;
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_BORROW_FREE);
 	opaque_borrow_race_rings(test, r);
 	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_writer));
@@ -17002,8 +17006,7 @@ static void opaque_borrow_smp_compact(struct kunit *test)
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 	struct io_opaque_data *data;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_BORROW_COMPACT);
 	opaque_borrow_race_rings(test, r);
 	data = opaque_pin_object(r->store);
@@ -17748,8 +17751,7 @@ static void opaque_borrow_smp_vec_free(struct kunit *test)
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 	struct io_opaque_data *data;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_BORROW_VEC_FREE);
 	opaque_borrow_race_rings(test, r);
 	r->store->config.max_objects = 2;
@@ -17779,8 +17781,7 @@ static void opaque_borrow_smp_vec_compact(struct kunit *test)
 	u64 handle[2];
 	u32 i;
 
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs to race on");
+	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_BORROW_VEC_COMPACT);
 	opaque_borrow_race_rings(test, r);
 	r->store->config.max_objects = 2;
