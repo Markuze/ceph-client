@@ -14158,6 +14158,19 @@ static void opaque_lk_stop(void)
 	io_opaque_stop(opaque_lk.store);
 }
 
+/*
+ * The store is stopped by another context: the puts of the stop are not the send's, and the spy of
+ * the test (opaque_put_spy_start()) does not count them.
+ */
+static void opaque_lk_stop_other(void)
+{
+	struct kunit *test = kunit_get_current_test();
+
+	kunit_deactivate_static_stub(test, io_opaque_data_put);
+	io_opaque_stop(opaque_lk.store);
+	kunit_activate_static_stub(test, io_opaque_data_put, opaque_test_data_put_spy);
+}
+
 /* The compaction is published; with @drop the old version loses the compaction's reference too. */
 static void opaque_lk_compact(void)
 {
@@ -16877,6 +16890,210 @@ static void opaque_borrow_last(struct kunit *test)
 	opaque_expect_lockdep(test, store);
 }
 
+/* What a version made by opaque_sparse_data() charges: 40 pages. */
+#define OPAQUE_STOP_CHARGE	(40 * PAGE_SIZE)
+
+/* A ring with a TCP socket, whose send buffer is @sndbuf bytes, for a store that can stop. */
+static struct opaque_wire *opaque_stop_wire(struct kunit *test, struct io_opaque_store *store,
+					    int sndbuf)
+{
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_stoppable(test, store);
+	opaque_wire_init(test, w);
+	opaque_wire_prep_setup(test, w, store);
+	opaque_wire_sndbuf(w->tx->sk, sndbuf);
+	return w;
+}
+
+/* A send of the ring that comes after the stop is refused by the store, and borrows nothing. */
+static void opaque_stop_refused(struct kunit *test, struct opaque_wire *w,
+				struct io_opaque_store *store, u64 handle)
+{
+	struct io_opaque_req late = {
+		.store = store, .req = &w->req[3], .handle = handle, .offset = 100, .length = 1000,
+		.may_borrow = true,
+	};
+
+	mutex_lock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_acquire(&late), -ESHUTDOWN);
+	mutex_unlock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_PTR_EQ(test, late.data, NULL);
+	KUNIT_EXPECT_FALSE(test, late.borrowed);
+}
+
+/*
+ * The stop comes in the admission of a send that owns its socket and holds the ring lock, once
+ * the send has its version, so that the reference of the ring is the only one left when the stop
+ * has put the table's. The send ends and puts it after the socket is released, once, and that put
+ * frees the version. With @held another send of the ring holds the version too: the end of the
+ * first gives its borrow back and puts nothing, and the end of the other frees the version.
+ */
+static void opaque_borrow_stop_owned(struct kunit *test, bool held)
+{
+	const u64 handle = io_opaque_handle(0, 9);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct opaque_wire *w = opaque_stop_wire(test, store, SZ_1M);
+	u8 *got = kunit_kmalloc(test, 1000, GFP_KERNEL);
+	struct sock *sk = w->tx->sk;
+	struct io_opaque_req hold, *op;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	if (held)
+		opaque_wire_hold(test, w, &hold, store, handle);
+	op = opaque_wire_prep(test, w, 0, 0, handle, 100, 1000, 0);
+	/* The puts of the stop are another context's, and the spy does not count them. */
+	opaque_lk_open_at(test, store, OPAQUE_LK_AFTER, opaque_lk_stop_other, 0);
+	opaque_lk.sk = sk;
+	opaque_put_spy_start(test, sk);
+	ret = opaque_wire_issue(w, 0, false);
+	opaque_put_spy_stop(test);
+	opaque_lk_close();
+	lockdep_assert_none_held_once();
+	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 1000);
+	KUNIT_EXPECT_EQ(test, opaque_lk.calls, 1U);
+	KUNIT_EXPECT_TRUE(test, opaque_lk.owned);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
+	KUNIT_EXPECT_FALSE(test, op->borrowed);
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
+	if (held) {
+		/* The other send still holds the version: a borrow went back, and no more. */
+		opaque_put_spy_expect(test, 0, 0);
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 1U);
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 1UL);
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)OPAQUE_STOP_CHARGE);
+	} else {
+		/* The ring's reference was the last, and went after the socket. */
+		opaque_put_spy_expect(test, 1, 1);
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 0U);
+		opaque_store_empty(test, store);
+	}
+	opaque_stop_refused(test, w, store, handle);
+	if (held) {
+		/* The send that holds it ends last, and frees it. */
+		KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 1UL);
+		opaque_put_spy_start(test, sk);
+		opaque_wire_unhold(w, &hold);
+		opaque_put_spy_stop(test);
+		opaque_put_spy_expect(test, 1, 1);
+	}
+	opaque_wire_read(test, w, got, 0, 1000);
+	opaque_wire_req_cleanup(w, 0);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+	opaque_store_empty(test, store);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * A head left with EAGAIN and two frames behind it, each with a borrow, when the ring exits. The
+ * stop is that of io_terminate_opaque(), which puts the last use of the store. The table's
+ * reference goes, and the ring's holds the version for the three. The requests are canceled and
+ * cleaned up one at a time, each cleanup gives its borrow back with the ring lock held, and the
+ * one that gives back the last frees the version, with no socket owned. Then the ring undoes its
+ * registrations (io_unregister_opaque()), and finds nothing borrowed.
+ */
+static void opaque_borrow_stop_exit(struct kunit *test)
+{
+	const u64 handle = io_opaque_handle(0, 9);
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct opaque_wire *w = opaque_stop_wire(test, store, SZ_32K);
+	u8 *got = kunit_kmalloc(test, 80000, GFP_KERNEL);
+	struct sock *sk = w->tx->sk;
+	struct io_opaque_req *a, *b;
+
+	KUNIT_ASSERT_NOT_NULL(test, got);
+	opaque_test_publish(store, 0, 9, data);
+	opaque_wire_prep(test, w, 0, 0, handle, 0, 80000, 0);
+	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 0, false), -EAGAIN);
+	a = opaque_wire_prep(test, w, 1, 0, handle, 100, 300, 0);
+	b = opaque_wire_prep(test, w, 2, 0, handle, 200, 300, 0);
+	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 1, false), IOU_ISSUE_SKIP_COMPLETE);
+	KUNIT_ASSERT_EQ(test, opaque_wire_issue(w, 2, false), IOU_ISSUE_SKIP_COMPLETE);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 3UL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+
+	/* The ring exits. The store is the test's, so it has the uses and references to put. */
+	refcount_set(&store->users, 1);
+	refcount_set(&store->refs, 2);
+	mutex_lock(&w->ctx->uring_lock);
+	io_terminate_opaque(w->ctx);
+	mutex_unlock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)OPAQUE_STOP_CHARGE);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 1U);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 3UL);
+	opaque_stop_refused(test, w, store, handle);
+
+	/* The requests are canceled and cleaned up; the cleanup of the last frees the version. */
+	mutex_lock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_TRUE(test, io_opaque_cancel_all(w->ctx, NULL, true));
+	mutex_unlock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_TRUE(test, a->canceled && b->canceled);
+	opaque_put_spy_start(test, sk);
+	opaque_wire_canceled(w, 1);
+	opaque_wire_canceled(w, 2);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow[0].borrows, 1UL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)OPAQUE_STOP_CHARGE);
+	opaque_put_spy_expect(test, 0, 0);
+	req_set_fail(&w->req[0]);
+	io_opaque_fail(&w->req[0]);
+	opaque_wire_req_cleanup(w, 0);
+	opaque_put_spy_stop(test);
+	opaque_put_spy_expect(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, w->ctx->opaque_borrow_nr, 0U);
+	opaque_store_empty(test, store);
+
+	/* The registrations are undone with nothing borrowed, and the ring puts its use. */
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_exit_hook_reset, NULL), 0);
+	WRITE_ONCE(io_opaque_borrows_exit_hook, opaque_test_exit_hook);
+	memset(&opaque_exit_seen, 0, sizeof(opaque_exit_seen));
+	mutex_lock(&w->ctx->uring_lock);
+	kunit_warning_suppress(test) {
+		io_unregister_opaque(w->ctx);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 0);
+	}
+	mutex_unlock(&w->ctx->uring_lock);
+	KUNIT_EXPECT_EQ(test, opaque_exit_seen.calls, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_exit_seen.nr, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&store->refs), 1);
+	while (opaque_wire_drain(w, got, 80000))
+		;
+	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+	kvfree_rcu_barrier();
+	opaque_expect_lockdep(test, store);
+}
+
+/*
+ * The store stops while sends of a ring borrow a version of it. A ring that exits does that: its
+ * requests are in flight when io_terminate_opaque() puts the use it has of its stores, the last
+ * use stops the store (io_opaque_stop()), which puts the table's reference of every object and
+ * refuses what comes after it, and cancellation then ends the requests one at a time. The sends
+ * keep their versions through all of it: the ring's reference holds each, with its entry, until
+ * the last send that borrows it has ended, and the free that ends it is not made with the socket
+ * owned. Over TCP, with the puts watched: the stop in the admission of a send that owns the
+ * socket, alone and with another send of the ring on the version, and the ring's exit. A send that
+ * comes after the stop is told ESHUTDOWN and borrows nothing.
+ */
+static void opaque_borrow_stop(struct kunit *test)
+{
+	opaque_borrow_stop_owned(test, false);
+	opaque_borrow_stop_owned(test, true);
+	opaque_borrow_stop_exit(test);
+}
+
 /*
  * What another ring does between the read of a slot and the send's hold of the version, with the
  * ring borrowing, deterministic on any number of CPUs and so under KASAN: a compaction that
@@ -18564,6 +18781,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_borrow_exit),
 	KUNIT_CASE(opaque_borrow_owned),
 	KUNIT_CASE(opaque_borrow_last),
+	KUNIT_CASE(opaque_borrow_stop),
 	KUNIT_CASE(opaque_borrow_window),
 	KUNIT_CASE(opaque_borrow_refused),
 	KUNIT_CASE_SLOW(opaque_borrow_smp_free),
