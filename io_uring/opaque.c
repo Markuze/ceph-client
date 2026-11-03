@@ -3070,9 +3070,10 @@ void io_opaque_cleanup(struct io_kiocb *req)
  * other has all of them to give back here, once, and each is given back only if it
  * is there: a call that is made to find that out is a call for nothing. A vector
  * whose admission failed, with the socket owned or not, is one of those: it left the
- * references it had taken for this (io_opaque_vec_acquire()). So is a send that
- * borrowed a version from its ring and ended in an issue that did not hold the ring
- * lock, which cleanup does: it gives the borrow back (io_opaque_send_return()), and
+ * references it had taken for this (io_opaque_vec_acquire()). So is a frame that a queue
+ * which failed refused after it had taken its references (io_opaque_tx_settle()). So is
+ * a send that borrowed a version from its ring and ended in an issue that did not hold the
+ * ring lock, which cleanup does: it gives the borrow back (io_opaque_send_return()), and
  * puts the ring's reference if that was the last borrow of the version.
  *
  * A send is on neither list that a waker walks under wait_lock, budget_waits and
@@ -3602,11 +3603,12 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
  * The table is under the ring lock. An inline issue holds that from end to end, and an io-wq
  * issue does not: it drops the lock for the socket, and does not take it again before it ends.
  * So only an inline issue borrows (op->may_borrow), and a borrow is given back where the ring
- * lock is held, which is the end of an inline issue, the cleanup of the request, and a frame that
- * joins a queue that has failed. A send that holds a borrow and ends in an issue that does not
- * hold the lock leaves it for its cleanup. A send with LAST takes the table's reference, a send
- * of a version that finds the table full takes one of its own, and so does one that is not
- * inline, as they all did.
+ * lock is held, which is the end of an inline issue and the cleanup of the request. A send that
+ * holds a borrow and ends in an issue that does not hold the lock leaves it for its cleanup, as
+ * does a frame that joins a queue that has failed: it is refused with its borrow
+ * (io_opaque_tx_settle()), since it may join with the socket owned, where no version is put. A
+ * send with LAST takes the table's reference, a send of a version that finds the table full takes
+ * one of its own, and so does one that is not inline, as they all did.
  */
 
 /* The entry of the ring for @data, or NULL. */
@@ -3824,7 +3826,9 @@ VISIBLE_IF_KUNIT void io_opaque_send_return(struct io_opaque_req *op)
 
 /*
  * Drop the references a send took at admission, giving back what it borrowed first (with the
- * ring lock held, see io_opaque_send_return()); a no-op when it took none.
+ * ring lock held, see io_opaque_send_return()); a no-op when it took none. The last of a version
+ * is put here, so this is for the end of a send once its socket is released, and nothing that
+ * has the socket calls it.
  */
 static void io_opaque_send_unpin(struct io_opaque_req *op)
 {
@@ -3849,9 +3853,9 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
  * after it has released its socket, if it ends owning it as this one does, or
  * in its cleanup, since a lookup puts nothing, a single range that fails holds
  * no reference, and a vector that fails leaves what it pinned for its cleanup
- * (io_opaque_vec_acquire()). A frame that joins a queue which fails meanwhile
- * gives its references back as it joins (io_opaque_tx_settle()), with the socket
- * as its caller has it. A decrement never takes a count from one to zero. A
+ * (io_opaque_vec_acquire()). So does a frame that joins a queue which fails
+ * meanwhile: it is refused with its references (io_opaque_tx_settle()), and
+ * its cleanup puts them. A decrement never takes a count from one to zero. A
  * vector's entries that were put are cleared, so that the rest cannot put them
  * again. A send that consumed its object does not call it (see io_opaque_send()).
  *
@@ -4353,6 +4357,13 @@ static int io_opaque_tx_acquire(struct io_opaque_req *op)
  * hold: a queue that fails in between cancels it. It holds no lock but the one that
  * a LAST send takes for its references (tables, alone), and the socket if its caller
  * owns it. Returns as io_opaque_tx_join() does.
+ *
+ * A request that is refused, because admission failed or the queue did, keeps the
+ * references it took, and a LAST send stays consumed: the socket may be owned, where a
+ * send puts no version, and a reference of the request may be the last one on its version
+ * (another ring frees the object once the request has it). The cleanup of the request gives
+ * them back, with the socket released and the ring locked, as it does for any send that ends
+ * without having the socket (io_opaque_vec_acquire()).
  */
 static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx)
 {
@@ -4362,15 +4373,9 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
 	spin_lock(&store->tx_lock);
 	tx->admitting--;
 	if (ret || tx->failed) {
-		bool pinned = !ret;
-
 		io_opaque_tx_unused(store, tx);
 		spin_unlock(&store->tx_lock);
-		if (!pinned)
-			return ret;
-		/* The head failed after the check: the pin goes, LAST stays consumed. */
-		io_opaque_send_unpin(op);
-		return -ECANCELED;
+		return ret ?: -ECANCELED;
 	}
 	op->tx = tx;
 	list_add_tail(&op->send, &tx->requests);
@@ -4397,7 +4402,8 @@ static int io_opaque_tx_settle(struct io_opaque_req *op, struct io_opaque_tx *tx
  * IO_OPAQUE_TX_WAIT when it waits for one (its phase is set before tx_lock is
  * dropped, so a release cannot miss it), IO_OPAQUE_TX_HEAD when it is the head
  * and holds its references, IO_OPAQUE_TX_SETTLE when it is the head and has
- * not taken them yet, or a negative errno.
+ * not taken them yet, or a negative errno, with the references that the request took
+ * before it was refused still its own, for its cleanup to give back.
  *
  * A request that finds its queue empty links itself as the head in the one
  * tx_lock hold that finds out, and takes its references later, from

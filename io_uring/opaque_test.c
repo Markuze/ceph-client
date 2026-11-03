@@ -1448,7 +1448,11 @@ static void opaque_tx_failed_head(struct kunit *test)
 	opaque_test_tx_done(&d, true);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&d), NULL);
 
-	/* A pin taken before the queue failed is dropped when the enqueue is refused. */
+	/*
+	 * A pin taken before the queue failed stays with the request when the enqueue is refused:
+	 * the socket may be owned, where a send puts no version, and the cleanup of the request
+	 * gives the pin back (io_opaque_tx_settle()).
+	 */
 	opaque_test_tx_op(&a, store);
 	opaque_test_tx_op(&b, store);
 	opaque_test_tx_op(&c, store);
@@ -1459,8 +1463,11 @@ static void opaque_tx_failed_head(struct kunit *test)
 	kunit_activate_static_stub(test, io_opaque_send_acquire, opaque_test_acquire_fail);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&b, &sk[1]), -ECANCELED);
 	KUNIT_EXPECT_FALSE(test, b.consumed);
-	KUNIT_EXPECT_PTR_EQ(test, b.data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, b.data, data);
 	KUNIT_EXPECT_PTR_EQ(test, b.tx, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 2);
+	io_opaque_data_put(store, b.data);
+	b.data = NULL;
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 	/* LAST took the object itself: it stays consumed and the request still ends. */
 	a.tx->failed = false;
@@ -1470,9 +1477,14 @@ static void opaque_tx_failed_head(struct kunit *test)
 	kunit_activate_static_stub(test, io_opaque_send_acquire, opaque_test_acquire_fail);
 	KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&c, &sk[1]), -ECANCELED);
 	KUNIT_EXPECT_TRUE(test, c.consumed);
-	KUNIT_EXPECT_PTR_EQ(test, c.data, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, c.data, data);
 	KUNIT_EXPECT_PTR_EQ(test, c.tx, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
+	/* The table's reference is the request's now, and the object is charged until it is put. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+	KUNIT_EXPECT_GT(test, atomic64_read(&store->bytes), 0LL);
+	io_opaque_data_put(store, c.data);
+	c.data = NULL;
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, a.tx->admitting, 0U);
@@ -6529,7 +6541,11 @@ static void opaque_send_vec_loopback(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
-/* A queue that fails after the check takes every pin back; a LAST vector stays consumed. */
+/*
+ * A queue that fails after the check refuses the vector with every pin it took, which are the
+ * request's to give back when it is cleaned up and not the join's, since the socket may be
+ * owned; a LAST vector stays consumed.
+ */
 static void opaque_send_vec_admit_fail(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
@@ -6560,12 +6576,20 @@ static void opaque_send_vec_admit_fail(struct kunit *test)
 		kunit_activate_static_stub(test, io_opaque_send_acquire, opaque_test_acquire_fail);
 		KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(v[i], sk), -ECANCELED);
 		KUNIT_EXPECT_EQ(test, v[i]->consumed, (bool)(i == 1));
-		KUNIT_EXPECT_EQ(test, v[i]->vec->pinned, 0U);
 		KUNIT_EXPECT_PTR_EQ(test, v[i]->tx, NULL);
+		if (!i) {
+			/* A pin for each run of entries, A, B and A again, besides the table's. */
+			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 3);
+			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 2);
+			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
+		}
+		/* The pins are held still; the cleanup of the request gives them back. */
+		KUNIT_EXPECT_EQ(test, v[i]->vec->pinned, (u32)ARRAY_SIZE(ent));
+		io_opaque_vec_release(v[i]);
+		KUNIT_EXPECT_EQ(test, v[i]->vec->pinned, 0U);
 		if (!i) {
 			KUNIT_EXPECT_EQ(test, refcount_read(&a->refs), 1);
 			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
-			KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), a);
 		}
 	}
 	/* Both handles went with the LAST vector, and the pins with the failed admission. */
@@ -16998,26 +17022,56 @@ static void opaque_borrow_smp_compact(struct kunit *test)
 }
 
 /*
- * A frame that joins a queue which fails after the frame has taken its version gives the version
- * back as it joins (io_opaque_tx_settle()), with the ring lock held: a borrow is given back, and
- * the ring's reference goes with it if it was the last borrow, and else stays for the sends
- * that still borrow it.
+ * Pin the object for real, let another ring free it, and fail the queue: the pin is then the last
+ * reference of the version when the join refuses the frame. The put of the other ring is not the
+ * request's, and the spy of the test (opaque_put_spy_start()) does not count it.
+ */
+static int opaque_test_acquire_free_fail(struct io_opaque_req *op)
+{
+	struct kunit *test = kunit_get_current_test();
+	int ret;
+
+	kunit_deactivate_static_stub(test, io_opaque_send_acquire);
+	ret = io_opaque_send_acquire(op);
+	kunit_deactivate_static_stub(test, io_opaque_data_put);
+	opaque_test_free(op->store, 0);
+	kunit_activate_static_stub(test, io_opaque_data_put, opaque_test_data_put_spy);
+	opaque_race_head->tx->failed = true;
+	return ret;
+}
+
+/*
+ * A frame that joins a queue which fails after the frame has taken its version is refused with the
+ * version still its own (io_opaque_tx_settle()). An inline issue joins with the socket owned, and
+ * a send puts no version then: the last put frees the version, and a free is not for the socket
+ * lock to wait out. The borrow, or the reference, is the request's to give back when it is cleaned
+ * up, with the ring lock held and the socket released. The join runs here as that issue runs it,
+ * on a real socket that the test owns, with the puts watched. In three cases: the frame is alone
+ * on the version, which the table holds as well; another send of the ring borrows it too, so that
+ * the frame's borrow is not the last; and another ring frees the object once the frame has taken
+ * hold, so that the ring's reference is the last, and its put frees the version.
  */
 static void opaque_borrow_refused(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct opaque_ring *r = opaque_ring_new(test);
-	struct io_opaque_data *data = opaque_test_object(test, store);
-	struct sock *sk = kunit_kcalloc(test, 1, sizeof(*sk), GFP_KERNEL);
 	struct io_opaque_req head, refused, hold;
-	unsigned int held;
+	struct socket *sock;
+	unsigned int mode;
+	struct sock *sk;
 
-	KUNIT_ASSERT_NOT_NULL(test, sk);
-	for (held = 0; held < 2; held++) {
+	KUNIT_ASSERT_EQ(test, sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock),
+			0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_sock_release, sock), 0);
+	sk = sock->sk;
+	for (mode = 0; mode < 3; mode++) {
+		struct io_opaque_data *data = opaque_test_object(test, store);
+		int ret;
+
 		opaque_test_tx_op(&head, store);
 		KUNIT_EXPECT_EQ(test, io_opaque_tx_admit(&head, sk), 1);
 		opaque_race_head = &head;
-		if (held) {
+		if (mode == 1) {
 			opaque_ring_send(r, &hold, store, data->handle, true);
 			KUNIT_ASSERT_EQ(test, opaque_ring_acquire(r, &hold), 0);
 		}
@@ -17027,14 +17081,39 @@ static void opaque_borrow_refused(struct kunit *test)
 		refused.offset = 100;
 		refused.length = 1000;
 		refused.may_borrow = true;
-		kunit_activate_static_stub(test, io_opaque_send_acquire, opaque_test_acquire_fail);
+		if (mode == 2)
+			kunit_activate_static_stub(test, io_opaque_send_acquire,
+						   opaque_test_acquire_free_fail);
+		else
+			kunit_activate_static_stub(test, io_opaque_send_acquire,
+						   opaque_test_acquire_fail);
+		/* The ring lock, then the socket, as an inline issue holds them. */
+		opaque_put_spy_start(test, sk);
 		mutex_lock(&r->ctx.uring_lock);
-		KUNIT_EXPECT_EQ(test, io_opaque_tx_join(&refused, sk), -ECANCELED);
+		lock_sock(sk);
+		ret = io_opaque_tx_join(&refused, sk);
+		release_sock(sk);
 		mutex_unlock(&r->ctx.uring_lock);
-		KUNIT_EXPECT_PTR_EQ(test, refused.data, NULL);
-		KUNIT_EXPECT_FALSE(test, refused.borrowed);
+		opaque_put_spy_stop(test);
+		KUNIT_EXPECT_EQ_MSG(test, ret, -ECANCELED, "mode %u", mode);
+		/* Nothing was put, and none of it was given back: the request has what it took. */
+		opaque_put_spy_expect(test, 0, 0);
+		KUNIT_EXPECT_PTR_EQ(test, refused.data, data);
+		KUNIT_EXPECT_TRUE(test, refused.borrowed);
 		KUNIT_EXPECT_PTR_EQ(test, refused.tx, NULL);
-		if (held) {
+		KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 1U);
+		KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow[0].borrows, mode == 1 ? 2UL : 1UL);
+		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), mode == 2 ? 1 : 2);
+		KUNIT_EXPECT_GT(test, atomic64_read(&store->bytes), 0LL);
+
+		/* Its cleanup gives the borrow back, with the socket released. */
+		opaque_put_spy_start(test, sk);
+		opaque_ring_end(r, &refused);
+		opaque_put_spy_stop(test);
+		KUNIT_EXPECT_PTR_EQ(test, refused.data, NULL);
+		/* The ring's reference goes with the last borrow, and is the last one in mode 2. */
+		opaque_put_spy_expect(test, mode == 1 ? 0 : 1, mode == 2 ? 1 : 0);
+		if (mode == 1) {
 			/* The held send still borrows the version; the ring keeps its reference. */
 			KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 1U);
 			KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow[0].borrows, 1UL);
@@ -17042,15 +17121,17 @@ static void opaque_borrow_refused(struct kunit *test)
 			opaque_ring_end(r, &hold);
 		}
 		KUNIT_EXPECT_EQ(test, r->ctx.opaque_borrow_nr, 0U);
-		KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 		head.tx->failed = false;
 		opaque_test_tx_done(&head, false);
 		KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&head), NULL);
 		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
+		if (mode != 2) {
+			KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
+			opaque_test_free(store, 0);
+		}
+		opaque_store_empty(test, store);
+		kvfree_rcu_barrier();
 	}
-	opaque_test_free(store, 0);
-	opaque_store_empty(test, store);
-	kvfree_rcu_barrier();
 	opaque_expect_lockdep(test, store);
 }
 
