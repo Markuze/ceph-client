@@ -3495,7 +3495,8 @@ static void io_opaque_send_unpin(struct io_opaque_req *op)
  * the lock to wait out. Nobody can take a reference on a version whose count
  * is one, which is not in the table, so the last one is still the last then.
  * A vector's entries that were put are cleared, so that the rest cannot put
- * them again.
+ * them again. A send that consumed its object does not call it (see
+ * io_opaque_send()).
  */
 static bool io_opaque_send_unpin_cheap(struct io_opaque_req *op)
 {
@@ -5023,11 +5024,17 @@ finish:
 	io_opaque_tx_put(op);
 	/*
 	 * The references go with the socket, the last of a version after it: what cleanup
-	 * is left to give back for this send is the request itself.
+	 * is left to give back for this send is the request itself. A send that consumed its
+	 * object (LAST) has nothing for the socket to wait out. It holds the table's reference,
+	 * which is the last one unless a send or a copy of the version is still under way, and
+	 * an extra one for each entry of a vector that names a handle again, whose decrement
+	 * frees nothing and is as good after the socket. All of them are for
+	 * io_opaque_send_unpin(), and the call that would find the count at one and drop
+	 * nothing is not made.
 	 */
 	left = false;
 	if (owned)
-		left = io_opaque_send_unpin_cheap(op);
+		left = op->consumed || io_opaque_send_unpin_cheap(op);
 	io_req_set_res(req, ret, op->consumed ? IORING_CQE_F_OPAQUE_CONSUMED : 0);
 	if (owned) {
 		/*

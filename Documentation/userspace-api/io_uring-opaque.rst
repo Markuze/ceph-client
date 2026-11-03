@@ -499,21 +499,21 @@ head polls for write space; later requests reuse their own request state as
 queue entries. On a plain TCP socket the head, whether it found its queue free
 or was promoted from behind an earlier send, gives its references back, all but
 the last on an object, while it owns the destination socket, and puts the last
-as soon as it has released the socket. One that returns EAGAIN keeps them, and
-its place at the head, for the next issue, and cancellation or failure then
-releases them with the request. The socket's security hook is asked before the
-socket is taken, once per issue while the send stays on this path, for what is
-left of the frame. Its verdict applies once the references are taken and the
-send has started, and a refusal or EAGAIN from it ends the issue as one from
-the first part of the frame would. An inline issue that then finds a frame
-ahead of it has asked the hook for nothing, and parks without applying the
-verdict; an io-wq issue parks before it asks. A socket whose TCP sendmsg has
-been replaced, by kTLS or a socket map for example, takes the ordinary send
-path instead: references first, then the hook and TCP for each part, and the
-references stay with the request until it is cleaned up. So do the remaining
-parts of a frame whose socket is found replaced part-way through, each asking
-the hook as the ordinary send does. This ordering does not cover plain writes
-or other stores.
+as soon as it has released the socket; a SEND_LAST puts all of them then. One
+that returns EAGAIN keeps them, and its place at the head, for the next issue,
+and cancellation or failure then releases them with the request. The socket's
+security hook is asked before the socket is taken, once per issue while the
+send stays on this path, for what is left of the frame. Its verdict applies
+once the references are taken and the send has started, and a refusal or EAGAIN
+from it ends the issue as one from the first part of the frame would. An inline
+issue that then finds a frame ahead of it has asked the hook for nothing, and
+parks without applying the verdict; an io-wq issue parks before it asks. A
+socket whose TCP sendmsg has been replaced, by kTLS or a socket map for
+example, takes the ordinary send path instead: references first, then the hook
+and TCP for each part, and the references stay with the request until it is
+cleaned up. So do the remaining parts of a frame whose socket is found replaced
+part-way through, each asking the hook as the ordinary send does. This ordering
+does not cover plain writes or other stores.
 
 Backing and memory management
 =============================

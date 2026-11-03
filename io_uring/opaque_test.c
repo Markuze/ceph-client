@@ -3739,7 +3739,11 @@ static void opaque_wire_read(struct kunit *test, struct opaque_wire *w, u8 *buf,
 /*
  * Watch the puts of versions made while a send runs: the references each held
  * when it was put and whether @sk was owned. A put of the last reference is the
- * one that frees the version, and must not be made with the socket owned.
+ * one that frees the version, and must not be made with the socket owned. A
+ * reference that a send drops with a decrement under the socket does not come
+ * through here: a send that did not consume its object does that for each of its
+ * references but the last of a version, and every reference of a LAST send is put
+ * after the socket is released.
  */
 static struct {
 	struct sock *sk;
@@ -3777,17 +3781,21 @@ static void opaque_put_spy_stop(struct kunit *test)
 	kunit_deactivate_static_stub(test, io_opaque_data_put);
 }
 
-/* Every put of a last reference seen since the spy started, and none made with the socket owned. */
-static void opaque_put_spy_expect(struct kunit *test, unsigned int last)
+/*
+ * The puts seen since the spy started are @puts, of which @frees found the last reference
+ * of a version, and none was made with the socket owned.
+ */
+static void opaque_put_spy_expect(struct kunit *test, unsigned int puts, unsigned int frees)
 {
-	unsigned int i, seen = min_t(unsigned int, opaque_put_spy.n,
-				     ARRAY_SIZE(opaque_put_spy.refs));
+	unsigned int i, last = 0, seen = min_t(unsigned int, opaque_put_spy.n,
+					       ARRAY_SIZE(opaque_put_spy.refs));
 
-	KUNIT_EXPECT_EQ(test, opaque_put_spy.n, last);
+	KUNIT_EXPECT_EQ(test, opaque_put_spy.n, puts);
 	for (i = 0; i < seen; i++) {
-		KUNIT_EXPECT_EQ(test, opaque_put_spy.refs[i], 1);
+		last += opaque_put_spy.refs[i] == 1;
 		KUNIT_EXPECT_FALSE(test, opaque_put_spy.owned[i]);
 	}
+	KUNIT_EXPECT_EQ(test, last, frees);
 }
 
 /*
@@ -4077,8 +4085,12 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 	WRITE_ONCE(io_opaque_send_part, NULL);
 	lockdep_assert_none_held_once();
 	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
-	/* LAST holds the table's reference, and its put frees the object: after the socket. */
-	opaque_put_spy_expect(test, c->last && !c->frame_only ? 1 : 0);
+	/*
+	 * LAST holds the table's reference, and its put frees the object: after the socket, as is
+	 * the put of the extra reference of each further entry of a vector.
+	 */
+	opaque_put_spy_expect(test, c->last && !c->frame_only ? (c->vector ? ARRAY_SIZE(ent) : 1) : 0,
+			      c->last && !c->frame_only ? 1 : 0);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
 	KUNIT_EXPECT_EQ(test, !!(w->req[0].cqe.flags & IORING_CQE_F_OPAQUE_CONSUMED), c->last);
 	KUNIT_EXPECT_EQ(test, op->consumed, c->last);
@@ -4367,8 +4379,12 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 	opaque_put_spy_stop(test);
 	lockdep_assert_none_held_once();
 	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
-	/* A version the send holds last is freed once, by the issue that completes it. */
-	opaque_put_spy_expect(test, last || action != OPAQUE_EAGAIN_KEEP ? 1 : 0);
+	/*
+	 * A version the send holds last is freed once, by the issue that completes it, which puts
+	 * the other references of a LAST vector after the socket as well.
+	 */
+	opaque_put_spy_expect(test, last ? nr : action != OPAQUE_EAGAIN_KEEP,
+			      last || action != OPAQUE_EAGAIN_KEEP);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
 	KUNIT_EXPECT_EQ(test, op->progress, (u64)total);
 	KUNIT_EXPECT_EQ(test, !!(w->req[0].cqe.flags & IORING_CQE_F_OPAQUE_CONSUMED), last);
@@ -4577,7 +4593,8 @@ static void opaque_send_locked_error(struct kunit *test)
 			lockdep_assert_none_held_once();
 			KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
 			/* An error frees what LAST took as a success does: after the socket. */
-			opaque_put_spy_expect(test, last ? 1 : 0);
+			opaque_put_spy_expect(test, last ? (vector ? ARRAY_SIZE(ent) : 1) : 0,
+					      last ? 1 : 0);
 			KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, -EPIPE);
 			KUNIT_EXPECT_TRUE(test, w->req[0].flags & REQ_F_FAIL);
 			KUNIT_EXPECT_EQ(test, w->req[0].cqe.flags & IORING_CQE_F_OPAQUE_CONSUMED,
@@ -4603,9 +4620,8 @@ static void opaque_send_locked_error(struct kunit *test)
 }
 
 /*
- * A LAST vector over two versions, one of them twice: each reference that is
- * not the last on its version goes with the socket, the last of each after it,
- * and none is put twice.
+ * A LAST vector over two versions, one of them twice: each of its references is
+ * put after the socket, the last of each version frees it, and none is put twice.
  */
 static void opaque_send_locked_last_versions(struct kunit *test)
 {
@@ -4642,8 +4658,8 @@ static void opaque_send_locked_last_versions(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, 3500);
 	KUNIT_EXPECT_TRUE(test, op->consumed);
-	/* B's only reference and A's last one: A's other was a decrement under the socket. */
-	opaque_put_spy_expect(test, 2);
+	/* A's first reference, B's only one and A's last one: B and A are freed, after the socket. */
+	opaque_put_spy_expect(test, 3, 2);
 	KUNIT_EXPECT_EQ(test, op->vec->pinned, 0U);
 	KUNIT_EXPECT_PTR_EQ(test, store->objects[0].data, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, store->objects[1].data, NULL);
@@ -8701,7 +8717,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			ret = opaque_wire_issue(w, 1, unlocked);
 			opaque_put_spy_stop(test);
 			KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
-			opaque_put_spy_expect(test, 1);
+			opaque_put_spy_expect(test, 1, 1);
 			KUNIT_EXPECT_EQ(test, w->req[1].cqe.res, 300);
 			KUNIT_EXPECT_EQ(test,
 					!!(w->req[1].cqe.flags & IORING_CQE_F_OPAQUE_CONSUMED), 1);
@@ -8922,7 +8938,7 @@ static void opaque_blocking_run(struct kunit *test, struct opaque_wire *w,
 	lockdep_assert_none_held_once();
 	KUNIT_ASSERT_EQ(test, ret, IOU_COMPLETE);
 	/* The version is put once, after the socket, and only if nothing else held it. */
-	opaque_put_spy_expect(test, freed);
+	opaque_put_spy_expect(test, freed, freed);
 	KUNIT_EXPECT_EQ(test, w->req[0].cqe.res, (s32)total);
 	/* It could not have finished before the peer began to read. */
 	KUNIT_EXPECT_GE(test, ms, 100LL);
