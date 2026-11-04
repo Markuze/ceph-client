@@ -1195,6 +1195,11 @@ static void opaque_generation_width(struct kunit *test)
 	struct io_opaque_req op = { .store = store };
 	struct io_opaque_slot *found, *stale;
 
+	/* Handle 0 names nothing, though a slot that was never used holds generation 0. */
+	spin_lock(&store->tables);
+	found = io_opaque_lookup(store, 0);
+	spin_unlock(&store->tables);
+	KUNIT_EXPECT_PTR_EQ(test, found, NULL);
 	KUNIT_EXPECT_NE(test, io_opaque_handle(0, 1), 0ULL);
 	KUNIT_EXPECT_EQ(test, io_opaque_handle(0, 1), 1ULL << IO_OPAQUE_INDEX_BITS);
 	KUNIT_EXPECT_EQ(test, IO_OPAQUE_GENERATION_MAX, (u64)U32_MAX);
@@ -6481,6 +6486,46 @@ static void opaque_attach_after_stop(struct kunit *test)
 }
 
 /*
+ * A stream slot is retired on its last generation as an object slot is: an attach passes by a slot
+ * that has none left, taking it for good, and the stream it attaches in the slot before that one is
+ * on the last generation there is, and leaves the slot taken when it ends.
+ */
+static void opaque_attach_retired(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	const u32 slots = io_opaque_seg_slots(0);
+	struct io_opaque_stream *stream;
+	struct io_opaque_seg *seg;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_stoppable(test, store);
+	opaque_attach_setup(test, w);
+	seg = rcu_dereference_raw(store->streams[0]);
+	opaque_test_stream_slot(store, 0)->generation = IO_OPAQUE_GENERATION_MAX;
+	opaque_test_stream_slot(store, 1)->generation = IO_OPAQUE_GENERATION_MAX - 1;
+	KUNIT_ASSERT_EQ(test, opaque_attach_one(test, w, store, &stream, 0xa1), 0);
+	KUNIT_EXPECT_EQ(test, stream->token, io_opaque_handle(1, IO_OPAQUE_GENERATION_MAX));
+	KUNIT_EXPECT_PTR_EQ(test, opaque_test_stream_slot(store, 1)->stream, stream);
+	KUNIT_EXPECT_NULL(test, opaque_test_stream_slot(store, 0)->stream);
+	KUNIT_EXPECT_EQ(test, opaque_test_stream_slot(store, 0)->generation,
+			IO_OPAQUE_GENERATION_MAX);
+	KUNIT_EXPECT_TRUE(test, test_bit(0, seg->used));
+	KUNIT_EXPECT_TRUE(test, test_bit(1, seg->used));
+	KUNIT_EXPECT_EQ(test, seg->free, slots - 2);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 1U);
+	/* The collector ends, and the stop puts the slot's stream: neither slot comes back. */
+	io_opaque_stream_close(stream);
+	io_opaque_stop(store);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 0U);
+	KUNIT_EXPECT_NULL(test, opaque_test_stream_slot(store, 1)->stream);
+	KUNIT_EXPECT_TRUE(test, test_bit(0, seg->used));
+	KUNIT_EXPECT_TRUE(test, test_bit(1, seg->used));
+	KUNIT_EXPECT_EQ(test, seg->free, slots - 2);
+	io_opaque_stream_put(stream);
+}
+
+/*
  * The entries are checked as a whole, without looking at any handle: as they
  * are read from user memory, and with the answers the model gives. Where the
  * number of entries is wrong prep says so before it reads any
@@ -7048,6 +7093,72 @@ static struct io_opaque_req *opaque_pin_vec(struct kunit *test, struct io_opaque
 	op = opaque_vec_new(test, store, ent, nr, flags);
 	KUNIT_ASSERT_EQ(test, opaque_vec_admit(op), 0);
 	return op;
+}
+
+/*
+ * A send that consumes what it names looks the handle up with tables held, in whichever segment of
+ * the table its slot is, and does it in line at each place that does: a send of one object, and a
+ * vector of two. The objects are in the third and in the fourth segment, at the first and the last
+ * slot of each, where a wrong split of the index finds another slot or none. A handle of a
+ * generation that the slot does not hold, or that was consumed, names nothing in either.
+ */
+static void opaque_send_last_grown(struct kunit *test)
+{
+	static const u32 index[4] = { 2048, 4095, 4096, 8191 };
+	static const u64 gen[4] = { 3, 5, 7, 9 };
+	struct io_opaque_store *store = opaque_test_big_store(test);
+	struct io_uring_opaque_send_entry ent[2];
+	struct io_opaque_data *data[4];
+	struct io_opaque_req single = {
+		.store = store, .offset = 100, .length = 1000, .send_flags = IORING_OPAQUE_SEND_LAST,
+	};
+	struct io_opaque_req *op;
+	unsigned int i;
+
+	opaque_test_slots(test, store, index[3] + 1);
+	for (i = 0; i < ARRAY_SIZE(index); i++) {
+		data[i] = opaque_sparse_data(test, store);
+		opaque_test_publish(store, index[i], gen[i], data[i]);
+	}
+	KUNIT_ASSERT_EQ(test, store->nr_objects, 4U);
+	/* The first slot of each segment, sent on its own. */
+	for (i = 0; i < ARRAY_SIZE(index); i += 2) {
+		single.handle = io_opaque_handle(index[i], gen[i]);
+		single.data = NULL;
+		single.consumed = false;
+		KUNIT_ASSERT_EQ(test, opaque_test_acquire(store, &single), 0);
+		KUNIT_EXPECT_TRUE(test, single.consumed);
+		KUNIT_EXPECT_PTR_EQ(test, single.data, data[i]);
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, index[i]), NULL);
+		KUNIT_EXPECT_FALSE(test, opaque_test_used(store, index[i]));
+		io_opaque_data_put(store, single.data);
+		single.data = NULL;
+		single.consumed = false;
+		KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &single), -ESTALE);
+	}
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 2U);
+	/* Another generation of the last slot of the segment: nothing, and the object stays. */
+	single.handle = io_opaque_handle(index[1], gen[1] + 1);
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &single), -ESTALE);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, index[1]), data[1]);
+	/* The last slots of the two segments, in one vector. */
+	ent[0] = (struct io_uring_opaque_send_entry) {
+		.handle = io_opaque_handle(index[1], gen[1]), .off = 0, .len = 1000,
+	};
+	ent[1] = (struct io_uring_opaque_send_entry) {
+		.handle = io_opaque_handle(index[3], gen[3]), .off = 5000, .len = 1000,
+	};
+	op = opaque_vec_new(test, store, ent, ARRAY_SIZE(ent), IORING_OPAQUE_SEND_LAST);
+	KUNIT_EXPECT_EQ(test, opaque_vec_admit(op), 0);
+	KUNIT_EXPECT_TRUE(test, op->consumed);
+	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[0], data[1]);
+	KUNIT_EXPECT_PTR_EQ(test, op->vec->pin[1], data[3]);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, index[1]), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, index[3]), NULL);
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+	io_opaque_vec_release(op);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
 /*
@@ -14736,6 +14847,36 @@ static void opaque_register_unbounded(struct kunit *test)
 }
 
 /*
+ * A store that grew is freed whole: the segments of both tables, however many there are, and the
+ * count of those that exist is what it was before the store.
+ */
+static void opaque_register_grown_free(struct kunit *test)
+{
+	const struct io_uring_opaque_config cfg = { .hard_limit = SZ_1M, .max_object_size = SZ_64K };
+	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	long live = atomic_long_read(&io_opaque_segs_live);
+	struct io_opaque_req op = {};
+	struct io_opaque_store *store;
+	unsigned int s;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	store = io_opaque_alloc(ctx, &cfg);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 2L);
+	op.store = store;
+	/* 4,097 objects, into the fourth segment of the objects, and four segments of streams. */
+	for (i = 0; i <= 4096; i++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	for (s = 1; s < 4; s++)
+		KUNIT_ASSERT_EQ(test, io_opaque_table_grow(store, store->streams,
+							   io_opaque_stream_seg), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 8L);
+	io_opaque_free(store);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+}
+
+/*
  * The ubuf of a pool completes where the last skb is freed, and that is often a softirq: the ACK
  * that frees a sent skb, a consumer that copies. It is put on the list there and taken by the
  * next skb in the task, with only atomics in between.
@@ -18508,12 +18649,14 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE_SLOW(opaque_attach_many),
 	KUNIT_CASE(opaque_attach_stopped),
 	KUNIT_CASE(opaque_attach_after_stop),
+	KUNIT_CASE(opaque_attach_retired),
 	KUNIT_CASE(opaque_send_vec_check),
 	KUNIT_CASE(opaque_vec_copy_in),
 	KUNIT_CASE(opaque_vec_copy_in_invalid),
 	KUNIT_CASE(opaque_vec_copy_in_fault),
 	KUNIT_CASE(opaque_vec_copy_in_model),
 	KUNIT_CASE(opaque_send_vec_acquire),
+	KUNIT_CASE(opaque_send_last_grown),
 	KUNIT_CASE(opaque_send_vec_pin_once),
 	KUNIT_CASE(opaque_send_vec_iter),
 	KUNIT_CASE(opaque_send_vec_loopback),
@@ -18606,6 +18749,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_ubuf_pool_teardown),
 	KUNIT_CASE(opaque_ubuf_pool_store),
 	KUNIT_CASE(opaque_register_unbounded),
+	KUNIT_CASE(opaque_register_grown_free),
 	KUNIT_CASE(opaque_ubuf_pool_atomic),
 	KUNIT_CASE(opaque_send_managed_pool),
 	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_stress),
