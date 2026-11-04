@@ -24,8 +24,11 @@ struct io_uring_opaque_config {
 	__u64 hard_limit;
 	__u64 compact_headroom;
 	__u32 max_object_size;
+	/* Ignored. Earlier versions of this interface required 1 to 16384. */
 	__u32 max_objects;
+	/* Ignored. Earlier versions of this interface required 1 to 1024. */
 	__u32 max_streams;
+	/* Ignored. Earlier versions of this interface required 4 to 65536. */
 	__u32 max_extents;
 	/* Ignored. Earlier versions of this interface required 1 to 4096. */
 	__u32 max_requests;

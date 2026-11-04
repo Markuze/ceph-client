@@ -14,6 +14,7 @@
 #include <linux/skbuff_ref.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include <net/hotdata.h>
 #include <net/page_pool/helpers.h>
@@ -676,42 +677,257 @@ u64 io_opaque_handle(u32 index, u64 generation)
 	return generation << IO_OPAQUE_INDEX_BITS | index;
 }
 
-static u32 io_opaque_index(u64 handle)
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * Segments that exist, for a test to see that one which lost a race, or a store, freed its own,
+ * and segments that were ever made, for a test to see that only one request made a segment.
+ */
+atomic_long_t io_opaque_segs_live = ATOMIC_LONG_INIT(0);
+atomic_long_t io_opaque_segs_made = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_SEG_MADE()				\
+	do {						\
+		atomic_long_inc(&io_opaque_segs_live);	\
+		atomic_long_inc(&io_opaque_segs_made);	\
+	} while (0)
+#define IO_OPAQUE_SEG_GONE()	atomic_long_dec(&io_opaque_segs_live)
+/*
+ * Run by io_opaque_table_grow() after it has found the segment that the table lacks and before it
+ * takes the lock of the growth, with no lock held: for a test to do what another request does
+ * meanwhile, and make the segment.
+ */
+void (*io_opaque_grow_before)(struct io_opaque_store *store);
+#define IO_OPAQUE_GROW_BEFORE(store)				\
+	do {							\
+		if (io_opaque_grow_before)			\
+			io_opaque_grow_before(store);		\
+	} while (0)
+/*
+ * Run by io_opaque_table_grow() after it has made a segment and before it takes tables to publish
+ * it, with the lock of the growth held and no other: for a test to do what a stop does in that
+ * time.
+ */
+void (*io_opaque_grow_between)(struct io_opaque_store *store);
+#define IO_OPAQUE_GROW_BETWEEN(store)				\
+	do {							\
+		if (io_opaque_grow_between)			\
+			io_opaque_grow_between(store);		\
+	} while (0)
+#else
+#define IO_OPAQUE_SEG_MADE()		((void)0)
+#define IO_OPAQUE_SEG_GONE()		((void)0)
+#define IO_OPAQUE_GROW_BEFORE(store)	((void)(store))
+#define IO_OPAQUE_GROW_BETWEEN(store)	((void)(store))
+#endif
+
+/*
+ * What a segment is allocated with. A table is as large as the memory it is given, so a segment can
+ * be most of a memory cgroup, and growing it where the cgroup is at its limit must fail (the
+ * caller's -ENOMEM) and not call the OOM killer, which charging a cgroup does for an allocation
+ * that is not allowed to fail (try_charge_memcg()): the task it would kill is likely the one that
+ * owns the store. __GFP_RETRY_MAYFAIL is that. It also asks kvmalloc() for the physically
+ * contiguous block before it falls back to vmalloc, which a table that every send reads is the
+ * better for (it is in the direct map, and not in a mapping of its own).
+ */
+#define IO_OPAQUE_SEG_GFP	(GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL | __GFP_NOWARN)
+
+/* The bytes of segment @seg of a table whose slots are @size bytes: header, slots, bitmap. */
+VISIBLE_IF_KUNIT size_t io_opaque_seg_bytes(unsigned int seg, size_t size)
 {
-	return handle & IO_OPAQUE_INDEX_MASK;
+	u32 nr = io_opaque_seg_slots(seg);
+
+	return size_add(size_add(sizeof(struct io_opaque_seg), array_size(nr, size)),
+			array_size(BITS_TO_LONGS(nr), sizeof(long)));
 }
 
-VISIBLE_IF_KUNIT u32 io_opaque_find_slot(unsigned long *used, u32 count, u32 *cursor)
+/*
+ * Zeroed memory for a segment that kvmalloc() refuses, which is one of more than INT_MAX bytes.
+ * Mapped by huge pages where it can be, as kvmalloc() maps its own: vmalloc() does not unless it
+ * is asked, and a lookup is a random access into the segment, which would miss the TLB on most of
+ * them with 4 KiB pages. A seam, so that a test can stand in for it: the segments that need it
+ * are gigabytes.
+ */
+VISIBLE_IF_KUNIT void *io_opaque_seg_vmalloc(size_t bytes, gfp_t gfp)
 {
-	u32 index = find_next_zero_bit(used, count, *cursor);
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_seg_vmalloc, bytes, gfp);
+	return vmalloc_huge(bytes, gfp | __GFP_ZERO);
+}
 
-	if (index == count && *cursor) {
-		index = find_first_zero_bit(used, *cursor);
-		if (index == *cursor)
-			return count;
+/*
+ * Segment @seg of a table whose slots are @size bytes: zeroed, with every slot free and the bitmap
+ * of the taken ones after the slots. The caller makes the slots what they are for. Memory is the
+ * only bound of a table, and a segment can be most of it, so it is allocated like a large array
+ * and a failure is the caller's -ENOMEM.
+ */
+VISIBLE_IF_KUNIT struct io_opaque_seg *io_opaque_seg_alloc(unsigned int seg, size_t size)
+{
+	u32 nr = io_opaque_seg_slots(seg);
+	size_t slots = array_size(nr, size);
+	size_t bytes = io_opaque_seg_bytes(seg, size);
+	struct io_opaque_seg *new;
+
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_seg_alloc, seg, size);
+	/*
+	 * kvmalloc() refuses more than INT_MAX bytes: the segments of the objects from the 17th and
+	 * of the streams from the 18th.
+	 */
+	if (bytes > INT_MAX)
+		new = io_opaque_seg_vmalloc(bytes, IO_OPAQUE_SEG_GFP);
+	else
+		new = kvzalloc(bytes, IO_OPAQUE_SEG_GFP);
+	if (!new)
+		return NULL;
+	new->free = nr;
+	new->used = (void *)new + sizeof(*new) + slots;
+	IO_OPAQUE_SEG_MADE();
+	return new;
+}
+
+VISIBLE_IF_KUNIT void io_opaque_seg_free(struct io_opaque_seg *seg)
+{
+	if (seg) {
+		kvfree(seg);
+		IO_OPAQUE_SEG_GONE();
 	}
-	if (index < count)
-		*cursor = (index + 1) % count;
-	return index;
 }
 
-VISIBLE_IF_KUNIT void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation)
+/*
+ * Segment @seg of the table of objects: every slot knows where it is, and is on no list. Not made
+ * with a lock held, so the slots of a large segment are done in turns.
+ */
+VISIBLE_IF_KUNIT struct io_opaque_seg *io_opaque_object_seg(unsigned int seg)
 {
-	if (generation != IO_OPAQUE_GENERATION_MAX)
-		__clear_bit(index, used);
+	struct io_opaque_seg *new = io_opaque_seg_alloc(seg, sizeof(*new->object));
+	u32 first = io_opaque_seg_first(seg), nr = io_opaque_seg_slots(seg), i;
+
+	if (!new)
+		return NULL;
+	for (i = 0; i < nr; i++) {
+		new->object[i].index = first + i;
+		INIT_LIST_HEAD(&new->object[i].candidate);
+		if (!(i % SZ_4K))
+			cond_resched();
+	}
+	return new;
+}
+
+/* Segment @seg of the table of streams. */
+VISIBLE_IF_KUNIT struct io_opaque_seg *io_opaque_stream_seg(unsigned int seg)
+{
+	return io_opaque_seg_alloc(seg, sizeof(struct io_opaque_stream_slot));
+}
+
+/*
+ * The first segment of each table, and the lock of their growth, for a store that nothing else
+ * can see yet.
+ */
+VISIBLE_IF_KUNIT int io_opaque_tables_init(struct io_opaque_store *store)
+{
+	struct io_opaque_seg *objects = io_opaque_object_seg(0);
+	struct io_opaque_seg *streams = io_opaque_stream_seg(0);
+
+	if (!objects || !streams) {
+		io_opaque_seg_free(objects);
+		io_opaque_seg_free(streams);
+		return -ENOMEM;
+	}
+	RCU_INIT_POINTER(store->objects[0], objects);
+	RCU_INIT_POINTER(store->streams[0], streams);
+	mutex_init(&store->grow);
+	return 0;
+}
+
+/* Every segment of both tables, for a store that nothing looks at any more. */
+VISIBLE_IF_KUNIT void io_opaque_tables_free(struct io_opaque_store *store)
+{
+	unsigned int s;
+
+	for (s = 0; s < IO_OPAQUE_SEGS; s++) {
+		io_opaque_seg_free(rcu_dereference_protected(store->objects[s], true));
+		RCU_INIT_POINTER(store->objects[s], NULL);
+		io_opaque_seg_free(rcu_dereference_protected(store->streams[s], true));
+		RCU_INIT_POINTER(store->streams[s], NULL);
+	}
+}
+
+/*
+ * Find a slot of a table that is not taken, from the cursor on and then from the start, with
+ * tables held. Returns whether there is one, and its index, and moves the cursor after it, so that
+ * a slot that is freed is taken again when the cursor comes round to it, and not at once. A segment
+ * with no free slot is passed without looking at its slots. The slot is not taken: the caller
+ * decides that with io_opaque_use_slot(), because it may find that the slot cannot be used.
+ */
+VISIBLE_IF_KUNIT bool io_opaque_find_slot(struct io_opaque_store *store,
+					  struct io_opaque_seg __rcu **segs, u32 *cursor,
+					  u32 *index)
+{
+	u32 off, nr, bit;
+	unsigned int from = io_opaque_seg_split(*cursor, &off), s;
+	struct io_opaque_seg *seg;
+
+	lockdep_assert_held(&store->tables);
+	/* From the cursor to the end of the segments there are... */
+	for (s = from; s < IO_OPAQUE_SEGS; s++) {
+		seg = rcu_dereference_protected(segs[s], lockdep_is_held(&store->tables));
+		if (!seg)
+			break;
+		nr = io_opaque_seg_slots(s);
+		if (!seg->free)
+			continue;
+		bit = find_next_zero_bit(seg->used, nr, s == from ? off : 0);
+		if (bit < nr)
+			goto found;
+	}
+	/* ...and from the start to the cursor. */
+	for (s = 0; s <= from; s++) {
+		seg = rcu_dereference_protected(segs[s], lockdep_is_held(&store->tables));
+		if (!seg)
+			break;
+		nr = s == from ? off : io_opaque_seg_slots(s);
+		if (!seg->free)
+			continue;
+		bit = find_first_zero_bit(seg->used, nr);
+		if (bit < nr)
+			goto found;
+	}
+	return false;
+found:
+	*index = io_opaque_seg_first(s) + bit;
+	*cursor = *index + 1;
+	return true;
+}
+
+/* Count the slot at @index of a table as taken, with tables held. */
+VISIBLE_IF_KUNIT void io_opaque_use_slot(struct io_opaque_seg __rcu **segs, u32 index)
+{
+	struct io_opaque_seg *seg;
+	u32 off;
+
+	seg = rcu_dereference_raw(segs[io_opaque_seg_split(index, &off)]);
+	if (!__test_and_set_bit(off, seg->used))
+		seg->free--;
+}
+
+/*
+ * Give the slot at @index of a table back, with tables held, unless it was on its last
+ * generation: it is retired then, and stays taken.
+ */
+VISIBLE_IF_KUNIT void io_opaque_release_slot(struct io_opaque_seg __rcu **segs, u32 index,
+					     u64 generation)
+{
+	struct io_opaque_seg *seg;
+	u32 off;
+
+	if (generation == IO_OPAQUE_GENERATION_MAX)
+		return;
+	seg = rcu_dereference_raw(segs[io_opaque_seg_split(index, &off)]);
+	if (__test_and_clear_bit(off, seg->used))
+		seg->free++;
 }
 
 struct io_opaque_slot *io_opaque_lookup(struct io_opaque_store *store,
 					u64 handle)
 {
-	u32 index = io_opaque_index(handle);
-
-	lockdep_assert_held(&store->tables);
-	if (!handle || index >= store->config.max_objects)
-		return NULL;
-	if (store->objects[index].generation != handle >> IO_OPAQUE_INDEX_BITS)
-		return NULL;
-	return &store->objects[index];
+	return io_opaque_lookup_inline(store, handle);
 }
 
 /* Drop handle visibility, transferring the table reference to the caller. */
@@ -728,26 +944,101 @@ VISIBLE_IF_KUNIT struct io_opaque_data *io_opaque_detach(struct io_opaque_store 
 		return NULL;
 	RCU_INIT_POINTER(slot->data, NULL);
 	store->nr_objects--;
-	io_opaque_release_slot(store->object_used, slot - store->objects, slot->generation);
+	io_opaque_release_slot(store->objects, slot->index, slot->generation);
 	slot->compacting = false;
 	list_del_init(&slot->candidate);
 	return data;
 }
 
+/*
+ * Add the next segment to a table that has no free slot. Called with no lock held, because making
+ * a segment sleeps, and takes as long as the segment is large, and nothing may wait for that: a
+ * send takes tables. One request makes a segment at a time, for the store, under its own lock
+ * (grow): rings that share a store do not share a ring lock, and without it each that found the
+ * table full would make the same segment. The one that comes second finds, once it has the lock,
+ * that the segment it saw missing is there, makes nothing and says there is room to look in.
+ * The store may stop meanwhile: the stop walks the segments that exist once it has set dead, so
+ * none is added after, and the request is told (-ESHUTDOWN). No lookup waits for the segment: it
+ * is published with one pointer, and the slots of the others do not move. Returns 0 when there is
+ * room to look again, or why there is none; a table that has all the segments there are, or no
+ * memory for the next, is -ENOMEM.
+ */
+VISIBLE_IF_KUNIT int io_opaque_table_grow(struct io_opaque_store *store,
+					  struct io_opaque_seg __rcu **segs,
+					  struct io_opaque_seg *(*new)(unsigned int seg))
+{
+	struct io_opaque_seg *seg = NULL;
+	struct mem_cgroup *old;
+	unsigned int s;
+	int ret = 0;
+
+	might_sleep();
+	if (READ_ONCE(store->dead))
+		return -ESHUTDOWN;
+	/* The first segment that is missing; they are added in order, and never taken away. */
+	for (s = 0; s < IO_OPAQUE_SEGS; s++)
+		if (!rcu_access_pointer(segs[s]))
+			break;
+	if (s == IO_OPAQUE_SEGS)
+		return -ENOMEM;
+	IO_OPAQUE_GROW_BEFORE(store);
+	mutex_lock(&store->grow);
+	if (READ_ONCE(store->dead)) {
+		ret = -ESHUTDOWN;
+	} else if (!rcu_dereference_protected(segs[s], lockdep_is_held(&store->grow))) {
+		old = set_active_memcg(store->memcg);
+		seg = new(s);
+		set_active_memcg(old);
+		if (!seg) {
+			ret = -ENOMEM;
+		} else {
+			IO_OPAQUE_GROW_BETWEEN(store);
+			spin_lock(&store->tables);
+			if (store->dead) {
+				ret = -ESHUTDOWN;
+			} else {
+				/*
+				 * Release: the contents of the segment are in place before the
+				 * pointer is, for a lookup that takes no lock (io_opaque_pin()).
+				 * The lock does not do that: the contents were stored before it
+				 * was taken, and taking a lock does not order them with the
+				 * stores that follow. x86 does, so it is a weaker architecture
+				 * that would show the difference (arm64).
+				 */
+				rcu_assign_pointer(segs[s], seg);
+				seg = NULL;
+			}
+			spin_unlock(&store->tables);
+		}
+	}
+	mutex_unlock(&store->grow);
+	io_opaque_seg_free(seg);
+	return ret;
+}
+
+/*
+ * Reserve a slot for the handle of a new version. The table grows when it has no free slot, which
+ * takes a segment made with no lock held, so this sleeps and is for the issue of a request.
+ */
 VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_slot *slot;
 	u32 index;
+	int ret;
 
-	guard(spinlock)(&store->tables);
+	spin_lock(&store->tables);
 	for (;;) {
-		index = io_opaque_find_slot(store->object_used, store->config.max_objects,
-					    &store->object_cursor);
-		if (index >= store->config.max_objects)
-			return -ENOSPC;
-		slot = &store->objects[index];
-		__set_bit(index, store->object_used);
+		if (!io_opaque_find_slot(store, store->objects, &store->object_cursor, &index)) {
+			spin_unlock(&store->tables);
+			ret = io_opaque_table_grow(store, store->objects, io_opaque_object_seg);
+			if (ret)
+				return ret;
+			spin_lock(&store->tables);
+			continue;
+		}
+		slot = io_opaque_slot_at(store, index);
+		io_opaque_use_slot(store->objects, index);
 		if (slot->generation != IO_OPAQUE_GENERATION_MAX)
 			break;
 	}
@@ -759,6 +1050,7 @@ VISIBLE_IF_KUNIT int io_opaque_slot_reserve(struct io_opaque_req *op)
 	op->slot = index;
 	op->handle = io_opaque_handle(index, slot->generation);
 	op->slot_reserved = true;
+	spin_unlock(&store->tables);
 	return 0;
 }
 
@@ -780,21 +1072,24 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	struct io_uring_opaque_config cfg = *config;
 	struct io_zcrx_ifq *maio = NULL;
 	struct io_opaque_store *store;
+	struct mem_cgroup *old;
 	int ret;
-	u32 i;
 
 	if ((cfg.flags & ~IORING_OPAQUE_CFG_MAIO) || cfg.__resv1 ||
 	    (cfg.zcrx_id && !(cfg.flags & IORING_OPAQUE_CFG_MAIO)) ||
 	    !mem_is_zero(cfg.__resv, sizeof(cfg.__resv)))
 		return ERR_PTR(-EINVAL);
-	if (!cfg.hard_limit || cfg.hard_limit > SZ_1T ||
+	/*
+	 * A store is bounded by memory: hard_limit, of any size, which is counted against
+	 * RLIMIT_MEMLOCK below, and the memory cgroup. Its tables grow with its objects and
+	 * streams, so max_objects and max_streams are neither read nor checked, as max_requests
+	 * is not. Neither is max_extents checked.
+	 */
+	if (!cfg.hard_limit ||
 	    !IS_ALIGNED(cfg.hard_limit, PAGE_SIZE) ||
 	    !IS_ALIGNED(cfg.compact_headroom, PAGE_SIZE) ||
 	    cfg.compact_headroom >= cfg.hard_limit ||
-	    !cfg.max_object_size || cfg.max_object_size > INT_MAX ||
-	    !cfg.max_objects || cfg.max_objects > 16384 ||
-	    !cfg.max_streams || cfg.max_streams > 1024 ||
-	    cfg.max_extents < 4 || cfg.max_extents > 65536)
+	    !cfg.max_object_size || cfg.max_object_size > INT_MAX)
 		return ERR_PTR(-EINVAL);
 	if (!IS_ALIGNED(cfg.reply_reserve, PAGE_SIZE) ||
 	    cfg.reply_reserve >= cfg.hard_limit - cfg.compact_headroom ||
@@ -831,16 +1126,6 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	/* The binding never changes, nor does the mark it gives the sends of the store. */
 	if (maio)
 		store->send_ubuf_flags = SKBFL_SHARED_FRAG;
-	store->objects = kvcalloc(cfg.max_objects, sizeof(*store->objects),
-				  GFP_KERNEL_ACCOUNT);
-	store->streams = kvcalloc(cfg.max_streams, sizeof(*store->streams),
-				  GFP_KERNEL_ACCOUNT);
-	store->object_used = bitmap_zalloc(cfg.max_objects, GFP_KERNEL_ACCOUNT);
-	store->stream_used = bitmap_zalloc(cfg.max_streams, GFP_KERNEL_ACCOUNT);
-	if (!store->objects || !store->streams || !store->object_used || !store->stream_used) {
-		ret = -ENOMEM;
-		goto free_store;
-	}
 	/* Cached destination units sit outside the hard limit but not RLIMIT_MEMLOCK. */
 	ret = io_account_mem(ctx->user, ctx->mm_account,
 			     (cfg.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
@@ -853,8 +1138,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	store->memcg = get_mem_cgroup_from_mm(store->mm);
 #ifdef CONFIG_MEMCG
 	if (store->memcg && !mem_cgroup_is_root(store->memcg)) {
-		struct mem_cgroup *old = set_active_memcg(store->memcg);
-
+		old = set_active_memcg(store->memcg);
 		store->objcg = get_obj_cgroup_from_current();
 		set_active_memcg(old);
 	}
@@ -869,18 +1153,25 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	INIT_LIST_HEAD(&store->candidates);
 	store->txs = RB_ROOT;
 	INIT_LIST_HEAD(&store->txs_idle);
-	for (i = 0; i < cfg.max_objects; i++)
-		INIT_LIST_HEAD(&store->objects[i].candidate);
 	INIT_DELAYED_WORK(&store->retry_work, io_opaque_retry_work);
 	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
 	/* Not having one is fine: the ubufs of a store without a pool come from the cache alone. */
 	store->ubuf_pool = io_opaque_ubuf_pool_new();
+	/*
+	 * The first segment of each table, charged to the cgroup of the store as the segments
+	 * that follow are, and not to the task that registers it. The tables grow from there as
+	 * the store fills. It is the last to be made, so that the store, whole, is what a failure
+	 * frees.
+	 */
+	old = set_active_memcg(store->memcg);
+	ret = io_opaque_tables_init(store);
+	set_active_memcg(old);
+	if (ret) {
+		io_opaque_free(store);
+		return ERR_PTR(ret);
+	}
 	return store;
 free_store:
-	bitmap_free(store->stream_used);
-	bitmap_free(store->object_used);
-	kvfree(store->streams);
-	kvfree(store->objects);
 	kfree(store);
 put_maio:
 	if (maio)
@@ -890,7 +1181,9 @@ put_maio:
 
 void io_opaque_stop(struct io_opaque_store *store)
 {
-	u32 i;
+	struct io_opaque_stream_slot *sslot;
+	struct io_opaque_slot *slot;
+	u64 i;
 
 	if (!store)
 		return;
@@ -906,15 +1199,19 @@ void io_opaque_stop(struct io_opaque_store *store)
 	/* Retirement refuses units once dead is visible under the cache lock. */
 	io_opaque_unit_drain(store);
 	cancel_delayed_work_sync(&store->retry_work);
-	for (i = 0; i < store->config.max_streams; i++) {
+	/*
+	 * No segment is added once dead is set (io_opaque_table_grow()), so the walks end at the
+	 * last segment there is, and the tables are not changed by them.
+	 */
+	io_opaque_for_each_stream_slot(store, i, sslot) {
 		struct io_opaque_stream *stream;
 
 		spin_lock(&store->tables);
-		stream = store->streams[i].stream;
-		store->streams[i].stream = NULL;
+		stream = sslot->stream;
+		sslot->stream = NULL;
 		if (stream) {
 			store->nr_streams--;
-			io_opaque_release_slot(store->stream_used, i, store->streams[i].generation);
+			io_opaque_release_slot(store->streams, i, sslot->generation);
 		}
 		spin_unlock(&store->tables);
 		if (stream) {
@@ -923,11 +1220,11 @@ void io_opaque_stop(struct io_opaque_store *store)
 		}
 		cond_resched();
 	}
-	for (i = 0; i < store->config.max_objects; i++) {
+	io_opaque_for_each_slot(store, i, slot) {
 		struct io_opaque_data *data;
 
 		spin_lock(&store->tables);
-		data = io_opaque_detach(store, &store->objects[i]);
+		data = io_opaque_detach(store, slot);
 		spin_unlock(&store->tables);
 		io_opaque_data_put(store, data);
 		cond_resched();
@@ -974,10 +1271,7 @@ void io_opaque_free(struct io_opaque_store *store)
 	if (store->mm)
 		mmdrop(store->mm);
 	free_uid(store->user);
-	bitmap_free(store->object_used);
-	bitmap_free(store->stream_used);
-	kvfree(store->objects);
-	kvfree(store->streams);
+	io_opaque_tables_free(store);
 	kfree(store);
 }
 
@@ -2105,7 +2399,10 @@ int io_opaque_recv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 /*
  * Make @op the collector of its socket. The socket is taken before tables,
  * which is the order a send admits in, with the socket owned. Nothing may wait
- * for a socket lock while it holds tables.
+ * for a socket lock while it holds tables. A table with no free slot grows,
+ * which takes neither: the stream table gets its next segment with the socket
+ * released, since packets for it wait in its backlog meanwhile, and what the
+ * attach checked about the socket is checked again, and so is whether the store has stopped.
  */
 VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 {
@@ -2113,8 +2410,9 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	struct io_opaque_stream *stream;
 	struct socket *sock = sock_from_file(op->req->file);
 	struct io_uring_cqe cqe[2] = {};
+	bool full;
 	u32 i;
-	int ret = -ENOSPC;
+	int ret;
 
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP)
 		return -EOPNOTSUPP;
@@ -2138,8 +2436,18 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	stream->owner.actor = io_opaque_actor;
 	stream->owner.data = stream;
 	stream->collector = op;
+retry:
+	full = false;
 	lock_sock(sock->sk);
 	spin_lock(&store->tables);
+	/*
+	 * The stop has walked the table of streams once it has set dead, and puts what it finds;
+	 * a stream that is added after is not found by anything, and with its socket is lost.
+	 */
+	if (store->dead) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
 	if (sock->sk->sk_rx_owner || sock->sk->sk_prot != sock->sk->sk_prot_creator ||
 	    tcp_sk(sock->sk)->repair || tcp_sk(sock->sk)->urg_data) {
 		ret = -EBUSY;
@@ -2152,13 +2460,13 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	for (;;) {
 		struct io_opaque_stream_slot *slot;
 
-		i = io_opaque_find_slot(store->stream_used, store->config.max_streams,
-					&store->stream_cursor);
-		if (i >= store->config.max_streams)
+		if (!io_opaque_find_slot(store, store->streams, &store->stream_cursor, &i)) {
+			full = true;
 			break;
-		slot = &store->streams[i];
+		}
+		slot = io_opaque_stream_slot_at(store, i);
 		if (slot->generation == IO_OPAQUE_GENERATION_MAX) {
-			__set_bit(i, store->stream_used);
+			io_opaque_use_slot(store->streams, i);
 			continue;
 		}
 		write_lock_bh(&sock->sk->sk_callback_lock);
@@ -2180,7 +2488,7 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 		WRITE_ONCE(sock->sk->sk_rx_owner, &stream->owner);
 		write_unlock_bh(&sock->sk->sk_callback_lock);
 		slot->stream = stream;
-		__set_bit(i, store->stream_used);
+		io_opaque_use_slot(store->streams, i);
 		store->nr_streams++;
 		refcount_inc(&stream->refs);
 		op->stream = stream;
@@ -2190,6 +2498,11 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 unlock:
 	spin_unlock(&store->tables);
 	release_sock(sock->sk);
+	if (full) {
+		ret = io_opaque_table_grow(store, store->streams, io_opaque_stream_seg);
+		if (!ret)
+			goto retry;
+	}
 	if (!ret)
 		wake_up_interruptible_poll(sk_sleep(sock->sk), EPOLLIN);
 	if (ret)
@@ -2400,13 +2713,14 @@ static int io_opaque_copy(struct io_opaque_data *data, u64 off, u32 length,
 VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_flags)
 {
 	struct io_opaque_store *store = op->store;
-	struct io_opaque_slot *slot = &store->objects[op->slot];
+	struct io_opaque_slot *slot;
 	struct io_opaque_data *data = op->data;
 
 	guard(spinlock)(&store->tables);
+	slot = io_opaque_slot_at(store, op->slot);
 	if (store->dead || READ_ONCE(op->canceled))
 		return -ECANCELED;
-	if (!slot->reserved ||
+	if (!slot || !slot->reserved ||
 	    slot->generation != op->handle >> IO_OPAQUE_INDEX_BITS)
 		return -ESTALE;
 	/* The handle is set before the version is seen, and not changed again. */
@@ -2585,14 +2899,15 @@ static int io_opaque_resolve(struct io_opaque_req *op)
 		return 0;
 	spin_lock(&store->tables);
 	if (io_opaque_stream_op(cmd)) {
-		u32 index = io_opaque_index(op->handle);
+		struct io_opaque_stream_slot *sslot = NULL;
 
-		if (!op->handle || index >= store->config.max_streams ||
-		    store->streams[index].generation != op->handle >> IO_OPAQUE_INDEX_BITS ||
-		    !store->streams[index].stream) {
+		if (op->handle)
+			sslot = io_opaque_stream_slot_at(store, io_opaque_index(op->handle));
+		if (!sslot || sslot->generation != op->handle >> IO_OPAQUE_INDEX_BITS ||
+		    !sslot->stream) {
 			ret = -ESTALE;
 		} else {
-			op->stream = store->streams[index].stream;
+			op->stream = sslot->stream;
 			refcount_inc(&op->stream->refs);
 			op->req->file = get_file(op->stream->file);
 		}
@@ -2921,19 +3236,24 @@ int io_opaque_issue(struct io_kiocb *req, unsigned int issue_flags)
 		}
 		break;
 	case IORING_OPAQUE_STREAM_CLOSE:
-		spin_lock(&store->tables);
-		if (store->streams[io_opaque_index(op->handle)].stream == op->stream) {
-			store->streams[io_opaque_index(op->handle)].stream = NULL;
-			store->nr_streams--;
-			io_opaque_release_slot(store->stream_used, io_opaque_index(op->handle),
-					       op->handle >> IO_OPAQUE_INDEX_BITS);
-			spin_unlock(&store->tables);
-			io_opaque_stream_close(op->stream);
-			io_opaque_stream_put(op->stream);
-			ret = 0;
-		} else {
-			spin_unlock(&store->tables);
-			ret = -ESTALE;
+		{
+			struct io_opaque_stream_slot *sslot;
+
+			spin_lock(&store->tables);
+			sslot = io_opaque_stream_slot_at(store, io_opaque_index(op->handle));
+			if (sslot && sslot->stream == op->stream) {
+				sslot->stream = NULL;
+				store->nr_streams--;
+				io_opaque_release_slot(store->streams, io_opaque_index(op->handle),
+						       op->handle >> IO_OPAQUE_INDEX_BITS);
+				spin_unlock(&store->tables);
+				io_opaque_stream_close(op->stream);
+				io_opaque_stream_put(op->stream);
+				ret = 0;
+			} else {
+				spin_unlock(&store->tables);
+				ret = -ESTALE;
+			}
 		}
 		break;
 	case IORING_OPAQUE_COMPACT:
@@ -3079,10 +3399,12 @@ void io_opaque_cleanup(struct io_kiocb *req)
 			io_opaque_stream_close(op->stream);
 	}
 	if (op->slot_reserved) {
+		struct io_opaque_slot *slot;
+
 		spin_lock(&store->tables);
-		store->objects[op->slot].reserved = false;
-		io_opaque_release_slot(store->object_used, op->slot,
-				       store->objects[op->slot].generation);
+		slot = io_opaque_slot_at(store, op->slot);
+		slot->reserved = false;
+		io_opaque_release_slot(store->objects, op->slot, slot->generation);
 		spin_unlock(&store->tables);
 	}
 	if (unlikely(op->vec))
@@ -3631,16 +3953,25 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
 static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 handle,
 					    u64 off, u32 len)
 {
-	u32 index = io_opaque_index(handle);
+	/* Through a pointer: the segment is below IO_OPAQUE_SEGS by its split, not by a check. */
+	struct io_opaque_seg __rcu **segs = store->objects;
+	struct io_opaque_seg *seg;
 	struct io_opaque_data *data;
 	bool taken = false;
+	u32 slot;
 	int ret = 0;
 
-	if (!handle || index >= store->config.max_objects)
+	if (!handle)
 		return ERR_PTR(-ESTALE);
 	IO_OPAQUE_LOOKUP_BEFORE(store);
 	rcu_read_lock();
-	data = rcu_dereference(store->objects[index].data);
+	seg = rcu_dereference(segs[io_opaque_seg_split(io_opaque_index(handle), &slot)]);
+	/* No such segment: the handle names a slot that no table of this store has had. */
+	if (unlikely(!seg)) {
+		rcu_read_unlock();
+		return ERR_PTR(-ESTALE);
+	}
+	data = rcu_dereference(seg->object[slot].data);
 	IO_OPAQUE_LOOKUP_BETWEEN(store);
 	if (data && data->handle == handle) {
 		ret = io_opaque_send_range(data, off, len);
@@ -3791,7 +4122,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 		u32 skip, n, stored;
 
 		if (last) {
-			struct io_opaque_slot *slot = io_opaque_lookup(store, ent->handle);
+			struct io_opaque_slot *slot = io_opaque_lookup_inline(store, ent->handle);
 
 			data = slot ? io_opaque_slot_data(store, slot) : NULL;
 			if (!data)
@@ -3838,7 +4169,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 	if (!last)
 		return 0;
 	for (i = 0; i < vec->nr; i++) {
-		struct io_opaque_slot *slot = io_opaque_lookup(store, vec->ent[i].handle);
+		struct io_opaque_slot *slot = io_opaque_lookup_inline(store, vec->ent[i].handle);
 
 		if (!io_opaque_slot_data(store, slot))
 			refcount_inc(&vec->pin[i]->refs);
@@ -3885,7 +4216,7 @@ static int io_opaque_send_acquire_one(struct io_opaque_req *op)
 	if (!op->length)
 		return 0;
 	if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
-		struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
+		struct io_opaque_slot *slot = io_opaque_lookup_inline(store, op->handle);
 
 		data = slot ? io_opaque_slot_data(store, slot) : NULL;
 		if (!data)
