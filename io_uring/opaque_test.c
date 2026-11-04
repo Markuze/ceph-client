@@ -1455,9 +1455,10 @@ static void opaque_table_grow(struct kunit *test)
 }
 
 /*
- * Another request that found the table full makes the same segment while this one makes its own,
- * and publishes first: this one finds the table with room, frees its segment, and looks again.
- * There is one segment more, and the handle is the first of it.
+ * Another request that found the table full makes the same segment before this one has the lock
+ * of the growth, and publishes: this one finds the segment there when it has the lock, makes none
+ * of its own, and looks again. There is one segment more, made once, and the handle is the first
+ * of it.
  */
 static struct {
 	bool inside;
@@ -1477,6 +1478,7 @@ static void opaque_grow_rival(struct io_opaque_store *store)
 
 static void opaque_grow_hook_restore(void *arg)
 {
+	WRITE_ONCE(io_opaque_grow_before, NULL);
 	WRITE_ONCE(io_opaque_grow_between, NULL);
 }
 
@@ -1484,24 +1486,28 @@ static void opaque_table_grow_rival(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_req op = { .store = store };
-	long live;
+	long live, made;
 	u32 i;
 
 	for (i = 0; i < io_opaque_seg_slots(0); i++)
 		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
 	memset(&opaque_grow_hook, 0, sizeof(opaque_grow_hook));
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
-	WRITE_ONCE(io_opaque_grow_between, opaque_grow_rival);
+	WRITE_ONCE(io_opaque_grow_before, opaque_grow_rival);
 	live = atomic_long_read(&io_opaque_segs_live);
+	made = atomic_long_read(&io_opaque_segs_made);
 	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
-	WRITE_ONCE(io_opaque_grow_between, NULL);
+	WRITE_ONCE(io_opaque_grow_before, NULL);
 	KUNIT_EXPECT_EQ(test, opaque_grow_hook.calls, 1U);
 	KUNIT_EXPECT_EQ(test, opaque_grow_hook.ret, 0);
 	KUNIT_EXPECT_EQ(test, op.handle, io_opaque_handle(io_opaque_seg_slots(0), 1));
 	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 2 * io_opaque_seg_slots(0) - 1));
 	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 2 * io_opaque_seg_slots(0)));
-	/* The one segment is the rival's: the one this request made was freed. */
+	/* The one segment is the rival's: this request made none, and did not free one. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_made) - made, 1L);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 1L);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->grow));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
 }
 
 /* A table that has no memory for its next segment is full: -ENOMEM, and nothing is taken. */
@@ -17972,6 +17978,107 @@ static void opaque_table_smp_grow_stop(struct kunit *test)
 }
 
 /*
+ * Rings that share a store find a table full together: each has seen the same segment missing,
+ * and each is at the lock of the growth before any has made it. The hook holds every request
+ * where it has seen the table, until all have, which is where a store without the lock would have
+ * each of them make the segment, and publish or free it. One of each table makes its segment, the
+ * others find it made, and every request is told there is room.
+ */
+#define OPAQUE_HERD	4
+
+struct opaque_herd;
+
+struct opaque_herd_task {
+	struct opaque_herd *h;
+	unsigned int id;
+	int ret;
+};
+
+struct opaque_herd {
+	struct io_opaque_store *store;
+	atomic_t ready, go, gathered;
+	struct opaque_herd_task task[OPAQUE_HERD];
+	struct completion done[OPAQUE_HERD];
+};
+
+static struct opaque_herd *opaque_herd_now;
+
+static void opaque_herd_gather(struct io_opaque_store *store)
+{
+	struct opaque_herd *h = READ_ONCE(opaque_herd_now);
+	unsigned long until = jiffies + 10 * HZ;
+
+	atomic_inc(&h->gathered);
+	while (atomic_read(&h->gathered) < OPAQUE_HERD && time_before(jiffies, until))
+		cond_resched();
+}
+
+static int opaque_herd_thread(void *arg)
+{
+	struct opaque_herd_task *t = arg;
+	struct opaque_herd *h = t->h;
+	struct io_opaque_store *store = h->store;
+
+	atomic_inc(&h->ready);
+	while (!atomic_read(&h->go))
+		cond_resched();
+	if (t->id & 1)
+		t->ret = io_opaque_table_grow(store, store->streams, io_opaque_stream_seg);
+	else
+		t->ret = io_opaque_table_grow(store, store->objects, io_opaque_object_seg);
+	complete(&h->done[t->id]);
+	return 0;
+}
+
+static void opaque_table_smp_grow_herd(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_herd *h = kunit_kzalloc(test, sizeof(*h), GFP_KERNEL);
+	struct task_struct *thread[OPAQUE_HERD];
+	const u32 first = io_opaque_seg_slots(0);
+	long live, made;
+	unsigned int n;
+
+	opaque_race_needs_cpus(test);
+	KUNIT_ASSERT_NOT_NULL(test, h);
+	h->store = store;
+	live = atomic_long_read(&io_opaque_segs_live);
+	made = atomic_long_read(&io_opaque_segs_made);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
+	WRITE_ONCE(opaque_herd_now, h);
+	WRITE_ONCE(io_opaque_grow_before, opaque_herd_gather);
+	for (n = 0; n < OPAQUE_HERD; n++) {
+		h->task[n] = (struct opaque_herd_task) { .h = h, .id = n };
+		init_completion(&h->done[n]);
+		thread[n] = kthread_create(opaque_herd_thread, &h->task[n], "opaque_herd%u", n);
+		if (IS_ERR(thread[n])) {
+			while (n--)
+				kthread_stop(thread[n]);
+			KUNIT_FAIL_AND_ABORT(test, "cannot make the tasks of the race");
+		}
+	}
+	for (n = 0; n < OPAQUE_HERD; n++)
+		wake_up_process(thread[n]);
+	while (atomic_read(&h->ready) < OPAQUE_HERD)
+		cond_resched();
+	atomic_set(&h->go, 1);
+	for (n = 0; n < OPAQUE_HERD; n++)
+		wait_for_completion(&h->done[n]);
+	WRITE_ONCE(io_opaque_grow_before, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&h->gathered), OPAQUE_HERD);
+	for (n = 0; n < OPAQUE_HERD; n++)
+		KUNIT_EXPECT_EQ(test, h->task[n].ret, 0);
+	/* Two requests for each table, and one segment made for each. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_made) - made, 2L);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 2L);
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 2 * first - 1));
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 2 * first));
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_stream_slot_at(store, 2 * first - 1));
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, 2 * first));
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&store->grow));
+}
+
+/*
  * Objects are published as fast as they go, in a table that grows under them from one segment to
  * four, while two readers look up the newest object and the one before it as a send does, in RCU,
  * with the jitter of the lookups and of the growths. Every handle that was published is a handle
@@ -18510,6 +18617,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE_SLOW(opaque_pin_smp_vec_free),
 	KUNIT_CASE_SLOW(opaque_pin_smp_vec_compact),
 	KUNIT_CASE_SLOW(opaque_table_smp_grow_stop),
+	KUNIT_CASE(opaque_table_smp_grow_herd),
 	KUNIT_CASE_SLOW(opaque_pin_smp_grow),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),

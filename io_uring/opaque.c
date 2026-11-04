@@ -678,13 +678,32 @@ u64 io_opaque_handle(u32 index, u64 generation)
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
-/* Segments that exist, for a test to see that one which lost a race, or a store, freed its own. */
+/*
+ * Segments that exist, for a test to see that one which lost a race, or a store, freed its own,
+ * and segments that were ever made, for a test to see that only one request made a segment.
+ */
 atomic_long_t io_opaque_segs_live = ATOMIC_LONG_INIT(0);
-#define IO_OPAQUE_SEG_MADE()	atomic_long_inc(&io_opaque_segs_live)
+atomic_long_t io_opaque_segs_made = ATOMIC_LONG_INIT(0);
+#define IO_OPAQUE_SEG_MADE()				\
+	do {						\
+		atomic_long_inc(&io_opaque_segs_live);	\
+		atomic_long_inc(&io_opaque_segs_made);	\
+	} while (0)
 #define IO_OPAQUE_SEG_GONE()	atomic_long_dec(&io_opaque_segs_live)
 /*
+ * Run by io_opaque_table_grow() after it has found the segment that the table lacks and before it
+ * takes the lock of the growth, with no lock held: for a test to do what another request does
+ * meanwhile, and make the segment.
+ */
+void (*io_opaque_grow_before)(struct io_opaque_store *store);
+#define IO_OPAQUE_GROW_BEFORE(store)				\
+	do {							\
+		if (io_opaque_grow_before)			\
+			io_opaque_grow_before(store);		\
+	} while (0)
+/*
  * Run by io_opaque_table_grow() after it has made a segment and before it takes tables to publish
- * it, with no lock held: for a test to do what another request or a stop does in that time.
+ * it, with the lock of the growth held and no other: for a test to do what a stop does in that time.
  */
 void (*io_opaque_grow_between)(struct io_opaque_store *store);
 #define IO_OPAQUE_GROW_BETWEEN(store)				\
@@ -695,6 +714,7 @@ void (*io_opaque_grow_between)(struct io_opaque_store *store);
 #else
 #define IO_OPAQUE_SEG_MADE()		((void)0)
 #define IO_OPAQUE_SEG_GONE()		((void)0)
+#define IO_OPAQUE_GROW_BEFORE(store)	((void)(store))
 #define IO_OPAQUE_GROW_BETWEEN(store)	((void)(store))
 #endif
 
@@ -795,7 +815,10 @@ VISIBLE_IF_KUNIT struct io_opaque_seg *io_opaque_stream_seg(unsigned int seg)
 	return io_opaque_seg_alloc(seg, sizeof(struct io_opaque_stream_slot));
 }
 
-/* The first segment of each table, for a store that nothing else can see yet. */
+/*
+ * The first segment of each table, and the lock of their growth, for a store that nothing else
+ * can see yet.
+ */
 VISIBLE_IF_KUNIT int io_opaque_tables_init(struct io_opaque_store *store)
 {
 	struct io_opaque_seg *objects = io_opaque_object_seg(0);
@@ -808,6 +831,7 @@ VISIBLE_IF_KUNIT int io_opaque_tables_init(struct io_opaque_store *store)
 	}
 	RCU_INIT_POINTER(store->objects[0], objects);
 	RCU_INIT_POINTER(store->streams[0], streams);
+	mutex_init(&store->grow);
 	return 0;
 }
 
@@ -928,49 +952,65 @@ VISIBLE_IF_KUNIT struct io_opaque_data *io_opaque_detach(struct io_opaque_store 
 /*
  * Add the next segment to a table that has no free slot. Called with no lock held, because making
  * a segment sleeps, and takes as long as the segment is large, and nothing may wait for that: a
- * send takes tables. So the table can have changed when tables is taken again to publish it.
- * Another request that found the table full may have added the segment: ours is freed then, and
- * there is room to look in. The store may have stopped: the stop walks the segments that exist
- * once it has set dead, so none is added after, and the request is told (-ESHUTDOWN). No lookup
- * waits for the segment: it is published with one pointer, and the slots of the others do not move.
- * Returns 0 when there is room to look again, or why there is none; a table that has all the
- * segments there are, or no memory for the next, is -ENOMEM.
+ * send takes tables. One request makes a segment at a time, for the store, under its own lock
+ * (grow): rings that share a store do not share a ring lock, and without it each that found the
+ * table full would make the same segment. The one that comes second finds, once it has the lock,
+ * that the segment it saw missing is there, makes nothing and says there is room to look in.
+ * The store may stop meanwhile: the stop walks the segments that exist once it has set dead, so
+ * none is added after, and the request is told (-ESHUTDOWN). No lookup waits for the segment: it
+ * is published with one pointer, and the slots of the others do not move. Returns 0 when there is
+ * room to look again, or why there is none; a table that has all the segments there are, or no
+ * memory for the next, is -ENOMEM.
  */
 VISIBLE_IF_KUNIT int io_opaque_table_grow(struct io_opaque_store *store,
 					  struct io_opaque_seg __rcu **segs,
 					  struct io_opaque_seg *(*new)(unsigned int seg))
 {
-	struct io_opaque_seg *seg;
+	struct io_opaque_seg *seg = NULL;
 	struct mem_cgroup *old;
 	unsigned int s;
 	int ret = 0;
 
 	might_sleep();
-	spin_lock(&store->tables);
+	if (READ_ONCE(store->dead))
+		return -ESHUTDOWN;
+	/* The first segment that is missing; they are added in order, and never taken away. */
 	for (s = 0; s < IO_OPAQUE_SEGS; s++)
-		if (!rcu_dereference_protected(segs[s], lockdep_is_held(&store->tables)))
+		if (!rcu_access_pointer(segs[s]))
 			break;
-	if (store->dead)
-		ret = -ESHUTDOWN;
-	else if (s == IO_OPAQUE_SEGS)
-		ret = -ENOMEM;
-	spin_unlock(&store->tables);
-	if (ret)
-		return ret;
-	old = set_active_memcg(store->memcg);
-	seg = new(s);
-	set_active_memcg(old);
-	if (!seg)
+	if (s == IO_OPAQUE_SEGS)
 		return -ENOMEM;
-	IO_OPAQUE_GROW_BETWEEN(store);
-	spin_lock(&store->tables);
-	if (store->dead) {
+	IO_OPAQUE_GROW_BEFORE(store);
+	mutex_lock(&store->grow);
+	if (READ_ONCE(store->dead)) {
 		ret = -ESHUTDOWN;
-	} else if (!rcu_dereference_protected(segs[s], lockdep_is_held(&store->tables))) {
-		rcu_assign_pointer(segs[s], seg);
-		seg = NULL;
+	} else if (!rcu_dereference_protected(segs[s], lockdep_is_held(&store->grow))) {
+		old = set_active_memcg(store->memcg);
+		seg = new(s);
+		set_active_memcg(old);
+		if (!seg) {
+			ret = -ENOMEM;
+		} else {
+			IO_OPAQUE_GROW_BETWEEN(store);
+			spin_lock(&store->tables);
+			if (store->dead) {
+				ret = -ESHUTDOWN;
+			} else {
+				/*
+				 * Release: the contents of the segment are in place before the
+				 * pointer is, for a lookup that takes no lock (io_opaque_pin()).
+				 * The lock does not do that: the contents were stored before it
+				 * was taken, and taking a lock does not order them with the
+				 * stores that follow. x86 does, so it is a weaker architecture
+				 * that would show the difference (arm64).
+				 */
+				rcu_assign_pointer(segs[s], seg);
+				seg = NULL;
+			}
+			spin_unlock(&store->tables);
+		}
 	}
-	spin_unlock(&store->tables);
+	mutex_unlock(&store->grow);
 	io_opaque_seg_free(seg);
 	return ret;
 }

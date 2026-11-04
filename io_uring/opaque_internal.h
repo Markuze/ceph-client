@@ -618,6 +618,14 @@ struct io_opaque_store {
 	 */
 	struct io_opaque_seg __rcu *objects[IO_OPAQUE_SEGS] ____cacheline_aligned_in_smp;
 	struct io_opaque_seg __rcu *streams[IO_OPAQUE_SEGS];
+	/*
+	 * Held by a request that adds a segment to either table, from the check that the table
+	 * still lacks it to its publication, with no other lock of the store: making a segment
+	 * sleeps. Rings that share a store do not share a ring lock, and without this each that
+	 * found a table full would make the same segment, and all but one would free theirs.
+	 * Nothing but the growth takes it, and a send never waits for it.
+	 */
+	struct mutex grow;
 };
 
 /* The index in the table that a handle carries. */
@@ -852,6 +860,8 @@ extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 extern atomic_long_t io_opaque_pin_slow;
 extern atomic_long_t io_opaque_segs_live;
+extern atomic_long_t io_opaque_segs_made;
+extern void (*io_opaque_grow_before)(struct io_opaque_store *store);
 extern void (*io_opaque_grow_between)(struct io_opaque_store *store);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
