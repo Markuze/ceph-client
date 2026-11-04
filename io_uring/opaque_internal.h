@@ -136,7 +136,8 @@ struct io_opaque_chunk {
  * Chunks are allocated in blocks, so that a stream that keeps a page per
  * fragment allocates once per IO_OPAQUE_BLOCK_CHUNKS pages and not once per
  * page. @live counts what keeps the block: a chunk until its backing is
- * released, and in the current block of a stream the chunks that are still to
+ * released (a chunk that holds only the extent of a second range of a page, until
+ * its extent is), and in the current block of a stream the chunks that are still to
  * be handed out and the hold of the stream. The last to let go frees the block.
  * A chunk of CREATE or compaction is a block of its own.
  *
