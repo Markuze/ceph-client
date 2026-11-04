@@ -421,19 +421,21 @@ struct io_opaque_ubuf_pool {
  * What a managed send hands to link_skb() through msg_ubuf: the ops, which
  * skb_zerocopy_iter_stream() finds link_skb() through, and what the send's store
  * gives the ubufs of the skbs that link_skb() makes: its pool and its flags. It
- * lives on the stack of io_opaque_send() for one tcp_sendmsg_locked(). No skb is
- * ever linked to it, and its own ubuf_info has no flags.
+ * lives on the stack of io_opaque_send() for one tcp_sendmsg_locked().
+ *
+ * The flags are those of uarg: what the store adds to the flags of every ubuf
+ * (io_opaque_ubuf_flags()), which is SKBFL_SHARED_FRAG if it binds a MAIO instance or
+ * holds a page of one, else none. They are not in a field of their own, which would
+ * make the struct larger, and the frame of io_opaque_send() with it. They reach no
+ * shinfo from here: no skb is ever linked to this ubuf_info, because link_skb() gives
+ * each skb a ubuf of its own, and skb_zcopy_set() then finds one there and does not
+ * call skb_zcopy_init(). link_skb() reads them and puts them in the flags of the ubufs
+ * it makes. They are not the pool's, because a store may have no pool.
  */
 struct io_opaque_msg_ubuf {
 	struct ubuf_info uarg;
 	/* The pool of the send's store, for the ubufs of its skbs; or none. */
 	struct io_opaque_ubuf_pool *pool;
-	/*
-	 * What the store adds to the flags of every ubuf (io_opaque_ubuf_flags()):
-	 * SKBFL_SHARED_FRAG if it binds a MAIO instance or holds a page of one, else none.
-	 * It is not the pool's, because a store may have no pool.
-	 */
-	u8 flags;
 };
 
 /* Evaluation tunables; module parameters, not ABI. */
@@ -490,7 +492,9 @@ struct io_opaque_store {
 	 * queue that an instance owns. The process that maps the area can write that page,
 	 * as it can write the pages of a bound store, so the managed sends of this store
 	 * are marked as theirs are (io_opaque_send_ubuf_flags()). The mark is the store's,
-	 * not the object's, as the binding is. Set by the capture, read by the sends.
+	 * not the object's, as the binding is. Set by the capture, with send_ubuf_flags,
+	 * which the sends read and the capture asks. This is the record that the tests
+	 * hold send_ubuf_flags to.
 	 */
 	bool maio_pages;
 	atomic64_t bytes;
@@ -534,6 +538,16 @@ struct io_opaque_store {
 	unsigned long token_time;
 	unsigned long auto_at;
 	int dead;
+	/*
+	 * What the managed sends add to the flags of every ubuf (io_opaque_ubuf_flags()):
+	 * SKBFL_SHARED_FRAG if the store binds a MAIO instance or holds a page of one
+	 * (maio || maio_pages), else none, as the one byte that a send reads
+	 * (io_opaque_send_ubuf_flags()). Set when the store is made, if it binds an
+	 * instance, and by the capture that first keeps an area page
+	 * (io_opaque_note_area_page()); never cleared. It is in the padding after dead,
+	 * which a send reads on entry: no field moved for it, and no line is read for it.
+	 */
+	u8 send_ubuf_flags;
 	struct io_opaque_unit_cache cache;
 };
 

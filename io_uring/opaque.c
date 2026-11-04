@@ -828,6 +828,9 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	store->config = cfg;
 	io_opaque_unit_cache_setup(store);
 	store->maio = maio;
+	/* The binding never changes, nor does the mark it gives the sends of the store. */
+	if (maio)
+		store->send_ubuf_flags = SKBFL_SHARED_FRAG;
 	store->objects = kvcalloc(cfg.max_objects, sizeof(*store->objects),
 				  GFP_KERNEL_ACCOUNT);
 	store->streams = kvcalloc(cfg.max_streams, sizeof(*store->streams),
@@ -1444,6 +1447,11 @@ static bool io_opaque_pp_page(const struct sk_buff *skb, struct page *page)
  * (io_opaque_send_ubuf_flags()). Set once: the mark is the store's, not the object's,
  * and a store does not go back.
  *
+ * The look asks send_ubuf_flags, which the sends read, and not maio_pages, and sets both.
+ * A capture that finds the store marked goes on to publish an object that the sends of
+ * the store will send, and it has found there what they will read, with no order between
+ * two flags to give it.
+ *
  * The caller's skb holds a pool reference to @page. That keeps its pool, and with it
  * the instance and its area, for the look. A page that an unmarked skb holds by a
  * plain reference is not looked at, because the pool can let go of it at any time.
@@ -1452,8 +1460,10 @@ static void io_opaque_note_area_page(struct io_opaque_store *store, struct page 
 {
 	/* The key is off until a pool binds a provider, so a host that has none pays a branch. */
 	if (IS_ENABLED(CONFIG_PAGE_POOL) && static_branch_unlikely(&page_pool_mem_providers) &&
-	    !READ_ONCE(store->maio_pages) && io_zcrx_maio_pool_area_page(page))
+	    !READ_ONCE(store->send_ubuf_flags) && io_zcrx_maio_pool_area_page(page)) {
+		WRITE_ONCE(store->send_ubuf_flags, SKBFL_SHARED_FRAG);
 		WRITE_ONCE(store->maio_pages, true);
+	}
 }
 
 /*
@@ -4500,16 +4510,19 @@ VISIBLE_IF_KUNIT u8 io_opaque_ubuf_flags(void)
 }
 
 /*
- * What a store adds to those flags for the ubufs of its sends. The binding is set
- * when the store is made and never changes. The flag of a store without an instance
- * goes from off to on, once, when the capture keeps a page of an area, and never
- * back. A ubuf that the store's pool kept is made whole again by link_skb() with
- * the flags of the send that has it now, so the ubufs of a send all have the same,
- * whether they are new or were kept, and whenever they were made.
+ * What a store adds to those flags for the ubufs of its sends: one byte of the store
+ * (send_ubuf_flags), so that a send tests neither the binding nor the flag of the
+ * capture. The binding is set when the store is made and never changes, and the byte of
+ * a bound store with it. The byte of a store without an instance goes from off to on,
+ * once, when the capture keeps a page of an area, and never back: a send that races it
+ * sees either, as it saw either value of the flag. A ubuf that the store's pool kept is
+ * made whole again by link_skb() with the flags of the send that has it now, so the
+ * ubufs of a send all have the same, whether they are new or were kept, and whenever
+ * they were made.
  */
 VISIBLE_IF_KUNIT u8 io_opaque_send_ubuf_flags(const struct io_opaque_store *store)
 {
-	return store->maio || READ_ONCE(store->maio_pages) ? SKBFL_SHARED_FRAG : 0;
+	return READ_ONCE(store->send_ubuf_flags);
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
@@ -4767,9 +4780,9 @@ static void io_opaque_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
  *
  * The ubuf is one that the send's store has kept (io_opaque_ubuf_pool_get()) if
  * the msg_ubuf names the pool and has one, else the cache's. Its flags are set here
- * whichever way it was got: those of every ubuf, and what the msg_ubuf adds, which
- * is SKBFL_SHARED_FRAG for a store that binds an instance or holds a page of one. A
- * skb of ours is joined only by a send that adds the same, so that the fragments of
+ * whichever way it was got: those of every ubuf, and what the flags of the msg_ubuf
+ * add, which is SKBFL_SHARED_FRAG for a store that binds an instance or holds a page of
+ * one. A skb of ours is joined only by a send that adds the same, so that the fragments of
  * such a store are never in a skb that is not marked, nor those of another store in
  * one that is: when a bound store and another store send on one socket, the skb is
  * a boundary, as another provider's is. So it is for a store whose flag turned on
@@ -4790,7 +4803,7 @@ VISIBLE_IF_KUNIT int io_opaque_link_skb(struct sk_buff *skb, struct ubuf_info *u
 			container_of(uarg, struct io_opaque_msg_ubuf, uarg);
 
 		pool = mub->pool;
-		flags = mub->flags;
+		flags = uarg->flags;
 	}
 	if (cur) {
 		if (cur->ops != &io_opaque_ubuf_ops ||
@@ -5307,10 +5320,14 @@ again:
 		msg.msg_iter = op->iter;
 		splice = io_opaque_send_splices(op);
 		if (splice && owned && io_opaque_sends_managed(sk)) {
-			/* The ubuf_info is whole: its ops, no count and no flags. */
-			mub.uarg = (struct ubuf_info) { .ops = &io_opaque_msg_ubuf_ops };
-			mub.pool = READ_ONCE(op->store->ubuf_pool);
-			mub.flags = io_opaque_send_ubuf_flags(op->store);
+			const struct io_opaque_store *store = op->store;
+
+			/* The ubuf_info is whole: its ops, no count, and the store's flags. */
+			mub.uarg = (struct ubuf_info) {
+				.ops = &io_opaque_msg_ubuf_ops,
+				.flags = io_opaque_send_ubuf_flags(store),
+			};
+			mub.pool = READ_ONCE(store->ubuf_pool);
 			msg.msg_flags |= MSG_ZEROCOPY;
 			msg.msg_ubuf = &mub.uarg;
 			msg.sg_from_iter = io_opaque_sg_from_iter;
