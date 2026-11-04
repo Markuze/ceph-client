@@ -14877,6 +14877,29 @@ static void opaque_register_grown_free(struct kunit *test)
 }
 
 /*
+ * A registration that has no memory for the first segments is refused with -ENOMEM, having made
+ * the whole store by then: it frees what it made, through the free of a store, which has to find
+ * a store with no tables, and the registration after it is as good as any.
+ */
+static void opaque_register_nomem(struct kunit *test)
+{
+	const struct io_uring_opaque_config cfg = { .hard_limit = SZ_1M, .max_object_size = SZ_64K };
+	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	long live = atomic_long_read(&io_opaque_segs_live);
+	struct io_opaque_store *store;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	kunit_activate_static_stub(test, io_opaque_seg_alloc, opaque_seg_alloc_fail);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -ENOMEM);
+	kunit_deactivate_static_stub(test, io_opaque_seg_alloc);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+	store = io_opaque_alloc(ctx, &cfg);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+	io_opaque_free(store);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+}
+
+/*
  * The ubuf of a pool completes where the last skb is freed, and that is often a softirq: the ACK
  * that frees a sent skb, a consumer that copies. It is put on the list there and taken by the
  * next skb in the task, with only atomics in between.
@@ -18750,6 +18773,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_ubuf_pool_store),
 	KUNIT_CASE(opaque_register_unbounded),
 	KUNIT_CASE(opaque_register_grown_free),
+	KUNIT_CASE(opaque_register_nomem),
 	KUNIT_CASE(opaque_ubuf_pool_atomic),
 	KUNIT_CASE(opaque_send_managed_pool),
 	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_stress),

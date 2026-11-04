@@ -1071,6 +1071,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	struct io_uring_opaque_config cfg = *config;
 	struct io_zcrx_ifq *maio = NULL;
 	struct io_opaque_store *store;
+	struct mem_cgroup *old;
 	int ret;
 
 	if ((cfg.flags & ~IORING_OPAQUE_CFG_MAIO) || cfg.__resv1 ||
@@ -1124,10 +1125,6 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	/* The binding never changes, nor does the mark it gives the sends of the store. */
 	if (maio)
 		store->send_ubuf_flags = SKBFL_SHARED_FRAG;
-	/* The first segment of each table; the tables grow from there as the store fills. */
-	ret = io_opaque_tables_init(store);
-	if (ret)
-		goto free_store;
 	/* Cached destination units sit outside the hard limit but not RLIMIT_MEMLOCK. */
 	ret = io_account_mem(ctx->user, ctx->mm_account,
 			     (cfg.hard_limit >> PAGE_SHIFT) + io_opaque_cache_pages(store));
@@ -1140,8 +1137,7 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	store->memcg = get_mem_cgroup_from_mm(store->mm);
 #ifdef CONFIG_MEMCG
 	if (store->memcg && !mem_cgroup_is_root(store->memcg)) {
-		struct mem_cgroup *old = set_active_memcg(store->memcg);
-
+		old = set_active_memcg(store->memcg);
 		store->objcg = get_obj_cgroup_from_current();
 		set_active_memcg(old);
 	}
@@ -1160,9 +1156,20 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	INIT_DELAYED_WORK(&store->compact_work, io_opaque_compact_work);
 	/* Not having one is fine: the ubufs of a store without a pool come from the cache alone. */
 	store->ubuf_pool = io_opaque_ubuf_pool_new();
+	/*
+	 * The first segment of each table, charged to the cgroup of the store as the segments that
+	 * follow are, and not to the task that registers it. The tables grow from there as the store
+	 * fills. It is the last to be made, so that the store, whole, is what a failure frees.
+	 */
+	old = set_active_memcg(store->memcg);
+	ret = io_opaque_tables_init(store);
+	set_active_memcg(old);
+	if (ret) {
+		io_opaque_free(store);
+		return ERR_PTR(ret);
+	}
 	return store;
 free_store:
-	io_opaque_tables_free(store);
 	kfree(store);
 put_maio:
 	if (maio)
