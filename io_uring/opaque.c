@@ -1270,6 +1270,16 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	      cfg.high_watermark > cfg.hard_limit - cfg.compact_headroom - cfg.reply_reserve)))
 		return ERR_PTR(-EINVAL);
 	/*
+	 * The least that capture takes is a page and the block that records it (io_opaque_need()),
+	 * and the capture limit is what is left of the hard limit when the headroom and the
+	 * reserve are taken out. A store with less could never capture: its collector would wait
+	 * for room that cannot be there, and nothing would tell it so. This is a structural
+	 * minimum, not a limit on how much a store can hold.
+	 */
+	if (cfg.hard_limit - cfg.compact_headroom - cfg.reply_reserve <
+	    PAGE_SIZE + io_opaque_block_bytes)
+		return ERR_PTR(-EINVAL);
+	/*
 	 * The caller holds the lock of the ring, which io_zcrx_maio_get()
 	 * needs. The store keeps the reference to the instance until
 	 * io_opaque_free(), and so it outlives every page of the store.

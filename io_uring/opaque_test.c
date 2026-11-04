@@ -15567,6 +15567,53 @@ static void opaque_register_unbounded(struct kunit *test)
 }
 
 /*
+ * The smallest store is one whose capture limit holds a page and the block that records it: with
+ * less, a collector would wait for room that could never be there. The capture limit is the hard
+ * limit less the headroom and the reply reserve, and each of them takes from it.
+ */
+static void opaque_register_smallest(struct kunit *test)
+{
+	const u64 least = ALIGN(PAGE_SIZE + io_opaque_block_bytes, PAGE_SIZE);
+	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct io_uring_opaque_config cfg = { .max_object_size = SZ_64K };
+	/* The hard limit is two pages more than the least, and these are taken from it. */
+	static const struct {
+		u64 headroom, reserve;
+		int err;
+	} cases[] = {
+		{ 0, 0, 0 }, { PAGE_SIZE, 0, 0 }, { 0, PAGE_SIZE, 0 }, { PAGE_SIZE, PAGE_SIZE, 0 },
+		{ 2 * PAGE_SIZE, 0, 0 }, { 0, 2 * PAGE_SIZE, 0 },
+		{ 3 * PAGE_SIZE, 0, -EINVAL }, { 0, 3 * PAGE_SIZE, -EINVAL },
+		{ PAGE_SIZE, 2 * PAGE_SIZE, -EINVAL }, { 2 * PAGE_SIZE, PAGE_SIZE, -EINVAL },
+	};
+	struct io_opaque_store *store;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	/* A page less than the least is refused, and the least itself is a store. */
+	cfg.hard_limit = least - PAGE_SIZE;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -EINVAL);
+	cfg.hard_limit = least;
+	store = io_opaque_alloc(ctx, &cfg);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+	io_opaque_free(store);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		cfg.hard_limit = least + 2 * PAGE_SIZE;
+		cfg.compact_headroom = cases[i].headroom;
+		cfg.reply_reserve = cases[i].reserve;
+		store = io_opaque_alloc(ctx, &cfg);
+		if (cases[i].err) {
+			KUNIT_EXPECT_EQ(test, PTR_ERR(store), cases[i].err);
+			continue;
+		}
+		KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+		KUNIT_EXPECT_GE(test, io_opaque_rx_limit(store),
+				(u64)PAGE_SIZE + io_opaque_block_bytes);
+		io_opaque_free(store);
+	}
+}
+
+/*
  * A store that grew is freed whole: the segments of both tables, however many there are, and the
  * count of those that exist is what it was before the store.
  */
@@ -19506,6 +19553,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_ubuf_pool_teardown),
 	KUNIT_CASE(opaque_ubuf_pool_store),
 	KUNIT_CASE(opaque_register_unbounded),
+	KUNIT_CASE(opaque_register_smallest),
 	KUNIT_CASE(opaque_register_grown_free),
 	KUNIT_CASE(opaque_register_nomem),
 	KUNIT_CASE(opaque_ubuf_pool_atomic),
