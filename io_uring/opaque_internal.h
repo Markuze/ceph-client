@@ -519,6 +519,16 @@ struct io_opaque_store {
 	 * that finds no version to take.
 	 */
 	spinlock_t tables;
+	/*
+	 * Where the pointers of the two tables and of their bitmaps were, before the tables grew in
+	 * segments. Nothing reads or writes this. Its place is kept so that every field after it is
+	 * where it was when the send path was measured (a70f5b29d), on the line it was on and beside
+	 * the same fields: without it they are 32 bytes earlier, and the queue's tree, the locks of
+	 * the queues and of the waiters and the flags that every send reads share lines with what
+	 * is written under other locks, as they did not. The pointers of the segments are at the
+	 * end, on lines that only a growth writes.
+	 */
+	unsigned long __hole[4];
 	u32 object_cursor;
 	u32 stream_cursor;
 	u32 nr_objects;
