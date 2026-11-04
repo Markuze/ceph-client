@@ -646,13 +646,18 @@ void (*io_opaque_policy_between)(struct io_opaque_store *store);
  * the candidates by itself, or does not, and one freed leaves them; the walk
  * adds a slot only if it is not on the list. A second change that starts
  * meanwhile walks the whole table itself, so the first gives up when it comes
- * back and finds it was overtaken, as it does if the store has stopped.
+ * back and finds it was overtaken, as it does if the store has stopped. The
+ * table may grow between chunks too: the walk goes on into the segments that
+ * have been added, whose objects are in the same case.
  */
 VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 					    const struct io_uring_opaque_policy *policy)
 {
 	bool automatic = policy->flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
-	u32 i, seq;
+	struct io_opaque_slot *slot;
+	unsigned int walked = 0;
+	u64 i;
+	u32 seq;
 
 	spin_lock(&store->tables);
 	if (store->dead) {
@@ -664,8 +669,7 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 	store->token_time = jiffies;
 	store->auto_at = jiffies;
 	seq = ++store->policy_seq;
-	for (i = 0; i < store->config.max_objects; i++) {
-		struct io_opaque_slot *slot = &store->objects[i];
+	for (i = 0; (slot = io_opaque_slot_at(store, i)); i++) {
 		struct io_opaque_data *data = io_opaque_slot_data(store, slot);
 
 		if (automatic && data && !data->dense && !data->forward_only &&
@@ -675,8 +679,9 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 		} else if (!automatic) {
 			list_del_init(&slot->candidate);
 		}
-		if ((i + 1) % IO_OPAQUE_POLICY_CHUNK_SLOTS || i + 1 == store->config.max_objects)
+		if (++walked < IO_OPAQUE_POLICY_CHUNK_SLOTS || !io_opaque_slot_at(store, i + 1))
 			continue;
+		walked = 0;
 		spin_unlock(&store->tables);
 		IO_OPAQUE_POLICY_BETWEEN(store);
 		cond_resched();
@@ -779,7 +784,7 @@ static void io_opaque_auto_compact(struct io_opaque_store *store)
 		store->tokens -= data->length;
 		op.data = data;
 		refcount_inc(&data->refs);
-		op.handle = io_opaque_handle(slot - store->objects, slot->generation);
+		op.handle = io_opaque_handle(slot->index, slot->generation);
 		break;
 	}
 unlock:

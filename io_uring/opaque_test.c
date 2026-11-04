@@ -49,69 +49,94 @@ static void opaque_test_txs_free(void *store)
 /* Slot @i of the objects, in a test that is alone with the table. */
 static struct io_opaque_slot *opaque_test_slot(struct io_opaque_store *store, u32 i)
 {
-	return &store->objects[i];
+	return io_opaque_slot_at(store, i);
 }
 
 /* Where slot @slot is in the table of objects. */
 static u32 opaque_test_slot_index(struct io_opaque_store *store, const struct io_opaque_slot *slot)
 {
-	return slot - store->objects;
+	return slot->index;
 }
 
 /* Slot @i of the streams, in a test that is alone with the table. */
 static struct io_opaque_stream_slot *opaque_test_stream_slot(struct io_opaque_store *store, u32 i)
 {
-	return &store->streams[i];
+	return io_opaque_stream_slot_at(store, i);
 }
 
 /* Whether the table counts slot @i of the objects as taken: reserved, holding one, or retired. */
 static bool opaque_test_used(struct io_opaque_store *store, u32 i)
 {
-	return test_bit(i, store->object_used);
+	struct io_opaque_seg *seg;
+	u32 off;
+
+	seg = rcu_dereference_raw(store->objects[io_opaque_seg_split(i, &off)]);
+	return test_bit(off, seg->used);
 }
 
 /* Count slot @i of the objects as taken, as a reservation does. */
 static void opaque_test_use(struct io_opaque_store *store, u32 i)
 {
-	__set_bit(i, store->object_used);
+	io_opaque_use_slot(store->objects, i);
 }
 
 /* Give slot @i of the objects back as FREE does: a slot on its last generation is retired. */
 static void opaque_test_release(struct io_opaque_store *store, u32 i)
 {
-	io_opaque_release_slot(store->object_used, i, opaque_test_slot(store, i)->generation);
+	io_opaque_release_slot(store->objects, i, opaque_test_slot(store, i)->generation);
 }
 
-/* Tables of @nr object slots, for a test that needs more than the fixture's or fewer. */
+/*
+ * Leave the first @nr slots of a table free and take the rest, for a case that needs a table of a
+ * given size: to take over the one slot there is, or to fill it. The table grows first if it has
+ * fewer. The others are taken as a retired slot is, which a reservation passes by. For a table
+ * that nothing has used yet, and then it may be done again with another size.
+ */
+static void opaque_test_fit(struct kunit *test, struct io_opaque_store *store,
+			    struct io_opaque_seg __rcu **segs,
+			    struct io_opaque_seg *(*new)(unsigned int), u32 nr)
+{
+	unsigned int s, last;
+	u32 off;
+
+	last = io_opaque_seg_split(nr - 1, &off);
+	for (s = 0; s <= last; s++)
+		if (!rcu_dereference_raw(segs[s]))
+			KUNIT_ASSERT_EQ(test, io_opaque_table_grow(store, segs, new), 0);
+	for (s = 0; s < IO_OPAQUE_SEGS && rcu_dereference_raw(segs[s]); s++) {
+		u32 first = io_opaque_seg_first(s), slots = io_opaque_seg_slots(s);
+
+		for (off = 0; off < slots; off++) {
+			if (first + off < nr)
+				io_opaque_release_slot(segs, first + off, 0);
+			else
+				io_opaque_use_slot(segs, first + off);
+		}
+	}
+}
+
+/* A table of @nr object slots. */
 static void opaque_test_slots(struct kunit *test, struct io_opaque_store *store, u32 nr)
 {
-	u32 i;
-
-	store->config.max_objects = nr;
-	store->objects = kunit_kcalloc(test, nr, sizeof(*store->objects), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, store->objects);
-	store->object_used = kunit_kzalloc(test, BITS_TO_LONGS(nr) * sizeof(unsigned long),
-					   GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, store->object_used);
-	for (i = 0; i < nr; i++)
-		INIT_LIST_HEAD(&store->objects[i].candidate);
+	opaque_test_fit(test, store, store->objects, io_opaque_object_seg, nr);
 }
 
-/* Tables of @nr stream slots. */
+/* A table of @nr stream slots. */
 static void opaque_test_streams(struct kunit *test, struct io_opaque_store *store, u32 nr)
 {
-	store->config.max_streams = nr;
-	store->streams = kunit_kcalloc(test, nr, sizeof(*store->streams), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, store->streams);
-	store->stream_used = kunit_kzalloc(test, BITS_TO_LONGS(nr) * sizeof(unsigned long),
-					   GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, store->stream_used);
+	opaque_test_fit(test, store, store->streams, io_opaque_stream_seg, nr);
 }
 
-/* The tables a fixture starts with: four object slots. */
+static void opaque_test_tables_free(void *store)
+{
+	io_opaque_tables_free(store);
+}
+
+/* The tables a fixture starts with: the first segment of each, as a store is made with them. */
 static void opaque_test_tables(struct kunit *test, struct io_opaque_store *store)
 {
-	opaque_test_slots(test, store, 4);
+	KUNIT_ASSERT_EQ(test, io_opaque_tables_init(store), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_tables_free, store), 0);
 }
 
 static struct io_opaque_store *opaque_test_store(struct kunit *test)
@@ -1101,40 +1126,100 @@ static void opaque_generation_retirement(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_test_slot(store, 0)->generation, IO_OPAQUE_GENERATION_MAX);
 }
 
+/*
+ * The slots of a table are taken in turn, and one that is freed is taken again when the rotation
+ * comes round to it, not before. When none is free the table grows by a segment, and the next
+ * handle is the first of it: a lookup in RCU, which reads the segment's pointer from the store,
+ * finds it like any other.
+ */
 static void opaque_slot_rotation(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
-	struct io_opaque_req op = { .store = store };
+	struct io_opaque_data *data = opaque_sparse_data(test, store);
+	struct io_opaque_req op = { .store = store, .data = data, .length = data->length };
+	struct io_opaque_req send = { .store = store, .offset = 100, .length = 1000 };
+	const u32 seg = 1U << IO_OPAQUE_SEG_BITS;
+	u64 flags = 0;
 	u32 i;
 
-	for (i = 0; i < store->config.max_objects; i++) {
+	for (i = 0; i < seg; i++) {
 		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
 		KUNIT_EXPECT_EQ(test, op.slot, i);
 	}
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_slot_at(store, seg), NULL);
+	/* The 1,025th: the table makes the second segment for it. */
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, seg);
+	KUNIT_EXPECT_EQ(test, op.handle, io_opaque_handle(seg, 1));
+	KUNIT_ASSERT_NOT_NULL(test, io_opaque_slot_at(store, seg));
+	KUNIT_EXPECT_PTR_NE(test, io_opaque_slot_at(store, seg), io_opaque_slot_at(store, seg - 1));
+	KUNIT_EXPECT_EQ(test, io_opaque_slot_at(store, seg)->index, seg);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_slot_at(store, 2 * seg), NULL);
+	KUNIT_ASSERT_EQ(test, io_opaque_publish(&op, &flags), (int)data->length);
+	send.handle = op.handle;
+	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), 0);
+	KUNIT_EXPECT_PTR_EQ(test, send.data, data);
+	io_opaque_data_put(store, send.data);
+	/* The rest of the second segment, in order. */
+	op.data = NULL;
+	for (i = seg + 1; i < 2 * seg; i++) {
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+		KUNIT_EXPECT_EQ(test, op.slot, i);
+	}
+	/* All taken, and a slot freed behind the cursor is taken again by the rotation. */
 	store->object_cursor = 2;
-	KUNIT_EXPECT_EQ(test, io_opaque_slot_reserve(&op), -ENOSPC);
 	opaque_test_slot(store, 1)->reserved = false;
 	opaque_test_release(store, 1);
 	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
 	KUNIT_EXPECT_EQ(test, op.slot, 1U);
 	KUNIT_EXPECT_EQ(test, opaque_test_slot(store, 1)->generation, 2ULL);
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_slot_at(store, 2 * seg), NULL);
+	/* Full again: the third segment, twice as long. */
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, 2 * seg);
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 4 * seg - 1));
+	KUNIT_EXPECT_PTR_EQ(test, io_opaque_slot_at(store, 4 * seg), NULL);
+	opaque_test_free(store, seg);
 }
 
+/*
+ * A handle is a generation above 32 bits of index, and a slot is retired on the last generation
+ * that 32 bits hold: a lookup tells apart the last two, and the first handle of a store is not zero.
+ */
 static void opaque_generation_width(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 	struct io_opaque_req op = { .store = store };
 	struct io_opaque_slot *found, *stale;
 
-	opaque_test_slot(store, 0)->generation = U32_MAX;
+	KUNIT_EXPECT_NE(test, io_opaque_handle(0, 1), 0ULL);
+	KUNIT_EXPECT_EQ(test, io_opaque_handle(0, 1), 1ULL << IO_OPAQUE_INDEX_BITS);
+	KUNIT_EXPECT_EQ(test, IO_OPAQUE_GENERATION_MAX, (u64)U32_MAX);
+	KUNIT_EXPECT_EQ(test, io_opaque_handle(U32_MAX, IO_OPAQUE_GENERATION_MAX), U64_MAX);
 	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
-	KUNIT_EXPECT_EQ(test, opaque_test_slot(store, 0)->generation, (u64)U32_MAX + 1);
+	KUNIT_EXPECT_EQ(test, op.handle, 1ULL << IO_OPAQUE_INDEX_BITS);
+	opaque_test_slot(store, 0)->reserved = false;
+	opaque_test_release(store, 0);
+
+	opaque_test_slot(store, 0)->generation = U32_MAX - 1;
+	store->object_cursor = 0;
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, 0U);
+	KUNIT_EXPECT_EQ(test, opaque_test_slot(store, 0)->generation, (u64)U32_MAX);
+	KUNIT_EXPECT_EQ(test, op.handle, (u64)U32_MAX << IO_OPAQUE_INDEX_BITS);
 	spin_lock(&store->tables);
 	found = io_opaque_lookup(store, op.handle);
-	stale = io_opaque_lookup(store, io_opaque_handle(0, U32_MAX));
+	stale = io_opaque_lookup(store, io_opaque_handle(0, U32_MAX - 1));
 	spin_unlock(&store->tables);
 	KUNIT_EXPECT_PTR_EQ(test, found, opaque_test_slot(store, 0));
 	KUNIT_EXPECT_PTR_EQ(test, stale, NULL);
+	/* The last generation: released, the slot stays taken, and a reservation passes it by. */
+	opaque_test_slot(store, 0)->reserved = false;
+	opaque_test_release(store, 0);
+	KUNIT_EXPECT_TRUE(test, opaque_test_used(store, 0));
+	store->object_cursor = 0;
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, 1U);
 }
 
 static void opaque_send_last_ownership(struct kunit *test)
@@ -8592,7 +8677,8 @@ static void opaque_policy_chunks(struct kunit *test)
 	io_opaque_policy_between = opaque_policy_between;
 	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
 	KUNIT_EXPECT_EQ(test, opaque_policy_mask(store), eligible);
-	KUNIT_EXPECT_EQ(test, opaque_policy_hook.calls, 3U);
+	/* The walk is over the whole segment, and lets go after each chunk but the last. */
+	KUNIT_EXPECT_EQ(test, opaque_policy_hook.calls, (io_opaque_seg_slots(0) - 1) / 3);
 	KUNIT_EXPECT_TRUE(test, opaque_policy_hook.tables_free);
 	KUNIT_EXPECT_EQ(test, opaque_policy_hook.candidates[0], 2U);	/* slots 0 and 2 */
 	KUNIT_EXPECT_EQ(test, opaque_policy_hook.candidates[1], 4U);	/* and 3 and 5 */
@@ -15121,12 +15207,12 @@ static void opaque_lk_free_other(void)
 static void opaque_lk_stop_like(void)
 {
 	struct io_opaque_store *store = opaque_lk.store;
-	u32 i;
+	u64 i;
 
 	spin_lock(&store->tables);
 	WRITE_ONCE(store->dead, 1);
 	spin_unlock(&store->tables);
-	for (i = 0; i < store->config.max_objects; i++)
+	for (i = 0; io_opaque_slot_at(store, i); i++)
 		opaque_test_free(store, i);
 }
 
@@ -15187,7 +15273,7 @@ static void opaque_pin_handles(struct kunit *test)
 	struct io_opaque_req send = { .store = store, .offset = 100, .length = 1000 };
 	const u64 first = io_opaque_handle(0, 9), second = io_opaque_handle(0, 10);
 	long slow = atomic_long_read(&io_opaque_pin_slow);
-	u64 flags = 0, name[5];
+	u64 flags = 0, name[7];
 	unsigned int i;
 
 	opaque_test_publish(store, 0, 9, old);
@@ -15203,12 +15289,18 @@ static void opaque_pin_handles(struct kunit *test)
 	io_opaque_data_put(store, send.data);
 	KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
 
-	/* Names of nothing: no handle, no such slot, a slot that holds none, two generations. */
+	/*
+	 * Names of nothing: no handle, slots of segments that the table does not have (the first index
+	 * past the first segment, one in the middle of the indexes, the last), a slot that holds none,
+	 * two generations.
+	 */
 	name[0] = 0;
-	name[1] = io_opaque_handle(store->config.max_objects, 9);
-	name[2] = io_opaque_handle(1, 9);
-	name[3] = io_opaque_handle(0, 10);
-	name[4] = io_opaque_handle(0, 8);
+	name[1] = io_opaque_handle(1U << IO_OPAQUE_SEG_BITS, 9);
+	name[2] = io_opaque_handle(1U << 31, 9);
+	name[3] = io_opaque_handle(U32_MAX, 9);
+	name[4] = io_opaque_handle(1, 9);
+	name[5] = io_opaque_handle(0, 10);
+	name[6] = io_opaque_handle(0, 8);
 	for (i = 0; i < ARRAY_SIZE(name); i++) {
 		send.data = NULL;
 		send.handle = name[i];
@@ -15258,7 +15350,7 @@ static void opaque_pin_handles(struct kunit *test)
 	/*
 	 * A lookup that found no version of its handle to take was asked of the table: the empty
 	 * slot, the two generations, and the slot that another object had taken. The names that no
-	 * slot can have, none and out of range, were refused at once.
+	 * slot can have, none and those of segments the table has not made, were refused at once.
 	 */
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow + 4);
 
@@ -16545,7 +16637,7 @@ static struct opaque_pin_race *opaque_pin_race_new(struct kunit *test, enum opaq
 	KUNIT_ASSERT_NOT_NULL(test, r);
 	r->store = opaque_test_store(test);
 	/* One slot, so that every round takes over the one the round before had. */
-	r->store->config.max_objects = 1;
+	opaque_test_slots(test, r->store, 1);
 	r->mode = mode;
 	atomic_set(&opaque_pin_bare, 0);
 	opaque_lookup_hook(test, opaque_pin_jitter);
@@ -16662,7 +16754,7 @@ static void opaque_pin_smp_stop(struct kunit *test)
 
 	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_STOP);
-	r->store->config.max_objects = 4;
+	opaque_test_slots(test, r->store, 4);
 	opaque_test_stoppable(test, r->store);
 	for (i = 0; i < 4; i++) {
 		struct io_opaque_data *data = opaque_pin_object(r->store);
@@ -16713,7 +16805,7 @@ static void opaque_pin_smp_vec_free(struct kunit *test)
 
 	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_VEC_FREE);
-	r->store->config.max_objects = 2;
+	opaque_test_slots(test, r->store, 2);
 	data = opaque_pin_object(r->store);
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	r->handle = opaque_pin_publish(r->store, data);
@@ -16743,7 +16835,7 @@ static void opaque_pin_smp_vec_compact(struct kunit *test)
 
 	opaque_race_needs_cpus(test);
 	r = opaque_pin_race_new(test, OPAQUE_PIN_VEC_COMPACT);
-	r->store->config.max_objects = 2;
+	opaque_test_slots(test, r->store, 2);
 	for (i = 0; i < ARRAY_SIZE(handle); i++) {
 		struct io_opaque_data *data = opaque_pin_object(r->store);
 
