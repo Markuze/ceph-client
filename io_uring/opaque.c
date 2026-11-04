@@ -1014,14 +1014,17 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	    (cfg.zcrx_id && !(cfg.flags & IORING_OPAQUE_CFG_MAIO)) ||
 	    !mem_is_zero(cfg.__resv, sizeof(cfg.__resv)))
 		return ERR_PTR(-EINVAL);
-	if (!cfg.hard_limit || cfg.hard_limit > SZ_1T ||
+	/*
+	 * A store is bounded by memory: hard_limit, of any size, which is counted against
+	 * RLIMIT_MEMLOCK below, and the memory cgroup. Its tables grow with its objects and streams,
+	 * so max_objects and max_streams are not read, nor are checked, as max_requests is not.
+	 * Neither is max_extents.
+	 */
+	if (!cfg.hard_limit ||
 	    !IS_ALIGNED(cfg.hard_limit, PAGE_SIZE) ||
 	    !IS_ALIGNED(cfg.compact_headroom, PAGE_SIZE) ||
 	    cfg.compact_headroom >= cfg.hard_limit ||
-	    !cfg.max_object_size || cfg.max_object_size > INT_MAX ||
-	    !cfg.max_objects || cfg.max_objects > 16384 ||
-	    !cfg.max_streams || cfg.max_streams > 1024 ||
-	    cfg.max_extents < 4 || cfg.max_extents > 65536)
+	    !cfg.max_object_size || cfg.max_object_size > INT_MAX)
 		return ERR_PTR(-EINVAL);
 	if (!IS_ALIGNED(cfg.reply_reserve, PAGE_SIZE) ||
 	    cfg.reply_reserve >= cfg.hard_limit - cfg.compact_headroom ||

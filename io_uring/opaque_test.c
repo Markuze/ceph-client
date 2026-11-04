@@ -13824,6 +13824,68 @@ static void opaque_ubuf_pool_store(struct kunit *test)
 }
 
 /*
+ * A store is not bounded by counts. Registration asks for none: max_objects, max_streams and
+ * max_extents take any value, as max_requests does, and the store has room for more objects
+ * than the smallest of them said; and a hard_limit of any size registers, for the memory lock of
+ * the user is what bounds it. What is still refused is not a size: a limit of zero or of
+ * a part of a page, a headroom that is all of it, an object size of zero or beyond INT_MAX.
+ */
+static void opaque_register_unbounded(struct kunit *test)
+{
+	static const u32 count[] = { 0, 1, 4, U32_MAX };
+	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	const struct io_uring_opaque_config base = {
+		.hard_limit = SZ_1M, .max_object_size = SZ_64K,
+	};
+	struct io_uring_opaque_config cfg;
+	struct io_opaque_store *store;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	for (i = 0; i < ARRAY_SIZE(count); i++) {
+		struct io_opaque_req op = {};
+		u32 slot;
+
+		cfg = base;
+		cfg.max_objects = count[i];
+		cfg.max_streams = count[ARRAY_SIZE(count) - 1 - i];
+		cfg.max_extents = count[(i + 1) % ARRAY_SIZE(count)];
+		store = io_opaque_alloc(ctx, &cfg);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+		op.store = store;
+		/* More objects than the smallest count asked for, each in a slot of its own. */
+		for (slot = 0; slot < 3; slot++) {
+			KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+			KUNIT_EXPECT_EQ(test, op.slot, slot);
+			KUNIT_EXPECT_EQ(test, op.handle, io_opaque_handle(slot, 1));
+		}
+		io_opaque_free(store);
+	}
+
+	/* A limit of any size, up to the whole pages that a u64 holds. */
+	cfg = base;
+	cfg.hard_limit = 2 * SZ_1T;
+	store = io_opaque_alloc(ctx, &cfg);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
+	KUNIT_EXPECT_EQ(test, store->config.hard_limit, 2 * SZ_1T);
+	io_opaque_free(store);
+
+	cfg = base;
+	cfg.hard_limit = 0;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -EINVAL);
+	cfg.hard_limit = SZ_1M + 1;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -EINVAL);
+	cfg = base;
+	cfg.compact_headroom = SZ_1M;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -EINVAL);
+	cfg = base;
+	cfg.max_object_size = 0;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -EINVAL);
+	cfg.max_object_size = (u32)INT_MAX + 1;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_alloc(ctx, &cfg)), -EINVAL);
+}
+
+/*
  * The ubuf of a pool completes where the last skb is freed, and that is often a softirq: the ACK
  * that frees a sent skb, a consumer that copies. It is put on the list there and taken by the
  * next skb in the task, with only atomics in between.
@@ -17277,6 +17339,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_ubuf_pool_bound),
 	KUNIT_CASE(opaque_ubuf_pool_teardown),
 	KUNIT_CASE(opaque_ubuf_pool_store),
+	KUNIT_CASE(opaque_register_unbounded),
 	KUNIT_CASE(opaque_ubuf_pool_atomic),
 	KUNIT_CASE(opaque_send_managed_pool),
 	KUNIT_CASE_SLOW(opaque_ubuf_pool_smp_stress),
