@@ -648,6 +648,13 @@ admitted while it is. A compaction reserves its pages, the records of its
 destination units and its vector together, and is refused where it begins when
 they do not fit.
 
+A release wakes the collectors that wait for the budget, and a wake is not a
+reservation: each looks again and takes what fits. A collector whose stream
+holds no block needs a page and a block, and one whose stream holds a block
+needs the page alone, so while room comes back a page at a time the second can
+go on and the first keep waiting. The order in which waiters are woken is not
+promised.
+
 Destination unit cache
 ----------------------
 
