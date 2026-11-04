@@ -668,7 +668,7 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 struct io_opaque_data *io_opaque_data_alloc(void);
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);
-int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data);
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force);
 struct page *io_opaque_owned_page(unsigned int *order);
 void io_opaque_unit_cache_init(struct io_opaque_store *store, u32 limit, u32 order);
 void io_opaque_unit_cache_setup(struct io_opaque_store *store);
@@ -712,6 +712,7 @@ void io_opaque_extents_free(struct io_opaque_store *store,
 struct io_opaque_data *io_opaque_detach(struct io_opaque_store *store,
 					struct io_opaque_slot *slot);
 int io_opaque_slot_reserve(struct io_opaque_req *op);
+int io_opaque_assemble(struct io_opaque_req *op);
 int io_opaque_publish(struct io_opaque_req *op, u64 *object_flags);
 void io_opaque_create_release(struct io_opaque_req *op);
 u32 io_opaque_find_slot(unsigned long *used, u32 count, u32 *cursor);

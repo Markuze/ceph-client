@@ -223,6 +223,23 @@ bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
 	}
 }
 
+/*
+ * Charge @bytes whatever the limit is. The records that draining the store needs are charged so:
+ * the split of a take or a DISCARD, the copies of an INSPECT and the vector of an object that a
+ * take has assembled. Capture stops at its limit and leaves the room for them above it, but the
+ * room can be nothing (a store without headroom) or taken (by the copy of a compaction), and a
+ * stream that is full must still be drained, by the operations that free it and by publishing what
+ * it holds. They are counted in bytes, so that everything which looks at bytes sees them and
+ * nothing more is let in while they are held; the memory cgroup bounds them, as it bounds the
+ * allocations that they are. They are bounded in number: two splits for a take or a DISCARD, and
+ * a snapshot's copies for the INSPECT, until their requests are done.
+ */
+static void io_opaque_charge_force(struct io_opaque_store *store, u64 bytes)
+{
+	atomic64_add(bytes, &store->bytes);
+	io_opaque_memory_mode(store);
+}
+
 /* Give bytes back to the store, and let nobody in on them yet. */
 static void io_opaque_uncharge_quiet(struct io_opaque_store *store, u64 bytes)
 {
@@ -697,9 +714,10 @@ void io_opaque_data_put(struct io_opaque_store *store,
  * once, for the whole version, and io_opaque_data_put() gives it back with the version. The
  * charge is against the hard limit and not the capture limit, because the version holds its
  * pages already and it is capture that the limit is there to stop. Returns -ENOBUFS if it
- * does not fit.
+ * does not fit. The version of a take is charged with @force, without the limit: publishing
+ * what capture holds must not fail for lack of room (io_opaque_charge_force()).
  */
-int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data)
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
@@ -724,7 +742,9 @@ int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data)
 	/* More than kvmalloc() allocates, and more than vec_bytes holds. */
 	if (size > INT_MAX)
 		return -ENOMEM;
-	if (!io_opaque_charge(store, size, false))
+	if (force)
+		io_opaque_charge_force(store, size);
+	else if (!io_opaque_charge(store, size, false))
 		return -ENOBUFS;
 	data->bvec = kvmalloc(size, GFP_KERNEL_ACCOUNT);
 	if (!data->bvec) {
@@ -1165,11 +1185,10 @@ static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw)
 }
 
 /*
- * Split @extent at @at. The new extent is a record of its own, and the store is charged for
- * it as for any record outside a block of a stream: against the hard limit and not the
- * capture limit. Capture stops at the capture limit and leaves the headroom above it, which
- * holds the splits at the ends of a take, so no record is kept back for them. Returns
- * -ENOBUFS if the record does not fit.
+ * Split @extent at @at. The new extent is a record of its own. A split is part of draining the
+ * stream, by a take or a DISCARD that cuts the extents at its ends, and it does not fail for lack
+ * of room: the store is charged for the record without the limit (io_opaque_charge_force()).
+ * Returns -ENOMEM if the record cannot be allocated.
  */
 VISIBLE_IF_KUNIT struct io_opaque_extent *io_opaque_extent_split(struct io_opaque_store *store,
 								 struct io_opaque_extent *extent,
@@ -1178,13 +1197,10 @@ VISIBLE_IF_KUNIT struct io_opaque_extent *io_opaque_extent_split(struct io_opaqu
 	struct io_opaque_extent *right;
 	u32 left = at - extent->start;
 
-	if (!io_opaque_charge(store, io_opaque_extent_bytes, false))
-		return ERR_PTR(-ENOBUFS);
 	right = kmalloc_obj(*right, GFP_KERNEL_ACCOUNT);
-	if (!right) {
-		io_opaque_uncharge(store, io_opaque_extent_bytes);
+	if (!right)
 		return ERR_PTR(-ENOMEM);
-	}
+	io_opaque_charge_force(store, io_opaque_extent_bytes);
 	atomic_long_inc(&store->extents);
 	*right = *extent;
 	right->embedded = false;
@@ -1237,9 +1253,10 @@ static int io_opaque_unclassified(struct io_opaque_stream *stream, u64 off, u64 
 
 /*
  * Copy the extents that INSPECT spans into the version of @op. The copies are records of
- * their own: the snapshot counts them first and charges the store for all of them at once,
- * against the hard limit as a split is, and the free of the version gives them back with its
- * pages in one step. A copy that cannot be allocated gives back the charge of those after it.
+ * their own, and an INSPECT does not fail for lack of room, as a split does not: the snapshot
+ * counts them first and charges the store for all of them at once, without the limit, and the
+ * free of the version gives them back with its pages in one step. A copy that cannot be
+ * allocated gives back the charge of those after it.
  */
 static int io_opaque_snapshot(struct io_opaque_req *op)
 {
@@ -1250,16 +1267,20 @@ static int io_opaque_snapshot(struct io_opaque_req *op)
 	if (ret <= 0)
 		return ret;
 	end = op->offset + ret;
-	list_for_each_entry(extent, &op->stream->extents, list)
+	list_for_each_entry(extent, &op->stream->extents, list) {
+		if (extent->start >= end)
+			break;
 		if (max(op->offset, extent->start) < min(end, extent->start + extent->length))
 			left++;
-	if (!io_opaque_charge(op->store, left * io_opaque_extent_bytes, false))
-		return -ENOBUFS;
+	}
+	io_opaque_charge_force(op->store, left * io_opaque_extent_bytes);
 	list_for_each_entry(extent, &op->stream->extents, list) {
 		u64 first = max(op->offset, extent->start);
 		u64 last = min(end, extent->start + extent->length);
 		struct io_opaque_extent *copy;
 
+		if (extent->start >= end)
+			break;
 		if (first >= last)
 			continue;
 		copy = kmalloc_obj(*copy, GFP_KERNEL_ACCOUNT);
@@ -2548,6 +2569,17 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	return op->length;
 }
 
+/*
+ * The version that a take assembled becomes an object, and needs its vector. It is the last
+ * of what the take costs, and it is charged without the limit: it does not fail for lack of room.
+ */
+VISIBLE_IF_KUNIT int io_opaque_assemble(struct io_opaque_req *op)
+{
+	if (op->data->length != op->length)
+		return -ENODATA;
+	return io_opaque_vector(op->store, op->data, true);
+}
+
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 {
 	struct io_kiocb *req = tw_req.req;
@@ -2564,8 +2596,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (ret >= 0 && op->op == IORING_OPAQUE_INSPECT)
 		ret = io_opaque_copy(op->data, 0, op->data->length, op->addr);
 	if (ret >= 0 && op->op == IORING_OPAQUE_RECV_OBJECT) {
-		ret = op->data->length == op->length ?
-			io_opaque_vector(store, op->data) : -ENODATA;
+		ret = io_opaque_assemble(op);
 		if (!ret)
 			ret = io_opaque_publish(op, &object_flags);
 	}
@@ -2910,7 +2941,7 @@ VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 		op->data->length = done;
 		cond_resched();
 	}
-	ret = io_opaque_vector(store, op->data);
+	ret = io_opaque_vector(store, op->data, false);
 	if (!ret)
 		op->data->dense = true;
 out:

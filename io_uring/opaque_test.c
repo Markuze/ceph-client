@@ -563,7 +563,7 @@ static void opaque_capture_gaps(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, page_count(page), 2);
 	list_splice_init(&stream.extents, &data->extents);
 	data->length = stream.next;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data, false), 0);
 	KUNIT_EXPECT_EQ(test, data->charge, (u64)4 * PAGE_SIZE);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes),
 			(s64)4 * PAGE_SIZE + OPAQUE_TEST_BLOCK + data->vec_bytes);
@@ -1092,10 +1092,10 @@ static void opaque_block_charge_limit(struct kunit *test)
 }
 
 /*
- * A split is a record of its own, charged against the hard limit less the reserve and not against
- * the limit that capture stops at: the headroom above it holds the splits at the ends of a take,
- * and nothing else needs to be kept back for them. It fails only when the record does not fit
- * there, and then it changes nothing.
+ * A split is part of draining a stream, and the record is charged to the store without the
+ * limit: with the store full to the limit that capture stops at, to the hard limit less the
+ * reserve, and past it, the split goes on. It is counted in bytes, nothing else is let in while
+ * it is held, and it goes back with its extent.
  */
 static void opaque_split_charge(struct kunit *test)
 {
@@ -1122,34 +1122,27 @@ static void opaque_split_charge(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx);
 	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, true));
 
-	/* The split is not capture: the record is taken from the headroom. */
+	/* The split is not capture: the record is counted, and there is no limit for it. */
 	second = io_opaque_extent_split(store, first, 64);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(second));
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx + OPAQUE_TEST_EXTENT);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
 
-	/* One byte short of the room for a record under the hard limit less the reserve. */
-	charge = hard - OPAQUE_TEST_EXTENT + 1 - atomic64_read(&store->bytes);
+	/* Up to the hard limit less the reserve, and past it. */
+	charge = hard - atomic64_read(&store->bytes);
 	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, charge, false));
 	held += charge;
-	third = io_opaque_extent_split(store, first, 32);
-	KUNIT_EXPECT_EQ(test, PTR_ERR(third), -ENOBUFS);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_EXTENT + 1);
-	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
-	KUNIT_EXPECT_EQ(test, first->length, 64U);
-
-	/* With the byte, it fits, and the reserve is untouched. */
-	io_opaque_uncharge(store, 1);
-	held--;
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard);
+	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, false));
 	third = io_opaque_extent_split(store, first, 32);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(third));
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard + OPAQUE_TEST_EXTENT);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 3);
 	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, false));
 
 	/* The records go back with their extents, and the page and the chunk with the last. */
 	io_opaque_extent_free(store, third);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_EXTENT);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard);
 	io_opaque_extent_free(store, second);
 	io_opaque_extent_free(store, first);
 	io_opaque_uncharge(store, held);
@@ -1325,7 +1318,7 @@ static void opaque_vector_charge(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		data = opaque_vector_data(test, store, cases[i].nr);
 		before = atomic64_read(&store->bytes);
-		KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+		KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data, false), 0);
 		KUNIT_EXPECT_EQ(test, data->nr, cases[i].nr);
 		KUNIT_EXPECT_EQ(test, data->vec_bytes, cases[i].bytes);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before + cases[i].bytes);
@@ -1343,7 +1336,7 @@ static void opaque_vector_charge(struct kunit *test)
 	data = opaque_vector_data(test, store, 1);
 	before = atomic64_read(&store->bytes);
 	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, rx - before, true));
-	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data, false), 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx + 16);
 	io_opaque_uncharge(store, rx - before);
 	io_opaque_data_put(store, data);
@@ -1353,13 +1346,26 @@ static void opaque_vector_charge(struct kunit *test)
 	data = opaque_vector_data(test, store, 17);
 	before = atomic64_read(&store->bytes);
 	store->config.hard_limit = before + 288 - 1 + store->config.reply_reserve;
-	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data, false), -ENOBUFS);
 	KUNIT_EXPECT_PTR_EQ(test, data->bvec, NULL);
 	KUNIT_EXPECT_EQ(test, data->vec_bytes, 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before);
 	store->config.hard_limit++;
-	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data, false), 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before + 288);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+
+	/* The vector of a take is not refused for the limit: it is counted past it. */
+	store->config.hard_limit = 128 * PAGE_SIZE;
+	data = opaque_vector_data(test, store, 17);
+	before = atomic64_read(&store->bytes);
+	store->config.hard_limit = before + store->config.reply_reserve;
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data, false), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data, true), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before + 288);
+	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, false));
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
@@ -1476,7 +1482,7 @@ static struct io_opaque_data *opaque_sparse_data(struct kunit *test,
 		list_add_tail(&extent->list, &data->extents);
 		data->length += 2000;
 	}
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data, false), 0);
 	return data;
 }
 
@@ -3233,7 +3239,7 @@ static void opaque_create_dense_classification(struct kunit *test)
 	list_add_tail(&extent->list, &op.data->extents);
 	op.data->length = 1;
 	op.data->dense = true;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, op.data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, op.data, false), 0);
 	store->policy.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
 	KUNIT_ASSERT_EQ(test, io_opaque_publish(&op, &flags), 1);
 	KUNIT_EXPECT_EQ(test, flags, 0ULL);
@@ -4043,7 +4049,7 @@ static struct io_opaque_data *opaque_runs_data(struct kunit *test,
 		list_add_tail(&extent->list, &data->extents);
 		data->length += len;
 	}
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data, false), 0);
 	return data;
 }
 
@@ -4921,7 +4927,7 @@ static struct io_opaque_data *opaque_varied_data(struct kunit *test,
 		list_add_tail(&extent->list, &data->extents);
 		data->length += len;
 	}
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data, false), 0);
 	return data;
 }
 
@@ -10513,7 +10519,7 @@ static struct io_opaque_data *opaque_maio_object(struct kunit *test,
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	list_splice_init(&stream->extents, &data->extents);
 	data->length = stream->next;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(stream->store, data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(stream->store, data, false), 0);
 	return data;
 }
 
@@ -13453,7 +13459,7 @@ static void opaque_managed_fill_captured(struct kunit *test)
 	/* The extents are the version, in the order they were captured. */
 	list_splice_init(&stream.extents, &data->extents);
 	data->length = at;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data, false), 0);
 	KUNIT_ASSERT_EQ(test, data->nr, (u32)ARRAY_SIZE(r));
 	opaque_expect_segments(test, data);
 	for (i = 0; i < ARRAY_SIZE(r); i++) {
@@ -16668,7 +16674,7 @@ static struct io_opaque_data *opaque_pin_object(struct io_opaque_store *store)
 		list_add_tail(&extent->list, &data->extents);
 		data->length += 2000;
 	}
-	if (io_opaque_vector(store, data))
+	if (io_opaque_vector(store, data, false))
 		goto fail;
 	return data;
 fail:
