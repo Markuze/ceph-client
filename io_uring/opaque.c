@@ -676,11 +676,6 @@ u64 io_opaque_handle(u32 index, u64 generation)
 	return generation << IO_OPAQUE_INDEX_BITS | index;
 }
 
-static u32 io_opaque_index(u64 handle)
-{
-	return handle & IO_OPAQUE_INDEX_MASK;
-}
-
 #if IS_ENABLED(CONFIG_KUNIT)
 /* Segments that exist, for a test to see that one which lost a race, or a store, freed its own. */
 atomic_long_t io_opaque_segs_live = ATOMIC_LONG_INIT(0);
@@ -871,15 +866,7 @@ VISIBLE_IF_KUNIT void io_opaque_release_slot(struct io_opaque_seg __rcu **segs, 
 struct io_opaque_slot *io_opaque_lookup(struct io_opaque_store *store,
 					u64 handle)
 {
-	struct io_opaque_slot *slot;
-
-	lockdep_assert_held(&store->tables);
-	if (!handle)
-		return NULL;
-	slot = io_opaque_slot_at(store, io_opaque_index(handle));
-	if (!slot || slot->generation != handle >> IO_OPAQUE_INDEX_BITS)
-		return NULL;
-	return slot;
+	return io_opaque_lookup_inline(store, handle);
 }
 
 /* Drop handle visibility, transferring the table reference to the caller. */
@@ -4042,7 +4029,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 		u32 skip, n, stored;
 
 		if (last) {
-			struct io_opaque_slot *slot = io_opaque_lookup(store, ent->handle);
+			struct io_opaque_slot *slot = io_opaque_lookup_inline(store, ent->handle);
 
 			data = slot ? io_opaque_slot_data(store, slot) : NULL;
 			if (!data)
@@ -4089,7 +4076,7 @@ static int io_opaque_vec_acquire(struct io_opaque_req *op)
 	if (!last)
 		return 0;
 	for (i = 0; i < vec->nr; i++) {
-		struct io_opaque_slot *slot = io_opaque_lookup(store, vec->ent[i].handle);
+		struct io_opaque_slot *slot = io_opaque_lookup_inline(store, vec->ent[i].handle);
 
 		if (!io_opaque_slot_data(store, slot))
 			refcount_inc(&vec->pin[i]->refs);
@@ -4136,7 +4123,7 @@ static int io_opaque_send_acquire_one(struct io_opaque_req *op)
 	if (!op->length)
 		return 0;
 	if (op->send_flags & IORING_OPAQUE_SEND_LAST) {
-		struct io_opaque_slot *slot = io_opaque_lookup(store, op->handle);
+		struct io_opaque_slot *slot = io_opaque_lookup_inline(store, op->handle);
 
 		data = slot ? io_opaque_slot_data(store, slot) : NULL;
 		if (!data)

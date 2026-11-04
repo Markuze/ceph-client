@@ -620,33 +620,65 @@ struct io_opaque_store {
 	struct io_opaque_seg __rcu *streams[IO_OPAQUE_SEGS];
 };
 
+/* The index in the table that a handle carries. */
+static inline u32 io_opaque_index(u64 handle)
+{
+	return handle & IO_OPAQUE_INDEX_MASK;
+}
+
 /*
  * The slot of @index in the table of objects or of streams, or NULL where the table has no segment
  * for it, which ends a walk of the table. A segment is never freed before the store, so a slot that
  * is found stays valid for as long as the store is; whether it is meaningful is for the caller's
  * lock: tables for what a slot holds, or the RCU section of io_opaque_pin(), which does not use this.
+ *
+ * The segment pointers are read through a pointer to the first, not by the array's name: the
+ * index is split below IO_OPAQUE_SEGS by construction, which the compiler cannot show, and a
+ * kernel built with UBSAN's bounds checks would test it, on the path of every send.
  */
 static inline struct io_opaque_slot *io_opaque_slot_at(struct io_opaque_store *store, u64 index)
 {
+	struct io_opaque_seg __rcu **segs = store->objects;
 	struct io_opaque_seg *seg;
 	u32 off;
 
 	if (index > U32_MAX)
 		return NULL;
-	seg = rcu_dereference_raw(store->objects[io_opaque_seg_split(index, &off)]);
+	seg = rcu_dereference_raw(segs[io_opaque_seg_split(index, &off)]);
 	return seg ? &seg->object[off] : NULL;
 }
 
 static inline struct io_opaque_stream_slot *io_opaque_stream_slot_at(struct io_opaque_store *store,
 								     u64 index)
 {
+	struct io_opaque_seg __rcu **segs = store->streams;
 	struct io_opaque_seg *seg;
 	u32 off;
 
 	if (index > U32_MAX)
 		return NULL;
-	seg = rcu_dereference_raw(store->streams[io_opaque_seg_split(index, &off)]);
+	seg = rcu_dereference_raw(segs[io_opaque_seg_split(index, &off)]);
 	return seg ? &seg->stream[off] : NULL;
+}
+
+/*
+ * The slot that @handle names, with tables held, or NULL if it names none now: no handle, no
+ * segment for its index, or another generation. This is io_opaque_lookup() with its body in the
+ * caller. The sends that consume what they name (LAST) look in the hold of tables, which every
+ * other send waits for, and they do not pay a call and its frame there.
+ */
+static __always_inline struct io_opaque_slot *io_opaque_lookup_inline(struct io_opaque_store *store,
+								      u64 handle)
+{
+	struct io_opaque_slot *slot;
+
+	lockdep_assert_held(&store->tables);
+	if (!handle)
+		return NULL;
+	slot = io_opaque_slot_at(store, io_opaque_index(handle));
+	if (!slot || slot->generation != handle >> IO_OPAQUE_INDEX_BITS)
+		return NULL;
+	return slot;
 }
 
 /*
