@@ -630,6 +630,7 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 /* Flags of io_opaque_extent_new(). */
 #define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store for the page already */
 #define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
+#define IO_OPAQUE_EXT_COVERED	BIT(2)	/* the caller charged the store for the chunk too */
 
 /*
  * How the capture holds the page of a new backing. AREA and POOL exist only for
@@ -673,7 +674,9 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 struct io_opaque_data *io_opaque_data_alloc(void);
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);
-int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force);
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force,
+		     u64 *reserved);
+u64 io_opaque_vector_bytes(u32 nr);
 struct page *io_opaque_owned_page(unsigned int *order);
 void io_opaque_unit_cache_init(struct io_opaque_store *store, u32 limit, u32 order);
 void io_opaque_unit_cache_setup(struct io_opaque_store *store);

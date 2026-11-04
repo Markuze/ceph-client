@@ -436,19 +436,21 @@ static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *str
 /*
  * A chunk in a block of its own, for the callers that make one extent at a time. The block is
  * charged to the store as it is: against the hard limit, not the capture limit, which is how
- * CREATE and compaction use the room that capture leaves them. It is given back when the
- * chunk is released. Returns an error pointer as io_opaque_chunk_take() does.
+ * CREATE uses the room that capture leaves it. A compaction has charged the store for the
+ * block already, in the reservation for its copy, and says so with @covered. It is given back
+ * when the chunk is released. Returns an error pointer as io_opaque_chunk_take() does.
  */
-static struct io_opaque_chunk *io_opaque_chunk_alone(struct io_opaque_store *store)
+static struct io_opaque_chunk *io_opaque_chunk_alone(struct io_opaque_store *store, bool covered)
 {
 	u32 charge = io_opaque_alone_bytes;
 	struct io_opaque_block *block;
 
-	if (!io_opaque_charge(store, charge, false))
+	if (!covered && !io_opaque_charge(store, charge, false))
 		return ERR_PTR(-ENOBUFS);
 	block = kzalloc_flex(*block, chunk, 1, GFP_KERNEL_ACCOUNT);
 	if (!block) {
-		io_opaque_uncharge(store, charge);
+		if (!covered)
+			io_opaque_uncharge(store, charge);
 		return ERR_PTR(-ENOMEM);
 	}
 	block->nr = 1;
@@ -476,7 +478,8 @@ static struct io_opaque_extent *io_opaque_extent_make(struct io_opaque_store *st
 		return ERR_PTR(-ENOBUFS);
 	if (memcg && io_opaque_memcg_charge(store, charge))
 		goto uncharge;
-	chunk = stream ? io_opaque_chunk_take(stream) : io_opaque_chunk_alone(store);
+	chunk = stream ? io_opaque_chunk_take(stream) :
+			 io_opaque_chunk_alone(store, flags & IO_OPAQUE_EXT_COVERED);
 	if (IS_ERR(chunk)) {
 		err = PTR_ERR(chunk);
 		goto uncharge_memcg;
@@ -703,6 +706,40 @@ void io_opaque_data_put(struct io_opaque_store *store,
 }
 
 /*
+ * The vector of a version of @nr extents is its segments, and for a version of more than
+ * IO_OPAQUE_SEEK_STRIDE of them the anchors, which start at the next multiple of eight bytes after
+ * the segments. Returns its size, with the number of anchors and where they start. An overflow
+ * saturates, and the allocation fails.
+ */
+static size_t io_opaque_vector_layout(u32 nr, u32 *anchors, size_t *at)
+{
+	size_t bytes = size_add(array_size(nr, sizeof(struct bio_vec)), sizeof(u64) - 1);
+
+	*anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
+	*at = bytes & ~(sizeof(u64) - 1);
+	return size_add(*at, array_size(*anchors, sizeof(u64)));
+}
+
+/*
+ * What the store is charged for a vector of @size bytes: the allocation it comes to, a size
+ * class of kmalloc() or the pages of a larger one (kvmalloc() takes a vmalloc area of whole pages
+ * if kmalloc() has none, which is less), as the records are charged.
+ */
+static u64 io_opaque_vector_charge(size_t size)
+{
+	return size > KMALLOC_MAX_SIZE ? PAGE_ALIGN(size) : kmalloc_size_roundup(size);
+}
+
+/* What the store is charged for the vector of a version of @nr extents. */
+u64 io_opaque_vector_bytes(u32 nr)
+{
+	u32 anchors;
+	size_t at;
+
+	return io_opaque_vector_charge(io_opaque_vector_layout(nr, &anchors, &at));
+}
+
+/*
  * Build the version's segments, and for a version of more than
  * IO_OPAQUE_SEEK_STRIDE of them the anchors that find one without walking
  * from the first, in one allocation. Both are made once, when the version is,
@@ -711,20 +748,24 @@ void io_opaque_data_put(struct io_opaque_store *store,
  * number of them would leave the anchors four-byte aligned.
  *
  * The allocation is memory of the store, as the records it is made from are: it is charged
- * once, for the whole version, and io_opaque_data_put() gives it back with the version. The
- * charge is against the hard limit and not the capture limit, because the version holds its
- * pages already and it is capture that the limit is there to stop. Returns -ENOBUFS if it
- * does not fit. The version of a take is charged with @force, without the limit: publishing
- * what capture holds must not fail for lack of room (io_opaque_charge_force()).
+ * once, for the whole version, at the size of the allocation (io_opaque_vector_charge()), and
+ * io_opaque_data_put() gives it back with the version. The charge is against the hard limit and
+ * not the capture limit, because the version holds its pages already and it is capture that the
+ * limit is there to stop. Returns -ENOBUFS if it does not fit. The version of a take is charged
+ * with @force, without the limit: publishing what capture holds must not fail for lack of room
+ * (io_opaque_charge_force()). A compaction has charged the store for its vector in the
+ * reservation for the copy, and passes what is left of that as @reserved: the vector comes out
+ * of it while it lasts.
  */
-int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force)
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force,
+		     u64 *reserved)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
-	bool mapped = true;
+	bool mapped = true, drawn = false;
 	u32 nr = 0, anchors;
 	size_t bytes, size;
-	u64 at = 0;
+	u64 at = 0, charge;
 
 	data->charge = 0;
 	list_for_each_entry(extent, &data->extents, list) {
@@ -734,24 +775,28 @@ int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data,
 		previous = extent->backing;
 		mapped &= extent->backing->area;
 	}
-	anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
-	/* Where the anchors start. An overflow saturates, and the allocation fails. */
-	bytes = size_add(array_size(nr, sizeof(*data->bvec)), sizeof(*data->anchor) - 1);
-	bytes &= ~(sizeof(*data->anchor) - 1);
-	size = size_add(bytes, array_size(anchors, sizeof(*data->anchor)));
+	size = io_opaque_vector_layout(nr, &anchors, &bytes);
 	/* More than kvmalloc() allocates, and more than vec_bytes holds. */
 	if (size > INT_MAX)
 		return -ENOMEM;
-	if (force)
-		io_opaque_charge_force(store, size);
-	else if (!io_opaque_charge(store, size, false))
+	charge = io_opaque_vector_charge(size);
+	if (reserved && *reserved >= charge) {
+		*reserved -= charge;
+		drawn = true;
+	} else if (force) {
+		io_opaque_charge_force(store, charge);
+	} else if (!io_opaque_charge(store, charge, false)) {
 		return -ENOBUFS;
+	}
 	data->bvec = kvmalloc(size, GFP_KERNEL_ACCOUNT);
 	if (!data->bvec) {
-		io_opaque_uncharge(store, size);
+		if (drawn)
+			*reserved += charge;
+		else
+			io_opaque_uncharge(store, charge);
 		return -ENOMEM;
 	}
-	data->vec_bytes = size;
+	data->vec_bytes = charge;
 	data->anchor = anchors ? (void *)data->bvec + bytes : NULL;
 	data->nr = nr;
 	data->mapped = nr && mapped;
@@ -2612,7 +2657,7 @@ VISIBLE_IF_KUNIT int io_opaque_assemble(struct io_opaque_req *op)
 {
 	if (op->data->length != op->length)
 		return -ENODATA;
-	return io_opaque_vector(op->store, op->data, true);
+	return io_opaque_vector(op->store, op->data, true, NULL);
 }
 
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
@@ -2976,7 +3021,7 @@ VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 		op->data->length = done;
 		cond_resched();
 	}
-	ret = io_opaque_vector(store, op->data, false);
+	ret = io_opaque_vector(store, op->data, false, NULL);
 	if (!ret)
 		op->data->dense = true;
 out:
