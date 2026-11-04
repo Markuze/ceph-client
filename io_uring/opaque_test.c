@@ -323,9 +323,9 @@ static void opaque_test_stream(struct io_opaque_stream *stream,
  * a snapshot, a second extent of a page). A stream's block is charged when its first chunk
  * is taken and given back with its last, whatever the stream has done with the others.
  */
-#define OPAQUE_TEST_BLOCK	((s64)io_opaque_block_bytes(IO_OPAQUE_BLOCK_CHUNKS))
-#define OPAQUE_TEST_ALONE	((s64)io_opaque_block_bytes(1))
-#define OPAQUE_TEST_EXTENT	((s64)io_opaque_extent_bytes())
+#define OPAQUE_TEST_BLOCK	((s64)io_opaque_block_bytes)
+#define OPAQUE_TEST_ALONE	((s64)io_opaque_alone_bytes)
+#define OPAQUE_TEST_EXTENT	((s64)io_opaque_extent_bytes)
 
 /*
  * What the store is charged for a version besides its pages, when every extent of it is a chunk of

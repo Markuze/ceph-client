@@ -323,6 +323,20 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 #endif
 }
 
+u32 io_opaque_block_bytes __ro_after_init;
+u32 io_opaque_alone_bytes __ro_after_init;
+u32 io_opaque_extent_bytes __ro_after_init;
+
+static int __init io_opaque_records_init(void)
+{
+	io_opaque_block_bytes = kmalloc_size_roundup(struct_size_t(struct io_opaque_block, chunk,
+								 IO_OPAQUE_BLOCK_CHUNKS));
+	io_opaque_alone_bytes = kmalloc_size_roundup(struct_size_t(struct io_opaque_block, chunk, 1));
+	io_opaque_extent_bytes = kmalloc_size_roundup(sizeof(struct io_opaque_extent));
+	return 0;
+}
+device_initcall(io_opaque_records_init);
+
 /*
  * Let go of @refs of what keeps @block; the last frees it. The last also returns what the store
  * was charged for the block, for the caller to give back; the others return 0.
@@ -377,7 +391,7 @@ static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *str
 	struct io_opaque_chunk *chunk;
 
 	if (!block) {
-		u32 charge = io_opaque_block_bytes(IO_OPAQUE_BLOCK_CHUNKS);
+		u32 charge = io_opaque_block_bytes;
 
 		if (!io_opaque_charge(stream->store, charge, true))
 			return ERR_PTR(-ENOBUFS);
@@ -408,7 +422,7 @@ static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *str
  */
 static struct io_opaque_chunk *io_opaque_chunk_alone(struct io_opaque_store *store)
 {
-	u32 charge = io_opaque_block_bytes(1);
+	u32 charge = io_opaque_alone_bytes;
 	struct io_opaque_block *block;
 
 	if (!io_opaque_charge(store, charge, false))
@@ -558,7 +572,7 @@ static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opa
 	list_del(&extent->list);
 	if (!extent->embedded) {
 		kfree(extent);
-		charge = io_opaque_extent_bytes();
+		charge = io_opaque_extent_bytes;
 	}
 	atomic_long_dec(&store->extents);
 	if (refcount_dec_and_test(&backing->refs)) {
@@ -1153,11 +1167,11 @@ VISIBLE_IF_KUNIT struct io_opaque_extent *io_opaque_extent_split(struct io_opaqu
 	struct io_opaque_extent *right;
 	u32 left = at - extent->start;
 
-	if (!io_opaque_charge(store, io_opaque_extent_bytes(), false))
+	if (!io_opaque_charge(store, io_opaque_extent_bytes, false))
 		return ERR_PTR(-ENOBUFS);
 	right = kmalloc_obj(*right, GFP_KERNEL_ACCOUNT);
 	if (!right) {
-		io_opaque_uncharge(store, io_opaque_extent_bytes());
+		io_opaque_uncharge(store, io_opaque_extent_bytes);
 		return ERR_PTR(-ENOMEM);
 	}
 	atomic_long_inc(&store->extents);
@@ -1227,7 +1241,7 @@ static int io_opaque_snapshot(struct io_opaque_req *op)
 	list_for_each_entry(extent, &op->stream->extents, list)
 		if (max(op->offset, extent->start) < min(end, extent->start + extent->length))
 			left++;
-	if (!io_opaque_charge(op->store, left * io_opaque_extent_bytes(), false))
+	if (!io_opaque_charge(op->store, left * io_opaque_extent_bytes, false))
 		return -ENOBUFS;
 	list_for_each_entry(extent, &op->stream->extents, list) {
 		u64 first = max(op->offset, extent->start);
@@ -1238,7 +1252,7 @@ static int io_opaque_snapshot(struct io_opaque_req *op)
 			continue;
 		copy = kmalloc_obj(*copy, GFP_KERNEL_ACCOUNT);
 		if (!copy) {
-			io_opaque_uncharge(op->store, left * io_opaque_extent_bytes());
+			io_opaque_uncharge(op->store, left * io_opaque_extent_bytes);
 			return -ENOMEM;
 		}
 		left--;
@@ -1811,7 +1825,7 @@ static void io_opaque_copy_page_put(struct io_opaque_store *store,
 static u64 io_opaque_need(const struct io_opaque_stream *stream, u64 bytes)
 {
 	if (!stream->block)
-		bytes += io_opaque_block_bytes(IO_OPAQUE_BLOCK_CHUNKS);
+		bytes += io_opaque_block_bytes;
 	return bytes;
 }
 
@@ -1861,11 +1875,11 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 		 * The page is held already, so this is a record and no more. The store is charged
 		 * for it as for a split, against the hard limit.
 		 */
-		if (!io_opaque_charge(stream->store, io_opaque_extent_bytes(), false))
+		if (!io_opaque_charge(stream->store, io_opaque_extent_bytes, false))
 			return -ENOBUFS;
 		extent = kmalloc_obj(*extent, GFP_KERNEL_ACCOUNT);
 		if (!extent) {
-			io_opaque_uncharge(stream->store, io_opaque_extent_bytes());
+			io_opaque_uncharge(stream->store, io_opaque_extent_bytes);
 			return -ENOMEM;
 		}
 		atomic_long_inc(&stream->store->extents);

@@ -14,8 +14,8 @@
 #include "opaque_internal.h"
 
 /* What the store is charged for the block of a stream, and for an extent that is a record. */
-#define OPAQUE_PRESSURE_BLOCK	((s64)io_opaque_block_bytes(IO_OPAQUE_BLOCK_CHUNKS))
-#define OPAQUE_PRESSURE_EXTENT	((s64)io_opaque_extent_bytes())
+#define OPAQUE_PRESSURE_BLOCK	((s64)io_opaque_block_bytes)
+#define OPAQUE_PRESSURE_EXTENT	((s64)io_opaque_extent_bytes)
 
 struct pressure_range {
 	struct list_head list;

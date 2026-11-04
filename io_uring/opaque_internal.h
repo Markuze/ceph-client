@@ -154,17 +154,13 @@ struct io_opaque_block {
  * allocation, which is what the allocator takes from the system. A block of a stream is
  * one of 4 KiB by construction (IO_OPAQUE_BLOCK_CHUNKS). A block of one chunk, which
  * CREATE and compaction make for each destination unit, and an extent of its own, which a
- * split, a snapshot or a second extent of a page allocates, are smaller.
+ * split or a snapshot allocates, are smaller. The allocator is asked once, when the kernel
+ * boots (io_opaque_records_init()), and these are constants after that: a capture or a
+ * release does not call it.
  */
-static inline u64 io_opaque_block_bytes(unsigned int nr)
-{
-	return kmalloc_size_roundup(struct_size_t(struct io_opaque_block, chunk, nr));
-}
-
-static inline u64 io_opaque_extent_bytes(void)
-{
-	return kmalloc_size_roundup(sizeof(struct io_opaque_extent));
-}
+extern u32 io_opaque_block_bytes;
+extern u32 io_opaque_alone_bytes;
+extern u32 io_opaque_extent_bytes;
 
 struct io_opaque_data {
 	refcount_t refs;
