@@ -956,6 +956,438 @@ static void opaque_block_lifetime(struct kunit *test)
 }
 
 /*
+ * A stream's block is charged to the store when the stream takes the first chunk of it, once for
+ * all of its chunks, and given back with the release of the last of them, whether the stream
+ * retired it before or after. The pages are charged one by one, as they always were.
+ */
+static void opaque_block_charge(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_extent *ext[IO_OPAQUE_BLOCK_CHUNKS + 1];
+	unsigned int i;
+
+	opaque_test_stream(&stream, store);
+	/* A block is the slab object of 4 KiB, whatever the configuration. */
+	KUNIT_EXPECT_EQ(test, OPAQUE_TEST_BLOCK, (s64)SZ_4K);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+
+	/* The first chunk charges the block and its page, the others their pages. */
+	ext[0] = opaque_block_extent(test, &stream, 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE + SZ_4K);
+	for (i = 1; i < IO_OPAQUE_BLOCK_CHUNKS; i++) {
+		ext[i] = opaque_block_extent(test, &stream, i * 128);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes),
+				(s64)(i + 1) * PAGE_SIZE + SZ_4K);
+	}
+	/* The block is used up: the next chunk charges another. */
+	KUNIT_EXPECT_NULL(test, stream.block);
+	ext[i] = opaque_block_extent(test, &stream, i * 128);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)(i + 1) * PAGE_SIZE + 2 * SZ_4K);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), (long)IO_OPAQUE_BLOCK_CHUNKS + 1);
+
+	/* The pages go back one by one, and a block with the last of its chunks. */
+	for (i = 0; i < IO_OPAQUE_BLOCK_CHUNKS - 1; i++)
+		io_opaque_extent_free(store, ext[i]);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)2 * PAGE_SIZE + 2 * SZ_4K);
+	io_opaque_extent_free(store, ext[IO_OPAQUE_BLOCK_CHUNKS - 1]);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE + SZ_4K);
+	/* The stream is still to take chunks of the second block, and holds it. */
+	io_opaque_extent_free(store, ext[IO_OPAQUE_BLOCK_CHUNKS]);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)SZ_4K);
+	io_opaque_block_retire(&stream);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+
+	/* Retired with chunks out, a block stays charged until the last of them is released. */
+	for (i = 0; i < 3; i++)
+		ext[i] = opaque_block_extent(test, &stream, i * 128);
+	io_opaque_block_retire(&stream);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)3 * PAGE_SIZE + SZ_4K);
+	io_opaque_extent_free(store, ext[1]);
+	io_opaque_extent_free(store, ext[0]);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE + SZ_4K);
+	io_opaque_extent_free(store, ext[2]);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+
+	/* What capture keeps in a stream goes with the stream: the extents, then the block. */
+	ext[0] = opaque_block_extent(test, &stream, 0);
+	io_opaque_extents_free(store, &stream.extents);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)SZ_4K);
+	io_opaque_capture_release(&stream);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+}
+
+/*
+ * The block is charged against the limit that capture stops at, as a page is: capture takes a page
+ * if it fits and the block of its chunk does not, and neither is charged then. The budget the
+ * waiter needs is the two, and the page alone when the stream has a block.
+ */
+static void opaque_block_charge_limit(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_extent *extent;
+	struct page *page = alloc_page(GFP_KERNEL), *next = alloc_page(GFP_KERNEL);
+	struct sk_buff *skb;
+	s64 rx, held;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	KUNIT_ASSERT_NOT_NULL(test, next);
+	store->config.hard_limit = 64 * PAGE_SIZE;
+	store->config.compact_headroom = 8 * PAGE_SIZE;
+	store->config.reply_reserve = 2 * PAGE_SIZE;
+	rx = io_opaque_rx_limit(store);
+	opaque_test_stream(&stream, store);
+
+	/* Not even the page fits: the stream has no block, and what it needs is both. */
+	held = rx - PAGE_SIZE + 1;
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, held, true));
+	skb = opaque_test_frag(test, page, 0, 32);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), held);
+	KUNIT_EXPECT_EQ(test, stream.need_bytes, (u64)PAGE_SIZE + SZ_4K);
+	kfree_skb(skb);
+
+	/* A page and one byte of a block fit below the capture limit: neither is kept. */
+	io_opaque_uncharge(store, SZ_4K);
+	held -= SZ_4K;
+	skb = opaque_test_frag(test, page, 0, 32);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), held);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+	KUNIT_EXPECT_NULL(test, stream.block);
+	KUNIT_EXPECT_TRUE(test, list_empty(&stream.extents));
+	KUNIT_EXPECT_EQ(test, page_count(page), 2);
+	/* Without a block the stream needs the page and the block to go on. */
+	KUNIT_EXPECT_EQ(test, stream.need_bytes, (u64)PAGE_SIZE + SZ_4K);
+	kfree_skb(skb);
+
+	/* One byte more, and both fit: the page and one block, and the capture limit is reached. */
+	io_opaque_uncharge(store, 1);
+	held--;
+	skb = opaque_test_frag(test, page, 0, 32);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), 32);
+	stream.next = 32;
+	kfree_skb(skb);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx);
+	KUNIT_ASSERT_NOT_NULL(test, stream.block);
+	KUNIT_EXPECT_EQ(test, stream.block->charge, (u32)SZ_4K);
+
+	/* The stream has its block now: what it needs from the next page is the page. */
+	skb = opaque_test_frag(test, next, 0, 32);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, stream.need_bytes, (u64)PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx);
+	kfree_skb(skb);
+
+	/* The one chunk that was taken goes back, and the block with it. */
+	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
+	io_opaque_extent_free(store, extent);
+	io_opaque_capture_release(&stream);
+	io_opaque_uncharge(store, held);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+	put_page(page);
+	put_page(next);
+}
+
+/*
+ * A split is a record of its own, charged against the hard limit less the reserve and not against
+ * the limit that capture stops at: the headroom above it holds the splits at the ends of a take,
+ * and nothing else needs to be kept back for them. It fails only when the record does not fit
+ * there, and then it changes nothing.
+ */
+static void opaque_split_charge(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_extent *first, *second, *third;
+	struct page *page = alloc_page(GFP_KERNEL);
+	LIST_HEAD(extents);
+	s64 rx, hard, held = 0, charge;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	store->config.hard_limit = 64 * PAGE_SIZE;
+	store->config.compact_headroom = 8 * PAGE_SIZE;
+	store->config.reply_reserve = 2 * PAGE_SIZE;
+	rx = io_opaque_rx_limit(store);
+	hard = store->config.hard_limit - store->config.reply_reserve;
+	first = io_opaque_extent_new(store, page, 0, 128, 0, 0);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(first));
+	list_add(&first->list, &extents);
+
+	/* The store is full as far as capture is concerned. */
+	charge = rx - atomic64_read(&store->bytes);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, charge, true));
+	held += charge;
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx);
+	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, true));
+
+	/* The split is not capture: the record is taken from the headroom. */
+	second = io_opaque_extent_split(store, first, 64);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(second));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx + OPAQUE_TEST_EXTENT);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
+
+	/* One byte short of the room for a record under the hard limit less the reserve. */
+	charge = hard - OPAQUE_TEST_EXTENT + 1 - atomic64_read(&store->bytes);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, charge, false));
+	held += charge;
+	third = io_opaque_extent_split(store, first, 32);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(third), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_EXTENT + 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
+	KUNIT_EXPECT_EQ(test, first->length, 64U);
+
+	/* With the byte, it fits, and the reserve is untouched. */
+	io_opaque_uncharge(store, 1);
+	held--;
+	third = io_opaque_extent_split(store, first, 32);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(third));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 3);
+	KUNIT_EXPECT_FALSE(test, io_opaque_charge(store, 1, false));
+
+	/* The records go back with their extents, and the page and the chunk with the last. */
+	io_opaque_extent_free(store, third);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_EXTENT);
+	io_opaque_extent_free(store, second);
+	io_opaque_extent_free(store, first);
+	io_opaque_uncharge(store, held);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+}
+
+/*
+ * A chunk made alone, as CREATE and compaction make them for the destination units, is a record
+ * charged against the hard limit less the reserve, not the capture limit, while the page is the
+ * caller's to have charged (IO_OPAQUE_EXT_RESERVED). When the record does not fit the extent is
+ * refused with -ENOBUFS and nothing is left charged.
+ */
+static void opaque_chunk_alone_charge(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_extent *extent;
+	struct page *page = alloc_page(GFP_KERNEL), *refused = alloc_page(GFP_KERNEL);
+	s64 rx, hard, held, charge;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	KUNIT_ASSERT_NOT_NULL(test, refused);
+	store->config.hard_limit = 64 * PAGE_SIZE;
+	store->config.compact_headroom = 8 * PAGE_SIZE;
+	store->config.reply_reserve = 2 * PAGE_SIZE;
+	rx = io_opaque_rx_limit(store);
+	hard = store->config.hard_limit - store->config.reply_reserve;
+
+	/* The caller has charged its pages up to the capture limit, with the extent's own. */
+	held = rx - PAGE_SIZE;
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, held, true));
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, PAGE_SIZE, true));
+	extent = io_opaque_extent_new(store, page, 0, 128, 0, IO_OPAQUE_EXT_RESERVED);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx + OPAQUE_TEST_ALONE);
+	KUNIT_EXPECT_EQ(test, extent->backing->charge, (u64)PAGE_SIZE);
+
+	/* One byte short of the room for another record. */
+	charge = hard - OPAQUE_TEST_ALONE + 1 - atomic64_read(&store->bytes);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, charge, false));
+	held += charge;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_extent_new(store, refused, 0, 128, 128,
+							   IO_OPAQUE_EXT_RESERVED)), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_ALONE + 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 1);
+	KUNIT_EXPECT_EQ(test, page_count(refused), 1);
+
+	/* A page that the store is to charge is refused at the capture limit, with no record. */
+	io_opaque_uncharge(store, 1);
+	held--;
+	KUNIT_EXPECT_EQ(test, PTR_ERR(io_opaque_extent_new(store, refused, 0, 128, 128, 0)),
+			-ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_ALONE);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 1);
+
+	io_opaque_extent_free(store, extent);
+	io_opaque_uncharge(store, held);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+	put_page(refused);
+}
+
+/*
+ * A second extent of a page that capture holds is a record of its own, charged against the hard
+ * limit less the reserve: capture can add a fragment of a page it holds when it can take no other
+ * page, and stops when the record does not fit, with nothing charged or counted for it.
+ */
+static void opaque_second_extent_charge(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, 2);
+	struct sk_buff *skb;
+	s64 rx, hard, held = 0, charge;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	store->config.hard_limit = 64 * PAGE_SIZE;
+	store->config.compact_headroom = 8 * PAGE_SIZE;
+	store->config.reply_reserve = 2 * PAGE_SIZE;
+	rx = io_opaque_rx_limit(store);
+	hard = store->config.hard_limit - store->config.reply_reserve;
+	opaque_test_stream(&stream, store);
+
+	/* The first fragment: the page of four, and the block of its chunk. */
+	skb = opaque_test_frag(test, page, 0, 512);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 512, false), 512);
+	stream.next = 512;
+	kfree_skb(skb);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)4 * PAGE_SIZE + OPAQUE_TEST_BLOCK);
+
+	/* Capture can take no page, and a fragment of the page that it holds still goes in. */
+	charge = rx - atomic64_read(&store->bytes);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, charge, true));
+	held += charge;
+	skb = opaque_test_frag(test, page, 1024, 512);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 512, false), 512);
+	stream.next += 512;
+	kfree_skb(skb);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx + OPAQUE_TEST_EXTENT);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
+
+	/* One byte short of the room for the next record. */
+	charge = hard - OPAQUE_TEST_EXTENT + 1 - atomic64_read(&store->bytes);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, charge, false));
+	held += charge;
+	skb = opaque_test_frag(test, page, 2048, 512);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 512, false), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard - OPAQUE_TEST_EXTENT + 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
+	kfree_skb(skb);
+
+	io_opaque_uncharge(store, 1);
+	held--;
+	skb = opaque_test_frag(test, page, 2048, 512);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 512, false), 512);
+	kfree_skb(skb);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), hard);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 3);
+
+	/* The three extents are one chunk and two records, and go with the page. */
+	io_opaque_extents_free(store, &stream.extents);
+	io_opaque_capture_release(&stream);
+	io_opaque_uncharge(store, held);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, page_count(page), 1);
+	put_page(page);
+}
+
+/* A version of @nr extents, each over a page of its own, for the cases about its vector. */
+static struct io_opaque_data *opaque_vector_data(struct kunit *test, struct io_opaque_store *store,
+						 u32 nr)
+{
+	struct io_opaque_data *data = io_opaque_data_alloc();
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	for (i = 0; i < nr; i++) {
+		struct page *page = alloc_page(GFP_KERNEL);
+		struct io_opaque_extent *extent;
+
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		extent = io_opaque_extent_new(store, page, 0, 16, i * 16, 0);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(extent));
+		list_add_tail(&extent->list, &data->extents);
+		data->length += 16;
+	}
+	return data;
+}
+
+/*
+ * The vector of a version, its segments and the anchors that follow them, is memory of the store:
+ * charged once for the whole of it when it is built, against the hard limit less the reserve, and
+ * given back, in the same step as the extents, when the version is. A vector that does not fit
+ * leaves nothing behind.
+ */
+static void opaque_vector_charge(struct kunit *test)
+{
+	static const struct { u32 nr, bytes; } cases[] = {
+		/* A segment is 16 bytes; over 16 of them, 8 bytes of anchor for each 16. */
+		{ 1, 16 }, { 16, 256 }, { 17, 288 }, { 40, 664 },
+	};
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data;
+	s64 before, rx;
+	long wakes;
+	u32 i;
+
+	store->config.hard_limit = 128 * PAGE_SIZE;
+	store->config.compact_headroom = 8 * PAGE_SIZE;
+	store->config.reply_reserve = 2 * PAGE_SIZE;
+	rx = io_opaque_rx_limit(store);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		data = opaque_vector_data(test, store, cases[i].nr);
+		before = atomic64_read(&store->bytes);
+		KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
+		KUNIT_EXPECT_EQ(test, data->nr, cases[i].nr);
+		KUNIT_EXPECT_EQ(test, data->vec_bytes, cases[i].bytes);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before + cases[i].bytes);
+		/* The pages are not counted again: the charge of the version is theirs alone. */
+		KUNIT_EXPECT_EQ(test, data->charge, (u64)cases[i].nr * PAGE_SIZE);
+		wakes = atomic_long_read(&io_opaque_budget_wakes);
+		io_opaque_data_put(store, data);
+		/* The vector, records and pages go back at once, with one look at the waiters. */
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 1L);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+	}
+
+	/* The vector is not capture: it is built when the capture limit is reached. */
+	data = opaque_vector_data(test, store, 1);
+	before = atomic64_read(&store->bytes);
+	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, rx - before, true));
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), rx + 16);
+	io_opaque_uncharge(store, rx - before);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+
+	/* It does not fit one byte short, and nothing is left of the attempt. */
+	data = opaque_vector_data(test, store, 17);
+	before = atomic64_read(&store->bytes);
+	store->config.hard_limit = before + 288 - 1 + store->config.reply_reserve;
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data), -ENOBUFS);
+	KUNIT_EXPECT_PTR_EQ(test, data->bvec, NULL);
+	KUNIT_EXPECT_EQ(test, data->vec_bytes, 0U);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before);
+	store->config.hard_limit++;
+	KUNIT_EXPECT_EQ(test, io_opaque_vector(store, data), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), before + 288);
+	io_opaque_data_put(store, data);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+}
+
+/* STAT reports the count of records in 32 bits, clamped. */
+static void opaque_stat_extents_clamp(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_extents(store), 0U);
+	atomic_long_set(&store->extents, 1234);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_extents(store), 1234U);
+	atomic_long_set(&store->extents, U32_MAX);
+	KUNIT_EXPECT_EQ(test, io_opaque_stat_extents(store), U32_MAX);
+	if (BITS_PER_LONG > 32) {
+		atomic_long_set(&store->extents, (long)U32_MAX + 1);
+		KUNIT_EXPECT_EQ(test, io_opaque_stat_extents(store), U32_MAX);
+		atomic_long_set(&store->extents, (long)U32_MAX * 4);
+		KUNIT_EXPECT_EQ(test, io_opaque_stat_extents(store), U32_MAX);
+	}
+	/* The count is a count and is checked against zero when the store is freed. */
+	atomic_long_set(&store->extents, 0);
+}
+
+/*
  * Nobody but its call may release a pending backing: the call settles it. If it
  * happens, the chunk stays for the call to find, and is not freed under it.
  */
@@ -17117,6 +17549,13 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_private_budget),
 	KUNIT_CASE(opaque_split_shared_charge),
 	KUNIT_CASE(opaque_block_lifetime),
+	KUNIT_CASE(opaque_block_charge),
+	KUNIT_CASE(opaque_block_charge_limit),
+	KUNIT_CASE(opaque_split_charge),
+	KUNIT_CASE(opaque_chunk_alone_charge),
+	KUNIT_CASE(opaque_second_extent_charge),
+	KUNIT_CASE(opaque_vector_charge),
+	KUNIT_CASE(opaque_stat_extents_clamp),
 	KUNIT_CASE(opaque_release_pending),
 	KUNIT_CASE(opaque_hold_flags),
 #if IS_ENABLED(CONFIG_PAGE_POOL)

@@ -2813,8 +2813,7 @@ static int io_opaque_stat(struct io_opaque_req *op)
 		.copied_bytes = atomic64_read(&store->copied),
 		.compacted_bytes = atomic64_read(&store->compacted),
 		.compact_count = atomic64_read(&store->compactions),
-		/* The uapi field is 32 bits; the count of records is not bounded by it. */
-		.extents = min_t(unsigned long, atomic_long_read(&store->extents), U32_MAX),
+		.extents = io_opaque_stat_extents(store),
 		.framing_bytes = atomic64_read(&store->framing),
 		.framing_copied_bytes = atomic64_read(&store->framing_copied),
 		.memory_mode = io_opaque_memory_mode(store),

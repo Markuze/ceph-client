@@ -594,6 +594,12 @@ static inline unsigned long io_opaque_cache_pages(struct io_opaque_store *store)
 	return (unsigned long)store->cache.limit << store->cache.order;
 }
 
+/* The count of extent records as IORING_OPAQUE_STAT reports it: the field is 32 bits. */
+static inline u32 io_opaque_stat_extents(struct io_opaque_store *store)
+{
+	return min_t(unsigned long, atomic_long_read(&store->extents), U32_MAX);
+}
+
 bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx);
 void io_opaque_uncharge(struct io_opaque_store *store, u64 bytes);
 bool io_opaque_charge_transient(struct io_opaque_store *store, u64 bytes, u64 limit);

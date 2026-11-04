@@ -792,6 +792,10 @@ static void pressure_stream_close(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->stream.undecided, 0ULL);
 	KUNIT_EXPECT_TRUE(test, list_empty(&f->stream.extents));
 	KUNIT_EXPECT_TRUE(test, list_empty(&f->collector.wait));
+	/* The stream gave back its extents and its block; the other object keeps a chunk of it. */
+	KUNIT_EXPECT_NULL(test, f->stream.block);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes),
+			(s64)PAGE_SIZE + OPAQUE_PRESSURE_BLOCK);
 }
 
 static void pressure_impossible_prefix(struct kunit *test)
@@ -835,6 +839,126 @@ static void pressure_release_before_enrollment(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&f->collector.wait));
 	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
 	pressure_expect_object(test, op);
+}
+
+/*
+ * A collector that waits for budget because the page fits and the block of its chunk does not is
+ * let in when the two fit, and not when only the page does.
+ */
+static void pressure_block_waiter(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+
+	pressure_fill(test, true);
+	/* The stream has no block to take a chunk from: what it waits for is a page and a block. */
+	KUNIT_EXPECT_EQ(test, f->stream.need_bytes, (u64)PAGE_SIZE + OPAQUE_PRESSURE_BLOCK);
+	KUNIT_EXPECT_EQ(test, f->collector.need_bytes, (u64)PAGE_SIZE + OPAQUE_PRESSURE_BLOCK);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 128);
+	pressure_start(test, op);
+	/* The page that the other object gives back fits, and the block is a byte short. */
+	f->store.config.hard_limit--;
+	io_opaque_extents_free(&f->store, &f->held);
+	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+	KUNIT_EXPECT_FALSE(test, list_empty(&f->collector.wait));
+	/* The byte, and both fit. */
+	f->store.config.hard_limit++;
+	io_opaque_retry_work(&f->store.retry_work.work);
+	KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->collector.wait));
+	KUNIT_EXPECT_EQ(test, pressure_recv(f), IOU_RETRY);
+	pressure_expect_object(test, op);
+}
+
+/*
+ * An INSPECT copies the extents that it spans. The store is charged for the records of the copies
+ * once, for all of them, against the hard limit and not the limit that capture stops at: it
+ * succeeds when capture is stopped, fails whole when the records do not all fit, and gives them
+ * all back in one step with the copies.
+ */
+static void pressure_snapshot_charge(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	long wakes;
+	s64 base;
+
+	pressure_seed(test, false);
+	base = atomic64_read(&f->store.bytes);
+	KUNIT_EXPECT_EQ(test, base, (s64)5 * PAGE_SIZE);
+	/* 8 to 88 spans the three extents of the stream. */
+	op = pressure_range(test, IORING_OPAQUE_INSPECT, 8, 80);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, 80);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), base + 3 * OPAQUE_PRESSURE_EXTENT);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4L + 3);
+	/* The copies go back with one uncharge and one look at the waiters, not one for each. */
+	wakes = atomic_long_read(&io_opaque_budget_wakes);
+	io_opaque_data_put(&f->store, op->data);
+	op->data = NULL;
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 1L);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), base);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4L);
+
+	/* Room for two of the three records: the INSPECT fails and leaves nothing behind. */
+	f->store.config.hard_limit = base + 2 * OPAQUE_PRESSURE_EXTENT;
+	op = pressure_range(test, IORING_OPAQUE_INSPECT, 8, 80);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, -ENOBUFS);
+	KUNIT_EXPECT_TRUE(test, list_empty(&op->data->extents));
+	KUNIT_EXPECT_EQ(test, op->data->length, 0ULL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), base);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4L);
+}
+
+/*
+ * A take that splits the extents at its ends is not capture. The records of the splits are charged
+ * against the hard limit, so a take goes on while capture is stopped, as long as the headroom has
+ * room for a record: the take of 16 to 80 cuts the first and the third extent.
+ */
+static void pressure_take_split_headroom(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	s64 base;
+
+	pressure_seed(test, false);
+	base = atomic64_read(&f->store.bytes);
+	/* Room for the two records, and none for capture: its limit is below the pages held. */
+	f->store.config.hard_limit = base + 2 * OPAQUE_PRESSURE_EXTENT;
+	KUNIT_EXPECT_FALSE(test, io_opaque_charge(&f->store, 1, true));
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 16, 64);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, 64);
+	KUNIT_EXPECT_EQ(test, op->data->length, 64ULL);
+	KUNIT_EXPECT_EQ(test, f->stream.undecided, 32ULL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), base + 2 * OPAQUE_PRESSURE_EXTENT);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4L + 2);
+}
+
+/* Room for one record of the two: the second split fails, and the take is given back. */
+static void pressure_take_split_refused(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	s64 base;
+
+	pressure_seed(test, false);
+	base = atomic64_read(&f->store.bytes);
+	f->store.config.hard_limit = base + OPAQUE_PRESSURE_EXTENT;
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 16, 64);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, op->progress, 0ULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&op->data->extents));
+	KUNIT_EXPECT_EQ(test, f->stream.undecided, 96ULL);
+	/* The first split stays: it is two extents of the stream now, and the record is charged. */
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), base + OPAQUE_PRESSURE_EXTENT);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4L + 1);
 }
 
 static void pressure_cache_drain(void *store)
@@ -913,6 +1037,10 @@ static struct kunit_case pressure_cases[] = {
 	KUNIT_CASE(pressure_impossible_prefix),
 	KUNIT_CASE(pressure_release_before_enrollment),
 	KUNIT_CASE(pressure_cache_rx_admission),
+	KUNIT_CASE(pressure_block_waiter),
+	KUNIT_CASE(pressure_snapshot_charge),
+	KUNIT_CASE(pressure_take_split_headroom),
+	KUNIT_CASE(pressure_take_split_refused),
 	{}
 };
 
