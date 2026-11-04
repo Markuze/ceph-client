@@ -4611,12 +4611,14 @@ static void opaque_parts_expect(struct kunit *test, const struct opaque_part_wan
 		if (managed) {
 			const struct io_opaque_msg_ubuf *mub = &opaque_parts.part[i].mub;
 
-			/* The msg_ubuf as TCP has it: its ops, no count and no flags. */
+			/*
+			 * The msg_ubuf as TCP has it: its ops, no count, and the flags that
+			 * the store adds to its ubufs. These stores bind no instance, and
+			 * add none.
+			 */
 			KUNIT_EXPECT_PTR_EQ(test, mub->uarg.ops, &io_opaque_msg_ubuf_ops);
 			KUNIT_EXPECT_EQ(test, refcount_read(&mub->uarg.refcnt), 0);
 			KUNIT_EXPECT_EQ(test, mub->uarg.flags, (u8)0);
-			/* These stores bind no instance, and add no flag to their ubufs. */
-			KUNIT_EXPECT_EQ(test, mub->flags, (u8)0);
 		}
 	}
 }
@@ -9871,13 +9873,17 @@ static void opaque_extents_free_wakes_all(struct kunit *test)
  */
 #define OPAQUE_BATCH	PP_ALLOC_CACHE_REFILL
 
-/* A store that binds the instance. The test owns the reference to it. */
+/*
+ * A store that binds the instance, and marks its sends as io_opaque_alloc() does. The test owns
+ * the reference to the instance.
+ */
 static struct io_opaque_store *opaque_maio_store(struct kunit *test,
 						 struct io_zcrx_ifq *ifq)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
 
 	store->maio = ifq;
+	store->send_ubuf_flags = SKBFL_SHARED_FRAG;
 	return store;
 }
 
@@ -9980,6 +9986,9 @@ static void opaque_maio_bind(struct kunit *test)
 	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
 	KUNIT_EXPECT_PTR_EQ(test, store->maio, ifq);
 	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 2U);
+	/* The sends of a bound store are marked from the start, not by the capture's flag. */
+	KUNIT_EXPECT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)SKBFL_SHARED_FRAG);
+	KUNIT_EXPECT_FALSE(test, store->maio_pages);
 	io_opaque_free(store);
 	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 1U);
 
@@ -10008,6 +10017,7 @@ static void opaque_maio_bind(struct kunit *test)
 	store = io_opaque_alloc(ctx, &cfg);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(store));
 	KUNIT_EXPECT_NULL(test, store->maio);
+	KUNIT_EXPECT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)0);
 	KUNIT_EXPECT_EQ(test, refcount_read(&ifq->refs), 1U);
 	io_opaque_free(store);
 
@@ -13830,7 +13840,7 @@ static struct sk_buff *opaque_shared_skb(struct kunit *test, struct io_opaque_st
 	skb->protocol = htons(ETH_P_ATALK);
 	skb->ip_summed = CHECKSUM_PARTIAL;
 	skb_shinfo(skb)->gso_size = OPAQUE_SHARED_MSS;
-	mub.flags = io_opaque_send_ubuf_flags(store);
+	mub.uarg.flags = io_opaque_send_ubuf_flags(store);
 	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, &mub.uarg), 0);
 	for (i = 0; i < segs->nr; i++)
 		len += segs->bv[i].bv_len;
@@ -13958,7 +13968,7 @@ static void opaque_shared_frag_one(struct kunit *test, struct io_opaque_store *s
 	skb = alloc_skb(0, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, skb);
 	skb_add_rx_frag(skb, 0, prefix, 0, 24, 24);
-	mub.flags = io_opaque_send_ubuf_flags(store);
+	mub.uarg.flags = io_opaque_send_ubuf_flags(store);
 	KUNIT_ASSERT_EQ(test, io_opaque_link_skb(skb, &mub.uarg), 0);
 	iov_iter_bvec(&iter, ITER_SOURCE, segs->bv, segs->nr, 2 * 2000);
 	KUNIT_EXPECT_EQ(test, io_opaque_sg_from_iter(skb, &iter, 2 * 2000), 0);
@@ -14126,7 +14136,7 @@ static void opaque_managed_link_binding(struct kunit *test)
 	struct sk_buff *skb;
 	unsigned int i;
 
-	bound.flags = SKBFL_SHARED_FRAG;
+	bound.uarg.flags = SKBFL_SHARED_FRAG;
 	for (i = 0; i < ARRAY_SIZE(send); i++) {
 		first = send[i];
 		other = send[!i];
@@ -14142,26 +14152,26 @@ static void opaque_managed_link_binding(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, io_opaque_link_skb(skb, &other->uarg), -EEXIST);
 		KUNIT_EXPECT_PTR_EQ(test, skb_zcopy(skb), uarg);
 		KUNIT_EXPECT_EQ(test, refcount_read(&uarg->refcnt), 1U);
-		KUNIT_EXPECT_EQ(test, !!(uarg->flags & SKBFL_SHARED_FRAG), !!first->flags);
+		KUNIT_EXPECT_EQ(test, !!(uarg->flags & SKBFL_SHARED_FRAG), !!first->uarg.flags);
 		KUNIT_EXPECT_EQ(test, !!(skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG),
-				!!first->flags);
+				!!first->uarg.flags);
 		kfree_skb(skb);
 	}
 
-	p->mub.flags = SKBFL_SHARED_FRAG;
+	p->mub.uarg.flags = SKBFL_SHARED_FRAG;
 	skb = opaque_pool_skb(test, p);
 	u = opaque_skb_ubuf(skb);
 	KUNIT_EXPECT_EQ(test, u->uarg.flags, io_opaque_ubuf_flags() | SKBFL_SHARED_FRAG);
 	kfree_skb(skb);
 	/* The ubuf is the pool's now, and the next skb has it, for a send that adds no flag. */
-	p->mub.flags = 0;
+	p->mub.uarg.flags = 0;
 	skb = opaque_pool_skb(test, p);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_skb_ubuf(skb), u);
 	KUNIT_EXPECT_EQ(test, u->uarg.flags, io_opaque_ubuf_flags());
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG, 0);
 	kfree_skb(skb);
 	/* And again for a send that does, which takes it from the pool too. */
-	p->mub.flags = SKBFL_SHARED_FRAG;
+	p->mub.uarg.flags = SKBFL_SHARED_FRAG;
 	skb = opaque_pool_skb(test, p);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_skb_ubuf(skb), u);
 	KUNIT_EXPECT_EQ(test, u->uarg.flags, io_opaque_ubuf_flags() | SKBFL_SHARED_FRAG);
@@ -14630,6 +14640,7 @@ static void opaque_maio_unbound_send_managed_flip(struct kunit *test)
 	opaque_test_publish(store, 0, 9, data);
 	opaque_test_copy(data, source);
 	KUNIT_ASSERT_FALSE(test, store->maio_pages);
+	KUNIT_ASSERT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)0);
 	opaque_managed_read(&before);
 
 	/* Before: an ordinary object, and an skb that is not marked and not sent. */
@@ -14644,6 +14655,7 @@ static void opaque_maio_unbound_send_managed_flip(struct kunit *test)
 		memset(area + i * 2000, 0x41 + i, 2000);
 	}
 	KUNIT_ASSERT_TRUE(test, store->maio_pages);
+	KUNIT_ASSERT_EQ(test, io_opaque_send_ubuf_flags(store), (u8)SKBFL_SHARED_FRAG);
 	opaque_test_free(store, 0);
 	data = opaque_maio_object(test, &stream);
 	KUNIT_EXPECT_FALSE(test, data->mapped);
