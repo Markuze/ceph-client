@@ -4696,7 +4696,8 @@ static void opaque_stop_segments(struct kunit *test)
 		opaque_test_publish(store, where[i], 3 + i, data[i]);
 	}
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 3U);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)120 * PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes),
+			ARRAY_SIZE(where) * opaque_sparse_held(data[0]));
 	io_opaque_stop(store);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	for (i = 0; i < ARRAY_SIZE(where); i++) {
@@ -4704,7 +4705,7 @@ static void opaque_stop_segments(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, opaque_test_used(store, where[i]));
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 4095));
 	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 4096));
 }
@@ -4724,13 +4725,13 @@ static void opaque_table_many_creates(struct kunit *test)
 	long slow = atomic_long_read(&io_opaque_pin_slow);
 	u8 pattern[64];
 	unsigned long addr;
+	s64 held;
 	u64 bad = 0;
 	u32 i;
 
 	KUNIT_ASSERT_NOT_NULL(test, req);
 	/* Room for the pages, and for what is charged beside them. */
 	store->config.hard_limit = (u64)OPAQUE_MANY * 4 * PAGE_SIZE;
-	store->config.max_extents = 2 * OPAQUE_MANY;
 	addr = kunit_vm_mmap(test, NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
 			     MAP_ANONYMOUS | MAP_PRIVATE, 0);
 	if (!addr || addr >= TASK_SIZE)
@@ -4756,7 +4757,9 @@ static void opaque_table_many_creates(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, bad, 0ULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, (u32)OPAQUE_MANY);
-	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)OPAQUE_MANY * PAGE_SIZE);
+	/* Each object is charged its page, the block of its one chunk, and its vector. */
+	held = PAGE_SIZE + opaque_records(opaque_slot_data(store, 0));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)OPAQUE_MANY * held);
 	/* Six segments hold 32,768 slots. */
 	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 32767));
 	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 32768));
@@ -4785,7 +4788,7 @@ static void opaque_table_many_creates(struct kunit *test)
 		opaque_test_free(store, i);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	for (i = 0; i < 6; i++) {
 		struct io_opaque_seg *seg = rcu_dereference_raw(store->objects[i]);
 
@@ -7856,7 +7859,7 @@ static void opaque_send_last_grown(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	io_opaque_vec_release(op);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -19025,7 +19028,6 @@ static void opaque_pin_smp_grow(struct kunit *test)
 	/* The whole first segment, not the one slot of the other races, and room for the pages. */
 	opaque_test_slots(test, r->store, io_opaque_seg_slots(0));
 	r->store->config.hard_limit = 128 * SZ_1M;
-	r->store->config.max_extents = 4 * OPAQUE_PIN_GROW_OBJECTS;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
 	WRITE_ONCE(io_opaque_grow_between, opaque_pin_grow_jitter);
 	/* Two objects before the readers begin, so that both handles they ask for name one. */
