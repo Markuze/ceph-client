@@ -569,14 +569,23 @@ static void io_opaque_backing_put(struct io_opaque_store *store,
 static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opaque_extent *extent)
 {
 	struct io_opaque_backing *backing = extent->backing;
+	struct io_opaque_block *own = NULL;
 	u64 charge = 0;
 
 	list_del(&extent->list);
 	if (!extent->embedded) {
 		kfree(extent);
 		charge = io_opaque_extent_bytes;
+	} else if (extent->secondary) {
+		own = container_of(extent, struct io_opaque_chunk, extent)->block;
 	}
 	atomic_long_dec(&store->extents);
+	/*
+	 * The chunk of a secondary extent is all that the extent was. The backing is another
+	 * chunk's, and this extent still holds it.
+	 */
+	if (own)
+		charge += io_opaque_block_put(own, 1);
 	if (refcount_dec_and_test(&backing->refs)) {
 		struct io_opaque_chunk *chunk;
 
@@ -1179,6 +1188,7 @@ VISIBLE_IF_KUNIT struct io_opaque_extent *io_opaque_extent_split(struct io_opaqu
 	atomic_long_inc(&store->extents);
 	*right = *extent;
 	right->embedded = false;
+	right->secondary = false;
 	refcount_inc(&right->backing->refs);
 	right->start = at;
 	right->offset += left;
@@ -1261,6 +1271,7 @@ static int io_opaque_snapshot(struct io_opaque_req *op)
 		atomic_long_inc(&op->store->extents);
 		*copy = *extent;
 		copy->embedded = false;
+		copy->secondary = false;
 		refcount_inc(&copy->backing->refs);
 		copy->start = first - op->offset;
 		copy->offset += first - extent->start;
@@ -1873,22 +1884,26 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	}
 	stream->need_bytes = page_size(page);
 	if (tail) {
+		struct io_opaque_chunk *chunk;
+
 		/*
-		 * The page is held already, so this is a record and no more. The store is charged
-		 * for it as for a split, against the hard limit.
+		 * The page is held already, so this is a record and no more. It takes a chunk
+		 * of the block of the stream, as the record of a page does, and costs what the
+		 * block does: one charge for IO_OPAQUE_BLOCK_CHUNKS of them, against the limit
+		 * that capture stops at. If the stream has no block, that is what the waiter
+		 * needs.
 		 */
-		if (!io_opaque_charge(stream->store, io_opaque_extent_bytes, false))
-			return -ENOBUFS;
-		extent = kmalloc_obj(*extent, GFP_KERNEL_ACCOUNT);
-		if (!extent) {
-			io_opaque_uncharge(stream->store, io_opaque_extent_bytes);
-			return -ENOMEM;
-		}
-		atomic_long_inc(&stream->store->extents);
+		stream->need_bytes = io_opaque_need(stream, 0);
+		chunk = io_opaque_chunk_take(stream);
+		if (IS_ERR(chunk))
+			return PTR_ERR(chunk);
+		extent = &chunk->extent;
 		*extent = (struct io_opaque_extent) {
 			.backing = tail->backing, .start = start,
 			.offset = offset, .length = length,
+			.embedded = true, .secondary = true,
 		};
+		atomic_long_inc(&stream->store->extents);
 		refcount_inc(&extent->backing->refs);
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;

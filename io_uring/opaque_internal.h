@@ -109,12 +109,23 @@ struct io_opaque_extent {
 	u64 start;
 	u32 offset;
 	u32 length;
+	/* The extent is the one of a chunk, and was not allocated by itself. */
 	bool embedded;
+	/*
+	 * The chunk of an embedded extent holds no backing of its own: the extent is another
+	 * range of a page that a backing in another chunk holds, and the chunk goes with the
+	 * extent and not with that backing.
+	 */
+	bool secondary;
 };
 
 struct io_opaque_block;
 
-/* The common capture: a backing and its first extent. A split allocates only an extent. */
+/*
+ * The common capture: a backing and its first extent. A second range of the page that
+ * a backing holds takes a chunk too, and uses its extent only. A split allocates only an
+ * extent.
+ */
 struct io_opaque_chunk {
 	struct io_opaque_backing backing;
 	struct io_opaque_extent extent;
