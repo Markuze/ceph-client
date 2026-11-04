@@ -57,7 +57,7 @@ static void pressure_cleanup(void *arg)
 	io_opaque_extents_free(&f->store, &f->stream.extents);
 	io_opaque_extents_free(&f->store, &f->held);
 	KUNIT_EXPECT_EQ(f->test, atomic64_read(&f->store.bytes), 0LL);
-	KUNIT_EXPECT_EQ(f->test, atomic_read(&f->store.extents), 0);
+	KUNIT_EXPECT_EQ(f->test, atomic_long_read(&f->store.extents), 0);
 	if (f->file)
 		fput(f->file);
 	else if (f->rx)
@@ -381,18 +381,19 @@ static void pressure_available(struct kunit *test)
 	struct pressure_fixture *f = test->priv;
 	struct io_opaque_req *op, *discard;
 	struct io_opaque_extent *extent;
-	int refs, extents;
+	long extents;
+	int refs;
 
 	pressure_seed(test, false);
 	extent = list_first_entry(&f->stream.extents, struct io_opaque_extent, list);
 	refs = refcount_read(&extent->backing->refs);
-	extents = atomic_read(&f->store.extents);
+	extents = atomic_long_read(&f->store.extents);
 	op = pressure_range(test, IORING_OPAQUE_AVAILABLE, 16, 40);
 	pressure_start(test, op);
 	KUNIT_EXPECT_EQ(test, op->result, 40);
 	KUNIT_EXPECT_PTR_EQ(test, op->data, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&extent->backing->refs), refs);
-	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), extents);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.copied), 0LL);
 	discard = pressure_range(test, IORING_OPAQUE_DISCARD, 32, 32);
 	pressure_start(test, discard);
@@ -549,7 +550,7 @@ static void pressure_discard_cursor(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->stream.next, 128ULL);
 	KUNIT_EXPECT_EQ(test, f->stream.undecided, 96ULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&f->store.bytes), (s64)4 * PAGE_SIZE);
-	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), 4);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4);
 }
 
 static void pressure_discard_gap(struct kunit *test)
@@ -572,7 +573,7 @@ static void pressure_discard_gap(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, later->phase, IO_OPAQUE_QUEUED);
 	KUNIT_EXPECT_EQ(test, gap->phase, IO_OPAQUE_QUEUED);
 	KUNIT_EXPECT_EQ(test, f->stream.next, 128ULL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&f->store.extents), 4);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f->store.extents), 4);
 }
 
 static void pressure_cancel_and_discard(struct kunit *test)

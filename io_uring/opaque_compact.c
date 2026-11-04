@@ -472,7 +472,7 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 		op->replacement->length = done;
 		cond_resched();
 	}
-	ret = io_opaque_vector(op->replacement);
+	ret = io_opaque_vector(store, op->replacement);
 	if (!ret)
 		op->replacement->dense = true;
 out:

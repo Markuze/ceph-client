@@ -6,10 +6,12 @@
 #include <linux/bvec.h>
 #include <linux/llist.h>
 #include <linux/net.h>
+#include <linux/overflow.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
+#include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <kunit/visibility.h>
 #include <uapi/linux/io_uring/opaque.h>
@@ -126,12 +128,16 @@ struct io_opaque_chunk {
  * released, and in the current block of a stream the chunks that are still to
  * be handed out and the hold of the stream. The last to let go frees the block.
  * A chunk of CREATE or compaction is a block of its own.
+ *
+ * The block is memory of the store: @charge is what the store was charged for it
+ * when it was allocated, and the last to let go gives that back.
  */
 struct io_opaque_block {
 	refcount_t live;
 	u32 nr;
 	/* Chunks handed out; changed by the stream that owns the block, under its lock. */
 	u32 used;
+	u32 charge;
 	struct io_opaque_chunk chunk[];
 };
 
@@ -143,8 +149,30 @@ struct io_opaque_block {
 #define IO_OPAQUE_BLOCK_CHUNKS \
 	((int)((SZ_4K - sizeof(struct io_opaque_block)) / sizeof(struct io_opaque_chunk)))
 
+/*
+ * What the store is charged for the records that are not pages: the size class of the
+ * allocation, which is what the allocator takes from the system. A block of a stream is
+ * one of 4 KiB by construction (IO_OPAQUE_BLOCK_CHUNKS). A block of one chunk, which
+ * CREATE and compaction make for each destination unit, and an extent of its own, which a
+ * split, a snapshot or a second extent of a page allocates, are smaller.
+ */
+static inline u64 io_opaque_block_bytes(unsigned int nr)
+{
+	return kmalloc_size_roundup(struct_size_t(struct io_opaque_block, chunk, nr));
+}
+
+static inline u64 io_opaque_extent_bytes(void)
+{
+	return kmalloc_size_roundup(sizeof(struct io_opaque_extent));
+}
+
 struct io_opaque_data {
 	refcount_t refs;
+	/*
+	 * What the store was charged for @bvec and @anchor when io_opaque_vector() made them,
+	 * which io_opaque_data_put() gives back with them; 0 while there is no vector.
+	 */
+	u32 vec_bytes;
 	/*
 	 * The handle that names this version. Set before the version is published and
 	 * never changed, so that a lookup that holds neither tables nor a reference can
@@ -497,6 +525,12 @@ struct io_opaque_store {
 	 * hold send_ubuf_flags to.
 	 */
 	bool maio_pages;
+	/*
+	 * In the padding after maio_pages, which is where it shares a line with bytes, as the
+	 * mode check reads both. extents is eight bytes now, and the place it left would have
+	 * moved ubuf_pool, wait_lock and tx_lock and all after them.
+	 */
+	atomic_t memory_mode;
 	atomic64_t bytes;
 	atomic64_t copied;
 	atomic64_t compacted;
@@ -514,8 +548,11 @@ struct io_opaque_store {
 	/* Serializes transient_seq writers. */
 	spinlock_t transient_lock;
 	seqcount_spinlock_t transient_seq;
-	atomic_t extents;
-	atomic_t memory_mode;
+	/*
+	 * Extent records alive: a count, for STAT and the leak check when the store is freed. Not
+	 * a limit. The records are bounded as the pages are, by being charged to bytes.
+	 */
+	atomic_long_t extents;
 	/* Completed ubufs of managed sends, for the next skbs; none if there was no memory. */
 	struct io_opaque_ubuf_pool *ubuf_pool;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
@@ -573,7 +610,7 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 }
 
 /* Flags of io_opaque_extent_new(). */
-#define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store already */
+#define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store for the page already */
 #define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
 
 /*
@@ -618,7 +655,7 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 struct io_opaque_data *io_opaque_data_alloc(void);
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);
-int io_opaque_vector(struct io_opaque_data *data);
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data);
 struct page *io_opaque_owned_page(unsigned int *order);
 void io_opaque_unit_cache_init(struct io_opaque_store *store, u32 limit, u32 order);
 void io_opaque_unit_cache_setup(struct io_opaque_store *store);

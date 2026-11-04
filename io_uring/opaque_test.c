@@ -377,7 +377,7 @@ static void opaque_capture_compound(struct kunit *test)
 	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
 	KUNIT_EXPECT_PTR_EQ(test, extent->backing->page, page);
 	KUNIT_EXPECT_EQ(test, extent->length, (u32)PAGE_SIZE + 128);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)2 * PAGE_SIZE);
 	kfree_skb(skb);
 	io_opaque_extents_free(store, &stream.extents);
@@ -435,7 +435,7 @@ static void opaque_capture_budget(struct kunit *test)
 	stream.next = 32;
 	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, b, 0, 32, false), -ENOBUFS);
 	KUNIT_EXPECT_EQ(test, page_count(second), 2);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 1);
 	kfree_skb(a);
 	kfree_skb(b);
 	io_opaque_extents_free(store, &stream.extents);
@@ -464,11 +464,11 @@ static void opaque_capture_gaps(struct kunit *test)
 		kfree_skb(skb);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)4 * PAGE_SIZE);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 8);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 8);
 	KUNIT_EXPECT_EQ(test, page_count(page), 2);
 	list_splice_init(&stream.extents, &data->extents);
 	data->length = stream.next;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
 	KUNIT_EXPECT_EQ(test, data->charge, (u64)4 * PAGE_SIZE);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
@@ -499,7 +499,7 @@ static void opaque_capture_copy_pack(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, extent->length, 512U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->copied), 512LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 1);
 	for (i = 0; i < 16; i++) {
 		void *mapped = kmap_local_page(extent->backing->page);
 
@@ -572,7 +572,7 @@ static void opaque_capture_private_budget(struct kunit *test)
 	KUNIT_EXPECT_GT(test, atomic64_read(&store->copied), 0LL);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	put_page(page);
 	io_opaque_capture_release(&stream);
 }
@@ -735,7 +735,7 @@ static void opaque_block_lifetime(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, second->used, n - IO_OPAQUE_BLOCK_CHUNKS);
 	refcount_inc(&second->live);
 	KUNIT_EXPECT_EQ(test, refcount_read(&second->live), IO_OPAQUE_BLOCK_CHUNKS + 2);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), (int)n);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), (int)n);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)n * PAGE_SIZE);
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_CHUNK_BLOCKS), blocks + 2);
 
@@ -763,7 +763,7 @@ static void opaque_block_lifetime(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&second->live), 1);
 	KUNIT_EXPECT_TRUE(test, refcount_dec_and_test(&second->live));
 	kfree(second);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 
 	/* A block retired with chunks out lives until the last of them is released. */
@@ -808,7 +808,7 @@ static void opaque_block_lifetime(struct kunit *test)
 	io_opaque_extent_free(store, ext[0]);
 	io_opaque_extent_free(store, ext[1]);
 	KUNIT_EXPECT_NULL(test, stream.block);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 }
 
@@ -839,7 +839,7 @@ static void opaque_release_pending(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&block->live), 1);
 	KUNIT_EXPECT_EQ(test, page_count(page), 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	kfree(block);
 	put_page(page);
 }
@@ -876,7 +876,7 @@ static void opaque_keep_restore(struct kunit *test)
 	io_opaque_data_put(store, data);
 	io_opaque_extents_free(store, &stream.extents);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	mutex_destroy(&stream.lock);
 }
 
@@ -901,7 +901,7 @@ static struct io_opaque_data *opaque_sparse_data(struct kunit *test,
 		list_add_tail(&extent->list, &data->extents);
 		data->length += 2000;
 	}
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
 	return data;
 }
 
@@ -962,7 +962,7 @@ static void opaque_compact_versions(struct kunit *test)
 	io_opaque_data_put(store, opaque_slot_data(store, 0));
 	opaque_slot_set(store, 0, NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_compact_watermarks(struct kunit *test)
@@ -1111,7 +1111,7 @@ static void opaque_send_last_ownership(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)40 * PAGE_SIZE);
 	io_opaque_data_put(store, data); /* the issued read/send */
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_send_last_compacted(struct kunit *test)
@@ -1138,7 +1138,7 @@ static void opaque_send_last_compacted(struct kunit *test)
 	io_opaque_data_put(store, compact.data);
 	io_opaque_data_put(store, send.data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_send_last_compact_race(struct kunit *test)
@@ -1178,7 +1178,7 @@ static void opaque_send_last_compact_race(struct kunit *test)
 	spin_unlock(&store->tables);
 	io_opaque_data_put(store, next);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_send_versions(struct kunit *test)
@@ -1213,7 +1213,7 @@ static void opaque_send_versions(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)ALIGN(80000, PAGE_SIZE));
 	io_opaque_data_put(store, second.data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* Requests that only queue: no handle, no body and no io_kiocb behind them. */
@@ -1505,7 +1505,7 @@ static void opaque_tx_failed_head(struct kunit *test)
 	io_opaque_data_put(store, c.data);
 	c.data = NULL;
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, a.tx->admitting, 0U);
 	opaque_test_tx_done(&a, false);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&a), NULL);
@@ -2167,7 +2167,7 @@ static void opaque_tx_lock_order(struct kunit *test)
 	spin_unlock(&store->tables);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -2256,7 +2256,7 @@ static void opaque_send_head_admit_fails(struct kunit *test)
 
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -2341,7 +2341,7 @@ static void opaque_send_head_races_follower(struct kunit *test)
 		/* A LAST frame's put freed the object, which nobody else held. */
 		KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	}
 }
 
@@ -2558,7 +2558,7 @@ static void opaque_forward_only_versions(struct kunit *test)
 	io_opaque_data_put(store, send.data);
 	io_opaque_data_put(store, last.data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_create_reservation_unwind(struct kunit *test)
@@ -2589,7 +2589,7 @@ static void opaque_create_reservation_unwind(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, op.create_reserved, 0ULL);
 	KUNIT_EXPECT_PTR_EQ(test, op.data, NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_create_publish_revalidate(struct kunit *test)
@@ -2648,7 +2648,7 @@ static void opaque_create_dense_classification(struct kunit *test)
 	list_add_tail(&extent->list, &op.data->extents);
 	op.data->length = 1;
 	op.data->dense = true;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(op.data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, op.data), 0);
 	store->policy.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
 	KUNIT_ASSERT_EQ(test, io_opaque_publish(&op, &flags), 1);
 	KUNIT_EXPECT_EQ(test, flags, 0ULL);
@@ -2660,7 +2660,7 @@ static void opaque_create_dense_classification(struct kunit *test)
 	io_opaque_data_put(store, data);
 	io_opaque_create_release(&op);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 #define OPAQUE_TEST_UNIT	(PAGE_SIZE << IO_OPAQUE_UNIT_ORDER)
@@ -2867,7 +2867,7 @@ static void opaque_cache_miss_then_hit(struct kunit *test)
 	io_opaque_unit_drain(store);
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* A unit still referenced elsewhere cools until only the cache holds it. */
@@ -2910,7 +2910,7 @@ static void opaque_cache_cooling_probe(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 2U);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* TCP fragments, transmit clones and retransmit copies all keep a unit cooling. */
@@ -2964,7 +2964,7 @@ static void opaque_cache_tx_clone(struct kunit *test)
 	io_opaque_unit_put(store, units[1]);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 struct opaque_splice {
@@ -3366,7 +3366,7 @@ static void opaque_cache_accounting(struct kunit *test)
 	put_page(units[0]);
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* Registration samples the tunables, bounds the cache and locks its memory. */
@@ -3456,7 +3456,7 @@ static struct io_opaque_data *opaque_runs_data(struct kunit *test,
 		list_add_tail(&extent->list, &data->extents);
 		data->length += len;
 	}
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
 	return data;
 }
 
@@ -3498,7 +3498,7 @@ static void opaque_compact_copy_runs(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, store->cache.hits, 2ULL);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static struct io_opaque_req *opaque_cancel_op;
@@ -3541,7 +3541,7 @@ static void opaque_compact_cancel_units(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* CREATE writes whole units taken from the cache. */
@@ -3589,7 +3589,7 @@ static void opaque_create_uses_cache(struct kunit *test)
 	io_opaque_create_release(&op);
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 1U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static const struct kernel_param *opaque_test_param(const char *name)
@@ -4058,7 +4058,7 @@ static void opaque_send_loopback(struct kunit *test)
 	spin_unlock(&store->tables);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -4335,7 +4335,7 @@ static struct io_opaque_data *opaque_varied_data(struct kunit *test,
 		list_add_tail(&extent->list, &data->extents);
 		data->length += len;
 	}
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
 	return data;
 }
 
@@ -4787,7 +4787,7 @@ static void opaque_wire_send(struct kunit *test, struct opaque_wire *w,
 		opaque_test_free(store, 0);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -5068,7 +5068,7 @@ static void opaque_wire_eagain(struct kunit *test, struct opaque_wire *w,
 		opaque_test_free(store, 0);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_send_locked_eagain(struct kunit *test)
@@ -5201,7 +5201,7 @@ static void opaque_send_locked_short(struct kunit *test)
 	follower->data = NULL;
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -5273,7 +5273,7 @@ static void opaque_send_locked_error(struct kunit *test)
 				opaque_test_free(store, 0);
 			}
 			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		}
 	}
 }
@@ -5323,7 +5323,7 @@ static void opaque_send_locked_last_versions(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static atomic_t opaque_test_proto_calls = ATOMIC_INIT(0);
@@ -5449,7 +5449,7 @@ static void opaque_send_fallback(struct kunit *test)
 	op->data = NULL;
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -5920,7 +5920,7 @@ static void opaque_vec_versions(struct kunit *test)
 	spin_unlock(&store->tables);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_test_vec_segs_restore(void *limit)
@@ -6090,7 +6090,7 @@ static void opaque_send_vec_acquire(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)80 * PAGE_SIZE);
 	io_opaque_vec_release(op);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	/* And a version published after admission or before it is the one pinned. */
 	opaque_vec_versions(test);
 }
@@ -6210,7 +6210,7 @@ static void opaque_send_vec_pin_once(struct kunit *test)
 	/* The one left is released as it always was. */
 	opaque_test_free(store, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* The combined cursor reads the ranges in order; TCP sees adjacent ones as one fragment. */
@@ -6446,7 +6446,7 @@ static void opaque_send_vec_loopback(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -6504,7 +6504,7 @@ static void opaque_send_vec_admit_fail(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 0), NULL);
 	KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, 1), NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, head.tx->admitting, 0U);
 	opaque_test_tx_done(&head, false);
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(&head), NULL);
@@ -6598,7 +6598,7 @@ static void opaque_tx_refused_owned(struct kunit *test)
 			opaque_test_free(store, 0);
 		}
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 		kvfree_rcu_barrier();
 	}
@@ -6775,7 +6775,7 @@ static void opaque_send_vec_resume(struct kunit *test)
 		opaque_test_free(r->store, i);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&r->store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&r->store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->store->extents), 0);
 }
 
 /*
@@ -6815,7 +6815,7 @@ static void opaque_vector_anchors(struct kunit *test)
 		io_opaque_data_put(store, data);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -6888,7 +6888,7 @@ static void opaque_send_vec_seek_bound(struct kunit *test)
 		opaque_test_free(store, i);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -6946,7 +6946,7 @@ static void opaque_send_vec_count_cap(struct kunit *test)
 	io_opaque_vec_release(op);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -6997,7 +6997,7 @@ static void opaque_send_single_seek(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -7155,7 +7155,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 		io_opaque_vec_release(op);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 
 	/*
 	 * A vector that cannot go fails instead of growing a block it would not
@@ -7241,7 +7241,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, op->vec->nr_segs, 0U);
 	KUNIT_EXPECT_PTR_EQ(test, op->tx, NULL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 
 	/*
@@ -7268,7 +7268,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, io_opaque_tx_release(op), NULL);
 	io_opaque_vec_release(op);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 
 	/*
@@ -7315,7 +7315,7 @@ static void opaque_send_vec_grow_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)ALIGN(80000, PAGE_SIZE));
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 }
 
@@ -7602,7 +7602,7 @@ static void opaque_send_vec_one_pass(struct kunit *test)
 		opaque_test_free(store, i);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -7724,7 +7724,7 @@ static void opaque_send_vec_acquire_fails(struct kunit *test)
 	opaque_test_free(store, 0);
 	opaque_test_free(store, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -7788,7 +7788,7 @@ static void opaque_send_vec_cursor_pinned(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)ALIGN(80000, PAGE_SIZE));
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_prep_sqe(struct opaque_prep *p, u16 ioprio, u64 addr, u64 off, u32 len)
@@ -8401,7 +8401,7 @@ static void opaque_compact_inline(struct kunit *test)
 		io_opaque_data_put(store, old);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -8625,11 +8625,11 @@ static void opaque_extents_free_wakes_once(struct kunit *test)
 	refcount_inc(&data->refs);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 0L);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 40);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 40);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 1L);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 
 	left = io_opaque_extent_new(store, page, 0, 128, 0, 0);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(left));
@@ -8647,7 +8647,7 @@ static void opaque_extents_free_wakes_once(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	io_opaque_extents_free(store, &first);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 2L);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -8833,7 +8833,7 @@ static void opaque_security_run(struct kunit *test, bool direct, int err, bool l
 	}
 	KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	kunit_deactivate_static_stub(test, io_opaque_send_direct);
 	kunit_deactivate_static_stub(test, io_opaque_tx_settle_head);
 	if (direct)
@@ -8993,7 +8993,7 @@ static void opaque_send_join_place(struct kunit *test)
 	kunit_deactivate_static_stub(test, io_opaque_send_security);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -9129,7 +9129,7 @@ static void opaque_send_parked_under_socket(struct kunit *test)
 	kunit_deactivate_static_stub(test, io_opaque_send_security);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /* How the requests of opaque_life_run() end. */
@@ -9307,7 +9307,7 @@ static void opaque_life_run(struct kunit *test, unsigned int mode, bool vector, 
 		opaque_test_free(store, 0);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -9541,7 +9541,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 			KUNIT_EXPECT_MEMEQ(test, got, source + 200, 300);
 			KUNIT_EXPECT_EQ(test, opaque_test_txs_busy(store), 0U);
 			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 			/* The next round, and the cleanup, have an object again. */
 			data = opaque_sparse_data(test, store);
 			opaque_test_publish(store, 0, 9, data);
@@ -9549,7 +9549,7 @@ static void opaque_send_locked_admit_fails(struct kunit *test)
 	}
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -9643,7 +9643,7 @@ static void opaque_direct_switch_run(struct kunit *test, unsigned int swap_at)
 	KUNIT_EXPECT_EQ(test, refcount_read(&data->refs), 1);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_send_direct_switch(struct kunit *test)
@@ -9772,7 +9772,7 @@ static void opaque_blocking_run(struct kunit *test, struct opaque_wire *w,
 		opaque_test_free(store, 0);
 	}
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 static void opaque_send_locked_blocking(struct kunit *test)
@@ -9861,7 +9861,7 @@ static void opaque_extents_free_wakes_all(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&store->budget_waits));
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - looks, 3L);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 #ifdef CONFIG_IO_URING_ZCRX_KUNIT_TEST
@@ -9938,7 +9938,7 @@ static struct io_opaque_data *opaque_maio_object(struct kunit *test,
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	list_splice_init(&stream->extents, &data->extents);
 	data->length = stream->next;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(stream->store, data), 0);
 	return data;
 }
 
@@ -10080,7 +10080,7 @@ static void opaque_maio_pool_ref(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, area->free_count, nfree);
 	KUNIT_EXPECT_EQ(test, opaque_slot_state(test, ifq, page), (u32)IO_ZCRX_KSLOT_OWNED);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	io_opaque_capture_release(&stream);
 }
 
@@ -10284,7 +10284,7 @@ static void opaque_maio_copy(struct kunit *test)
 	second = list_next_entry(extent, list);
 	KUNIT_EXPECT_EQ(test, extent->length, (u32)PAGE_SIZE);
 	KUNIT_EXPECT_EQ(test, second->length, 6100U - PAGE_SIZE);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 2);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)2 * PAGE_SIZE);
 	for (i = 0; i < 2; i++) {
 		extent = i ? second : extent;
@@ -10308,7 +10308,7 @@ static void opaque_maio_copy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, area->free_count, 16U);
 	KUNIT_EXPECT_EQ(test, opaque_slots_in(ifq, IO_ZCRX_KSLOT_OWNED), 0U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	io_opaque_capture_release(&stream);
 }
 
@@ -10498,7 +10498,7 @@ static void opaque_maio_extents(struct kunit *test)
 		kfree_skb(skb[i]);
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	io_opaque_capture_release(&stream);
 }
 
@@ -10532,7 +10532,7 @@ static void opaque_maio_exhausted(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 100, false), -ENOMEM);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->copied), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_TRUE(test, list_empty(&stream.extents));
 	KUNIT_EXPECT_EQ(test, stream.undecided, 0ULL);
 
@@ -10685,7 +10685,7 @@ static void opaque_maio_create(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, area->free_count, 16U);
 	KUNIT_EXPECT_EQ(test, opaque_slots_in(ifq, IO_ZCRX_KSLOT_FREE), 16U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 #endif
 
@@ -11173,7 +11173,7 @@ static void opaque_steal_mixed_discard(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)0);
 	/* The two discarded pages went back to the pool in the call. */
 	KUNIT_EXPECT_EQ(test, opaque_ring_pages(pp), 2U);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 2);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
 	i = 0;
 	list_for_each_entry(extent, &stream.extents, list) {
 		struct page *page = pages[i ? 3 : 0];
@@ -11269,7 +11269,7 @@ static void opaque_steal_fraglist_whole(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, skb_shinfo(top)->nr_frags, (u8)0);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(kid[0])->nr_frags, (u8)0);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(kid[1])->nr_frags, (u8)0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 6);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 6);
 	for (i = 0; i < 6; i++)
 		KUNIT_EXPECT_EQ(test, opaque_pp_refs(pages[i]), 1L);
 	kfree_skb(top);
@@ -11369,7 +11369,7 @@ static void opaque_steal_same_page_two_skbs(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_STOLEN), stolen + 1);
 	KUNIT_EXPECT_EQ(test, io_opaque_stat_read(IO_OPAQUE_STAT_PAGES_HELD), held);
 	/* One backing, charged once, with two units; two extents name it. */
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 2);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 2);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE);
 	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
 	KUNIT_EXPECT_PTR_EQ(test, list_last_entry(&stream.extents, struct io_opaque_extent,
@@ -11469,7 +11469,7 @@ static void opaque_steal_split_fragment(struct kunit *test)
 	/* The middle third goes to an object: a backing of its own on the same page. */
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, skb, 0, 3000), 3000);
 	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, (u8)0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 3);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 3);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)2 * PAGE_SIZE);
 	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
 	KUNIT_EXPECT_EQ(test, extent->backing->units, (u16)1);
@@ -11690,7 +11690,7 @@ static void opaque_remote_completion_run(struct kunit *test, unsigned int pages)
 	KUNIT_EXPECT_EQ(test, io_opaque_actor(&desc, top, 0, top->len), (int)top->len);
 	/* The object was published and freed, and the call settled what it had left. */
 	KUNIT_EXPECT_NULL(test, op.data);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	kfree_skb(top);
 	KUNIT_EXPECT_EQ(test, opaque_ring_pages(pp), pages);
@@ -12024,7 +12024,7 @@ static void opaque_send_managed_holds_unit(struct kunit *test)
 	if (taken[1])
 		io_opaque_unit_put(store, taken[1]);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -12246,7 +12246,7 @@ static void opaque_send_managed_vec_distinct(struct kunit *test)
 	}
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 /*
@@ -12487,7 +12487,7 @@ static void opaque_managed_fill_limits(struct kunit *test)
 	/* Every reference was given back by the last skb of its ubuf. */
 	opaque_splice_done(&f);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&f.store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&f.store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&f.store->extents), 0);
 }
 
 /*
@@ -12865,7 +12865,7 @@ static void opaque_managed_fill_captured(struct kunit *test)
 	/* The extents are the version, in the order they were captured. */
 	list_splice_init(&stream.extents, &data->extents);
 	data->length = at;
-	KUNIT_ASSERT_EQ(test, io_opaque_vector(data), 0);
+	KUNIT_ASSERT_EQ(test, io_opaque_vector(store, data), 0);
 	KUNIT_ASSERT_EQ(test, data->nr, (u32)ARRAY_SIZE(r));
 	opaque_expect_segments(test, data);
 	for (i = 0; i < ARRAY_SIZE(r); i++) {
@@ -13132,7 +13132,7 @@ static void opaque_managed_boundary(struct kunit *test)
 	io_opaque_data_put(store, data);
 	KUNIT_EXPECT_TRUE(test, opaque_pages_settle(pages, false));
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 }
 
 struct opaque_atomic {
@@ -14258,7 +14258,7 @@ static void opaque_wire_shared_frag(struct kunit *test, struct io_opaque_store *
 	KUNIT_EXPECT_EQ(test, after.copied, before.copied);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	store->ubuf_pool = NULL;
 }
 
@@ -14683,7 +14683,7 @@ static void opaque_maio_unbound_send_managed_flip(struct kunit *test)
 	opaque_wire_acked(w->tx->sk);
 	opaque_test_free(store, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	store->ubuf_pool = NULL;
 }
 #endif
@@ -15230,7 +15230,7 @@ static void opaque_pin_handles(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&new->refs), 1);
 	io_opaque_data_put(store, send.data);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	kvfree_rcu_barrier();
 	opaque_expect_lockdep(test, store);
 }
@@ -15276,7 +15276,7 @@ static void opaque_pin_retired(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, opaque_lk.before, 1);
 			KUNIT_EXPECT_EQ(test, opaque_lk.refs, 0);
 			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		} else {
 			KUNIT_EXPECT_EQ(test, ret, 0);
 			KUNIT_EXPECT_PTR_EQ(test, send.data, data);
@@ -15288,7 +15288,7 @@ static void opaque_pin_retired(struct kunit *test)
 			io_opaque_data_put(store, send.data);
 			io_opaque_data_put(store, data);
 			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		}
 		kvfree_rcu_barrier();
 	}
@@ -15344,7 +15344,7 @@ static void opaque_pin_retired_send(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(sk));
 		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_send_locked_calls), calls);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		kvfree_rcu_barrier();
 	}
 	opaque_expect_lockdep(test, store);
@@ -15443,7 +15443,7 @@ static void opaque_pin_stop_window(struct kunit *test)
 			KUNIT_EXPECT_PTR_EQ(test, send.data, NULL);
 		}
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		kvfree_rcu_barrier();
 		opaque_expect_lockdep(test, store);
 	}
@@ -15512,7 +15512,7 @@ static void opaque_pin_compacted(struct kunit *test)
 		io_opaque_data_put(store, send.data);
 		opaque_test_free(store, 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
 		kvfree_rcu_barrier();
 	}
@@ -15571,7 +15571,7 @@ static void opaque_pin_reused(struct kunit *test)
 		}
 		opaque_test_free(store, 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		kvfree_rcu_barrier();
 	}
 	opaque_expect_lockdep(test, store);
@@ -15631,7 +15631,7 @@ static void opaque_pin_slow_free(struct kunit *test)
 			opaque_test_free(store, 0);
 		}
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
 		kvfree_rcu_barrier();
 	}
@@ -15718,7 +15718,7 @@ static void opaque_pin_vec_run(struct kunit *test)
 		opaque_test_free(store, 0);
 		opaque_test_free(store, 1);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-		KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 		KUNIT_EXPECT_EQ(test, atomic64_read(&store->transient), 0LL);
 		kvfree_rcu_barrier();
 	}
@@ -15767,7 +15767,7 @@ static void opaque_pin_vec_failed(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
 	opaque_test_free(store, 1);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	kvfree_rcu_barrier();
 	opaque_expect_lockdep(test, store);
 }
@@ -15882,7 +15882,7 @@ static void opaque_pin_vec_owned(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, refcount_read(&b->refs), 1);
 			opaque_test_free(store, 1);
 			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 			kvfree_rcu_barrier();
 		}
 	}
@@ -15966,7 +15966,7 @@ static void opaque_pin_send_owned(struct kunit *test)
 				KUNIT_EXPECT_MEMEQ(test, got, source + 100, 1000);
 			}
 			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-			KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 			kvfree_rcu_barrier();
 		}
 	}
@@ -15994,7 +15994,7 @@ static void opaque_pin_grace(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, seen, data);
 	KUNIT_EXPECT_EQ(test, refs, 0);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	kvfree_rcu_barrier();
 	opaque_expect_lockdep(test, store);
 }
@@ -16079,7 +16079,7 @@ static struct io_opaque_data *opaque_pin_object(struct io_opaque_store *store)
 		list_add_tail(&extent->list, &data->extents);
 		data->length += 2000;
 	}
-	if (io_opaque_vector(data))
+	if (io_opaque_vector(store, data))
 		goto fail;
 	return data;
 fail:
@@ -16519,7 +16519,7 @@ static void opaque_pin_expect(struct kunit *test, struct opaque_pin_race *r, lon
 	KUNIT_EXPECT_EQ(test, atomic_read(&opaque_pin_bare), 0);
 	KUNIT_EXPECT_GT(test, atomic_long_read(&r->ok), 0L);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
 	opaque_expect_lockdep(test, store);
 	kvfree_rcu_barrier();
