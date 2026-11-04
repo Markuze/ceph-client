@@ -66,8 +66,7 @@ static bool io_opaque_budget_ready(struct io_opaque_req *op, unsigned long now)
 
 	lockdep_assert_held(&store->wait_lock);
 	return !time_before(now, op->retry_at) && used <= limit &&
-	       op->need_bytes <= limit - used &&
-	       atomic_read(&store->extents) < store->config.max_extents - 2;
+	       op->need_bytes <= limit - used;
 }
 
 /* A DISCARD at the capture cursor consumes TCP bytes without allocating. */
@@ -208,13 +207,32 @@ int io_opaque_memory_mode(struct io_opaque_store *store)
 	}
 }
 
-bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
+static u64 io_opaque_limit(const struct io_opaque_store *store, bool rx)
 {
 	u64 limit = store->config.hard_limit - store->config.reply_reserve;
+
+	return rx ? limit - store->config.compact_headroom : limit;
+}
+
+/*
+ * Whether @bytes fit now, which a charge finds out again. It is for a caller that would charge
+ * one part, find that the rest does not fit, and give the part back, when each charge and each
+ * give-back looks at the waiters for budget: it asks for the whole first, and a stall costs no
+ * more than the look.
+ */
+static bool io_opaque_room(struct io_opaque_store *store, u64 bytes, bool rx)
+{
+	u64 limit = io_opaque_limit(store, rx);
 	s64 used = atomic64_read(&store->bytes);
 
-	if (rx)
-		limit -= store->config.compact_headroom;
+	return bytes <= limit && used <= limit - bytes;
+}
+
+bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
+{
+	u64 limit = io_opaque_limit(store, rx);
+	s64 used = atomic64_read(&store->bytes);
+
 	for (;;) {
 		if (bytes > limit || used > limit - bytes)
 			return false;
@@ -223,6 +241,23 @@ bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
 			return true;
 		}
 	}
+}
+
+/*
+ * Charge @bytes whatever the limit is. The records that draining the store needs are charged so:
+ * the split of a take or a DISCARD, the copies of an INSPECT and the vector of an object that a
+ * take has assembled. Capture stops at its limit and leaves the room for them above it, but the
+ * room can be nothing (a store without headroom) or taken (by the copy of a compaction), and a
+ * stream that is full must still be drained, by the operations that free it and by publishing what
+ * it holds. They are counted in bytes, so that everything which looks at bytes sees them and
+ * nothing more is let in while they are held; the memory cgroup bounds them, as it bounds the
+ * allocations that they are. They are bounded in number: two splits for a take or a DISCARD, and
+ * a snapshot's copies for the INSPECT, until their requests are done.
+ */
+static void io_opaque_charge_force(struct io_opaque_store *store, u64 bytes)
+{
+	atomic64_add(bytes, &store->bytes);
+	io_opaque_memory_mode(store);
 }
 
 /* Give bytes back to the store, and let nobody in on them yet. */
@@ -307,17 +342,6 @@ void io_opaque_uncharge_frame(struct io_opaque_store *store, u64 bytes, bool res
 		io_opaque_release_transient(store, bytes, bytes);
 }
 
-static bool io_opaque_extent_reserve(struct io_opaque_store *store)
-{
-	int nr = atomic_read(&store->extents);
-
-	while (nr < store->config.max_extents) {
-		if (atomic_try_cmpxchg(&store->extents, &nr, nr + 1))
-			return true;
-	}
-	return false;
-}
-
 static int io_opaque_memcg_charge(struct io_opaque_store *store, u64 bytes)
 {
 #ifdef CONFIG_MEMCG
@@ -336,25 +360,53 @@ static void io_opaque_memcg_uncharge(struct io_opaque_store *store, u64 bytes)
 #endif
 }
 
-/* Let go of @refs of what keeps @block; the last frees it. */
-static void io_opaque_block_put(struct io_opaque_block *block, unsigned int refs)
+u32 io_opaque_block_bytes __ro_after_init;
+u32 io_opaque_alone_bytes __ro_after_init;
+u32 io_opaque_extent_bytes __ro_after_init;
+
+static int __init io_opaque_records_init(void)
 {
-	if (refcount_sub_and_test(refs, &block->live))
-		kfree(block);
+	size_t block = struct_size_t(struct io_opaque_block, chunk, IO_OPAQUE_BLOCK_CHUNKS);
+	size_t alone = struct_size_t(struct io_opaque_block, chunk, 1);
+
+	io_opaque_block_bytes = kmalloc_size_roundup(block);
+	io_opaque_alone_bytes = kmalloc_size_roundup(alone);
+	io_opaque_extent_bytes = kmalloc_size_roundup(sizeof(struct io_opaque_extent));
+	return 0;
+}
+device_initcall(io_opaque_records_init);
+
+/*
+ * Let go of @refs of what keeps @block; the last frees it. The last also returns what the store
+ * was charged for the block, for the caller to give back; the others return 0.
+ */
+static u64 io_opaque_block_put(struct io_opaque_block *block, unsigned int refs)
+{
+	u64 charge;
+
+	if (!refcount_sub_and_test(refs, &block->live))
+		return 0;
+	charge = block->charge;
+	kfree(block);
+	return charge;
 }
 
 /*
  * The stream hands out no more chunks of its current block: it lets go of the
- * ones that are left and of its hold. The chunks handed out keep the block.
+ * ones that are left and of its hold. The chunks handed out keep the block. If
+ * there are none, the block goes, and the store gets its charge back.
  */
 VISIBLE_IF_KUNIT void io_opaque_block_retire(struct io_opaque_stream *stream)
 {
 	struct io_opaque_block *block = stream->block;
+	u64 charge;
 
 	if (!block)
 		return;
 	stream->block = NULL;
-	io_opaque_block_put(block, block->nr - block->used + 1);
+	charge = io_opaque_block_put(block, block->nr - block->used + 1);
+	if (charge)
+		io_opaque_uncharge(stream->store, charge);
 }
 
 /* Let go of everything that capture keeps in @stream: the block, and the room for a call. */
@@ -365,17 +417,30 @@ VISIBLE_IF_KUNIT void io_opaque_capture_release(struct io_opaque_stream *stream)
 	stream->pending = NULL;
 }
 
-/* The next chunk of the current block of @stream, in a new block if that is used up. */
+/*
+ * The next chunk of the current block of @stream, in a new block if that is used up. A new
+ * block is charged to the store, as capture charges a page: against the limit that capture
+ * stops at, and it is given back when the last chunk of the block is released. That is one
+ * charge for IO_OPAQUE_BLOCK_CHUNKS captures. Returns an error pointer: -ENOBUFS if the
+ * block does not fit, -ENOMEM if it cannot be allocated.
+ */
 static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *stream)
 {
 	struct io_opaque_block *block = stream->block;
 	struct io_opaque_chunk *chunk;
 
 	if (!block) {
+		u32 charge = io_opaque_block_bytes;
+
+		if (!io_opaque_charge(stream->store, charge, true))
+			return ERR_PTR(-ENOBUFS);
 		block = kzalloc_flex(*block, chunk, IO_OPAQUE_BLOCK_CHUNKS, GFP_KERNEL_ACCOUNT);
-		if (!block)
-			return NULL;
+		if (!block) {
+			io_opaque_uncharge(stream->store, charge);
+			return ERR_PTR(-ENOMEM);
+		}
 		block->nr = IO_OPAQUE_BLOCK_CHUNKS;
+		block->charge = charge;
 		/* Every chunk, to be handed out or released, and the hold of the stream. */
 		refcount_set(&block->live, block->nr + 1);
 		stream->block = block;
@@ -388,15 +453,29 @@ static struct io_opaque_chunk *io_opaque_chunk_take(struct io_opaque_stream *str
 	return chunk;
 }
 
-/* A chunk in a block of its own, for the callers that make one extent at a time. */
-static struct io_opaque_chunk *io_opaque_chunk_alone(void)
+/*
+ * A chunk in a block of its own, for the callers that make one extent at a time. The block is
+ * charged to the store as it is: against the hard limit, not the capture limit, which is how
+ * CREATE uses the room that capture leaves it. A compaction has charged the store for the
+ * block already, in the reservation for its copy, and says so with @covered. It is given back
+ * when the chunk is released. Returns an error pointer as io_opaque_chunk_take() does.
+ */
+static struct io_opaque_chunk *io_opaque_chunk_alone(struct io_opaque_store *store, bool covered)
 {
-	struct io_opaque_block *block = kzalloc_flex(*block, chunk, 1, GFP_KERNEL_ACCOUNT);
+	u32 charge = io_opaque_alone_bytes;
+	struct io_opaque_block *block;
 
-	if (!block)
-		return NULL;
+	if (!covered && !io_opaque_charge(store, charge, false))
+		return ERR_PTR(-ENOBUFS);
+	block = kzalloc_flex(*block, chunk, 1, GFP_KERNEL_ACCOUNT);
+	if (!block) {
+		if (!covered)
+			io_opaque_uncharge(store, charge);
+		return ERR_PTR(-ENOMEM);
+	}
 	block->nr = 1;
 	block->used = 1;
+	block->charge = charge;
 	refcount_set(&block->live, 1);
 	block->chunk[0].block = block;
 	return &block->chunk[0];
@@ -413,18 +492,25 @@ static struct io_opaque_extent *io_opaque_extent_make(struct io_opaque_store *st
 	bool memcg = !(flags & (IO_OPAQUE_EXT_RESERVED | IO_OPAQUE_EXT_NO_MEMCG));
 	struct io_opaque_chunk *chunk;
 	u64 charge = page_size(compound_head(page));
+	int err = -ENOMEM;
 
-	if (!io_opaque_extent_reserve(store))
+	/*
+	 * A page and the block of its chunk are asked for together: a stream without a block that
+	 * has room for the page and not for the block would charge the page, and the memory
+	 * cgroup, to give them back, and wake the waiters for it.
+	 */
+	if (stream && !stream->block && !reserved &&
+	    !io_opaque_room(store, charge + io_opaque_block_bytes, true))
 		return ERR_PTR(-ENOBUFS);
 	if (!reserved && !io_opaque_charge(store, charge, true))
-		goto no_space;
+		return ERR_PTR(-ENOBUFS);
 	if (memcg && io_opaque_memcg_charge(store, charge))
-		goto no_memory;
-	chunk = stream ? io_opaque_chunk_take(stream) : io_opaque_chunk_alone();
-	if (!chunk) {
-		if (memcg)
-			io_opaque_memcg_uncharge(store, charge);
-		goto no_memory;
+		goto uncharge;
+	chunk = stream ? io_opaque_chunk_take(stream) :
+			 io_opaque_chunk_alone(store, flags & IO_OPAQUE_EXT_COVERED);
+	if (IS_ERR(chunk)) {
+		err = PTR_ERR(chunk);
+		goto uncharge_memcg;
 	}
 	refcount_set(&chunk->backing.refs, 1);
 	chunk->backing.page = compound_head(page);
@@ -439,15 +525,15 @@ static struct io_opaque_extent *io_opaque_extent_make(struct io_opaque_store *st
 	chunk->extent.length = length;
 	chunk->extent.embedded = true;
 	INIT_LIST_HEAD(&chunk->extent.list);
+	atomic_long_inc(&store->extents);
 	return &chunk->extent;
-no_memory:
+uncharge_memcg:
+	if (memcg)
+		io_opaque_memcg_uncharge(store, charge);
+uncharge:
 	if (!reserved)
 		io_opaque_uncharge(store, charge);
-	atomic_dec(&store->extents);
-	return ERR_PTR(-ENOMEM);
-no_space:
-	atomic_dec(&store->extents);
-	return ERR_PTR(-ENOBUFS);
+	return ERR_PTR(err);
 }
 
 struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
@@ -522,36 +608,49 @@ static void io_opaque_backing_put(struct io_opaque_store *store,
 
 /*
  * Let go of @extent, and of its backing if it was the last to use it. Returns
- * the charge of the backing that went, for the caller to give back to the
- * store: giving it back lets those waiting for budget in, which one free does
- * once and a list of them once, not once per extent.
+ * what the store was charged for what went, for the caller to give back to the
+ * store: the extent, if it was a record of its own; the page of the backing, if
+ * that was the last extent to use it; and the block of the chunk, if that was
+ * the last chunk of its block. Giving it back lets those waiting for budget in,
+ * which one free does once and a list of them once, not once per extent.
  */
 static u64 io_opaque_extent_release(struct io_opaque_store *store, struct io_opaque_extent *extent)
 {
 	struct io_opaque_backing *backing = extent->backing;
+	struct io_opaque_block *own = NULL;
 	u64 charge = 0;
 
 	list_del(&extent->list);
-	if (!extent->embedded)
+	if (!extent->embedded) {
 		kfree(extent);
-	atomic_dec(&store->extents);
+		charge = io_opaque_extent_bytes;
+	} else if (extent->secondary) {
+		own = container_of(extent, struct io_opaque_chunk, extent)->block;
+	}
+	atomic_long_dec(&store->extents);
+	/*
+	 * The chunk of a secondary extent is all that the extent was. The backing is another
+	 * chunk's, and this extent still holds it.
+	 */
+	if (own)
+		charge += io_opaque_block_put(own, 1);
 	if (refcount_dec_and_test(&backing->refs)) {
 		struct io_opaque_chunk *chunk;
 
-		charge = backing->charge;
+		charge += backing->charge;
 		if (backing->accounted)
-			io_opaque_memcg_uncharge(store, charge);
+			io_opaque_memcg_uncharge(store, backing->charge);
 		/*
 		 * A call of the actor has not settled a pending backing yet, and it
 		 * will. Nobody else may release one. If it happens, leak the chunk and
 		 * the page reference that the call will give it, rather than free the
-		 * chunk under the call.
+		 * chunk under the call. The block stays charged with the chunk.
 		 */
 		if (WARN_ON_ONCE(backing->ref == IO_OPAQUE_REF_PENDING))
 			return charge;
 		io_opaque_backing_put(store, backing);
 		chunk = container_of(backing, struct io_opaque_chunk, backing);
-		io_opaque_block_put(chunk->block, 1);
+		charge += io_opaque_block_put(chunk->block, 1);
 	}
 	return charge;
 }
@@ -568,19 +667,20 @@ VISIBLE_IF_KUNIT void io_opaque_extent_free(struct io_opaque_store *store,
 }
 
 /*
- * Free the extents of @list. What they held is returned to the store in one
- * step, and the waiters for budget are looked at in one go: each look takes
- * wait_lock and walks the list of them, which for the 700 extents of a 1 MB
- * object that is not a single mapping was 700 times. The look is repeated
- * while it leaves ready waiters behind, as the many that it replaces would
- * have, so that they are let in by the free and not by the retry work.
+ * Free the extents of @list, and give the store back @extra bytes besides what they
+ * held. What they held is returned to the store in one step, and the waiters for
+ * budget are looked at in one go: each look takes wait_lock and walks the list of
+ * them, which for the 700 extents of a 1 MB object that is not a single mapping was
+ * 700 times. The look is repeated while it leaves ready waiters behind, as the many
+ * that it replaces would have, so that they are let in by the free and not by the
+ * retry work.
  */
-VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
-					     struct list_head *list)
+static void io_opaque_extents_free_more(struct io_opaque_store *store,
+					struct list_head *list, u64 extra)
 {
 	struct io_opaque_extent *extent, *next;
-	bool any = false;
-	u64 charge = 0;
+	bool any = extra != 0;
+	u64 charge = extra;
 
 	list_for_each_entry_safe(extent, next, list, list) {
 		charge += io_opaque_extent_release(store, extent);
@@ -590,6 +690,12 @@ VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
 		io_opaque_uncharge_quiet(store, charge);
 	if (any)
 		io_opaque_wake_budget_all(store);
+}
+
+VISIBLE_IF_KUNIT void io_opaque_extents_free(struct io_opaque_store *store,
+					     struct list_head *list)
+{
+	io_opaque_extents_free_more(store, list, 0);
 }
 
 struct io_opaque_data *io_opaque_data_alloc(void)
@@ -608,8 +714,11 @@ void io_opaque_data_put(struct io_opaque_store *store,
 {
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_data_put, store, data);
 	if (data && refcount_dec_and_test(&data->refs)) {
-		io_opaque_extents_free(store, &data->extents);
+		u64 vector = data->vec_bytes;
+
 		kvfree(data->bvec);
+		/* The vector was charged to the store with the object, and goes back with it. */
+		io_opaque_extents_free_more(store, &data->extents, vector);
 		/*
 		 * The extents and the segments go now, as they always did. Only the struct
 		 * waits for the grace period: a lookup that read the version from its slot
@@ -625,21 +734,66 @@ void io_opaque_data_put(struct io_opaque_store *store,
 }
 
 /*
+ * The vector of a version of @nr extents is its segments, and for a version of more than
+ * IO_OPAQUE_SEEK_STRIDE of them the anchors, which start at the next multiple of eight bytes after
+ * the segments. Returns its size, with the number of anchors and where they start. An overflow
+ * saturates, and the allocation fails.
+ */
+static size_t io_opaque_vector_layout(u32 nr, u32 *anchors, size_t *at)
+{
+	size_t bytes = size_add(array_size(nr, sizeof(struct bio_vec)), sizeof(u64) - 1);
+
+	*anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
+	*at = bytes & ~(sizeof(u64) - 1);
+	return size_add(*at, array_size(*anchors, sizeof(u64)));
+}
+
+/*
+ * What the store is charged for a vector of @size bytes: the allocation it comes to, a size
+ * class of kmalloc() or the pages of a larger one (kvmalloc() takes a vmalloc area of whole pages
+ * if kmalloc() has none, which is less), as the records are charged.
+ */
+static u64 io_opaque_vector_charge(size_t size)
+{
+	return size > KMALLOC_MAX_SIZE ? PAGE_ALIGN(size) : kmalloc_size_roundup(size);
+}
+
+/* What the store is charged for the vector of a version of @nr extents. */
+u64 io_opaque_vector_bytes(u32 nr)
+{
+	u32 anchors;
+	size_t at;
+
+	return io_opaque_vector_charge(io_opaque_vector_layout(nr, &anchors, &at));
+}
+
+/*
  * Build the version's segments, and for a version of more than
  * IO_OPAQUE_SEEK_STRIDE of them the anchors that find one without walking
  * from the first, in one allocation. Both are made once, when the version is,
  * and never change. The anchors follow the segments at the next multiple of
  * eight bytes: a segment is 16 bytes, but only 12 on 32 bits, where an odd
  * number of them would leave the anchors four-byte aligned.
+ *
+ * The allocation is memory of the store, as the records it is made from are: it is charged
+ * once, for the whole version, at the size of the allocation (io_opaque_vector_charge()), and
+ * io_opaque_data_put() gives it back with the version. The charge is against the hard limit and
+ * not the capture limit, because the version holds its pages already and it is capture that the
+ * limit is there to stop. Returns -ENOBUFS if it does not fit. The version of a take is charged
+ * with @force, without the limit: publishing what capture holds must not fail for lack of room
+ * (io_opaque_charge_force()). A compaction has charged the store for its vector in the
+ * reservation for the copy, and passes what is left of that as @reserved: the vector comes out
+ * of it while it lasts.
  */
-int io_opaque_vector(struct io_opaque_data *data)
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force,
+		     u64 *reserved)
 {
 	struct io_opaque_extent *extent;
 	struct io_opaque_backing *previous = NULL;
-	bool mapped = true;
+	bool mapped = true, drawn = false;
 	u32 nr = 0, anchors;
-	size_t bytes;
-	u64 at = 0;
+	size_t bytes, size;
+	u64 at = 0, charge;
 
 	data->charge = 0;
 	list_for_each_entry(extent, &data->extents, list) {
@@ -649,14 +803,28 @@ int io_opaque_vector(struct io_opaque_data *data)
 		previous = extent->backing;
 		mapped &= extent->backing->area;
 	}
-	anchors = nr > IO_OPAQUE_SEEK_STRIDE ? DIV_ROUND_UP(nr, IO_OPAQUE_SEEK_STRIDE) : 0;
-	/* Where the anchors start. An overflow saturates, and the allocation fails. */
-	bytes = size_add(array_size(nr, sizeof(*data->bvec)), sizeof(*data->anchor) - 1);
-	bytes &= ~(sizeof(*data->anchor) - 1);
-	data->bvec = kvmalloc(size_add(bytes, array_size(anchors, sizeof(*data->anchor))),
-			      GFP_KERNEL_ACCOUNT);
-	if (!data->bvec)
+	size = io_opaque_vector_layout(nr, &anchors, &bytes);
+	/* More than kvmalloc() allocates, and more than vec_bytes holds. */
+	if (size > INT_MAX)
 		return -ENOMEM;
+	charge = io_opaque_vector_charge(size);
+	if (reserved && *reserved >= charge) {
+		*reserved -= charge;
+		drawn = true;
+	} else if (force) {
+		io_opaque_charge_force(store, charge);
+	} else if (!io_opaque_charge(store, charge, false)) {
+		return -ENOBUFS;
+	}
+	data->bvec = kvmalloc(size, GFP_KERNEL_ACCOUNT);
+	if (!data->bvec) {
+		if (drawn)
+			*reserved += charge;
+		else
+			io_opaque_uncharge(store, charge);
+		return -ENOMEM;
+	}
+	data->vec_bytes = charge;
 	data->anchor = anchors ? (void *)data->bvec + bytes : NULL;
 	data->nr = nr;
 	data->mapped = nr && mapped;
@@ -1253,7 +1421,7 @@ void io_opaque_free(struct io_opaque_store *store)
 		return;
 	io_opaque_stop(store);
 	WARN_ON_ONCE(atomic64_read(&store->bytes));
-	WARN_ON_ONCE(atomic_read(&store->extents));
+	WARN_ON_ONCE(atomic_long_read(&store->extents));
 	WARN_ON_ONCE(store->cache.nr_idle || store->cache.nr_cooling);
 	io_opaque_txs_free(store);
 	io_opaque_ubuf_pool_close(store->ubuf_pool);
@@ -1382,6 +1550,12 @@ static void io_opaque_resume(struct io_tw_req tw_req, io_tw_token_t tw)
 		io_req_task_submit(tw_req, tw);
 }
 
+/*
+ * Split @extent at @at. The new extent is a record of its own. A split is part of draining the
+ * stream, by a take or a DISCARD that cuts the extents at its ends, and it does not fail for lack
+ * of room: the store is charged for the record without the limit (io_opaque_charge_force()).
+ * Returns -ENOMEM if the record cannot be allocated.
+ */
 VISIBLE_IF_KUNIT struct io_opaque_extent *io_opaque_extent_split(struct io_opaque_store *store,
 								 struct io_opaque_extent *extent,
 								 u64 at)
@@ -1389,15 +1563,14 @@ VISIBLE_IF_KUNIT struct io_opaque_extent *io_opaque_extent_split(struct io_opaqu
 	struct io_opaque_extent *right;
 	u32 left = at - extent->start;
 
-	if (!io_opaque_extent_reserve(store))
-		return ERR_PTR(-ENOBUFS);
 	right = kmalloc_obj(*right, GFP_KERNEL_ACCOUNT);
-	if (!right) {
-		atomic_dec(&store->extents);
+	if (!right)
 		return ERR_PTR(-ENOMEM);
-	}
+	io_opaque_charge_force(store, io_opaque_extent_bytes);
+	atomic_long_inc(&store->extents);
 	*right = *extent;
 	right->embedded = false;
+	right->secondary = false;
 	refcount_inc(&right->backing->refs);
 	right->start = at;
 	right->offset += left;
@@ -1444,31 +1617,48 @@ static int io_opaque_unclassified(struct io_opaque_stream *stream, u64 off, u64 
 	return io_opaque_available(stream, off, len);
 }
 
+/*
+ * Copy the extents that INSPECT spans into the version of @op. The copies are records of
+ * their own, and an INSPECT does not fail for lack of room, as a split does not: the snapshot
+ * counts them first and charges the store for all of them at once, without the limit, and the
+ * free of the version gives them back with its pages in one step. A copy that cannot be
+ * allocated gives back the charge of those after it.
+ */
 static int io_opaque_snapshot(struct io_opaque_req *op)
 {
 	struct io_opaque_extent *extent;
 	int ret = io_opaque_available(op->stream, op->offset, op->length);
-	u64 end;
+	u64 end, left = 0;
 
 	if (ret <= 0)
 		return ret;
 	end = op->offset + ret;
 	list_for_each_entry(extent, &op->stream->extents, list) {
+		if (extent->start >= end)
+			break;
+		if (max(op->offset, extent->start) < min(end, extent->start + extent->length))
+			left++;
+	}
+	io_opaque_charge_force(op->store, left * io_opaque_extent_bytes);
+	list_for_each_entry(extent, &op->stream->extents, list) {
 		u64 first = max(op->offset, extent->start);
 		u64 last = min(end, extent->start + extent->length);
 		struct io_opaque_extent *copy;
 
+		if (extent->start >= end)
+			break;
 		if (first >= last)
 			continue;
-		if (!io_opaque_extent_reserve(op->store))
-			return -ENOBUFS;
 		copy = kmalloc_obj(*copy, GFP_KERNEL_ACCOUNT);
 		if (!copy) {
-			atomic_dec(&op->store->extents);
+			io_opaque_uncharge(op->store, left * io_opaque_extent_bytes);
 			return -ENOMEM;
 		}
+		left--;
+		atomic_long_inc(&op->store->extents);
 		*copy = *extent;
 		copy->embedded = false;
+		copy->secondary = false;
 		refcount_inc(&copy->backing->refs);
 		copy->start = first - op->offset;
 		copy->offset += first - extent->start;
@@ -1518,8 +1708,12 @@ VISIBLE_IF_KUNIT int io_opaque_take(struct io_opaque_req *op)
 
 			tail = list_last_entry_or_null(&op->data->extents,
 						       struct io_opaque_extent, list);
-			if (!tail || tail->backing != extent->backing)
+			if (!tail || tail->backing != extent->backing) {
 				op->data->charge += extent->backing->charge;
+				op->data->chunks++;
+			}
+			if (extent->secondary)
+				op->data->chunks++;
 			extent->start -= op->offset;
 			list_move_tail(&extent->list, &op->data->extents);
 			op->data->length += last - off;
@@ -1555,6 +1749,7 @@ VISIBLE_IF_KUNIT void io_opaque_restore(struct io_opaque_req *op)
 	stream->undecided += op->data->length;
 	op->data->length = 0;
 	op->data->charge = 0;
+	op->data->chunks = 0;
 	op->progress = 0;
 }
 
@@ -1605,13 +1800,26 @@ VISIBLE_IF_KUNIT int io_opaque_range_insert(struct io_opaque_req *op)
 	return 0;
 }
 
+/*
+ * What a version that a take assembles holds of the store at the least, if it is of @pages bytes
+ * of pages in @chunks chunks: the pages, and the blocks that its chunks sit in, one for each
+ * IO_OPAQUE_BLOCK_CHUNKS of them. Capture stops at the capture limit, and a take whose version
+ * holds more than that of it can never be completed, even in an empty store. It is refused where
+ * it is made and not left to wait for what cannot come: the check counted pages only, and a take
+ * that needed the last page and a block was accepted, failed, and was accepted again.
+ */
+static u64 io_opaque_keep_bytes(u64 pages, u64 chunks)
+{
+	return pages + DIV_ROUND_UP(chunks, IO_OPAQUE_BLOCK_CHUNKS) * (u64)io_opaque_block_bytes;
+}
+
 /* Validate a blocked TAKE without taking and restoring its retained prefix. */
 static int io_opaque_defer_take(struct io_opaque_req *op)
 {
 	struct io_opaque_stream *stream = op->stream;
 	struct io_opaque_extent *extent, *tail = NULL;
 	u64 off = op->offset, end = min(off + op->length, stream->next);
-	u64 charge = 0, left;
+	u64 charge = 0, chunks = 0, left;
 
 	/* Allocation backoff can leave an already private prefix in place. */
 	if (op->progress)
@@ -1621,8 +1829,12 @@ static int io_opaque_defer_take(struct io_opaque_req *op)
 			continue;
 		if (extent->start > off)
 			break;
-		if (!tail || tail->backing != extent->backing)
+		if (!tail || tail->backing != extent->backing) {
 			charge += extent->backing->charge;
+			chunks++;
+		}
+		if (extent->secondary)
+			chunks++;
 		tail = extent;
 		off = min(end, extent->start + extent->length);
 		if (off == end)
@@ -1634,8 +1846,9 @@ static int io_opaque_defer_take(struct io_opaque_req *op)
 	if (tail && tail->backing->copied &&
 	    tail->offset + tail->length == tail->backing->filled)
 		left -= min_t(u64, left, PAGE_SIZE - tail->backing->filled);
-	return charge + ALIGN(left, PAGE_SIZE) > io_opaque_rx_limit(op->store) ?
-		-ENOBUFS : 0;
+	left = ALIGN(left, PAGE_SIZE);
+	return io_opaque_keep_bytes(charge + left, chunks + left / PAGE_SIZE) >
+	       io_opaque_rx_limit(op->store) ? -ENOBUFS : 0;
 }
 
 static void io_opaque_stream_process(struct io_opaque_stream *stream)
@@ -1667,10 +1880,14 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 			ret = io_opaque_defer_take(op);
 		else
 			ret = stream->closed ? -ECANCELED : io_opaque_take(op);
-		if (!ret && op->op == IORING_OPAQUE_RECV_OBJECT &&
-		    op->data->charge + io_opaque_dense_left(op) >
-		    io_opaque_rx_limit(op->store))
-			ret = -ENOBUFS;
+		if (!ret && op->op == IORING_OPAQUE_RECV_OBJECT) {
+			u64 dense = io_opaque_dense_left(op);
+
+			if (io_opaque_keep_bytes(op->data->charge + dense,
+						 op->data->chunks + dense / PAGE_SIZE) >
+			    io_opaque_rx_limit(op->store))
+				ret = -ENOBUFS;
+		}
 		if (!ret && !stream->eof && !stream->closed && !stream->error)
 			continue;
 		rb_erase_cached(node, &stream->decisions);
@@ -2028,6 +2245,18 @@ static void io_opaque_copy_page_put(struct io_opaque_store *store,
 }
 
 /*
+ * What a stream needs below the capture limit to take a page of @bytes: the page and, if the
+ * stream has no block to take a chunk from, the block, which is charged with it. A collector
+ * that waits for budget is let in when this fits, and not when only the page does.
+ */
+static u64 io_opaque_need(const struct io_opaque_stream *stream, u64 bytes)
+{
+	if (!stream->block)
+		bytes += io_opaque_block_bytes;
+	return bytes;
+}
+
+/*
  * Keep @length bytes of @page at @offset in the stream, in a backing that holds
  * the page. @src says where they come from, if the pass may take the reference of
  * the skb over: the backing is then left pending, and the pass settles it. Without
@@ -2044,7 +2273,7 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	struct list_head *list = &stream->extents;
 	struct io_opaque_extent *extent, *tail;
 	u64 start = stream->next;
-	bool new_backing = false;
+	bool new_backing = false, new_chunk = false;
 
 	if (op) {
 		list = &op->data->extents;
@@ -2068,30 +2297,44 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 		}
 	}
 	stream->need_bytes = page_size(page);
-	if (atomic_read(&stream->store->extents) >= stream->store->config.max_extents - 2)
-		return -ENOBUFS;
 	if (tail) {
-		if (!io_opaque_extent_reserve(stream->store))
-			return -ENOBUFS;
-		extent = kmalloc_obj(*extent, GFP_KERNEL_ACCOUNT);
-		if (!extent) {
-			atomic_dec(&stream->store->extents);
-			return -ENOMEM;
-		}
+		struct io_opaque_chunk *chunk;
+
+		/*
+		 * The page is held already, so this is a record and no more. It takes a chunk
+		 * of the block of the stream, as the record of a page does, and costs what the
+		 * block does: one charge for IO_OPAQUE_BLOCK_CHUNKS of them, against the limit
+		 * that capture stops at. If the stream has no block, that is what the waiter
+		 * needs.
+		 */
+		stream->need_bytes = io_opaque_need(stream, 0);
+		chunk = io_opaque_chunk_take(stream);
+		if (IS_ERR(chunk))
+			return PTR_ERR(chunk);
+		extent = &chunk->extent;
 		*extent = (struct io_opaque_extent) {
 			.backing = tail->backing, .start = start,
 			.offset = offset, .length = length,
+			.embedded = true, .secondary = true,
 		};
+		atomic_long_inc(&stream->store->extents);
 		refcount_inc(&extent->backing->refs);
+		new_chunk = true;
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
 		bool bound = !!stream->store->maio;
 		unsigned int flags = io_opaque_hold_flags(hold);
 
-		/* Leave room for dense copies of a private KEEP's remaining bytes. */
-		if (!copied && op && op->data->charge + stream->need_bytes + left >
+		/*
+		 * Leave room for dense copies of a private KEEP's remaining bytes, and for the
+		 * blocks that the chunks of the version sit in.
+		 */
+		if (!copied && op &&
+		    io_opaque_keep_bytes(op->data->charge + stream->need_bytes + left,
+					 op->data->chunks + 1 + left / PAGE_SIZE) >
 		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
+		stream->need_bytes = io_opaque_need(stream, stream->need_bytes);
 		extent = io_opaque_stream_extent_new(stream, page, offset, length, start, flags);
 		if (IS_ERR(extent))
 			return PTR_ERR(extent);
@@ -2122,6 +2365,8 @@ accounted:
 		op->data->length += length;
 		if (new_backing)
 			op->data->charge += extent->backing->charge;
+		if (new_backing || new_chunk)
+			op->data->chunks++;
 	} else {
 		stream->undecided += length;
 	}
@@ -2159,7 +2404,7 @@ static int io_opaque_capture_part(struct io_opaque_stream *stream, struct sk_buf
 			struct page *page = virt_to_page(data);
 
 			/* A compound allocation larger than the limit can never fit. */
-			if (page_size(compound_head(page)) > retain_limit ||
+			if (io_opaque_need(stream, page_size(compound_head(page))) > retain_limit ||
 			    !io_opaque_retain(stream->store, skb, page, &hold))
 				goto copy;
 			src.frag = -1;
@@ -2181,7 +2426,9 @@ static int io_opaque_capture_part(struct io_opaque_stream *stream, struct sk_buf
 			continue;
 		}
 		chunk = min(start + size - offset, len);
-		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit ||
+		if (copy_frags ||
+		    io_opaque_need(stream, page_size(compound_head(skb_frag_page(frag)))) >
+		    retain_limit ||
 		    !io_opaque_retain(stream->store, skb, skb_frag_page(frag), &hold))
 			goto copy;
 		src.frag = i;
@@ -2216,8 +2463,10 @@ copy:
 			pos = tail->backing->filled;
 			allocated = false;
 		} else {
-			stream->need_bytes = PAGE_SIZE;
-			if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
+			stream->need_bytes = io_opaque_need(stream, PAGE_SIZE);
+			/* The page and the block of its chunk, before the page is copied. */
+			if (!io_opaque_room(stream->store, stream->need_bytes, true) ||
+			    !io_opaque_charge(stream->store, PAGE_SIZE, true))
 				return -ENOBUFS;
 			/*
 			 * An empty area fails like a failed allocation. The
@@ -2745,6 +2994,17 @@ VISIBLE_IF_KUNIT int io_opaque_publish(struct io_opaque_req *op, u64 *object_fla
 	return op->length;
 }
 
+/*
+ * The version that a take assembled becomes an object, and needs its vector. It is the last
+ * of what the take costs, and it is charged without the limit: it does not fail for lack of room.
+ */
+VISIBLE_IF_KUNIT int io_opaque_assemble(struct io_opaque_req *op)
+{
+	if (op->data->length != op->length)
+		return -ENODATA;
+	return io_opaque_vector(op->store, op->data, true, NULL);
+}
+
 static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 {
 	struct io_kiocb *req = tw_req.req;
@@ -2761,8 +3021,7 @@ static void io_opaque_ready(struct io_tw_req tw_req, io_tw_token_t tw)
 	if (ret >= 0 && op->op == IORING_OPAQUE_INSPECT)
 		ret = io_opaque_copy(op->data, 0, op->data->length, op->addr);
 	if (ret >= 0 && op->op == IORING_OPAQUE_RECV_OBJECT) {
-		ret = op->data->length == op->length ?
-			io_opaque_vector(op->data) : -ENODATA;
+		ret = io_opaque_assemble(op);
 		if (!ret)
 			ret = io_opaque_publish(op, &object_flags);
 	}
@@ -3042,7 +3301,7 @@ static int io_opaque_stat(struct io_opaque_req *op)
 		.copied_bytes = atomic64_read(&store->copied),
 		.compacted_bytes = atomic64_read(&store->compacted),
 		.compact_count = atomic64_read(&store->compactions),
-		.extents = atomic_read(&store->extents),
+		.extents = io_opaque_stat_extents(store),
 		.framing_bytes = atomic64_read(&store->framing),
 		.framing_copied_bytes = atomic64_read(&store->framing_copied),
 		.memory_mode = io_opaque_memory_mode(store),
@@ -3108,7 +3367,7 @@ VISIBLE_IF_KUNIT int io_opaque_create_build(struct io_opaque_req *op)
 		op->data->length = done;
 		cond_resched();
 	}
-	ret = io_opaque_vector(op->data);
+	ret = io_opaque_vector(store, op->data, false, NULL);
 	if (!ret)
 		op->data->dense = true;
 out:
