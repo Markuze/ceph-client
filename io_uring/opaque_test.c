@@ -6339,6 +6339,40 @@ static void opaque_attach_stopped(struct kunit *test)
 }
 
 /*
+ * A collector that attaches to a store that has stopped is refused. The stop walks the table of
+ * streams once and puts what it finds, so a stream that was added after the walk, with the file
+ * of its socket, was found by nothing: the receive saw the stop only after the attach, ended with
+ * -ECANCELED, and the second stop that the free makes returns at dead.
+ */
+static void opaque_attach_after_stop(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_stream *none;
+	struct io_rings *rings;
+	long files;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_stoppable(test, store);
+	rings = opaque_attach_setup(test, w);
+	io_opaque_stop(store);
+	KUNIT_ASSERT_EQ(test, READ_ONCE(store->dead), 1);
+	files = file_count(w->file);
+	KUNIT_EXPECT_EQ(test, opaque_attach_one(test, w, store, &none, 0xdead), -ESHUTDOWN);
+	KUNIT_EXPECT_NULL(test, none);
+	/* No stream in the table, no token for the ring, and the socket and its file as they were. */
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 0U);
+	KUNIT_EXPECT_NULL(test, opaque_test_stream_slot(store, 0)->stream);
+	KUNIT_EXPECT_EQ(test, opaque_test_stream_slot(store, 0)->generation, 0ULL);
+	KUNIT_EXPECT_EQ(test, rings->cqes[0].user_data, 0ULL);
+	KUNIT_EXPECT_EQ(test, file_count(w->file), files);
+	KUNIT_EXPECT_PTR_EQ(test, w->tx->sk->sk_rx_owner, NULL);
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+	lockdep_assert_none_held_once();
+}
+
+/*
  * The entries are checked as a whole, without looking at any handle: as they
  * are read from user memory, and with the answers the model gives. Where the
  * number of entries is wrong prep says so before it reads any
@@ -18263,6 +18297,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_attach_lock_order),
 	KUNIT_CASE_SLOW(opaque_attach_many),
 	KUNIT_CASE(opaque_attach_stopped),
+	KUNIT_CASE(opaque_attach_after_stop),
 	KUNIT_CASE(opaque_send_vec_check),
 	KUNIT_CASE(opaque_vec_copy_in),
 	KUNIT_CASE(opaque_vec_copy_in_invalid),

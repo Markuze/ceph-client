@@ -2317,7 +2317,7 @@ int io_opaque_recv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
  * for a socket lock while it holds tables. A table with no free slot grows,
  * which takes neither: the stream table gets its next segment with the socket
  * released, since packets for it wait in its backlog meanwhile, and what the
- * attach checked about the socket is checked again.
+ * attach checked about the socket is checked again, and so is whether the store has stopped.
  */
 VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 {
@@ -2355,6 +2355,14 @@ retry:
 	full = false;
 	lock_sock(sock->sk);
 	spin_lock(&store->tables);
+	/*
+	 * The stop has walked the table of streams once it has set dead, and puts what it finds;
+	 * a stream that is added after is not found by anything, and with its socket is lost.
+	 */
+	if (store->dead) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
 	if (sock->sk->sk_rx_owner || sock->sk->sk_prot != sock->sk->sk_prot_creator ||
 	    tcp_sk(sock->sk)->repair || tcp_sk(sock->sk)->urg_data) {
 		ret = -EBUSY;
