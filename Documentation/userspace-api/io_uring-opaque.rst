@@ -51,13 +51,25 @@ flags are rejected with EINVAL. Output copies respect the supplied argument
 size, zero unknown trailing bytes and report the kernel's known registration
 size in ``size``. Failed output copies unwind IDs, descriptors and references.
 
-All configuration limits are explicit. ``hard_limit`` and
+Memory bounds a store, and the configuration says how much. ``hard_limit`` and
 ``compact_headroom`` are page aligned; ordinary capture cannot use headroom.
-The hard limit includes headroom. Object size, object slots, stream slots and
-extents have separate bounds. Registering reserves the hard-limit capacity
-against the registration owner's locked-memory accounting, plus the destination
-unit cache when one is enabled (see `Destination unit cache`_). The payload is
-allocated or retained on demand.
+The hard limit includes headroom, and it counts what the store holds for its
+objects: the pages of the payload and the records that describe them (see
+`What the hard limit counts`_). ``max_object_size`` bounds one object. Nothing
+but memory bounds the number of objects, streams or extents: the tables of
+handles grow in segments as they fill, and the segments, like the records, are
+allocated in the memory cgroup of the store. ``max_objects``, ``max_streams``,
+``max_extents`` and ``max_requests`` are ignored; they may hold any value.
+Registering reserves the hard-limit capacity against the registration owner's
+locked-memory accounting, plus the destination unit cache when one is enabled
+(see `Destination unit cache`_). The payload is allocated or retained on
+demand.
+
+The smallest store is one whose capture limit holds a page and the block of
+records that goes with it, 4 KiB. The capture limit is ``hard_limit`` less
+``compact_headroom`` and ``reply_reserve``. A smaller store could never capture
+a page, and registration refuses it with EINVAL. That is a minimum of structure
+and not a limit on what a store holds.
 
 The optional ``high_watermark``, ``low_watermark`` and ``reply_reserve``
 fields define a memory-pressure policy at store creation. Omitted fields are
@@ -87,7 +99,7 @@ ownership is acquired. No bytes are consumed before this CQE can be posted.
 A full completion queue rejects attachment with ENOSPC before acquiring the
 receive claim or consuming TCP bytes. Drain completions before retrying attach.
 ``IORING_RECVSEND_POLL_FIRST`` waits for socket readiness before attachment.
-A backing or extent quota stall produces a nonterminal 32-byte CQE with result
+A backing quota stall produces a nonterminal 32-byte CQE with result
 ``-ENOBUFS`` and ``IORING_CQE_F_MORE``. Its extra words contain the stream token
 and the absolute first unread TCP offset respectively. The notification is
 coalesced until that offset advances. The application can release objects,
@@ -242,11 +254,12 @@ Normal linking, personality and cancellation apply; CQE suppression is rejected.
 CREATE rejects a zero length, null source, nonzero handle/offset or unused
 operation fields with EINVAL. Lengths beyond the configured object bound or
 page-rounded capture allowance return EMSGSIZE. An inaccessible source or
-pointer overflow returns EFAULT. Current payload or extent quota exhaustion
-returns ENOBUFS immediately; CREATE never joins a TCP budget wait list.
-Slot exhaustion returns ENOSPC, allocation failure returns ENOMEM, and
-cancellation returns ECANCELED. Failures release the reserved slot, partial
-pages and unused reservation.
+pointer overflow returns EFAULT. Current payload quota exhaustion, which counts
+the records of the object as well as its pages, returns ENOBUFS immediately;
+CREATE never joins a TCP budget wait list. Allocation failure returns ENOMEM,
+as does a table of handles that cannot grow for want of memory, and
+cancellation returns ECANCELED. There is no slot limit to exhaust. Failures
+release the reserved slot, partial pages and unused reservation.
 
 CREATE reserves page-rounded ordinary payload capacity before copying.
 It cannot use compaction headroom or the protected reply reserve. The
@@ -299,14 +312,17 @@ order; capture consults the earliest decision rather than scanning all pending
 requests. A following header can be read independently of a preceding RECV_OBJECT.
 Object slots and private assembly are reserved before a RECV_OBJECT can consume data.
 Handles are opaque 64-bit values; applications must not decode their index or
-generation. Slots are allocated through rotating bitmaps and the current
-implementation uses 50 generation bits. Generation exhaustion retires a slot
-instead of wrapping a stale handle.
+generation. Slots are allocated through rotating bitmaps in tables that grow
+with the store, and the current implementation keeps 32 bits of index and 32
+bits of generation. A slot that has used its last generation is retired
+instead of wrapping a stale handle, is not used again, and the table grows to
+take its place. Slots retire at the rate of CREATEs divided by 2^32, about 20 a
+day at a million a second, each costing 56 bytes.
 RECV_OBJECT lengths exceeding either the configured object-size bound or the entire
 capture allowance are rejected with EMSGSIZE. Capture falls back to packed
 page copies when retaining another allocation would leave no room for dense
-backing of the remaining private range. If physical backing or extent limits
-still stop a partial RECV_OBJECT, it completes with ENOBUFS and restores its prefix;
+backing of the remaining private range. If physical backing or the charge of its
+records still stops a partial RECV_OBJECT, it completes with ENOBUFS and restores its prefix;
 it does not indefinitely pin quota waiting for its own completion. A range
 with no captured prefix can wait for quota release, announced by the collector's
 nonterminal ENOBUFS CQE. Deadlines and cancellation
@@ -565,7 +581,8 @@ total. This does not bound private object assembly. An unsuccessful
 assembly restores its admitted bytes as undecided, and the stream then
 waits for a decision, a waiting INSPECT or a decision further in the stream
 before collecting more.
-Vectors are built once at object publication and are bounded by extent limits.
+Vectors are built once at object publication and are charged to the store with
+the object, one 16-byte record for each extent.
 Releasing backing or metadata wakes eligible collectors suspended on the store
 budget in bounded batches. Their native multishot polls remain armed for socket
 errors and urgent data. Transient capture ENOMEM backs off for 50 milliseconds
@@ -596,6 +613,40 @@ is full, and allocation can fail independently. Framing cannot consume
 compaction headroom. With a zero reply reserve, snapshots share ordinary
 capture capacity, so an eviction guarantees reply admission only while no
 permitted collection pass takes the freed capacity first.
+
+What the hard limit counts
+--------------------------
+
+``hard_limit`` bounds the memory that a store holds for its objects. Besides
+the pages of payload it counts the records that describe them, each at the size
+of the allocation that holds it:
+
+- A block of records for each stream, 4 KiB for 46 records. Capture charges it
+  when it takes the first record of the stream and gives it back when the last
+  record of the block is released. A stream that has captured holds one block
+  while it lives, so a store with streams is not at zero when it holds no
+  objects.
+- A record outside a block, 64 or 128 bytes: the extent of a split, a copy, a
+  second range of a page, and the block of one record that CREATE and
+  compaction make for each destination unit.
+- The vector of an object, 16 bytes for each extent.
+
+``backing_bytes`` of STAT, the watermarks and the capture limit count all of
+them. ``backing_bytes`` of OBJECT_STAT counts pages only. ``extents`` of STAT
+counts the records, clamped to 32 bits. The memory cgroup of the store pays for
+the records as it does for the pages.
+
+Capture charges pages and blocks against the capture limit, ``hard_limit`` less
+the headroom and the reply reserve. The records that CREATE and the other
+records outside a block need are charged against ``hard_limit`` less the reply
+reserve. What a take, a DISCARD, an INSPECT or the publication of an object
+needs in order to drain a stream, the records of a split, the copies of an
+inspection and the vector, is charged without a limit: a store that capture has
+filled can always be drained. So ``backing_bytes`` can be above ``hard_limit``
+while an operation that holds such records is in flight, and nothing more is
+admitted while it is. A compaction reserves its pages, the records of its
+destination units and its vector together, and is refused where it begins when
+they do not fit.
 
 Destination unit cache
 ----------------------
@@ -956,8 +1007,7 @@ A bound store decides for each page of a socket buffer how to hold it:
 ``copied_bytes`` in STAT counts the bytes that the capture copied. A byte
 that the store holds by reference is not in it. A bound store copies into area
 pages, and an unbound store copies into pages of its own. The retention limit,
-the extent limits, the watermarks and the forwarding-only classification
-apply as before.
+the watermarks and the forwarding-only classification apply as before.
 
 The area pages of a bound store are not charged to the memory cgroup of the
 store. The instance accounted the area when it was registered. The bytes that
@@ -1134,7 +1184,8 @@ readers; it is not presented as a kernel memory-safety requirement.
 compound allocation and oversized-copy, charge splitting, exact compaction
 reservation, version lifetime, rollback, cancellation and generation-retirement
 tests, plus final-send reference transfer and compaction publication races with
-slot reuse, allocation rotation/exhaustion and generations beyond 32 bits.
+slot reuse, allocation rotation, growth of the tables of handles and retirement
+at the last of 32 generation bits.
 Memory-policy cases cover watermark transitions, compaction copies excluded
 from the watermarks, framing that takes the reply reserve only after capture
 capacity, the collection gate (retained undecided bytes, held passes and
