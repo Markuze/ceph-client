@@ -1017,8 +1017,8 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	/*
 	 * A store is bounded by memory: hard_limit, of any size, which is counted against
 	 * RLIMIT_MEMLOCK below, and the memory cgroup. Its tables grow with its objects and streams,
-	 * so max_objects and max_streams are not read, nor are checked, as max_requests is not.
-	 * Neither is max_extents.
+	 * so max_objects and max_streams are neither read nor checked, as max_requests is not.
+	 * Neither is max_extents checked.
 	 */
 	if (!cfg.hard_limit ||
 	    !IS_ALIGNED(cfg.hard_limit, PAGE_SIZE) ||
@@ -2340,7 +2340,7 @@ VISIBLE_IF_KUNIT int io_opaque_attach(struct io_opaque_req *op)
 	struct io_uring_cqe cqe[2] = {};
 	bool full;
 	u32 i;
-	int ret = -ENOSPC;
+	int ret;
 
 	if (!sock || sock->type != SOCK_STREAM || sock->sk->sk_protocol != IPPROTO_TCP)
 		return -EOPNOTSUPP;
