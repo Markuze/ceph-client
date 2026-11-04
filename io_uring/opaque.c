@@ -329,9 +329,11 @@ u32 io_opaque_extent_bytes __ro_after_init;
 
 static int __init io_opaque_records_init(void)
 {
-	io_opaque_block_bytes = kmalloc_size_roundup(struct_size_t(struct io_opaque_block, chunk,
-								 IO_OPAQUE_BLOCK_CHUNKS));
-	io_opaque_alone_bytes = kmalloc_size_roundup(struct_size_t(struct io_opaque_block, chunk, 1));
+	size_t block = struct_size_t(struct io_opaque_block, chunk, IO_OPAQUE_BLOCK_CHUNKS);
+	size_t alone = struct_size_t(struct io_opaque_block, chunk, 1);
+
+	io_opaque_block_bytes = kmalloc_size_roundup(block);
+	io_opaque_alone_bytes = kmalloc_size_roundup(alone);
 	io_opaque_extent_bytes = kmalloc_size_roundup(sizeof(struct io_opaque_extent));
 	return 0;
 }
