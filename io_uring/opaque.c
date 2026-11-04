@@ -730,7 +730,7 @@ VISIBLE_IF_KUNIT struct io_opaque_seg *io_opaque_seg_alloc(unsigned int seg, siz
 	return new;
 }
 
-static void io_opaque_seg_free(struct io_opaque_seg *seg)
+VISIBLE_IF_KUNIT void io_opaque_seg_free(struct io_opaque_seg *seg)
 {
 	if (seg) {
 		kvfree(seg);

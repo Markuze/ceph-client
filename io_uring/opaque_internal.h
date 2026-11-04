@@ -755,6 +755,7 @@ void io_opaque_capture_release(struct io_opaque_stream *stream);
 void io_opaque_use_slot(struct io_opaque_seg __rcu **segs, u32 index);
 void io_opaque_release_slot(struct io_opaque_seg __rcu **segs, u32 index, u64 generation);
 struct io_opaque_seg *io_opaque_seg_alloc(unsigned int seg, size_t size);
+void io_opaque_seg_free(struct io_opaque_seg *seg);
 struct io_opaque_seg *io_opaque_object_seg(unsigned int seg);
 struct io_opaque_seg *io_opaque_stream_seg(unsigned int seg);
 int io_opaque_tables_init(struct io_opaque_store *store);

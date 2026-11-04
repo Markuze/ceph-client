@@ -1139,6 +1139,7 @@ static void opaque_slot_rotation(struct kunit *test)
 	struct io_opaque_req op = { .store = store, .data = data, .length = data->length };
 	struct io_opaque_req send = { .store = store, .offset = 100, .length = 1000 };
 	const u32 seg = 1U << IO_OPAQUE_SEG_BITS;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
 	u64 flags = 0;
 	u32 i;
 
@@ -1160,6 +1161,8 @@ static void opaque_slot_rotation(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, opaque_test_acquire(store, &send), 0);
 	KUNIT_EXPECT_PTR_EQ(test, send.data, data);
 	io_opaque_data_put(store, send.data);
+	/* In RCU, from the segment's pointer and the slot, and not settled with tables held. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow);
 	/* The rest of the second segment, in order. */
 	op.data = NULL;
 	for (i = seg + 1; i < 2 * seg; i++) {
@@ -1220,6 +1223,351 @@ static void opaque_generation_width(struct kunit *test)
 	store->object_cursor = 0;
 	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
 	KUNIT_EXPECT_EQ(test, op.slot, 1U);
+}
+
+/*
+ * The segment and the offset of an index are exact at the first and the last slot of every segment,
+ * the segments adjoin, and the last ends at the last index a handle can carry. Indexes of every
+ * magnitude split, and put together again, as they should.
+ */
+static void opaque_seg_split(struct kunit *test)
+{
+	static const struct {
+		u32 index;
+		unsigned int seg;
+		u32 off;
+	} edge[] = {
+		{ 0, 0, 0 }, { 1, 0, 1 }, { 1023, 0, 1023 },
+		{ 1024, 1, 0 }, { 1025, 1, 1 }, { 2047, 1, 1023 },
+		{ 2048, 2, 0 }, { 4095, 2, 2047 }, { 4096, 3, 0 }, { 8191, 3, 4095 },
+		{ 8192, 4, 0 }, { (1U << 31) - 1, 21, (1U << 30) - 1 },
+		{ 1U << 31, 22, 0 }, { U32_MAX, 22, (1U << 31) - 1 },
+	};
+	u64 bad = 0;
+	u32 off, n;
+	unsigned int s;
+
+	KUNIT_EXPECT_EQ(test, IO_OPAQUE_SEGS, 23);
+	for (n = 0; n < ARRAY_SIZE(edge); n++) {
+		KUNIT_EXPECT_EQ(test, io_opaque_seg_split(edge[n].index, &off), edge[n].seg);
+		KUNIT_EXPECT_EQ(test, off, edge[n].off);
+	}
+	for (s = 0; s < IO_OPAQUE_SEGS; s++) {
+		u32 first = io_opaque_seg_first(s), slots = io_opaque_seg_slots(s);
+
+		KUNIT_EXPECT_EQ(test, io_opaque_seg_split(first, &off), s);
+		KUNIT_EXPECT_EQ(test, off, 0U);
+		KUNIT_EXPECT_EQ(test, io_opaque_seg_split(first + slots - 1, &off), s);
+		KUNIT_EXPECT_EQ(test, off, slots - 1);
+		if (s + 1 < IO_OPAQUE_SEGS)
+			KUNIT_EXPECT_EQ(test, io_opaque_seg_first(s + 1), first + slots);
+	}
+	KUNIT_EXPECT_EQ(test, (u64)io_opaque_seg_first(IO_OPAQUE_SEGS - 1) +
+				io_opaque_seg_slots(IO_OPAQUE_SEGS - 1),
+			1ULL << IO_OPAQUE_INDEX_BITS);
+	for (n = 0; n < 100000; n++) {
+		u32 index = get_random_u32() >> get_random_u32_below(32);
+
+		s = io_opaque_seg_split(index, &off);
+		bad += s >= IO_OPAQUE_SEGS || off >= io_opaque_seg_slots(s) ||
+		       io_opaque_seg_first(s) + off != index;
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+}
+
+/*
+ * A segment is one allocation: the slots, zeroed, with the bitmap of the taken ones after them on
+ * a word, all of them free. A segment too large for kvmalloc() is made another way, and when the
+ * memory is not there, which for the last segment of the objects (120 GiB) it never is, the answer
+ * is NULL and nothing is said.
+ */
+static void opaque_seg_alloc(struct kunit *test)
+{
+	long live = atomic_long_read(&io_opaque_segs_live);
+	struct io_opaque_seg *seg;
+	unsigned int s;
+
+	for (s = 0; s < 4; s++) {
+		u32 slots = io_opaque_seg_slots(s);
+
+		seg = io_opaque_seg_alloc(s, sizeof(struct io_opaque_slot));
+		KUNIT_ASSERT_NOT_NULL(test, seg);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 1L);
+		KUNIT_EXPECT_EQ(test, seg->free, slots);
+		KUNIT_EXPECT_PTR_EQ(test, (void *)seg->used, (void *)&seg->object[slots]);
+		KUNIT_EXPECT_TRUE(test, IS_ALIGNED((unsigned long)seg->used, sizeof(long)));
+		KUNIT_EXPECT_TRUE(test, bitmap_empty(seg->used, slots));
+		KUNIT_EXPECT_NULL(test, rcu_access_pointer(seg->object[slots - 1].data));
+		io_opaque_seg_free(seg);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+	}
+	seg = io_opaque_seg_alloc(IO_OPAQUE_SEGS - 1, sizeof(struct io_opaque_slot));
+	KUNIT_EXPECT_NULL(test, seg);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+}
+
+/*
+ * A table grows by a segment at a time, each twice as long as the last but the second, and the
+ * tables of objects and of streams grow on their own. What a new segment holds is what a table
+ * starts with: slots that know where they are, are on no list, hold nothing and are all free.
+ */
+static void opaque_table_grow(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	long live = atomic_long_read(&io_opaque_segs_live);
+	struct io_opaque_slot *slot;
+	unsigned int s;
+	u64 i, bad = 0;
+
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 1023));
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 1024));
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_stream_slot_at(store, 1023));
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, 1024));
+	for (s = 1; s <= 4; s++) {
+		u32 next = io_opaque_seg_first(s + 1);
+
+		KUNIT_ASSERT_EQ(test, io_opaque_table_grow(store, store->objects,
+							   io_opaque_object_seg), 0);
+		KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, next - 1));
+		KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, next));
+	}
+	for (s = 1; s <= 2; s++)
+		KUNIT_ASSERT_EQ(test, io_opaque_table_grow(store, store->streams,
+							   io_opaque_stream_seg), 0);
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_stream_slot_at(store, 4 * 1024 - 1));
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, 4 * 1024));
+	/* Four segments more of objects and two of streams, each table on its own. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 6L);
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 16 * 1024));
+	io_opaque_for_each_slot(store, i, slot)
+		bad += slot->index != i || !list_empty(&slot->candidate) || slot->generation ||
+		       slot->reserved || rcu_access_pointer(slot->data);
+	KUNIT_EXPECT_EQ(test, i, 16ULL * 1024);
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	for (s = 0; s < 5; s++) {
+		struct io_opaque_seg *seg = rcu_dereference_raw(store->objects[s]);
+
+		KUNIT_EXPECT_EQ(test, seg->free, io_opaque_seg_slots(s));
+		KUNIT_EXPECT_TRUE(test, bitmap_empty(seg->used, io_opaque_seg_slots(s)));
+	}
+}
+
+/*
+ * Another request that found the table full makes the same segment while this one makes its own,
+ * and publishes first: this one finds the table with room, frees its segment, and looks again.
+ * There is one segment more, and the handle is the first of it.
+ */
+static struct {
+	bool inside;
+	unsigned int calls;
+	int ret;
+} opaque_grow_hook;
+
+static void opaque_grow_rival(struct io_opaque_store *store)
+{
+	if (opaque_grow_hook.inside)
+		return;
+	opaque_grow_hook.inside = true;
+	opaque_grow_hook.calls++;
+	opaque_grow_hook.ret = io_opaque_table_grow(store, store->objects, io_opaque_object_seg);
+	opaque_grow_hook.inside = false;
+}
+
+static void opaque_grow_hook_restore(void *arg)
+{
+	WRITE_ONCE(io_opaque_grow_between, NULL);
+}
+
+static void opaque_table_grow_rival(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store };
+	long live;
+	u32 i;
+
+	for (i = 0; i < io_opaque_seg_slots(0); i++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	memset(&opaque_grow_hook, 0, sizeof(opaque_grow_hook));
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
+	WRITE_ONCE(io_opaque_grow_between, opaque_grow_rival);
+	live = atomic_long_read(&io_opaque_segs_live);
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	WRITE_ONCE(io_opaque_grow_between, NULL);
+	KUNIT_EXPECT_EQ(test, opaque_grow_hook.calls, 1U);
+	KUNIT_EXPECT_EQ(test, opaque_grow_hook.ret, 0);
+	KUNIT_EXPECT_EQ(test, op.handle, io_opaque_handle(io_opaque_seg_slots(0), 1));
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 2 * io_opaque_seg_slots(0) - 1));
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 2 * io_opaque_seg_slots(0)));
+	/* The one segment is the rival's: the one this request made was freed. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 1L);
+}
+
+/* A table that has no memory for its next segment is full: -ENOMEM, and nothing is taken. */
+static struct io_opaque_seg *opaque_seg_alloc_fail(unsigned int seg, size_t size)
+{
+	return NULL;
+}
+
+static void opaque_table_grow_nomem(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store };
+	u32 i;
+
+	for (i = 0; i < io_opaque_seg_slots(0); i++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	kunit_activate_static_stub(test, io_opaque_seg_alloc, opaque_seg_alloc_fail);
+	KUNIT_EXPECT_EQ(test, io_opaque_slot_reserve(&op), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, io_opaque_table_grow(store, store->streams, io_opaque_stream_seg),
+			-ENOMEM);
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, io_opaque_seg_slots(0)));
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, io_opaque_seg_slots(0)));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+	kunit_deactivate_static_stub(test, io_opaque_seg_alloc);
+	/* Nothing was left half done: the next request gets the segment, and its first slot. */
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, io_opaque_seg_slots(0));
+}
+
+/*
+ * All the segments there can be, none with a free slot: the table is full and cannot grow. The
+ * stand-ins are never looked into, for none has a free slot to look for.
+ */
+static void opaque_table_full(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store };
+	unsigned int s;
+	u32 i;
+
+	for (i = 0; i < io_opaque_seg_slots(0); i++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	for (s = 1; s < IO_OPAQUE_SEGS; s++) {
+		struct io_opaque_seg *fake = kunit_kzalloc(test, sizeof(*fake), GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, fake);
+		RCU_INIT_POINTER(store->objects[s], fake);
+	}
+	KUNIT_EXPECT_EQ(test, io_opaque_slot_reserve(&op), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, io_opaque_table_grow(store, store->objects, io_opaque_object_seg),
+			-ENOMEM);
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+	/* The store frees the segments it made, and not these. */
+	for (s = 1; s < IO_OPAQUE_SEGS; s++)
+		RCU_INIT_POINTER(store->objects[s], NULL);
+}
+
+/*
+ * A slot on its last generation is retired in whichever segment it is: a reservation passes it
+ * by, taking it for good, and the freed slot after it is the next that is taken.
+ */
+static void opaque_generation_retirement_grown(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store };
+	const u32 first = io_opaque_seg_slots(0);
+	struct io_opaque_seg *seg;
+	u32 i;
+
+	for (i = 0; i <= first; i++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_ASSERT_EQ(test, op.slot, first);
+	seg = rcu_dereference_raw(store->objects[1]);
+	KUNIT_EXPECT_EQ(test, seg->free, first - 1);
+	/* Give the first slot of the segment back on its last generation, as a free would. */
+	opaque_test_slot(store, first)->generation = IO_OPAQUE_GENERATION_MAX;
+	opaque_test_slot(store, first)->reserved = false;
+	opaque_test_release(store, first);
+	KUNIT_EXPECT_TRUE(test, opaque_test_used(store, first));
+	KUNIT_EXPECT_EQ(test, seg->free, first - 1);
+	/* The next reservation passes it by. */
+	store->object_cursor = first;
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, first + 1);
+	KUNIT_EXPECT_EQ(test, op.handle, io_opaque_handle(first + 1, 1));
+	KUNIT_EXPECT_EQ(test, seg->free, first - 2);
+	/* And when that one is freed, it is that one again, and the retired slot stays retired. */
+	opaque_test_slot(store, first + 1)->reserved = false;
+	opaque_test_release(store, first + 1);
+	KUNIT_EXPECT_EQ(test, seg->free, first - 1);
+	store->object_cursor = first;
+	KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_EXPECT_EQ(test, op.slot, first + 1);
+	KUNIT_EXPECT_EQ(test, op.handle, io_opaque_handle(first + 1, 2));
+	KUNIT_EXPECT_TRUE(test, opaque_test_used(store, first));
+}
+
+/*
+ * The search for a free slot against a model, in a table of three segments (4,096 slots): slots
+ * are taken and given back at random, and the cursor is put anywhere, past the end of the table
+ * too. Every answer is the model's, which looks from the cursor to the end and from the start to
+ * the cursor; so is the cursor it leaves; and the free count of each segment is the number of its
+ * slots that the model has free.
+ */
+static void opaque_find_slot_model(struct kunit *test)
+{
+	const u32 slots = 4 * io_opaque_seg_slots(0);
+	struct io_opaque_store *store = opaque_test_store(test);
+	u8 *taken = kunit_kzalloc(test, slots, GFP_KERNEL);
+	u64 bad = 0;
+	u32 cursor = 0, round, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, taken);
+	opaque_test_slots(test, store, slots);
+	for (round = 0; round < 30000; round++) {
+		u32 act = get_random_u32_below(10), index, want = U32_MAX;
+		bool found;
+
+		if (act < 5) {
+			/* Look, and take what is found, as a reservation does. */
+			for (i = 0; i < slots; i++) {
+				u32 at = (cursor < slots ? cursor : 0) + i;
+
+				if (at >= slots)
+					at -= slots;
+				if (!taken[at]) {
+					want = at;
+					break;
+				}
+			}
+			spin_lock(&store->tables);
+			found = io_opaque_find_slot(store, store->objects, &cursor, &index);
+			if (found)
+				io_opaque_use_slot(store->objects, index);
+			spin_unlock(&store->tables);
+			bad += found != (want != U32_MAX) || (found && index != want);
+			if (found) {
+				bad += taken[index];
+				taken[index] = 1;
+				bad += cursor != index + 1;
+			}
+		} else if (act < 9) {
+			/* Give back one that is taken, if any is. */
+			i = get_random_u32_below(slots);
+			if (taken[i]) {
+				io_opaque_release_slot(store->objects, i, 0);
+				taken[i] = 0;
+			}
+		} else {
+			/* The cursor anywhere: at a segment's end, past the table, at the end. */
+			static const u32 spot[] = {
+				0, 1023, 1024, 2047, 2048, 4095, 4096, 5000, 1U << 20, U32_MAX,
+			};
+
+			cursor = get_random_u32_below(3) ? get_random_u32_below(slots + 8) :
+				 spot[get_random_u32_below(ARRAY_SIZE(spot))];
+		}
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	for (i = 0; i < 3; i++) {
+		struct io_opaque_seg *seg = rcu_dereference_raw(store->objects[i]);
+		u32 first = io_opaque_seg_first(i), n, free = 0;
+
+		for (n = 0; n < io_opaque_seg_slots(i); n++)
+			free += !taken[first + n];
+		bad += seg->free != free || test_bit(0, seg->used) != taken[first];
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
 }
 
 static void opaque_send_last_ownership(struct kunit *test)
@@ -3519,6 +3867,160 @@ static void opaque_cache_accounting(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
 }
 
+/*
+ * The stop of a store that is making a segment: it sets dead while the segment is made, and the
+ * request finds the store stopped when it comes to publish it. The segment is freed and not
+ * published, for the stop's walk has passed where it would be, and the request is told. A store
+ * that has stopped grows neither table, and does not begin to.
+ */
+static void opaque_grow_stop(struct io_opaque_store *store)
+{
+	io_opaque_stop(store);
+}
+
+static void opaque_table_grow_stopped(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store };
+	long live;
+	u32 i;
+
+	opaque_test_stoppable(test, store);
+	for (i = 0; i < io_opaque_seg_slots(0); i++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
+	WRITE_ONCE(io_opaque_grow_between, opaque_grow_stop);
+	live = atomic_long_read(&io_opaque_segs_live);
+	KUNIT_EXPECT_EQ(test, io_opaque_slot_reserve(&op), -ESHUTDOWN);
+	WRITE_ONCE(io_opaque_grow_between, NULL);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, io_opaque_seg_slots(0)));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+	KUNIT_EXPECT_EQ(test, io_opaque_slot_reserve(&op), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, io_opaque_table_grow(store, store->streams, io_opaque_stream_seg),
+			-ESHUTDOWN);
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, io_opaque_seg_slots(0)));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+}
+
+/*
+ * The stop of a store with versions in three segments lets go of all of them, and the slots of all
+ * are free again. The segments stay, as they do until the store is freed.
+ */
+static void opaque_stop_segments(struct kunit *test)
+{
+	static const u32 where[] = { 7, 1500, 3000 };
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *data[ARRAY_SIZE(where)];
+	u32 i;
+
+	opaque_test_stoppable(test, store);
+	opaque_test_slots(test, store, 4096);
+	for (i = 0; i < ARRAY_SIZE(where); i++) {
+		data[i] = opaque_sparse_data(test, store);
+		opaque_test_publish(store, where[i], 3 + i, data[i]);
+	}
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 3U);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)120 * PAGE_SIZE);
+	io_opaque_stop(store);
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+	for (i = 0; i < ARRAY_SIZE(where); i++) {
+		KUNIT_EXPECT_PTR_EQ(test, opaque_slot_data(store, where[i]), NULL);
+		KUNIT_EXPECT_FALSE(test, opaque_test_used(store, where[i]));
+	}
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 4095));
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 4096));
+}
+
+/*
+ * 20,000 objects created in a store, the way CREATE makes them (a version, a slot, a charge, the
+ * bytes, the publication), with 64 bytes each: the table has six segments for them, every handle
+ * is another, a lookup like a send's finds each by its own, and freeing them all gives back every
+ * slot and every byte. The store counts what it holds.
+ */
+#define OPAQUE_MANY	20000
+
+static void opaque_table_many_creates(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_kiocb *req = kunit_kzalloc(test, sizeof(*req), GFP_KERNEL);
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	u8 pattern[64];
+	unsigned long addr;
+	u64 bad = 0;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, req);
+	/* Room for the pages, and for what is charged beside them. */
+	store->config.hard_limit = (u64)OPAQUE_MANY * 4 * PAGE_SIZE;
+	store->config.max_extents = 2 * OPAQUE_MANY;
+	addr = kunit_vm_mmap(test, NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE, 0);
+	if (!addr || addr >= TASK_SIZE)
+		kunit_skip(test, "no userspace mapping for CREATE input");
+	get_random_bytes(pattern, sizeof(pattern));
+	KUNIT_ASSERT_EQ(test, copy_to_user((void __user *)addr, pattern, sizeof(pattern)), 0UL);
+	for (i = 0; i < OPAQUE_MANY; i++) {
+		struct io_opaque_req op = {
+			.store = store, .req = req, .op = IORING_OPAQUE_CREATE,
+			.length = sizeof(pattern), .addr = (void __user *)addr,
+		};
+		u64 flags = 0;
+
+		op.data = io_opaque_data_alloc();
+		KUNIT_ASSERT_NOT_NULL(test, op.data);
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&op), 0);
+		KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, PAGE_SIZE, true));
+		op.create_reserved = PAGE_SIZE;
+		KUNIT_ASSERT_EQ(test, io_opaque_create_build(&op), 0);
+		KUNIT_ASSERT_EQ(test, io_opaque_publish(&op, &flags), (int)sizeof(pattern));
+		io_opaque_create_release(&op);
+		bad += op.handle != io_opaque_handle(i, 1);
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	KUNIT_EXPECT_EQ(test, store->nr_objects, (u32)OPAQUE_MANY);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)OPAQUE_MANY * PAGE_SIZE);
+	/* Six segments hold 32,768 slots. */
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 32767));
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(store, 32768));
+	for (i = 0; i < OPAQUE_MANY; i++) {
+		struct io_opaque_req send = {
+			.store = store, .handle = io_opaque_handle(i, 1), .length = sizeof(pattern),
+		};
+		u8 got[sizeof(pattern)];
+
+		if (opaque_test_acquire(store, &send)) {
+			bad++;
+			continue;
+		}
+		bad += send.data->handle != send.handle || send.data->length != sizeof(pattern) ||
+		       copy_from_iter(got, sizeof(got), &send.iter) != sizeof(got) ||
+		       memcmp(got, pattern, sizeof(got));
+		io_opaque_data_put(store, send.data);
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	/*
+	 * Each was found in RCU, by the pointer of its segment and its slot: a lookup that reads
+	 * the wrong slot gets the right version from the table in the end, and costs a lock.
+	 */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow);
+	for (i = 0; i < OPAQUE_MANY; i++)
+		opaque_test_free(store, i);
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&store->extents), 0);
+	for (i = 0; i < 6; i++) {
+		struct io_opaque_seg *seg = rcu_dereference_raw(store->objects[i]);
+
+		bad += seg->free != io_opaque_seg_slots(i);
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	/* The segments stay. */
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(store, 32767));
+}
+
 /* Registration samples the tunables, bounds the cache and locks its memory. */
 static void opaque_cache_store_lifecycle(struct kunit *test)
 {
@@ -5690,6 +6192,150 @@ static void opaque_attach_lock_order(struct kunit *test)
 	store->nr_streams--;
 	io_opaque_stream_put(stream);
 	io_opaque_stream_put(stream);
+}
+
+/*
+ * 1,100 collectors on one store: the stream table has the first segment full at the 1,024th, grows
+ * for the 1,025th, and each token is the next, in the segment that its index names. The attach
+ * that cannot get the memory for the segment ends with the socket let go of, no stream and no
+ * token, and the table as it was. The stop closes every stream, in both segments. A collector
+ * ends with the socket, so the test lets go of it after each attach, as the end of a collector
+ * does, and the slot of its stream stays until the stop.
+ */
+#define OPAQUE_STREAMS	1100
+
+static int opaque_attach_one(struct kunit *test, struct opaque_wire *w,
+			     struct io_opaque_store *store, struct io_opaque_stream **stream,
+			     u64 user_data)
+{
+	struct io_opaque_req *op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, op);
+	op->store = store;
+	op->req = &w->req[0];
+	op->op = U16_MAX - 1;
+	INIT_LIST_HEAD(&op->wait);
+	INIT_LIST_HEAD(&op->cancel);
+	w->req[0].cqe.user_data = user_data;
+	/* The application has taken the token of the last attach, so the ring has room. */
+	WRITE_ONCE(w->ctx->rings->cq.head, w->ctx->cached_cq_tail);
+	mutex_lock(&w->ctx->uring_lock);
+	ret = io_opaque_attach(op);
+	mutex_unlock(&w->ctx->uring_lock);
+	*stream = ret ? NULL : op->stream;
+	return ret;
+}
+
+/* The wire's ring, with room for the 32-byte token of an attach. */
+static struct io_rings *opaque_attach_setup(struct kunit *test, struct opaque_wire *w)
+{
+	struct io_rings *rings = kunit_kzalloc(test, struct_size(rings, cqes, 8), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, rings);
+	opaque_wire_init(test, w);
+	w->ctx->rings = rings;
+	RCU_INIT_POINTER(w->ctx->rings_rcu, rings);
+	w->ctx->cq_entries = 4;
+	w->ctx->flags |= IORING_SETUP_CQE32;
+	spin_lock_init(&w->ctx->completion_lock);
+	return rings;
+}
+
+static void opaque_attach_many(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_stream **stream = kunit_kcalloc(test, OPAQUE_STREAMS, sizeof(*stream),
+							 GFP_KERNEL);
+	struct io_opaque_stream *none;
+	const u32 first = io_opaque_seg_slots(0);
+	u64 bad = 0;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, stream);
+	opaque_test_stoppable(test, store);
+	opaque_attach_setup(test, w);
+	for (i = 0; i < OPAQUE_STREAMS; i++) {
+		if (i == first) {
+			/* The first segment is full, and the next cannot be made. */
+			KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, first));
+			kunit_activate_static_stub(test, io_opaque_seg_alloc,
+						   opaque_seg_alloc_fail);
+			KUNIT_EXPECT_EQ(test, opaque_attach_one(test, w, store, &none, 0xdead),
+					-ENOMEM);
+			kunit_deactivate_static_stub(test, io_opaque_seg_alloc);
+			KUNIT_EXPECT_NULL(test, none);
+			KUNIT_EXPECT_EQ(test, store->nr_streams, first);
+			KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, first));
+			KUNIT_EXPECT_PTR_EQ(test, w->tx->sk->sk_rx_owner, NULL);
+			KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
+			KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+			lockdep_assert_none_held_once();
+		}
+		KUNIT_ASSERT_EQ(test, opaque_attach_one(test, w, store, &stream[i], 0xa000 + i), 0);
+		bad += stream[i]->token != io_opaque_handle(i, 1);
+		/* The collector ends: the socket is let go of, and the slot keeps the stream. */
+		io_opaque_stream_close(stream[i]);
+	}
+	lockdep_assert_none_held_once();
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, (u32)OPAQUE_STREAMS);
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_stream_slot_at(store, 2 * first - 1));
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, 2 * first));
+	for (i = 0; i < OPAQUE_STREAMS; i++)
+		bad += opaque_test_stream_slot(store, i)->stream != stream[i];
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	io_opaque_stop(store);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 0U);
+	for (i = 0; i < OPAQUE_STREAMS; i++) {
+		bad += opaque_test_stream_slot(store, i)->stream != NULL;
+		/* The stop put the table's reference; the collector's is the test's. */
+		bad += refcount_read(&stream[i]->refs) != 1;
+	}
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	for (i = 0; i < 2; i++) {
+		struct io_opaque_seg *seg = rcu_dereference_raw(store->streams[i]);
+
+		KUNIT_EXPECT_EQ(test, seg->free, io_opaque_seg_slots(i));
+	}
+	for (i = 0; i < OPAQUE_STREAMS; i++)
+		io_opaque_stream_put(stream[i]);
+}
+
+/*
+ * A collector that finds the stream table full makes the next segment with the socket let go of,
+ * and the store may stop meanwhile: the attach is told, with no stream, no token and the socket
+ * free, and no segment is added.
+ */
+static void opaque_attach_stopped(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_wire *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct io_opaque_stream *none;
+	long live;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	opaque_test_stoppable(test, store);
+	opaque_attach_setup(test, w);
+	for (i = 0; i < io_opaque_seg_slots(0); i++)
+		io_opaque_use_slot(store->streams, i);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
+	WRITE_ONCE(io_opaque_grow_between, opaque_grow_stop);
+	live = atomic_long_read(&io_opaque_segs_live);
+	KUNIT_EXPECT_EQ(test, opaque_attach_one(test, w, store, &none, 0xdead), -ESHUTDOWN);
+	WRITE_ONCE(io_opaque_grow_between, NULL);
+	KUNIT_EXPECT_NULL(test, none);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
+	KUNIT_EXPECT_EQ(test, store->nr_streams, 0U);
+	KUNIT_EXPECT_NULL(test, io_opaque_stream_slot_at(store, io_opaque_seg_slots(0)));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+	KUNIT_EXPECT_PTR_EQ(test, w->tx->sk->sk_rx_owner, NULL);
+	KUNIT_EXPECT_FALSE(test, sock_owned_by_user_nocheck(w->tx->sk));
+	KUNIT_EXPECT_FALSE(test, opaque_test_held(&store->tables));
+	lockdep_assert_none_held_once();
 }
 
 /*
@@ -8735,6 +9381,68 @@ static void opaque_policy_chunks(struct kunit *test)
 		list_del_init(&opaque_test_slot(store, i)->candidate);
 		kfree(data[i]);
 	}
+}
+
+/*
+ * A policy change walks the table in chunks, and the table can grow between two of them: the walk
+ * goes on into the segment that was added, and marks the version that is in it as it marks the ones
+ * in the segment there was.
+ */
+#define OPAQUE_POLICY_FAR	1030
+
+static struct {
+	unsigned int calls;
+	int grown;
+	struct io_opaque_data *far;
+	bool inside;
+} opaque_policy_grow_hook;
+
+static void opaque_policy_grow_between(struct io_opaque_store *store)
+{
+	if (opaque_policy_grow_hook.inside)
+		return;
+	opaque_policy_grow_hook.inside = true;
+	if (!opaque_policy_grow_hook.calls++) {
+		opaque_policy_grow_hook.grown = io_opaque_table_grow(store, store->objects,
+								     io_opaque_object_seg);
+		opaque_slot_set(store, OPAQUE_POLICY_FAR, opaque_policy_grow_hook.far);
+	}
+	opaque_policy_grow_hook.inside = false;
+}
+
+static void opaque_policy_grown(struct kunit *test)
+{
+	struct io_uring_opaque_policy on = {
+		.flags = IORING_OPAQUE_POLICY_F_AUTO_COMPACT, .bytes_per_second = SZ_1M,
+		.burst_bytes = SZ_64K, .max_temporary_bytes = SZ_64K,
+	};
+	struct io_uring_opaque_policy off = { };
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_data *near = io_opaque_data_alloc(), *far = io_opaque_data_alloc();
+
+	KUNIT_ASSERT_NOT_NULL(test, near);
+	KUNIT_ASSERT_NOT_NULL(test, far);
+	INIT_LIST_HEAD(&store->copies);
+	INIT_DELAYED_WORK(&store->compact_work, opaque_test_noop_work);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_test_cancel_work,
+							&store->compact_work), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_policy_restore, NULL), 0);
+	opaque_slot_set(store, 5, near);
+	memset(&opaque_policy_grow_hook, 0, sizeof(opaque_policy_grow_hook));
+	opaque_policy_grow_hook.far = far;
+	io_opaque_policy_between = opaque_policy_grow_between;
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &on), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_grow_hook.grown, 0);
+	/* 2,048 slots in chunks of 256, the table having grown after the first: seven stops. */
+	KUNIT_EXPECT_EQ(test, opaque_policy_grow_hook.calls, 7U);
+	KUNIT_EXPECT_FALSE(test, list_empty(&opaque_test_slot(store, 5)->candidate));
+	KUNIT_EXPECT_FALSE(test,
+			   list_empty(&opaque_test_slot(store, OPAQUE_POLICY_FAR)->candidate));
+	KUNIT_EXPECT_EQ(test, opaque_policy_count(store), 2U);
+	KUNIT_EXPECT_EQ(test, io_opaque_apply_policy(store, &off), 0);
+	KUNIT_EXPECT_EQ(test, opaque_policy_count(store), 0U);
+	kfree(near);
+	kfree(far);
 }
 
 /*
@@ -15269,12 +15977,13 @@ static void opaque_lk_free_other(void)
 static void opaque_lk_stop_like(void)
 {
 	struct io_opaque_store *store = opaque_lk.store;
+	struct io_opaque_slot *slot;
 	u64 i;
 
 	spin_lock(&store->tables);
 	WRITE_ONCE(store->dead, 1);
 	spin_unlock(&store->tables);
-	for (i = 0; io_opaque_slot_at(store, i); i++)
+	io_opaque_for_each_slot(store, i, slot)
 		opaque_test_free(store, i);
 }
 
@@ -16215,6 +16924,8 @@ enum opaque_pin_mode {
 	OPAQUE_PIN_COMPACT,
 	/* Four objects, until the store stops. */
 	OPAQUE_PIN_STOP,
+	/* Objects published and kept, in a table that grows. */
+	OPAQUE_PIN_GROW,
 	/* Vectors read two objects, a new one each round, the one before it freed. */
 	OPAQUE_PIN_VEC_FREE,
 	/* Vectors read two objects, whose versions the writer replaces by compaction. */
@@ -16919,6 +17630,302 @@ static void opaque_pin_smp_vec_compact(struct kunit *test)
 }
 
 /*
+ * Two writers make objects as fast as they go in a table that is nearly full, so that it grows
+ * under them. One task walks the table with policy changes, which drop tables every chunk, and
+ * another stops the store when the first segment is being made, a little before or a little
+ * after it is published. What the store may not do is add a segment once it is stopped, lose one,
+ * or keep an object: after the stop returns the number of segments is the number it ever gets,
+ * the segments that were made and not published were freed, every slot is empty, and no writer
+ * was told anything but that the store is stopped. It needs two CPUs to race on.
+ */
+#define OPAQUE_GROW_WRITERS	2
+#define OPAQUE_GROW_TASKS	(OPAQUE_GROW_WRITERS + 2)
+#define OPAQUE_GROW_ROUNDS	200000
+
+struct opaque_grow_race;
+
+struct opaque_grow_task {
+	struct opaque_grow_race *r;
+	unsigned int id;
+};
+
+struct opaque_grow_race {
+	struct io_opaque_store *store;
+	atomic_t ready, go, growing, stopped;
+	struct opaque_grow_task task[OPAQUE_GROW_TASKS];
+	struct completion done[OPAQUE_GROW_TASKS];
+	/* Objects published, writers told that the store is stopped, anything else, walks. */
+	atomic_long_t published, refused, bad, walks;
+	/* Segments the table has the moment the stop returns. */
+	atomic_t segs_at_stop;
+};
+
+static unsigned int opaque_grow_segs(struct io_opaque_store *store)
+{
+	unsigned int s = 0;
+
+	while (s < IO_OPAQUE_SEGS && rcu_dereference_raw(store->objects[s]))
+		s++;
+	return s;
+}
+
+static void opaque_grow_start(struct opaque_grow_race *r)
+{
+	atomic_inc(&r->ready);
+	while (!atomic_read(&r->go))
+		cond_resched();
+}
+
+/* The race that is running, for the hook that a growth runs. */
+static struct opaque_grow_race *opaque_grow_now;
+
+/* A segment has been made and is not yet published: say so, and stay a little. */
+static void opaque_grow_jitter(struct io_opaque_store *store)
+{
+	atomic_set(&READ_ONCE(opaque_grow_now)->growing, 1);
+	udelay(get_random_u32_below(80));
+}
+
+static int opaque_grow_writer(void *arg)
+{
+	struct opaque_grow_task *t = arg;
+	struct opaque_grow_race *r = t->r;
+	struct io_opaque_store *store = r->store;
+	unsigned int n;
+
+	opaque_grow_start(r);
+	for (n = 0; n < OPAQUE_GROW_ROUNDS; n++) {
+		struct io_opaque_data *data = io_opaque_data_alloc();
+		struct io_opaque_req op = { .store = store, .data = data };
+		u64 flags = 0;
+		int ret;
+
+		if (!data) {
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		ret = io_opaque_slot_reserve(&op);
+		if (ret == -ESHUTDOWN) {
+			atomic_long_inc(&r->refused);
+			io_opaque_data_put(store, data);
+			break;
+		}
+		if (ret) {
+			atomic_long_inc(&r->bad);
+			io_opaque_data_put(store, data);
+			break;
+		}
+		ret = io_opaque_publish(&op, &flags);
+		if (ret == -ECANCELED) {
+			/* Stopped between the reservation and the publication: slot goes back. */
+			spin_lock(&store->tables);
+			opaque_test_slot(store, op.slot)->reserved = false;
+			io_opaque_release_slot(store->objects, op.slot,
+					       opaque_test_slot(store, op.slot)->generation);
+			spin_unlock(&store->tables);
+			atomic_long_inc(&r->refused);
+			io_opaque_data_put(store, data);
+			break;
+		}
+		if (ret) {
+			atomic_long_inc(&r->bad);
+			io_opaque_data_put(store, data);
+			break;
+		}
+		atomic_long_inc(&r->published);
+	}
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+static int opaque_grow_stopper(void *arg)
+{
+	struct opaque_grow_task *t = arg;
+	struct opaque_grow_race *r = t->r;
+	unsigned long until = jiffies + 10 * HZ;
+
+	opaque_grow_start(r);
+	/* The first segment is being made: a little earlier or later than its publication. */
+	while (!atomic_read(&r->growing) && time_before(jiffies, until))
+		cond_resched();
+	udelay(get_random_u32_below(80));
+	io_opaque_stop(r->store);
+	atomic_set(&r->segs_at_stop, opaque_grow_segs(r->store));
+	atomic_set(&r->stopped, 1);
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+static int opaque_grow_walker(void *arg)
+{
+	struct opaque_grow_task *t = arg;
+	struct opaque_grow_race *r = t->r;
+	const struct io_uring_opaque_policy off = { };
+	int ret;
+
+	opaque_grow_start(r);
+	do {
+		ret = io_opaque_apply_policy(r->store, &off);
+		atomic_long_inc(&r->walks);
+		cond_resched();
+	} while (!ret && !atomic_read(&r->stopped));
+	if (ret && ret != -ESHUTDOWN)
+		atomic_long_inc(&r->bad);
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+static void opaque_table_smp_grow_stop(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct opaque_grow_race *r = kunit_kzalloc(test, sizeof(*r), GFP_KERNEL);
+	struct task_struct *thread[OPAQUE_GROW_TASKS];
+	struct io_opaque_req fill = { .store = store };
+	struct io_opaque_slot *slot;
+	long live;
+	u64 i, bad = 0;
+	unsigned int n;
+
+	opaque_race_needs_cpus(test);
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	opaque_test_stoppable(test, store);
+	r->store = store;
+	/* All but eight slots of the segment are taken: the writers come to its end at once. */
+	for (n = 0; n < io_opaque_seg_slots(0) - 8; n++)
+		KUNIT_ASSERT_EQ(test, io_opaque_slot_reserve(&fill), 0);
+	live = atomic_long_read(&io_opaque_segs_live);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
+	WRITE_ONCE(opaque_grow_now, r);
+	WRITE_ONCE(io_opaque_grow_between, opaque_grow_jitter);
+	for (n = 0; n < OPAQUE_GROW_TASKS; n++) {
+		r->task[n] = (struct opaque_grow_task) { .r = r, .id = n };
+		init_completion(&r->done[n]);
+		thread[n] = kthread_create(n < OPAQUE_GROW_WRITERS ? opaque_grow_writer :
+					   n == OPAQUE_GROW_WRITERS ? opaque_grow_stopper :
+					   opaque_grow_walker, &r->task[n], "opaque_grow%u", n);
+		if (IS_ERR(thread[n])) {
+			while (n--)
+				kthread_stop(thread[n]);
+			KUNIT_FAIL_AND_ABORT(test, "cannot make the tasks of the race");
+		}
+	}
+	for (n = 0; n < OPAQUE_GROW_TASKS; n++)
+		wake_up_process(thread[n]);
+	while (atomic_read(&r->ready) < OPAQUE_GROW_TASKS)
+		cond_resched();
+	atomic_set(&r->go, 1);
+	for (n = 0; n < OPAQUE_GROW_TASKS; n++)
+		wait_for_completion(&r->done[n]);
+	WRITE_ONCE(io_opaque_grow_between, NULL);
+	kunit_info(test, "%ld published, %ld refused as stopped, %ld walks, %u segments",
+		   atomic_long_read(&r->published), atomic_long_read(&r->refused),
+		   atomic_long_read(&r->walks), opaque_grow_segs(store));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->bad), 0L);
+	KUNIT_EXPECT_GT(test, atomic_long_read(&r->published), 0L);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(store->dead), 1);
+	/* No segment was added after the stop returned, and none that was made was lost. */
+	KUNIT_EXPECT_EQ(test, opaque_grow_segs(store), (unsigned int)atomic_read(&r->segs_at_stop));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live,
+			(long)opaque_grow_segs(store) - 1);
+	/* The stop let go of every version that was published, in every segment there was. */
+	KUNIT_EXPECT_EQ(test, store->nr_objects, 0U);
+	io_opaque_for_each_slot(store, i, slot)
+		bad += rcu_access_pointer(slot->data) != NULL;
+	KUNIT_EXPECT_EQ(test, bad, 0ULL);
+	kvfree_rcu_barrier();
+}
+
+/*
+ * Objects are published as fast as they go, in a table that grows under them from one segment to
+ * four, while two readers look up the newest object and the one before it as a send does, in RCU,
+ * with the jitter of the lookups and of the growths. Every handle that was published is a handle
+ * of a version, whichever segment it is in and wherever the table is in its growth: no lookup of
+ * one is stale, or gets another version, and none that reads a segment that is being added sees
+ * it half made. It needs two CPUs to race on.
+ */
+#define OPAQUE_PIN_GROW_OBJECTS	4200
+
+static void opaque_pin_grow_jitter(struct io_opaque_store *store)
+{
+	u32 r = get_random_u32();
+
+	if (!(r & 3))
+		udelay(1 + ((r >> 2) & 31));
+}
+
+static int opaque_pin_grow_writer(void *arg)
+{
+	struct opaque_pin_task *t = arg;
+	struct opaque_pin_race *r = t->r;
+	struct io_opaque_store *store = r->store;
+	unsigned int n;
+
+	opaque_pin_start(r);
+	for (n = 0; n < OPAQUE_PIN_GROW_OBJECTS && !atomic_read(&r->stop); n++) {
+		struct io_opaque_data *data = opaque_pin_object(store);
+		u64 h;
+
+		if (!data) {
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		h = opaque_pin_publish(store, data);
+		if (!h) {
+			io_opaque_data_put(store, data);
+			atomic_long_inc(&r->bad);
+			break;
+		}
+		WRITE_ONCE(r->prev, READ_ONCE(r->handle));
+		WRITE_ONCE(r->handle, h);
+		r->rounds = n + 1;
+	}
+	complete(&r->done[t->id]);
+	return 0;
+}
+
+static void opaque_pin_smp_grow(struct kunit *test)
+{
+	struct opaque_pin_race *r;
+	long slow = atomic_long_read(&io_opaque_pin_slow);
+	struct io_opaque_data *data;
+	unsigned int n;
+	long live;
+
+	opaque_race_needs_cpus(test);
+	r = opaque_pin_race_new(test, OPAQUE_PIN_GROW);
+	live = atomic_long_read(&io_opaque_segs_live);
+	/* The whole first segment, not the one slot of the other races, and room for the pages. */
+	opaque_test_slots(test, r->store, io_opaque_seg_slots(0));
+	r->store->config.hard_limit = 128 * SZ_1M;
+	r->store->config.max_extents = 4 * OPAQUE_PIN_GROW_OBJECTS;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, opaque_grow_hook_restore, NULL), 0);
+	WRITE_ONCE(io_opaque_grow_between, opaque_pin_grow_jitter);
+	/* Two objects before the readers begin, so that both handles they ask for name one. */
+	for (n = 0; n < 2; n++) {
+		data = opaque_pin_object(r->store);
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		r->prev = r->handle;
+		r->handle = opaque_pin_publish(r->store, data);
+		KUNIT_ASSERT_NE(test, r->handle, 0ULL);
+	}
+	KUNIT_ASSERT_TRUE(test, opaque_pin_launch(r, opaque_pin_grow_writer));
+	KUNIT_EXPECT_TRUE(test, opaque_pin_finish(r));
+	WRITE_ONCE(io_opaque_grow_between, NULL);
+	KUNIT_EXPECT_EQ(test, r->rounds, (unsigned int)OPAQUE_PIN_GROW_OBJECTS);
+	/* 4,202 objects are in four segments, and the segments that lost a race were freed. */
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(r->store, OPAQUE_PIN_GROW_OBJECTS + 1));
+	KUNIT_EXPECT_NOT_NULL(test, io_opaque_slot_at(r->store, 8 * io_opaque_seg_slots(0) - 1));
+	KUNIT_EXPECT_NULL(test, io_opaque_slot_at(r->store, 8 * io_opaque_seg_slots(0)));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 3L);
+	/* A published handle is never stale, and its lookup never needs the table. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&r->stale), 0L);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_pin_slow), slow);
+	for (n = 0; n < OPAQUE_PIN_GROW_OBJECTS + 2; n++)
+		opaque_test_free(r->store, n);
+	opaque_pin_expect(test, r, slow);
+}
+
+/*
  * SEND_ZC's notification and IORING_SEND_ZC_NO_RX_COPY, the counterpart of the managed sends
  * above that a registered-buffer send gets by asking for it. The notifications are built by
  * hand, as io_alloc_notif() and io_send_zc_prep() leave them, with no ring behind them, and
@@ -17191,6 +18198,17 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_generation_retirement),
 	KUNIT_CASE(opaque_slot_rotation),
 	KUNIT_CASE(opaque_generation_width),
+	KUNIT_CASE(opaque_seg_split),
+	KUNIT_CASE(opaque_seg_alloc),
+	KUNIT_CASE(opaque_table_grow),
+	KUNIT_CASE(opaque_table_grow_rival),
+	KUNIT_CASE(opaque_table_grow_nomem),
+	KUNIT_CASE(opaque_table_full),
+	KUNIT_CASE(opaque_generation_retirement_grown),
+	KUNIT_CASE(opaque_find_slot_model),
+	KUNIT_CASE(opaque_table_grow_stopped),
+	KUNIT_CASE(opaque_stop_segments),
+	KUNIT_CASE_SLOW(opaque_table_many_creates),
 	KUNIT_CASE(opaque_send_last_ownership),
 	KUNIT_CASE(opaque_send_last_compacted),
 	KUNIT_CASE(opaque_send_last_compact_race),
@@ -17243,6 +18261,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_send_direct_switch),
 	KUNIT_CASE(opaque_send_locked_blocking),
 	KUNIT_CASE(opaque_attach_lock_order),
+	KUNIT_CASE_SLOW(opaque_attach_many),
+	KUNIT_CASE(opaque_attach_stopped),
 	KUNIT_CASE(opaque_send_vec_check),
 	KUNIT_CASE(opaque_vec_copy_in),
 	KUNIT_CASE(opaque_vec_copy_in_invalid),
@@ -17280,6 +18300,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_cleanup_calls),
 	KUNIT_CASE(opaque_send_vec_prep_grows),
 	KUNIT_CASE(opaque_policy_chunks),
+	KUNIT_CASE(opaque_policy_grown),
 	KUNIT_CASE(opaque_extents_free_wakes_once),
 	KUNIT_CASE(opaque_extents_free_wakes_all),
 	KUNIT_CASE(opaque_params_sysfs),
@@ -17350,6 +18371,8 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE_SLOW(opaque_pin_smp_stop),
 	KUNIT_CASE_SLOW(opaque_pin_smp_vec_free),
 	KUNIT_CASE_SLOW(opaque_pin_smp_vec_compact),
+	KUNIT_CASE_SLOW(opaque_table_smp_grow_stop),
+	KUNIT_CASE_SLOW(opaque_pin_smp_grow),
 	KUNIT_CASE(sendzc_link_waiver),
 	KUNIT_CASE_PARAM(sendzc_rx_copy, sendzc_rx_gen_params),
 	{}
