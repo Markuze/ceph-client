@@ -1392,6 +1392,46 @@ static void opaque_stat_extents_clamp(struct kunit *test)
 }
 
 /*
+ * A zero-copy capture into a private KEEP leaves room for dense copies of the bytes still to come,
+ * and for the blocks that the chunks of the version sit in. A KEEP of two pages whose first
+ * fragment is a hundred bytes needs a page, two for the rest and a block: a limit a byte short of
+ * that has the fragment copied, and the limit itself has it held.
+ */
+static void opaque_capture_keep_blocks(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		struct io_opaque_store *store = opaque_test_store(test);
+		struct io_opaque_stream stream;
+		struct io_opaque_data *data = io_opaque_data_alloc();
+		struct page *page = alloc_page(GFP_KERNEL);
+		struct io_opaque_req op = {
+			.store = store, .stream = &stream, .data = data,
+			.op = IORING_OPAQUE_RECV_OBJECT, .length = 2 * PAGE_SIZE,
+		};
+		struct io_opaque_extent *extent;
+		struct sk_buff *skb;
+
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		store->config.hard_limit = 3 * PAGE_SIZE + OPAQUE_TEST_BLOCK - !i;
+		opaque_test_stream(&stream, store);
+		KUNIT_ASSERT_EQ(test, io_opaque_range_insert(&op), 0);
+		skb = opaque_test_frag(test, page, 0, 100);
+		KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 100, false), 100);
+		kfree_skb(skb);
+		extent = list_first_entry(&data->extents, struct io_opaque_extent, list);
+		KUNIT_EXPECT_EQ(test, extent->backing->copied, !i);
+		KUNIT_EXPECT_EQ(test, data->chunks, 1U);
+		io_opaque_data_put(store, data);
+		io_opaque_capture_release(&stream);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		put_page(page);
+	}
+}
+
+/*
  * Nobody but its call may release a pending backing: the call settles it. If it
  * happens, the chunk stays for the call to find, and is not freed under it.
  */
@@ -17557,6 +17597,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_second_extent_charge),
 	KUNIT_CASE(opaque_vector_charge),
 	KUNIT_CASE(opaque_stat_extents_clamp),
+	KUNIT_CASE(opaque_capture_keep_blocks),
 	KUNIT_CASE(opaque_release_pending),
 	KUNIT_CASE(opaque_hold_flags),
 #if IS_ENABLED(CONFIG_PAGE_POOL)

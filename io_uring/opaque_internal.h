@@ -204,6 +204,11 @@ struct io_opaque_data {
 	u64 length;
 	u64 charge;
 	u32 nr;
+	/*
+	 * While a take assembles the version: the chunks that its extents take, a backing's and a
+	 * second range's, for the blocks that they sit in (io_opaque_keep_bytes()).
+	 */
+	u32 chunks;
 	bool dense;
 	bool forward_only;
 	/*

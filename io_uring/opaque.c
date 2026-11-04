@@ -1342,8 +1342,12 @@ VISIBLE_IF_KUNIT int io_opaque_take(struct io_opaque_req *op)
 
 			tail = list_last_entry_or_null(&op->data->extents,
 						       struct io_opaque_extent, list);
-			if (!tail || tail->backing != extent->backing)
+			if (!tail || tail->backing != extent->backing) {
 				op->data->charge += extent->backing->charge;
+				op->data->chunks++;
+			}
+			if (extent->secondary)
+				op->data->chunks++;
 			extent->start -= op->offset;
 			list_move_tail(&extent->list, &op->data->extents);
 			op->data->length += last - off;
@@ -1379,6 +1383,7 @@ VISIBLE_IF_KUNIT void io_opaque_restore(struct io_opaque_req *op)
 	stream->undecided += op->data->length;
 	op->data->length = 0;
 	op->data->charge = 0;
+	op->data->chunks = 0;
 	op->progress = 0;
 }
 
@@ -1429,13 +1434,26 @@ VISIBLE_IF_KUNIT int io_opaque_range_insert(struct io_opaque_req *op)
 	return 0;
 }
 
+/*
+ * What a version that a take assembles holds of the store at the least, if it is of @pages bytes
+ * of pages in @chunks chunks: the pages, and the blocks that its chunks sit in, one for each
+ * IO_OPAQUE_BLOCK_CHUNKS of them. Capture stops at the capture limit, and a take whose version
+ * holds more than that of it can never be completed, even in an empty store. It is refused where
+ * it is made and not left to wait for what cannot come: the check counted pages only, and a take
+ * that needed the last page and a block was accepted, failed, and was accepted again.
+ */
+static u64 io_opaque_keep_bytes(u64 pages, u64 chunks)
+{
+	return pages + DIV_ROUND_UP(chunks, IO_OPAQUE_BLOCK_CHUNKS) * (u64)io_opaque_block_bytes;
+}
+
 /* Validate a blocked TAKE without taking and restoring its retained prefix. */
 static int io_opaque_defer_take(struct io_opaque_req *op)
 {
 	struct io_opaque_stream *stream = op->stream;
 	struct io_opaque_extent *extent, *tail = NULL;
 	u64 off = op->offset, end = min(off + op->length, stream->next);
-	u64 charge = 0, left;
+	u64 charge = 0, chunks = 0, left;
 
 	/* Allocation backoff can leave an already private prefix in place. */
 	if (op->progress)
@@ -1445,8 +1463,12 @@ static int io_opaque_defer_take(struct io_opaque_req *op)
 			continue;
 		if (extent->start > off)
 			break;
-		if (!tail || tail->backing != extent->backing)
+		if (!tail || tail->backing != extent->backing) {
 			charge += extent->backing->charge;
+			chunks++;
+		}
+		if (extent->secondary)
+			chunks++;
 		tail = extent;
 		off = min(end, extent->start + extent->length);
 		if (off == end)
@@ -1458,8 +1480,9 @@ static int io_opaque_defer_take(struct io_opaque_req *op)
 	if (tail && tail->backing->copied &&
 	    tail->offset + tail->length == tail->backing->filled)
 		left -= min_t(u64, left, PAGE_SIZE - tail->backing->filled);
-	return charge + ALIGN(left, PAGE_SIZE) > io_opaque_rx_limit(op->store) ?
-		-ENOBUFS : 0;
+	left = ALIGN(left, PAGE_SIZE);
+	return io_opaque_keep_bytes(charge + left, chunks + left / PAGE_SIZE) >
+	       io_opaque_rx_limit(op->store) ? -ENOBUFS : 0;
 }
 
 static void io_opaque_stream_process(struct io_opaque_stream *stream)
@@ -1491,10 +1514,14 @@ static void io_opaque_stream_process(struct io_opaque_stream *stream)
 			ret = io_opaque_defer_take(op);
 		else
 			ret = stream->closed ? -ECANCELED : io_opaque_take(op);
-		if (!ret && op->op == IORING_OPAQUE_RECV_OBJECT &&
-		    op->data->charge + io_opaque_dense_left(op) >
-		    io_opaque_rx_limit(op->store))
-			ret = -ENOBUFS;
+		if (!ret && op->op == IORING_OPAQUE_RECV_OBJECT) {
+			u64 dense = io_opaque_dense_left(op);
+
+			if (io_opaque_keep_bytes(op->data->charge + dense,
+						 op->data->chunks + dense / PAGE_SIZE) >
+			    io_opaque_rx_limit(op->store))
+				ret = -ENOBUFS;
+		}
 		if (!ret && !stream->eof && !stream->closed && !stream->error)
 			continue;
 		rb_erase_cached(node, &stream->decisions);
@@ -1880,7 +1907,7 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 	struct list_head *list = &stream->extents;
 	struct io_opaque_extent *extent, *tail;
 	u64 start = stream->next;
-	bool new_backing = false;
+	bool new_backing = false, new_chunk = false;
 
 	if (op) {
 		list = &op->data->extents;
@@ -1926,13 +1953,19 @@ static int io_opaque_append(struct io_opaque_stream *stream, struct page *page,
 		};
 		atomic_long_inc(&stream->store->extents);
 		refcount_inc(&extent->backing->refs);
+		new_chunk = true;
 	} else {
 		u64 left = op ? ALIGN(op->length - op->progress - length, PAGE_SIZE) : 0;
 		bool bound = !!stream->store->maio;
 		unsigned int flags = io_opaque_hold_flags(hold);
 
-		/* Leave room for dense copies of a private KEEP's remaining bytes. */
-		if (!copied && op && op->data->charge + stream->need_bytes + left >
+		/*
+		 * Leave room for dense copies of a private KEEP's remaining bytes, and for the
+		 * blocks that the chunks of the version sit in.
+		 */
+		if (!copied && op &&
+		    io_opaque_keep_bytes(op->data->charge + stream->need_bytes + left,
+					 op->data->chunks + 1 + left / PAGE_SIZE) >
 		    io_opaque_rx_limit(stream->store))
 			return -ENOBUFS;
 		stream->need_bytes = io_opaque_need(stream, stream->need_bytes);
@@ -1966,6 +1999,8 @@ accounted:
 		op->data->length += length;
 		if (new_backing)
 			op->data->charge += extent->backing->charge;
+		if (new_backing || new_chunk)
+			op->data->chunks++;
 	} else {
 		stream->undecided += length;
 	}

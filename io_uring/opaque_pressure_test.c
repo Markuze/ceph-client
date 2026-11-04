@@ -805,10 +805,11 @@ static void pressure_impossible_prefix(struct kunit *test)
 
 	pressure_fill(test, false);
 	/*
-	 * Length fits the store, but this sparse prefix (three pages) plus a dense suffix (three
-	 * pages more, for the rest of the length) is more than the capture limit of five.
+	 * Length fits the store, but this sparse prefix (three pages) plus a dense suffix (two
+	 * pages more, for the rest of the length) and the block that their chunks sit in is six
+	 * pages, and capture may hold five.
 	 */
-	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 3 * PAGE_SIZE);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 2 * PAGE_SIZE);
 	pressure_start(test, op);
 	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
 	KUNIT_EXPECT_EQ(test, op->result, -ENOBUFS);
@@ -1004,6 +1005,59 @@ static void pressure_drain_headroom_held(struct kunit *test)
 	io_opaque_release_transient(&f->store, PAGE_SIZE, PAGE_SIZE);
 }
 
+/*
+ * A take that needs the last page and a block is refused where it is made, and not left to wait
+ * for what can never come (review of K1, R1). The store holds three sparse pages, a fourth of
+ * another object and a block, and capture stops at five pages. The three pages and one dense page
+ * more make five with the block: that is accepted. A byte more is a second dense page, and six
+ * pages are more than capture may hold: that is refused, and so is the retry, which does not
+ * wait.
+ */
+static void pressure_take_exact_fill(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+	int i;
+
+	pressure_fill(test, false);
+	for (i = 0; i < 2; i++) {
+		op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 96 + PAGE_SIZE + 1);
+		pressure_start(test, op);
+		KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+		KUNIT_EXPECT_EQ(test, op->result, -ENOBUFS);
+		KUNIT_EXPECT_EQ(test, op->progress, 0ULL);
+		KUNIT_EXPECT_EQ(test, f->stream.undecided, 96ULL);
+	}
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 96 + PAGE_SIZE);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_RANGE_WAIT);
+}
+
+/*
+ * The same when the collector is not waiting for budget: the take assembles its prefix, and then
+ * asks whether the rest of the version can be held. The prefix is three pages, and a dense page
+ * more with the block is five, which capture may hold. Two dense pages are not.
+ */
+static void pressure_take_dense_check(struct kunit *test)
+{
+	struct pressure_fixture *f = test->priv;
+	struct io_opaque_req *op;
+
+	pressure_seed(test, false);
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 96 + PAGE_SIZE + 1);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_QUEUED);
+	KUNIT_EXPECT_EQ(test, op->result, -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, op->progress, 0ULL);
+	KUNIT_EXPECT_EQ(test, f->stream.undecided, 96ULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&op->data->extents));
+	op = pressure_range(test, IORING_OPAQUE_RECV_OBJECT, 0, 96 + PAGE_SIZE);
+	pressure_start(test, op);
+	KUNIT_EXPECT_EQ(test, op->phase, IO_OPAQUE_RANGE_WAIT);
+	KUNIT_EXPECT_EQ(test, op->progress, 96ULL);
+	KUNIT_EXPECT_EQ(test, f->stream.undecided, 0ULL);
+}
+
 static void pressure_cache_drain(void *store)
 {
 	io_opaque_unit_drain(store);
@@ -1085,6 +1139,8 @@ static struct kunit_case pressure_cases[] = {
 	KUNIT_CASE(pressure_take_split_unlimited),
 	KUNIT_CASE(pressure_drain_at_limit),
 	KUNIT_CASE(pressure_drain_headroom_held),
+	KUNIT_CASE(pressure_take_exact_fill),
+	KUNIT_CASE(pressure_take_dense_check),
 	{}
 };
 
