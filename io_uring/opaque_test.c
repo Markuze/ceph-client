@@ -6,6 +6,7 @@
 #include <linux/gcd.h>
 #include <linux/highmem.h>
 #include <linux/inet.h>
+#include <linux/interrupt.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
 #include <linux/kthread.h>
@@ -17,6 +18,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/sched/user.h>
 #include <linux/skbuff.h>
+#include <linux/smp.h>
 #include <linux/uaccess.h>
 #include <linux/xarray.h>
 #include <net/hotdata.h>
@@ -2776,6 +2778,17 @@ static struct opaque_page_refs *opaque_page_refs_take(struct kunit *test,
 }
 
 /*
+ * An skb without a ubuf that a reader frees on another CPU than the one that allocated it is not
+ * freed then: it is queued for that CPU (skb_attempt_defer_free()), which frees it in its next
+ * NET_RX softirq, and on a quiet system that can be a long time off. A case that waits for the
+ * page references of such an skb to go raises the softirq on every CPU between its looks.
+ */
+static void opaque_rx_kick(void *unused)
+{
+	raise_softirq_irqoff(NET_RX_SOFTIRQ);
+}
+
+/*
  * TCP, the peer's queue and the ubufs have let go of the pages: the test's
  * reference is left, and the backing's if @held, the object being still there.
  */
@@ -2790,6 +2803,7 @@ static bool opaque_pages_settle(const struct opaque_page_refs *r, bool held)
 				break;
 		if (i == r->nr)
 			return true;
+		on_each_cpu(opaque_rx_kick, NULL, 1);
 		msleep(20);
 	}
 	return false;
@@ -11798,7 +11812,10 @@ static void opaque_managed_read(struct opaque_managed *m)
 	m->body = io_opaque_stat_read(IO_OPAQUE_STAT_BODY_COPIED);
 }
 
-/* Wait for the peer to have acknowledged everything that @sk sent. */
+/*
+ * Wait for the peer to have acknowledged everything that @sk sent. That is snd_una, which is not
+ * the same as the skbs of the data being gone (opaque_wire_settle()).
+ */
 static void opaque_wire_acked(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -11806,6 +11823,44 @@ static void opaque_wire_acked(struct sock *sk)
 
 	for (i = 0; i < 100 && READ_ONCE(tp->snd_una) != READ_ONCE(tp->write_seq); i++)
 		msleep(20);
+}
+
+/* The pages of @data have only the references of their extents, and the ubufs are as they were. */
+static bool opaque_wire_back(const struct io_opaque_data *data, long live)
+{
+	const struct io_opaque_extent *extent;
+
+	list_for_each_entry(extent, &data->extents, list)
+		if (page_count(extent->backing->page) != 1)
+			return false;
+	return atomic_long_read(&io_opaque_ubufs_live) == live;
+}
+
+#define OPAQUE_WIRE_SETTLE_MS	5000
+
+/*
+ * What the skbs of the data held is not back when opaque_wire_acked() returns, and a case that
+ * counts it has to wait for the counts that it expects. tcp_ack() moves snd_una and only then calls
+ * tcp_clean_rtx_queue(), which frees the skbs that the ACK acknowledged, in the softirq that read
+ * it on whatever CPU that is: a case that waits for snd_una on another CPU can look in between.
+ * An skb without a ubuf that the peer has read can be queued for another CPU to free
+ * (opaque_rx_kick()); the probe of the path MTU, which TCP makes of the fragments of the queue, is
+ * one. Their page references and ubufs are put after that.
+ *
+ * This waits for the pages of @data to have only the references of their extents, and for the
+ * ubufs made since @live was read to be gone, for five seconds at most, and raises NET_RX on every
+ * CPU between its looks. It expects nothing itself: the case makes its expectations after it, as
+ * it would have, so a reference that is never put fails the case, with the count that is left,
+ * when the time is up.
+ */
+static void opaque_wire_settle(const struct io_opaque_data *data, long live)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(OPAQUE_WIRE_SETTLE_MS);
+
+	while (!opaque_wire_back(data, live) && time_before(jiffies, timeout)) {
+		on_each_cpu(opaque_rx_kick, NULL, 1);
+		usleep_range(500, 2000);
+	}
 }
 
 static u8 opaque_test_ubuf_no_waiver(void)
@@ -14237,7 +14292,8 @@ static void opaque_probing_restore(void *arg)
  * mark of theirs: were the mark lost on the way, the pages of a marked store would be summed in
  * software as the pages of an ordinary one are. The first send of the connection grows the window,
  * a later one finds a probe due. The peer's queue holds the probe, as a tap on the way would; the
- * bytes are the object's, and every page reference is given back when the peer has read.
+ * bytes are the object's, and every page reference is given back when the peer has read and the
+ * skbs of the sender are freed (opaque_wire_settle()).
  */
 static void opaque_wire_probe(struct kunit *test, struct io_opaque_store *store)
 {
@@ -14283,8 +14339,12 @@ static void opaque_wire_probe(struct kunit *test, struct io_opaque_store *store)
 	KUNIT_EXPECT_NE(test, tp->mtu_probe.probe_seq_end, 0U);
 	KUNIT_EXPECT_EQ(test, marks, marked ? probes : 0U);
 
-	/* The peer has read everything, and the sender has everything acknowledged. */
+	/*
+	 * The peer has read everything, and the sender has everything acknowledged. The skbs go a
+	 * moment after that, and with them the page references and the ubufs.
+	 */
 	opaque_wire_acked(w->tx->sk);
+	opaque_wire_settle(data, before.live);
 	list_for_each_entry(extent, &data->extents, list)
 		KUNIT_EXPECT_EQ(test, page_count(extent->backing->page), 1);
 	opaque_pool_read(&after);
