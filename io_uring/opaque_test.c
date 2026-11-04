@@ -512,6 +512,37 @@ static void opaque_capture_oversized(struct kunit *test)
 	put_page(page);
 }
 
+/*
+ * A compound page that the limit holds, and not with the block of its chunk, is not held and given
+ * back: the capture copies at once, and charges and wakes nobody for the attempt.
+ */
+static void opaque_capture_compound_block(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_stream stream;
+	struct io_opaque_extent *extent;
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_COMP, 1);
+	struct sk_buff *skb;
+	long wakes;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	/* The page of two, the block, and a byte less. */
+	store->config.hard_limit = 2 * PAGE_SIZE + OPAQUE_TEST_BLOCK - 1;
+	opaque_test_stream(&stream, store);
+	skb = opaque_test_frag(test, page, 0, 32);
+	wakes = atomic_long_read(&io_opaque_budget_wakes);
+	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), 32);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 0L);
+	kfree_skb(skb);
+	extent = list_first_entry(&stream.extents, struct io_opaque_extent, list);
+	KUNIT_EXPECT_TRUE(test, extent->backing->copied);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), (s64)PAGE_SIZE + OPAQUE_TEST_BLOCK);
+	io_opaque_extents_free(store, &stream.extents);
+	io_opaque_capture_release(&stream);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+	put_page(page);
+}
+
 static void opaque_capture_budget(struct kunit *test)
 {
 	struct io_opaque_store *store = opaque_test_store(test);
@@ -1029,6 +1060,7 @@ static void opaque_block_charge_limit(struct kunit *test)
 	struct io_opaque_extent *extent;
 	struct page *page = alloc_page(GFP_KERNEL), *next = alloc_page(GFP_KERNEL);
 	struct sk_buff *skb;
+	long wakes;
 	s64 rx, held;
 
 	KUNIT_ASSERT_NOT_NULL(test, page);
@@ -1043,7 +1075,9 @@ static void opaque_block_charge_limit(struct kunit *test)
 	held = rx - PAGE_SIZE + 1;
 	KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, held, true));
 	skb = opaque_test_frag(test, page, 0, 32);
+	wakes = atomic_long_read(&io_opaque_budget_wakes);
 	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 0L);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), held);
 	KUNIT_EXPECT_EQ(test, stream.need_bytes, (u64)PAGE_SIZE + SZ_4K);
 	kfree_skb(skb);
@@ -1052,7 +1086,10 @@ static void opaque_block_charge_limit(struct kunit *test)
 	io_opaque_uncharge(store, SZ_4K);
 	held -= SZ_4K;
 	skb = opaque_test_frag(test, page, 0, 32);
+	wakes = atomic_long_read(&io_opaque_budget_wakes);
 	KUNIT_EXPECT_EQ(test, io_opaque_capture(&stream, skb, 0, 32, false), -ENOBUFS);
+	/* Asked for the page and the block together, it charged nothing and woke nobody. */
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_budget_wakes) - wakes, 0L);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), held);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
 	KUNIT_EXPECT_NULL(test, stream.block);
@@ -4277,6 +4314,41 @@ static void opaque_create_uses_cache(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, store->cache.nr_idle, 1U);
 	KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+}
+
+/*
+ * CREATE builds the vector of its object against the limit, as it charges its record: when the
+ * vector does not fit, the object is refused with -ENOBUFS, the pages that CREATE reserved go back
+ * with the rest, and nothing is left charged or counted.
+ */
+static void opaque_create_vector_refused(struct kunit *test)
+{
+	struct io_opaque_store *store = opaque_test_store(test);
+	struct io_opaque_req op = { .store = store, .op = IORING_OPAQUE_CREATE, .length = 100 };
+	unsigned long addr;
+	int i;
+
+	addr = kunit_vm_mmap(test, NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE, 0);
+	if (!addr || addr >= TASK_SIZE)
+		kunit_skip(test, "no userspace mapping for CREATE input");
+	op.addr = (void __user *)addr;
+	for (i = 0; i < 2; i++) {
+		/* The page, the unit's record and the vector, a byte less on the first try. */
+		store->config.hard_limit = PAGE_SIZE + OPAQUE_TEST_ALONE +
+					   io_opaque_vector_bytes(1) - !i;
+		op.data = io_opaque_data_alloc();
+		KUNIT_ASSERT_NOT_NULL(test, op.data);
+		KUNIT_ASSERT_TRUE(test, io_opaque_charge(store, PAGE_SIZE, true));
+		op.create_reserved = PAGE_SIZE;
+		KUNIT_EXPECT_EQ(test, io_opaque_create_build(&op), i ? 0 : -ENOBUFS);
+		if (i)
+			KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes),
+					(s64)store->config.hard_limit);
+		io_opaque_create_release(&op);
+		KUNIT_EXPECT_EQ(test, atomic64_read(&store->bytes), 0LL);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&store->extents), 0);
+	}
 }
 
 static const struct kernel_param *opaque_test_param(const char *name)
@@ -17625,6 +17697,7 @@ static void sendzc_rx_copy(struct kunit *test)
 
 static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_create_reservation_unwind),
+	KUNIT_CASE(opaque_create_vector_refused),
 	KUNIT_CASE(opaque_create_publish_revalidate),
 	KUNIT_CASE(opaque_create_dense_classification),
 	KUNIT_CASE(opaque_memory_watermarks),
@@ -17638,6 +17711,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_capture_compound),
 	KUNIT_CASE(opaque_capture_oversized),
 	KUNIT_CASE(opaque_capture_budget),
+	KUNIT_CASE(opaque_capture_compound_block),
 	KUNIT_CASE(opaque_capture_gaps),
 	KUNIT_CASE(opaque_capture_copy_pack),
 	KUNIT_CASE(opaque_capture_partial_pressure),

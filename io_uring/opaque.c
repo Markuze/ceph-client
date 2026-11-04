@@ -206,13 +206,32 @@ int io_opaque_memory_mode(struct io_opaque_store *store)
 	}
 }
 
-bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
+static u64 io_opaque_limit(const struct io_opaque_store *store, bool rx)
 {
 	u64 limit = store->config.hard_limit - store->config.reply_reserve;
+
+	return rx ? limit - store->config.compact_headroom : limit;
+}
+
+/*
+ * Whether @bytes fit now, which a charge finds out again. It is for a caller that would charge
+ * one part, find that the rest does not fit, and give the part back, when each charge and each
+ * give-back looks at the waiters for budget: it asks for the whole first, and a stall costs no
+ * more than the look.
+ */
+static bool io_opaque_room(struct io_opaque_store *store, u64 bytes, bool rx)
+{
+	u64 limit = io_opaque_limit(store, rx);
 	s64 used = atomic64_read(&store->bytes);
 
-	if (rx)
-		limit -= store->config.compact_headroom;
+	return bytes <= limit && used <= limit - bytes;
+}
+
+bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx)
+{
+	u64 limit = io_opaque_limit(store, rx);
+	s64 used = atomic64_read(&store->bytes);
+
 	for (;;) {
 		if (bytes > limit || used > limit - bytes)
 			return false;
@@ -474,6 +493,14 @@ static struct io_opaque_extent *io_opaque_extent_make(struct io_opaque_store *st
 	u64 charge = page_size(compound_head(page));
 	int err = -ENOMEM;
 
+	/*
+	 * A page and the block of its chunk are asked for together: a stream without a block that
+	 * has room for the page and not for the block would charge the page, and the memory
+	 * cgroup, to give them back, and wake the waiters for it.
+	 */
+	if (stream && !stream->block && !reserved &&
+	    !io_opaque_room(store, charge + io_opaque_block_bytes, true))
+		return ERR_PTR(-ENOBUFS);
 	if (!reserved && !io_opaque_charge(store, charge, true))
 		return ERR_PTR(-ENOBUFS);
 	if (memcg && io_opaque_memcg_charge(store, charge))
@@ -2083,7 +2110,7 @@ static int io_opaque_capture_part(struct io_opaque_stream *stream, struct sk_buf
 			struct page *page = virt_to_page(data);
 
 			/* A compound allocation larger than the limit can never fit. */
-			if (page_size(compound_head(page)) > retain_limit ||
+			if (io_opaque_need(stream, page_size(compound_head(page))) > retain_limit ||
 			    !io_opaque_retain(stream->store, skb, page, &hold))
 				goto copy;
 			src.frag = -1;
@@ -2105,7 +2132,9 @@ static int io_opaque_capture_part(struct io_opaque_stream *stream, struct sk_buf
 			continue;
 		}
 		chunk = min(start + size - offset, len);
-		if (copy_frags || page_size(compound_head(skb_frag_page(frag))) > retain_limit ||
+		if (copy_frags ||
+		    io_opaque_need(stream, page_size(compound_head(skb_frag_page(frag)))) >
+		    retain_limit ||
 		    !io_opaque_retain(stream->store, skb, skb_frag_page(frag), &hold))
 			goto copy;
 		src.frag = i;
@@ -2141,7 +2170,9 @@ copy:
 			allocated = false;
 		} else {
 			stream->need_bytes = io_opaque_need(stream, PAGE_SIZE);
-			if (!io_opaque_charge(stream->store, PAGE_SIZE, true))
+			/* The page and the block of its chunk, before the page is copied. */
+			if (!io_opaque_room(stream->store, stream->need_bytes, true) ||
+			    !io_opaque_charge(stream->store, PAGE_SIZE, true))
 				return -ENOBUFS;
 			/*
 			 * An empty area fails like a failed allocation. The
