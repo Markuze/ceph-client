@@ -1187,7 +1187,8 @@ static void opaque_slot_rotation(struct kunit *test)
 
 /*
  * A handle is a generation above 32 bits of index, and a slot is retired on the last generation
- * that 32 bits hold: a lookup tells apart the last two, and the first handle of a store is not zero.
+ * that 32 bits hold: a lookup tells apart the last two, and the first handle of a store is not
+ * zero.
  */
 static void opaque_generation_width(struct kunit *test)
 {
@@ -1328,7 +1329,8 @@ static void opaque_seg_alloc(struct kunit *test)
 					io_opaque_seg_bytes(s, sizes[t]));
 			KUNIT_EXPECT_TRUE(test, IS_ALIGNED((unsigned long)seg->used, sizeof(long)));
 			KUNIT_EXPECT_TRUE(test, bitmap_empty(seg->used, slots));
-			KUNIT_EXPECT_TRUE(test, mem_is_zero((void *)seg->object, (size_t)slots * sizes[t]));
+			KUNIT_EXPECT_TRUE(test, mem_is_zero((void *)seg->object,
+							    (size_t)slots * sizes[t]));
 			io_opaque_seg_free(seg);
 			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
 		}
@@ -1358,11 +1360,11 @@ static void opaque_seg_alloc_large(struct kunit *test)
 		  sizeof(struct io_opaque_seg) + BIT_ULL(31) * sizeof(struct io_opaque_slot) +
 		  BIT_ULL(31) / 8 },
 		{ sizeof(struct io_opaque_stream_slot), 18,
-		  sizeof(struct io_opaque_seg) + BIT_ULL(27) * sizeof(struct io_opaque_stream_slot) +
-		  BIT_ULL(27) / 8 },
+		  sizeof(struct io_opaque_seg) +
+		  BIT_ULL(27) * sizeof(struct io_opaque_stream_slot) + BIT_ULL(27) / 8 },
 		{ sizeof(struct io_opaque_stream_slot), 22,
-		  sizeof(struct io_opaque_seg) + BIT_ULL(31) * sizeof(struct io_opaque_stream_slot) +
-		  BIT_ULL(31) / 8 },
+		  sizeof(struct io_opaque_seg) +
+		  BIT_ULL(31) * sizeof(struct io_opaque_stream_slot) + BIT_ULL(31) / 8 },
 	};
 	long live = atomic_long_read(&io_opaque_segs_live);
 	const size_t slot = sizeof(struct io_opaque_slot);
@@ -1390,7 +1392,8 @@ static void opaque_seg_alloc_large(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, (u64)opaque_vmalloc_hook.bytes, large[i].bytes);
 		KUNIT_EXPECT_GT(test, opaque_vmalloc_hook.bytes, (size_t)INT_MAX);
 		/* Charged to the cgroup, and failing at its limit as any allocation may. */
-		KUNIT_EXPECT_TRUE(test, (opaque_vmalloc_hook.gfp & GFP_KERNEL_ACCOUNT) == GFP_KERNEL_ACCOUNT);
+		KUNIT_EXPECT_TRUE(test, (opaque_vmalloc_hook.gfp & GFP_KERNEL_ACCOUNT) ==
+					GFP_KERNEL_ACCOUNT);
 		KUNIT_EXPECT_TRUE(test, opaque_vmalloc_hook.gfp & __GFP_RETRY_MAYFAIL);
 		KUNIT_EXPECT_FALSE(test, opaque_vmalloc_hook.gfp & (__GFP_NOFAIL | __GFP_NORETRY));
 		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
@@ -6473,7 +6476,7 @@ static void opaque_attach_after_stop(struct kunit *test)
 	files = file_count(w->file);
 	KUNIT_EXPECT_EQ(test, opaque_attach_one(test, w, store, &none, 0xdead), -ESHUTDOWN);
 	KUNIT_EXPECT_NULL(test, none);
-	/* No stream in the table, no token for the ring, and the socket and its file as they were. */
+	/* No stream in the table, no token for the ring, the socket and its file as they were. */
 	KUNIT_EXPECT_EQ(test, store->nr_streams, 0U);
 	KUNIT_EXPECT_NULL(test, opaque_test_stream_slot(store, 0)->stream);
 	KUNIT_EXPECT_EQ(test, opaque_test_stream_slot(store, 0)->generation, 0ULL);
@@ -7110,7 +7113,8 @@ static void opaque_send_last_grown(struct kunit *test)
 	struct io_uring_opaque_send_entry ent[2];
 	struct io_opaque_data *data[4];
 	struct io_opaque_req single = {
-		.store = store, .offset = 100, .length = 1000, .send_flags = IORING_OPAQUE_SEND_LAST,
+		.store = store, .offset = 100, .length = 1000,
+		.send_flags = IORING_OPAQUE_SEND_LAST,
 	};
 	struct io_opaque_req *op;
 	unsigned int i;
@@ -14852,7 +14856,9 @@ static void opaque_register_unbounded(struct kunit *test)
  */
 static void opaque_register_grown_free(struct kunit *test)
 {
-	const struct io_uring_opaque_config cfg = { .hard_limit = SZ_1M, .max_object_size = SZ_64K };
+	const struct io_uring_opaque_config cfg = {
+		.hard_limit = SZ_1M, .max_object_size = SZ_64K,
+	};
 	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	long live = atomic_long_read(&io_opaque_segs_live);
 	struct io_opaque_req op = {};
@@ -14883,7 +14889,9 @@ static void opaque_register_grown_free(struct kunit *test)
  */
 static void opaque_register_nomem(struct kunit *test)
 {
-	const struct io_uring_opaque_config cfg = { .hard_limit = SZ_1M, .max_object_size = SZ_64K };
+	const struct io_uring_opaque_config cfg = {
+		.hard_limit = SZ_1M, .max_object_size = SZ_64K,
+	};
 	struct io_ring_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	long live = atomic_long_read(&io_opaque_segs_live);
 	struct io_opaque_store *store;
@@ -16367,9 +16375,9 @@ static void opaque_pin_handles(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&old->refs), 1);
 
 	/*
-	 * Names of nothing: no handle, slots of segments that the table does not have (the first index
-	 * past the first segment, one in the middle of the indexes, the last), a slot that holds none,
-	 * two generations.
+	 * Names of nothing: no handle, slots of segments that the table does not have (the first
+	 * index past the first segment, one in the middle of the indexes, the last), a slot that
+	 * holds none, two generations.
 	 */
 	name[0] = 0;
 	name[1] = io_opaque_handle(1U << IO_OPAQUE_SEG_BITS, 9);

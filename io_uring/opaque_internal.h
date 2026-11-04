@@ -520,13 +520,13 @@ struct io_opaque_store {
 	 */
 	spinlock_t tables;
 	/*
-	 * Where the pointers of the two tables and of their bitmaps were, before the tables grew in
-	 * segments. Nothing reads or writes this. Its place is kept so that every field after it is
-	 * where it was when the send path was measured (a70f5b29d), on the line it was on and beside
-	 * the same fields: without it they are 32 bytes earlier, and the queue's tree, the locks of
-	 * the queues and of the waiters and the flags that every send reads share lines with what
-	 * is written under other locks, as they did not. The pointers of the segments are at the
-	 * end, on lines that only a growth writes.
+	 * Where the pointers of the two tables and of their bitmaps were, before the tables grew
+	 * in segments. Nothing reads or writes this. Its place is kept so that every field after
+	 * it is where it was when the send path was measured (a70f5b29d), on the line it was on
+	 * and beside the same fields: without it they are 32 bytes earlier, and the queue's tree,
+	 * the locks of the queues and of the waiters and the flags that every send reads share
+	 * lines with what is written under other locks, as they did not. The pointers of the
+	 * segments are at the end, on lines that only a growth writes.
 	 */
 	unsigned long __hole[4];
 	u32 object_cursor;
@@ -611,10 +611,10 @@ struct io_opaque_store {
 	u8 send_ubuf_flags;
 	struct io_opaque_unit_cache cache;
 	/*
-	 * The segments of the table of objects and of the table of streams, in lines of their own at
-	 * the end: they are written when a table grows, which is seldom, with tables held, and read by
-	 * every lookup of a send (io_opaque_pin()), which takes no lock. A segment is NULL until it is
-	 * added; they are added in order, so those that exist are the first ones.
+	 * The segments of the table of objects and of the table of streams, in lines of their own
+	 * at the end: they are written when a table grows, which is seldom, with tables held, and
+	 * read by every lookup of a send (io_opaque_pin()), which takes no lock. A segment is NULL
+	 * until it is added; they are added in order, so those that exist are the first ones.
 	 */
 	struct io_opaque_seg __rcu *objects[IO_OPAQUE_SEGS] ____cacheline_aligned_in_smp;
 	struct io_opaque_seg __rcu *streams[IO_OPAQUE_SEGS];
@@ -635,10 +635,11 @@ static inline u32 io_opaque_index(u64 handle)
 }
 
 /*
- * The slot of @index in the table of objects or of streams, or NULL where the table has no segment
- * for it, which ends a walk of the table. A segment is never freed before the store, so a slot that
- * is found stays valid for as long as the store is; whether it is meaningful is for the caller's
- * lock: tables for what a slot holds, or the RCU section of io_opaque_pin(), which does not use this.
+ * The slot of @index in the table of objects or of streams, or NULL where the table has no
+ * segment for it, which ends a walk of the table. A segment is never freed before the store,
+ * so a slot that is found stays valid for as long as the store is; whether it is meaningful
+ * is for the caller's lock: tables for what a slot holds, or the RCU section of
+ * io_opaque_pin(), which does not use this.
  *
  * The segment pointers are read through a pointer to the first, not by the array's name: the
  * index is split below IO_OPAQUE_SEGS by construction, which the compiler cannot show, and a

@@ -703,7 +703,8 @@ void (*io_opaque_grow_before)(struct io_opaque_store *store);
 	} while (0)
 /*
  * Run by io_opaque_table_grow() after it has made a segment and before it takes tables to publish
- * it, with the lock of the growth held and no other: for a test to do what a stop does in that time.
+ * it, with the lock of the growth held and no other: for a test to do what a stop does in that
+ * time.
  */
 void (*io_opaque_grow_between)(struct io_opaque_store *store);
 #define IO_OPAQUE_GROW_BETWEEN(store)				\
@@ -1080,9 +1081,9 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 		return ERR_PTR(-EINVAL);
 	/*
 	 * A store is bounded by memory: hard_limit, of any size, which is counted against
-	 * RLIMIT_MEMLOCK below, and the memory cgroup. Its tables grow with its objects and streams,
-	 * so max_objects and max_streams are neither read nor checked, as max_requests is not.
-	 * Neither is max_extents checked.
+	 * RLIMIT_MEMLOCK below, and the memory cgroup. Its tables grow with its objects and
+	 * streams, so max_objects and max_streams are neither read nor checked, as max_requests
+	 * is not. Neither is max_extents checked.
 	 */
 	if (!cfg.hard_limit ||
 	    !IS_ALIGNED(cfg.hard_limit, PAGE_SIZE) ||
@@ -1157,9 +1158,10 @@ struct io_opaque_store *io_opaque_alloc(struct io_ring_ctx *ctx,
 	/* Not having one is fine: the ubufs of a store without a pool come from the cache alone. */
 	store->ubuf_pool = io_opaque_ubuf_pool_new();
 	/*
-	 * The first segment of each table, charged to the cgroup of the store as the segments that
-	 * follow are, and not to the task that registers it. The tables grow from there as the store
-	 * fills. It is the last to be made, so that the store, whole, is what a failure frees.
+	 * The first segment of each table, charged to the cgroup of the store as the segments
+	 * that follow are, and not to the task that registers it. The tables grow from there as
+	 * the store fills. It is the last to be made, so that the store, whole, is what a failure
+	 * frees.
 	 */
 	old = set_active_memcg(store->memcg);
 	ret = io_opaque_tables_init(store);
@@ -1198,8 +1200,8 @@ void io_opaque_stop(struct io_opaque_store *store)
 	io_opaque_unit_drain(store);
 	cancel_delayed_work_sync(&store->retry_work);
 	/*
-	 * No segment is added once dead is set (io_opaque_table_grow()), so the walks end at the last
-	 * segment there is, and the tables are not changed by them.
+	 * No segment is added once dead is set (io_opaque_table_grow()), so the walks end at the
+	 * last segment there is, and the tables are not changed by them.
 	 */
 	io_opaque_for_each_stream_slot(store, i, sslot) {
 		struct io_opaque_stream *stream;
@@ -3951,7 +3953,7 @@ static struct io_opaque_data *io_opaque_pin_locked(struct io_opaque_store *store
 static struct io_opaque_data *io_opaque_pin(struct io_opaque_store *store, u64 handle,
 					    u64 off, u32 len)
 {
-	/* Indexed through a pointer: the segment is below IO_OPAQUE_SEGS by its split, not by a check. */
+	/* Through a pointer: the segment is below IO_OPAQUE_SEGS by its split, not by a check. */
 	struct io_opaque_seg __rcu **segs = store->objects;
 	struct io_opaque_seg *seg;
 	struct io_opaque_data *data;
