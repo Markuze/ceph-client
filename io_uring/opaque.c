@@ -1109,6 +1109,8 @@ put_maio:
 
 void io_opaque_stop(struct io_opaque_store *store)
 {
+	struct io_opaque_stream_slot *sslot;
+	struct io_opaque_slot *slot;
 	u64 i;
 
 	if (!store)
@@ -1129,12 +1131,9 @@ void io_opaque_stop(struct io_opaque_store *store)
 	 * No segment is added once dead is set (io_opaque_table_grow()), so the walks end at the last
 	 * segment there is, and the tables are not changed by them.
 	 */
-	for (i = 0; ; i++) {
-		struct io_opaque_stream_slot *sslot = io_opaque_stream_slot_at(store, i);
+	io_opaque_for_each_stream_slot(store, i, sslot) {
 		struct io_opaque_stream *stream;
 
-		if (!sslot)
-			break;
 		spin_lock(&store->tables);
 		stream = sslot->stream;
 		sslot->stream = NULL;
@@ -1149,12 +1148,9 @@ void io_opaque_stop(struct io_opaque_store *store)
 		}
 		cond_resched();
 	}
-	for (i = 0; ; i++) {
-		struct io_opaque_slot *slot = io_opaque_slot_at(store, i);
+	io_opaque_for_each_slot(store, i, slot) {
 		struct io_opaque_data *data;
 
-		if (!slot)
-			break;
 		spin_lock(&store->tables);
 		data = io_opaque_detach(store, slot);
 		spin_unlock(&store->tables);

@@ -639,6 +639,16 @@ static inline struct io_opaque_stream_slot *io_opaque_stream_slot_at(struct io_o
 	return seg ? &seg->stream[off] : NULL;
 }
 
+/*
+ * Walk the slots of a table in order, to the end of the last segment that it has when the walk
+ * gets there. @i is a u64, so that a table with every segment, which ends at the last index a
+ * handle can carry, ends the walk as well.
+ */
+#define io_opaque_for_each_slot(store, i, slot) \
+	for ((i) = 0; ((slot) = io_opaque_slot_at((store), (i))); (i)++)
+#define io_opaque_for_each_stream_slot(store, i, slot) \
+	for ((i) = 0; ((slot) = io_opaque_stream_slot_at((store), (i))); (i)++)
+
 /* Locked-memory pages reserved for the unit cache at registration. */
 static inline unsigned long io_opaque_cache_pages(struct io_opaque_store *store)
 {

@@ -669,7 +669,7 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 	store->token_time = jiffies;
 	store->auto_at = jiffies;
 	seq = ++store->policy_seq;
-	for (i = 0; (slot = io_opaque_slot_at(store, i)); i++) {
+	io_opaque_for_each_slot(store, i, slot) {
 		struct io_opaque_data *data = io_opaque_slot_data(store, slot);
 
 		if (automatic && data && !data->dense && !data->forward_only &&
