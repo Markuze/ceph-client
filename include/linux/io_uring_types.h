@@ -326,27 +326,6 @@ enum {
 
 struct iou_ctx {};
 
-#ifdef CONFIG_IO_URING_OPAQUE_OBJ
-struct io_opaque_data;
-
-/*
- * A version of an OPAQUE store that sends of the ring are in flight on: one reference of the
- * ring's own, and the number of sends that borrow it (io_uring/opaque.c). The ring holds the
- * reference while @borrows is not zero, and not after.
- */
-struct io_opaque_borrow {
-	struct io_opaque_data	*data;
-	unsigned long		borrows;
-};
-
-/*
- * Versions that a ring borrows for its sends at a time: the window of the evaluation's senders,
- * which keep up to eight sends in flight. A send of a version that finds the table full takes a
- * reference of its own.
- */
-#define IO_OPAQUE_BORROW_MAX	8
-#endif
-
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -444,9 +423,6 @@ struct io_ring_ctx {
 		struct hlist_head	cancelable_uring_cmd;
 #ifdef CONFIG_IO_URING_OPAQUE_OBJ
 		struct list_head	opaque_waits;
-		/* Under ->uring_lock: the first ->opaque_borrow_nr entries are in use. */
-		unsigned int		opaque_borrow_nr;
-		struct io_opaque_borrow	opaque_borrow[IO_OPAQUE_BORROW_MAX];
 #endif
 		/*
 		 * For Hybrid IOPOLL, runtime in hybrid polling, without

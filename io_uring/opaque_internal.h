@@ -230,8 +230,6 @@ struct io_opaque_vec {
 	 * request, and when it needs a bigger block, which takes them over.
 	 */
 	u32 pinned;
-	/* Entries of pin[] that are borrowed from the ring, see borrowed[]. */
-	u32 nr_borrowed;
 	u32 cap_nr;
 	u32 cap_segs;
 	/* The largest entry; the copy threshold applies to it. */
@@ -239,12 +237,6 @@ struct io_opaque_vec {
 	struct io_uring_opaque_send_entry *ent;
 	struct io_opaque_data **pin;
 	struct bio_vec *bv;
-	/*
-	 * Whether the version of an entry that owns its pin (io_opaque_vec_owns()), among the
-	 * first @pinned, is held by a borrow from the ring (io_opaque_pin()) and not by a
-	 * reference of the send's own. Read only while @nr_borrowed is not zero.
-	 */
-	u8 *borrowed;
 };
 
 /*
@@ -368,13 +360,6 @@ enum io_opaque_stat_item {
 	IO_OPAQUE_STAT_SEND_ADMIT_FAST,
 	IO_OPAQUE_STAT_SEND_ADMIT_SLOW,
 	IO_OPAQUE_STAT_SEND_UBUF_REUSED,
-	/*
-	 * Versions that sends hold, counted when they are acquired: a reference that the send
-	 * took on the version, or the table's own that a send with LAST took over.
-	 */
-	IO_OPAQUE_STAT_SEND_REFS_TAKEN,
-	/* Versions that a send borrowed from its ring, taking no reference (io_opaque_pin()). */
-	IO_OPAQUE_STAT_SEND_REFS_BORROWED,
 	IO_OPAQUE_STAT_NR,
 };
 
@@ -686,7 +671,6 @@ int io_opaque_actor(read_descriptor_t *desc, struct sk_buff *skb,
 bool io_opaque_collect_demand(struct io_opaque_stream *stream);
 void io_opaque_send_resolve(struct io_opaque_req *op);
 int io_opaque_send_acquire(struct io_opaque_req *op);
-void io_opaque_send_return(struct io_opaque_req *op);
 int io_opaque_vec_grow(struct io_opaque_req *op, u32 nr, u32 segs, u32 keep);
 void io_opaque_vec_commit(struct io_opaque_req *op, u32 nr, u32 total, u32 longest);
 int io_opaque_vec_copy_in(struct io_opaque_req *op,
@@ -701,7 +685,6 @@ extern void (*io_opaque_lookup_before)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 extern atomic_long_t io_opaque_pin_slow;
-extern void (*io_opaque_borrows_exit_hook)(struct io_ring_ctx *ctx);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;

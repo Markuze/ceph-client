@@ -69,18 +69,6 @@ struct io_opaque_req {
 			u16 send_flags;
 			bool tx_started;
 			bool frame_reserved;
-			/*
-			 * Whether the issue that is running holds the ring lock from end to
-			 * end, and so may borrow its version from the ring (io_opaque_pin()).
-			 * Each issue sets it.
-			 */
-			bool may_borrow;
-			/*
-			 * The version in ->data is borrowed from the ring: the send holds no
-			 * reference of its own, and gives back a borrow, with the ring lock held
-			 * (io_opaque_send_return()).
-			 */
-			bool borrowed;
 		};
 		struct {
 			struct io_opaque_data *replacement;
@@ -107,7 +95,6 @@ void io_opaque_put(struct io_opaque_store *store);
 int io_register_opaque(struct io_ring_ctx *ctx, void __user *arg);
 void io_terminate_opaque(struct io_ring_ctx *ctx);
 void io_unregister_opaque(struct io_ring_ctx *ctx);
-void io_opaque_borrows_exit(struct io_ring_ctx *ctx);
 void io_opaque_stop(struct io_opaque_store *store);
 void io_opaque_free(struct io_opaque_store *store);
 int io_opaque_recv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
