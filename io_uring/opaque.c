@@ -14,6 +14,7 @@
 #include <linux/skbuff_ref.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include <net/hotdata.h>
 #include <net/page_pool/helpers.h>
@@ -698,6 +699,39 @@ void (*io_opaque_grow_between)(struct io_opaque_store *store);
 #endif
 
 /*
+ * What a segment is allocated with. A table is as large as the memory it is given, so a segment can
+ * be most of a memory cgroup, and growing it where the cgroup is at its limit must fail (the
+ * caller's -ENOMEM) and not call the OOM killer, which charging a cgroup does for an allocation
+ * that is not allowed to fail (try_charge_memcg()): the task it would kill is likely the one that
+ * owns the store. __GFP_RETRY_MAYFAIL is that. It also asks kvmalloc() for the physically
+ * contiguous block before it falls back to vmalloc, which a table that every send reads is the
+ * better for (it is in the direct map, and not in a mapping of its own).
+ */
+#define IO_OPAQUE_SEG_GFP	(GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL | __GFP_NOWARN)
+
+/* The bytes of segment @seg of a table whose slots are @size bytes: header, slots, bitmap. */
+VISIBLE_IF_KUNIT size_t io_opaque_seg_bytes(unsigned int seg, size_t size)
+{
+	u32 nr = io_opaque_seg_slots(seg);
+
+	return size_add(size_add(sizeof(struct io_opaque_seg), array_size(nr, size)),
+			array_size(BITS_TO_LONGS(nr), sizeof(long)));
+}
+
+/*
+ * Zeroed memory for a segment that kvmalloc() refuses, which is one of more than INT_MAX bytes.
+ * Mapped by huge pages where it can be, as kvmalloc() maps its own: vmalloc() does not unless it
+ * is asked, and a lookup is a random access into the segment, which would miss the TLB on most of
+ * them with 4 KiB pages. A seam, so that a test can stand in for it: the segments that need it
+ * are gigabytes.
+ */
+VISIBLE_IF_KUNIT void *io_opaque_seg_vmalloc(size_t bytes, gfp_t gfp)
+{
+	KUNIT_STATIC_STUB_REDIRECT(io_opaque_seg_vmalloc, bytes, gfp);
+	return vmalloc_huge(bytes, gfp | __GFP_ZERO);
+}
+
+/*
  * Segment @seg of a table whose slots are @size bytes: zeroed, with every slot free and the bitmap
  * of the taken ones after the slots. The caller makes the slots what they are for. Memory is the
  * only bound of a table, and a segment can be most of it, so it is allocated like a large array
@@ -707,16 +741,18 @@ VISIBLE_IF_KUNIT struct io_opaque_seg *io_opaque_seg_alloc(unsigned int seg, siz
 {
 	u32 nr = io_opaque_seg_slots(seg);
 	size_t slots = array_size(nr, size);
-	size_t bytes = size_add(size_add(sizeof(struct io_opaque_seg), slots),
-				array_size(BITS_TO_LONGS(nr), sizeof(long)));
+	size_t bytes = io_opaque_seg_bytes(seg, size);
 	struct io_opaque_seg *new;
 
 	KUNIT_STATIC_STUB_REDIRECT(io_opaque_seg_alloc, seg, size);
-	/* kvmalloc() refuses more than INT_MAX bytes, which the segments from the 17th are. */
+	/*
+	 * kvmalloc() refuses more than INT_MAX bytes: the segments of the objects from the 17th and
+	 * of the streams from the 18th.
+	 */
 	if (bytes > INT_MAX)
-		new = __vmalloc(bytes, GFP_KERNEL_ACCOUNT | __GFP_ZERO | __GFP_NOWARN);
+		new = io_opaque_seg_vmalloc(bytes, IO_OPAQUE_SEG_GFP);
 	else
-		new = kvzalloc(bytes, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+		new = kvzalloc(bytes, IO_OPAQUE_SEG_GFP);
 	if (!new)
 		return NULL;
 	new->free = nr;

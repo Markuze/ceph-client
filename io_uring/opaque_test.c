@@ -1276,33 +1276,135 @@ static void opaque_seg_split(struct kunit *test)
 }
 
 /*
+ * What the stand-in for the allocator of the large segments saw, and what it gives back.
+ */
+static struct {
+	unsigned int calls;
+	size_t bytes;
+	gfp_t gfp;
+	void *ret;
+} opaque_vmalloc_hook;
+
+static void *opaque_seg_vmalloc_stub(size_t bytes, gfp_t gfp)
+{
+	opaque_vmalloc_hook.calls++;
+	opaque_vmalloc_hook.bytes = bytes;
+	opaque_vmalloc_hook.gfp = gfp;
+	return opaque_vmalloc_hook.ret;
+}
+
+/*
  * A segment is one allocation: the slots, zeroed, with the bitmap of the taken ones after them on
- * a word, all of them free. A segment too large for kvmalloc() is made another way, and when the
- * memory is not there, which for the last segment of the objects (120 GiB) it never is, the answer
- * is NULL and nothing is said.
+ * a word, all of them free. The first segments of both tables are made for real, with the
+ * allocator of the large ones standing by to say that it was not asked for them.
  */
 static void opaque_seg_alloc(struct kunit *test)
 {
+	static const size_t sizes[] = { sizeof(struct io_opaque_slot),
+					sizeof(struct io_opaque_stream_slot) };
 	long live = atomic_long_read(&io_opaque_segs_live);
 	struct io_opaque_seg *seg;
-	unsigned int s;
+	unsigned int s, t;
 
-	for (s = 0; s < 4; s++) {
-		u32 slots = io_opaque_seg_slots(s);
+	memset(&opaque_vmalloc_hook, 0, sizeof(opaque_vmalloc_hook));
+	kunit_activate_static_stub(test, io_opaque_seg_vmalloc, opaque_seg_vmalloc_stub);
+	for (t = 0; t < ARRAY_SIZE(sizes); t++) {
+		for (s = 0; s < 4; s++) {
+			u32 slots = io_opaque_seg_slots(s);
 
-		seg = io_opaque_seg_alloc(s, sizeof(struct io_opaque_slot));
-		KUNIT_ASSERT_NOT_NULL(test, seg);
-		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 1L);
-		KUNIT_EXPECT_EQ(test, seg->free, slots);
-		KUNIT_EXPECT_PTR_EQ(test, (void *)seg->used, (void *)&seg->object[slots]);
-		KUNIT_EXPECT_TRUE(test, IS_ALIGNED((unsigned long)seg->used, sizeof(long)));
-		KUNIT_EXPECT_TRUE(test, bitmap_empty(seg->used, slots));
-		KUNIT_EXPECT_NULL(test, rcu_access_pointer(seg->object[slots - 1].data));
-		io_opaque_seg_free(seg);
+			seg = io_opaque_seg_alloc(s, sizes[t]);
+			KUNIT_ASSERT_NOT_NULL(test, seg);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 1L);
+			KUNIT_EXPECT_EQ(test, seg->free, slots);
+			KUNIT_EXPECT_PTR_EQ(test, (void *)seg->used,
+					    (void *)seg->object + (size_t)slots * sizes[t]);
+			KUNIT_EXPECT_EQ(test, (size_t)((void *)seg->used + BITS_TO_LONGS(slots) *
+						       sizeof(long) - (void *)seg),
+					io_opaque_seg_bytes(s, sizes[t]));
+			KUNIT_EXPECT_TRUE(test, IS_ALIGNED((unsigned long)seg->used, sizeof(long)));
+			KUNIT_EXPECT_TRUE(test, bitmap_empty(seg->used, slots));
+			KUNIT_EXPECT_TRUE(test, mem_is_zero((void *)seg->object, (size_t)slots * sizes[t]));
+			io_opaque_seg_free(seg);
+			KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
+		}
+	}
+	KUNIT_EXPECT_EQ(test, opaque_vmalloc_hook.calls, 0U);
+}
+
+/*
+ * A segment of more than INT_MAX bytes, which kvmalloc() refuses, is made by the allocator of the
+ * large ones, for the objects from the 17th segment (3.5 GiB) and for the streams from the 18th
+ * (2 GiB), with flags that fail at the limit of a memory cgroup and do not call the OOM killer. The
+ * last segment of the objects is 112 GiB: the test stands in for that allocator, and no memory of
+ * that size is ever asked for. An allocation of it that succeeded, on a host that has the memory,
+ * would be zeroed, and then leaked by a test that expects none.
+ */
+static void opaque_seg_alloc_large(struct kunit *test)
+{
+	static const struct {
+		size_t size;
+		unsigned int seg;
+		u64 bytes;
+	} large[] = {
+		{ sizeof(struct io_opaque_slot), 17,
+		  sizeof(struct io_opaque_seg) + BIT_ULL(26) * sizeof(struct io_opaque_slot) +
+		  BIT_ULL(26) / 8 },
+		{ sizeof(struct io_opaque_slot), 22,
+		  sizeof(struct io_opaque_seg) + BIT_ULL(31) * sizeof(struct io_opaque_slot) +
+		  BIT_ULL(31) / 8 },
+		{ sizeof(struct io_opaque_stream_slot), 18,
+		  sizeof(struct io_opaque_seg) + BIT_ULL(27) * sizeof(struct io_opaque_stream_slot) +
+		  BIT_ULL(27) / 8 },
+		{ sizeof(struct io_opaque_stream_slot), 22,
+		  sizeof(struct io_opaque_seg) + BIT_ULL(31) * sizeof(struct io_opaque_stream_slot) +
+		  BIT_ULL(31) / 8 },
+	};
+	long live = atomic_long_read(&io_opaque_segs_live);
+	const size_t slot = sizeof(struct io_opaque_slot);
+	const size_t sslot = sizeof(struct io_opaque_stream_slot);
+	struct io_opaque_seg *seg;
+	void *buf;
+	unsigned int i;
+
+	if (!IS_ENABLED(CONFIG_64BIT))
+		kunit_skip(test, "the segments are larger than the address space");
+	/* The last segment that kvmalloc() takes, and the first that it does not. */
+	KUNIT_EXPECT_LE(test, io_opaque_seg_bytes(16, slot), (size_t)INT_MAX);
+	KUNIT_EXPECT_GT(test, io_opaque_seg_bytes(17, slot), (size_t)INT_MAX);
+	KUNIT_EXPECT_LE(test, io_opaque_seg_bytes(17, sslot), (size_t)INT_MAX);
+	KUNIT_EXPECT_GT(test, io_opaque_seg_bytes(18, sslot), (size_t)INT_MAX);
+	kunit_activate_static_stub(test, io_opaque_seg_vmalloc, opaque_seg_vmalloc_stub);
+	for (i = 0; i < ARRAY_SIZE(large); i++) {
+		KUNIT_EXPECT_EQ(test, (u64)io_opaque_seg_bytes(large[i].seg, large[i].size),
+				large[i].bytes);
+		memset(&opaque_vmalloc_hook, 0, sizeof(opaque_vmalloc_hook));
+		/* No memory: NULL, nothing is counted, and the allocator was asked once. */
+		seg = io_opaque_seg_alloc(large[i].seg, large[i].size);
+		KUNIT_EXPECT_NULL(test, seg);
+		KUNIT_EXPECT_EQ(test, opaque_vmalloc_hook.calls, 1U);
+		KUNIT_EXPECT_EQ(test, (u64)opaque_vmalloc_hook.bytes, large[i].bytes);
+		KUNIT_EXPECT_GT(test, opaque_vmalloc_hook.bytes, (size_t)INT_MAX);
+		/* Charged to the cgroup, and failing at its limit as any allocation may. */
+		KUNIT_EXPECT_TRUE(test, (opaque_vmalloc_hook.gfp & GFP_KERNEL_ACCOUNT) == GFP_KERNEL_ACCOUNT);
+		KUNIT_EXPECT_TRUE(test, opaque_vmalloc_hook.gfp & __GFP_RETRY_MAYFAIL);
+		KUNIT_EXPECT_FALSE(test, opaque_vmalloc_hook.gfp & (__GFP_NOFAIL | __GFP_NORETRY));
 		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
 	}
-	seg = io_opaque_seg_alloc(IO_OPAQUE_SEGS - 1, sizeof(struct io_opaque_slot));
-	KUNIT_EXPECT_NULL(test, seg);
+	/* Memory: the segment is the allocation, with its pointers set after it, and counted. */
+	buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	opaque_vmalloc_hook.ret = buf;
+	seg = io_opaque_seg_alloc(17, slot);
+	KUNIT_EXPECT_PTR_EQ(test, seg, buf);
+	if (seg) {
+		KUNIT_EXPECT_EQ(test, seg->free, io_opaque_seg_slots(17));
+		KUNIT_EXPECT_PTR_EQ(test, (void *)seg->used,
+				    (void *)seg->object + (size_t)io_opaque_seg_slots(17) * slot);
+		KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live) - live, 1L);
+		io_opaque_seg_free(seg);
+	} else {
+		kfree(buf);
+	}
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&io_opaque_segs_live), live);
 }
 
@@ -18234,6 +18336,7 @@ static struct kunit_case opaque_cases[] = {
 	KUNIT_CASE(opaque_generation_width),
 	KUNIT_CASE(opaque_seg_split),
 	KUNIT_CASE(opaque_seg_alloc),
+	KUNIT_CASE(opaque_seg_alloc_large),
 	KUNIT_CASE(opaque_table_grow),
 	KUNIT_CASE(opaque_table_grow_rival),
 	KUNIT_CASE(opaque_table_grow_nomem),
