@@ -6,10 +6,12 @@
 #include <linux/bvec.h>
 #include <linux/llist.h>
 #include <linux/net.h>
+#include <linux/overflow.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
+#include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <kunit/visibility.h>
 #include <uapi/linux/io_uring/opaque.h>
@@ -22,8 +24,9 @@
 #define IO_OPAQUE_ALLOC_RETRY_MS	50
 /* Waiters looked at in one hold of wait_lock, or followers of a failed queue in one of tx_lock. */
 #define IO_OPAQUE_WAKE_BATCH	32
-#define IO_OPAQUE_INDEX_BITS	14
-#define IO_OPAQUE_INDEX_MASK	((1U << IO_OPAQUE_INDEX_BITS) - 1)
+/* A handle is its generation above 32 bits of the index of its slot. */
+#define IO_OPAQUE_INDEX_BITS	32
+#define IO_OPAQUE_INDEX_MASK	((1ULL << IO_OPAQUE_INDEX_BITS) - 1)
 #define IO_OPAQUE_GENERATION_MAX	(U64_MAX >> IO_OPAQUE_INDEX_BITS)
 /* Default destination unit: 32 KiB, the largest per-CPU cached buddy order. */
 #define IO_OPAQUE_UNIT_ORDER	(PAGE_SHIFT < 15 ? 15 - PAGE_SHIFT : 0)
@@ -107,12 +110,23 @@ struct io_opaque_extent {
 	u64 start;
 	u32 offset;
 	u32 length;
+	/* The extent is the one of a chunk, and was not allocated by itself. */
 	bool embedded;
+	/*
+	 * The chunk of an embedded extent holds no backing of its own: the extent is another
+	 * range of a page that a backing in another chunk holds, and the chunk goes with the
+	 * extent and not with that backing.
+	 */
+	bool secondary;
 };
 
 struct io_opaque_block;
 
-/* The common capture: a backing and its first extent. A split allocates only an extent. */
+/*
+ * The common capture: a backing and its first extent. A second range of the page that
+ * a backing holds takes a chunk too, and uses its extent only. A split allocates only an
+ * extent.
+ */
 struct io_opaque_chunk {
 	struct io_opaque_backing backing;
 	struct io_opaque_extent extent;
@@ -123,15 +137,20 @@ struct io_opaque_chunk {
  * Chunks are allocated in blocks, so that a stream that keeps a page per
  * fragment allocates once per IO_OPAQUE_BLOCK_CHUNKS pages and not once per
  * page. @live counts what keeps the block: a chunk until its backing is
- * released, and in the current block of a stream the chunks that are still to
+ * released (a chunk that holds only the extent of a second range of a page, until
+ * its extent is), and in the current block of a stream the chunks that are still to
  * be handed out and the hold of the stream. The last to let go frees the block.
  * A chunk of CREATE or compaction is a block of its own.
+ *
+ * The block is memory of the store: @charge is what the store was charged for it
+ * when it was allocated, and the last to let go gives that back.
  */
 struct io_opaque_block {
 	refcount_t live;
 	u32 nr;
 	/* Chunks handed out; changed by the stream that owns the block, under its lock. */
 	u32 used;
+	u32 charge;
 	struct io_opaque_chunk chunk[];
 };
 
@@ -143,8 +162,26 @@ struct io_opaque_block {
 #define IO_OPAQUE_BLOCK_CHUNKS \
 	((int)((SZ_4K - sizeof(struct io_opaque_block)) / sizeof(struct io_opaque_chunk)))
 
+/*
+ * What the store is charged for the records that are not pages: the size class of the
+ * allocation, which is what the allocator takes from the system. A block of a stream is
+ * one of 4 KiB by construction (IO_OPAQUE_BLOCK_CHUNKS). A block of one chunk, which
+ * CREATE and compaction make for each destination unit, and an extent of its own, which a
+ * split or a snapshot allocates, are smaller. The allocator is asked once, when the kernel
+ * boots (io_opaque_records_init()), and these are constants after that: a capture or a
+ * release does not call it.
+ */
+extern u32 io_opaque_block_bytes;
+extern u32 io_opaque_alone_bytes;
+extern u32 io_opaque_extent_bytes;
+
 struct io_opaque_data {
 	refcount_t refs;
+	/*
+	 * What the store was charged for @bvec and @anchor when io_opaque_vector() made them,
+	 * which io_opaque_data_put() gives back with them; 0 while there is no vector.
+	 */
+	u32 vec_bytes;
 	/*
 	 * The handle that names this version. Set before the version is published and
 	 * never changed, so that a lookup that holds neither tables nor a reference can
@@ -169,6 +206,11 @@ struct io_opaque_data {
 	u64 length;
 	u64 charge;
 	u32 nr;
+	/*
+	 * While a take assembles the version: the chunks that its extents take, a backing's and a
+	 * second range's, for the blocks that they sit in (io_opaque_keep_bytes()).
+	 */
+	u32 chunks;
 	bool dense;
 	bool forward_only;
 	/*
@@ -189,6 +231,8 @@ struct io_opaque_slot {
 	u64 generation;
 	bool reserved;
 	bool compacting;
+	/* Where the slot is in its table. Set when its segment is made, and never changed. */
+	u32 index;
 	struct list_head candidate;
 	unsigned long born;
 	unsigned long retry;
@@ -198,6 +242,57 @@ struct io_opaque_stream_slot {
 	struct io_opaque_stream *stream;
 	u64 generation;
 };
+
+/*
+ * The table of objects and the table of streams are arrays of segments, and grow by adding one
+ * when no slot is free. The first segment has 2^IO_OPAQUE_SEG_BITS slots and so has the second;
+ * each segment after has as many as all before it, so segment s >= 1 holds the indexes from
+ * 2^(IO_OPAQUE_SEG_BITS + s - 1) to twice that, and IO_OPAQUE_SEGS segments hold all the indexes
+ * that a handle can carry. A slot never moves and a segment is never freed before the store: the
+ * pointer to a segment is published once, whole, with tables held, and what is read through it
+ * stays what it is. So the slot of an index is found by two dependent loads, the pointer of its
+ * segment (in the store) and the slot, with the position of the index's highest bit between them
+ * (io_opaque_seg_split()), and a table that has outgrown a segment copies nothing.
+ */
+#define IO_OPAQUE_SEG_BITS	10
+#define IO_OPAQUE_SEGS		(IO_OPAQUE_INDEX_BITS - IO_OPAQUE_SEG_BITS + 1)
+
+struct io_opaque_seg {
+	/* Slots that are not taken, with tables held. */
+	u32 free;
+	/* A bit for each slot that is taken, with tables held. It follows the slots. */
+	unsigned long *used;
+	union {
+		DECLARE_FLEX_ARRAY(struct io_opaque_slot, object);
+		DECLARE_FLEX_ARRAY(struct io_opaque_stream_slot, stream);
+	};
+};
+
+/*
+ * The segment that holds @index, and the offset of the index in it. The highest set bit of the
+ * index, but never below the tenth, names the segment: the indexes of segment s >= 1 have bit
+ * IO_OPAQUE_SEG_BITS + s - 1 as their highest. The mask on the shift is the count's own limit,
+ * which the processor applies anyway and which tells a kernel built with UBSAN's shift checks
+ * that there is nothing to check.
+ */
+static inline unsigned int io_opaque_seg_split(u32 index, u32 *off)
+{
+	unsigned int bits = fls(index | (BIT(IO_OPAQUE_SEG_BITS) - 1));
+
+	*off = index - ((1U << ((bits - 1) & 31)) & ~(BIT(IO_OPAQUE_SEG_BITS) - 1));
+	return bits - IO_OPAQUE_SEG_BITS;
+}
+
+/* The index of the first slot of segment @seg, and how many slots the segment has. */
+static inline u32 io_opaque_seg_first(unsigned int seg)
+{
+	return seg ? 1U << (IO_OPAQUE_SEG_BITS + seg - 1) : 0;
+}
+
+static inline u32 io_opaque_seg_slots(unsigned int seg)
+{
+	return 1U << (IO_OPAQUE_SEG_BITS + (seg ? seg - 1 : 0));
+}
 
 struct io_opaque_tx {
 	struct rb_node node;
@@ -451,23 +546,30 @@ struct io_opaque_store {
 	refcount_t users;
 	struct io_uring_opaque_config config;
 	/*
-	 * Handles and candidates. A spinlock: nothing under it sleeps or allocates, and
-	 * a version is put, a copy made and a socket locked only after it is dropped. It
-	 * is held for a time that the request bounds: what the admission of a send that
-	 * consumes its object does under it is a lookup per entry, the segments its
-	 * ranges span up to the limit, which it counts and stores in the request's
-	 * block, and for each range a walk that the version's anchors keep to about two
-	 * strides and a binary search. Attach and that admission take it with the socket
-	 * owned, so a socket lock is never taken while holding it. Every change of a
-	 * slot's version is made with it held, and a send that does not consume its
-	 * object does not take it to read one (see io_opaque_pin()), but for the lookup
+	 * Handles and candidates, and the pointers of the segments of the tables of handles,
+	 * which are published with it held (io_opaque_table_grow()). A spinlock: nothing under
+	 * it sleeps or allocates, and a version is put, a copy made, a socket locked and a
+	 * segment made only after it is dropped. It is held for a time that the request
+	 * bounds: what the admission of a send that consumes its object does under it is a
+	 * lookup per entry, the segments its ranges span up to the limit, which it counts and
+	 * stores in the request's block, and for each range a walk that the version's anchors
+	 * keep to about two strides and a binary search. Attach and that admission take it
+	 * with the socket owned, so a socket lock is never taken while holding it. Every
+	 * change of a slot's version is made with it held, and a send that does not consume
+	 * its object does not take it to read one (see io_opaque_pin()), but for the lookup
 	 * that finds no version to take.
 	 */
 	spinlock_t tables;
-	struct io_opaque_slot *objects;
-	struct io_opaque_stream_slot *streams;
-	unsigned long *object_used;
-	unsigned long *stream_used;
+	/*
+	 * Where the pointers of the two tables and of their bitmaps were, before the tables grew
+	 * in segments. Nothing reads or writes this. Its place is kept so that every field after
+	 * it is where it was when the send path was measured (a70f5b29d), on the line it was on
+	 * and beside the same fields: without it they are 32 bytes earlier, and the queue's tree,
+	 * the locks of the queues and of the waiters and the flags that every send reads share
+	 * lines with what is written under other locks, as they did not. The pointers of the
+	 * segments are at the end, on lines that only a growth writes.
+	 */
+	unsigned long __hole[4];
 	u32 object_cursor;
 	u32 stream_cursor;
 	u32 nr_objects;
@@ -497,6 +599,12 @@ struct io_opaque_store {
 	 * hold send_ubuf_flags to.
 	 */
 	bool maio_pages;
+	/*
+	 * In the padding after maio_pages, which is where it shares a line with bytes, as the
+	 * mode check reads both. extents is eight bytes now, and the place it left would have
+	 * moved ubuf_pool, wait_lock and tx_lock and all after them.
+	 */
+	atomic_t memory_mode;
 	atomic64_t bytes;
 	atomic64_t copied;
 	atomic64_t compacted;
@@ -514,8 +622,11 @@ struct io_opaque_store {
 	/* Serializes transient_seq writers. */
 	spinlock_t transient_lock;
 	seqcount_spinlock_t transient_seq;
-	atomic_t extents;
-	atomic_t memory_mode;
+	/*
+	 * Extent records alive: a count, for STAT and the leak check when the store is freed. Not
+	 * a limit. The records are bounded as the pages are, by being charged to bytes.
+	 */
+	atomic_long_t extents;
 	/* Completed ubufs of managed sends, for the next skbs; none if there was no memory. */
 	struct io_opaque_ubuf_pool *ubuf_pool;
 	/* Budget waiters and remote wakeup/cancellation arbitration. */
@@ -549,12 +660,106 @@ struct io_opaque_store {
 	 */
 	u8 send_ubuf_flags;
 	struct io_opaque_unit_cache cache;
+	/*
+	 * The segments of the table of objects and of the table of streams, in lines of their own
+	 * at the end: they are written when a table grows, which is seldom, with tables held, and
+	 * read by every lookup of a send (io_opaque_pin()), which takes no lock. A segment is NULL
+	 * until it is added; they are added in order, so those that exist are the first ones.
+	 */
+	struct io_opaque_seg __rcu *objects[IO_OPAQUE_SEGS] ____cacheline_aligned_in_smp;
+	struct io_opaque_seg __rcu *streams[IO_OPAQUE_SEGS];
+	/*
+	 * Held by a request that adds a segment to either table, from the check that the table
+	 * still lacks it to its publication, with no other lock of the store: making a segment
+	 * sleeps. Rings that share a store do not share a ring lock, and without this each that
+	 * found a table full would make the same segment, and all but one would free theirs.
+	 * Nothing but the growth takes it, and a send never waits for it.
+	 */
+	struct mutex grow;
 };
+
+/* The index in the table that a handle carries. */
+static inline u32 io_opaque_index(u64 handle)
+{
+	return handle & IO_OPAQUE_INDEX_MASK;
+}
+
+/*
+ * The slot of @index in the table of objects or of streams, or NULL where the table has no
+ * segment for it, which ends a walk of the table. A segment is never freed before the store,
+ * so a slot that is found stays valid for as long as the store is; whether it is meaningful
+ * is for the caller's lock: tables for what a slot holds, or the RCU section of
+ * io_opaque_pin(), which does not use this.
+ *
+ * The segment pointers are read through a pointer to the first, not by the array's name: the
+ * index is split below IO_OPAQUE_SEGS by construction, which the compiler cannot show, and a
+ * kernel built with UBSAN's bounds checks would test it, on the path of every send.
+ */
+static inline struct io_opaque_slot *io_opaque_slot_at(struct io_opaque_store *store, u64 index)
+{
+	struct io_opaque_seg __rcu **segs = store->objects;
+	struct io_opaque_seg *seg;
+	u32 off;
+
+	if (index > U32_MAX)
+		return NULL;
+	seg = rcu_dereference_raw(segs[io_opaque_seg_split(index, &off)]);
+	return seg ? &seg->object[off] : NULL;
+}
+
+static inline struct io_opaque_stream_slot *io_opaque_stream_slot_at(struct io_opaque_store *store,
+								     u64 index)
+{
+	struct io_opaque_seg __rcu **segs = store->streams;
+	struct io_opaque_seg *seg;
+	u32 off;
+
+	if (index > U32_MAX)
+		return NULL;
+	seg = rcu_dereference_raw(segs[io_opaque_seg_split(index, &off)]);
+	return seg ? &seg->stream[off] : NULL;
+}
+
+/*
+ * The slot that @handle names, with tables held, or NULL if it names none now: no handle, no
+ * segment for its index, or another generation. This is io_opaque_lookup() with its body in the
+ * caller. The sends that consume what they name (LAST) look in the hold of tables, which every
+ * other send waits for, and they do not pay a call and its frame there.
+ */
+static __always_inline struct io_opaque_slot *io_opaque_lookup_inline(struct io_opaque_store *store,
+								      u64 handle)
+{
+	struct io_opaque_slot *slot;
+
+	lockdep_assert_held(&store->tables);
+	if (!handle)
+		return NULL;
+	slot = io_opaque_slot_at(store, io_opaque_index(handle));
+	if (!slot || slot->generation != handle >> IO_OPAQUE_INDEX_BITS)
+		return NULL;
+	return slot;
+}
+
+/*
+ * Walk the slots of a table in order, to the end of the last segment that it has when the walk
+ * gets there. @i is a u64, so that a table with every segment, which ends at the last index a
+ * handle can carry, ends the walk as well.
+ */
+#define io_opaque_for_each_slot(store, i, slot) \
+	for ((i) = 0; ((slot) = io_opaque_slot_at((store), (i))); (i)++)
+#define io_opaque_for_each_stream_slot(store, i, slot) \
+	for ((i) = 0; ((slot) = io_opaque_stream_slot_at((store), (i))); (i)++)
 
 /* Locked-memory pages reserved for the unit cache at registration. */
 static inline unsigned long io_opaque_cache_pages(struct io_opaque_store *store)
 {
 	return (unsigned long)store->cache.limit << store->cache.order;
+}
+
+/* The count of extent records as IORING_OPAQUE_STAT reports it: the field is 32 bits. */
+static inline u32 io_opaque_stat_extents(struct io_opaque_store *store)
+{
+	return min_t(unsigned long, atomic_long_read(&store->extents), U32_MAX);
 }
 
 bool io_opaque_charge(struct io_opaque_store *store, u64 bytes, bool rx);
@@ -573,8 +778,9 @@ static inline u64 io_opaque_rx_limit(struct io_opaque_store *store)
 }
 
 /* Flags of io_opaque_extent_new(). */
-#define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store already */
+#define IO_OPAQUE_EXT_RESERVED	BIT(0)	/* the caller charged the store for the page already */
 #define IO_OPAQUE_EXT_NO_MEMCG	BIT(1)	/* another owner accounts for the memory */
+#define IO_OPAQUE_EXT_COVERED	BIT(2)	/* the caller charged the store for the chunk too */
 
 /*
  * How the capture holds the page of a new backing. AREA and POOL exist only for
@@ -618,7 +824,9 @@ struct io_opaque_extent *io_opaque_extent_new(struct io_opaque_store *store,
 struct io_opaque_data *io_opaque_data_alloc(void);
 void io_opaque_data_put(struct io_opaque_store *store,
 			struct io_opaque_data *data);
-int io_opaque_vector(struct io_opaque_data *data);
+int io_opaque_vector(struct io_opaque_store *store, struct io_opaque_data *data, bool force,
+		     u64 *reserved);
+u64 io_opaque_vector_bytes(u32 nr);
 struct page *io_opaque_owned_page(unsigned int *order);
 void io_opaque_unit_cache_init(struct io_opaque_store *store, u32 limit, u32 order);
 void io_opaque_unit_cache_setup(struct io_opaque_store *store);
@@ -654,7 +862,18 @@ struct io_opaque_extent *io_opaque_stream_extent_new(struct io_opaque_stream *st
 						     unsigned int flags);
 void io_opaque_block_retire(struct io_opaque_stream *stream);
 void io_opaque_capture_release(struct io_opaque_stream *stream);
-void io_opaque_release_slot(unsigned long *used, u32 index, u64 generation);
+void io_opaque_use_slot(struct io_opaque_seg __rcu **segs, u32 index);
+void io_opaque_release_slot(struct io_opaque_seg __rcu **segs, u32 index, u64 generation);
+size_t io_opaque_seg_bytes(unsigned int seg, size_t size);
+void *io_opaque_seg_vmalloc(size_t bytes, gfp_t gfp);
+struct io_opaque_seg *io_opaque_seg_alloc(unsigned int seg, size_t size);
+void io_opaque_seg_free(struct io_opaque_seg *seg);
+struct io_opaque_seg *io_opaque_object_seg(unsigned int seg);
+struct io_opaque_seg *io_opaque_stream_seg(unsigned int seg);
+int io_opaque_tables_init(struct io_opaque_store *store);
+void io_opaque_tables_free(struct io_opaque_store *store);
+int io_opaque_table_grow(struct io_opaque_store *store, struct io_opaque_seg __rcu **segs,
+			 struct io_opaque_seg *(*new)(unsigned int seg));
 void io_opaque_extent_free(struct io_opaque_store *store,
 			   struct io_opaque_extent *extent);
 void io_opaque_extents_free(struct io_opaque_store *store,
@@ -662,9 +881,11 @@ void io_opaque_extents_free(struct io_opaque_store *store,
 struct io_opaque_data *io_opaque_detach(struct io_opaque_store *store,
 					struct io_opaque_slot *slot);
 int io_opaque_slot_reserve(struct io_opaque_req *op);
+int io_opaque_assemble(struct io_opaque_req *op);
 int io_opaque_publish(struct io_opaque_req *op, u64 *object_flags);
 void io_opaque_create_release(struct io_opaque_req *op);
-u32 io_opaque_find_slot(unsigned long *used, u32 count, u32 *cursor);
+bool io_opaque_find_slot(struct io_opaque_store *store, struct io_opaque_seg __rcu **segs,
+			 u32 *cursor, u32 *index);
 struct io_opaque_extent *io_opaque_extent_split(struct io_opaque_store *store,
 						struct io_opaque_extent *extent,
 						u64 at);
@@ -699,6 +920,10 @@ extern void (*io_opaque_lookup_before)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_between)(struct io_opaque_store *store);
 extern void (*io_opaque_lookup_after)(struct io_opaque_store *store);
 extern atomic_long_t io_opaque_pin_slow;
+extern atomic_long_t io_opaque_segs_live;
+extern atomic_long_t io_opaque_segs_made;
+extern void (*io_opaque_grow_before)(struct io_opaque_store *store);
+extern void (*io_opaque_grow_between)(struct io_opaque_store *store);
 extern unsigned int io_opaque_send_vec_segs;
 extern atomic_long_t io_opaque_vec_seeks;
 extern atomic_long_t io_opaque_vec_stepped;

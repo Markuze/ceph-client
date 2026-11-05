@@ -410,12 +410,33 @@ struct page *io_opaque_dest_page(struct io_opaque_store *store, u64 pages_left,
 	return io_opaque_owned_page(order);
 }
 
+/*
+ * The destination units that a copy of @length bytes takes, if each is as large as
+ * io_opaque_dest_page() prefers: whole units of the order of the unit cache, or of the largest
+ * order without one, and the rest in powers of two, the largest first. A copy that gets smaller
+ * ones takes more.
+ */
+static u32 io_opaque_dest_units(struct io_opaque_store *store, u64 length)
+{
+	u64 pages = DIV_ROUND_UP_ULL(length, PAGE_SIZE);
+	unsigned int order = store->cache.limit ? store->cache.order : IO_OPAQUE_MAX_ORDER;
+
+	return (pages >> order) + hweight64(pages & (BIT_ULL(order) - 1));
+}
+
 int io_opaque_compact_build(struct io_opaque_req *op)
 {
 	struct io_opaque_store *store = op->store;
 	struct io_opaque_cursor cursor;
 	u64 done = 0, length = op->data->length;
-	u64 charge = ALIGN(length, PAGE_SIZE);
+	u32 units = io_opaque_dest_units(store, length);
+	/*
+	 * What the copy holds besides the original: its pages, a block of one chunk for each unit,
+	 * and its vector. They are reserved together, so that the copy cannot be refused for its
+	 * records after it has taken the room for its pages.
+	 */
+	u64 charge = ALIGN(length, PAGE_SIZE) + (u64)units * io_opaque_alone_bytes +
+		     io_opaque_vector_bytes(units);
 	struct mem_cgroup *old;
 	int ret = 0;
 
@@ -439,6 +460,7 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 	cursor.offset = 0;
 	while (done < length) {
 		u64 pages_left = DIV_ROUND_UP_ULL(length - done, PAGE_SIZE);
+		unsigned int flags = IO_OPAQUE_EXT_RESERVED;
 		struct io_opaque_extent *extent;
 		unsigned int order;
 		struct page *page;
@@ -454,8 +476,14 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 			goto out;
 		}
 		chunk = min_t(u64, length - done, PAGE_SIZE << order);
-		extent = io_opaque_extent_new(store, page, 0, chunk, done,
-					      IO_OPAQUE_EXT_RESERVED);
+		/*
+		 * The block of the unit comes out of the reservation, while what is left of it
+		 * still covers the pages to come. A copy of smaller units than it was reserved
+		 * for pays for the rest as CREATE does.
+		 */
+		if (op->reserved >= pages_left * PAGE_SIZE + io_opaque_alone_bytes)
+			flags |= IO_OPAQUE_EXT_COVERED;
+		extent = io_opaque_extent_new(store, page, 0, chunk, done, flags);
 		if (IS_ERR(extent)) {
 			io_opaque_unit_put(store, page);
 			ret = PTR_ERR(extent);
@@ -463,6 +491,8 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 		}
 		extent->backing->ref = IO_OPAQUE_REF_UNIT;
 		op->reserved -= page_size(page);
+		if (flags & IO_OPAQUE_EXT_COVERED)
+			op->reserved -= io_opaque_alone_bytes;
 		list_add_tail(&extent->list, &op->replacement->extents);
 		ret = io_opaque_compact_copy(op, &cursor, page, chunk);
 		if (ret)
@@ -472,7 +502,7 @@ int io_opaque_compact_build(struct io_opaque_req *op)
 		op->replacement->length = done;
 		cond_resched();
 	}
-	ret = io_opaque_vector(op->replacement);
+	ret = io_opaque_vector(store, op->replacement, false, &op->reserved);
 	if (!ret)
 		op->replacement->dense = true;
 out:
@@ -646,13 +676,18 @@ void (*io_opaque_policy_between)(struct io_opaque_store *store);
  * the candidates by itself, or does not, and one freed leaves them; the walk
  * adds a slot only if it is not on the list. A second change that starts
  * meanwhile walks the whole table itself, so the first gives up when it comes
- * back and finds it was overtaken, as it does if the store has stopped.
+ * back and finds it was overtaken, as it does if the store has stopped. The
+ * table may grow between chunks too: the walk goes on into the segments that
+ * have been added, whose objects are in the same case.
  */
 VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 					    const struct io_uring_opaque_policy *policy)
 {
 	bool automatic = policy->flags & IORING_OPAQUE_POLICY_F_AUTO_COMPACT;
-	u32 i, seq;
+	struct io_opaque_slot *slot;
+	unsigned int walked = 0;
+	u64 i;
+	u32 seq;
 
 	spin_lock(&store->tables);
 	if (store->dead) {
@@ -664,8 +699,7 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 	store->token_time = jiffies;
 	store->auto_at = jiffies;
 	seq = ++store->policy_seq;
-	for (i = 0; i < store->config.max_objects; i++) {
-		struct io_opaque_slot *slot = &store->objects[i];
+	io_opaque_for_each_slot(store, i, slot) {
 		struct io_opaque_data *data = io_opaque_slot_data(store, slot);
 
 		if (automatic && data && !data->dense && !data->forward_only &&
@@ -675,8 +709,9 @@ VISIBLE_IF_KUNIT int io_opaque_apply_policy(struct io_opaque_store *store,
 		} else if (!automatic) {
 			list_del_init(&slot->candidate);
 		}
-		if ((i + 1) % IO_OPAQUE_POLICY_CHUNK_SLOTS || i + 1 == store->config.max_objects)
+		if (++walked < IO_OPAQUE_POLICY_CHUNK_SLOTS || !io_opaque_slot_at(store, i + 1))
 			continue;
+		walked = 0;
 		spin_unlock(&store->tables);
 		IO_OPAQUE_POLICY_BETWEEN(store);
 		cond_resched();
@@ -779,7 +814,7 @@ static void io_opaque_auto_compact(struct io_opaque_store *store)
 		store->tokens -= data->length;
 		op.data = data;
 		refcount_inc(&data->refs);
-		op.handle = io_opaque_handle(slot - store->objects, slot->generation);
+		op.handle = io_opaque_handle(slot->index, slot->generation);
 		break;
 	}
 unlock:

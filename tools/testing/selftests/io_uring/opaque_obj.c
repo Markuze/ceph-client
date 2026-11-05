@@ -56,6 +56,14 @@ struct ring {
 
 static uint64_t next_tag = 1000;
 
+/*
+ * The bytes of the block that records the chunks of a stream, 46 of them: charged to the store
+ * with the first page that the stream captures, and given back with the stream's last chunk. STAT
+ * counts it in backing_bytes, with the vectors of the objects, besides the pages; OBJECT_STAT
+ * counts pages only.
+ */
+#define OPAQUE_BLOCK_BYTES	4096
+
 static void require(bool ok, const char *what)
 {
 	if (!ok)
@@ -906,7 +914,11 @@ static void test_interleaved(struct io_uring_opaque_config cfg)
 		pthread_t producer;
 		int source[2], other[2];
 
-		cfg.hard_limit = i ? sizeof(data) : 256 * 1024;
+		/*
+		 * The pages of the object and the block that records them. The vector of the object
+		 * is charged beside them, without a limit, and is what STAT counts over it.
+		 */
+		cfg.hard_limit = i ? sizeof(data) + sysconf(_SC_PAGESIZE) : 256 * 1024;
 		cfg.compact_headroom = 0;
 		require(!ring_init(&r, IORING_SETUP_CQE32), "interleaved ring");
 		require(!register_store(&r, &cfg, &context), "interleaved store");
@@ -931,7 +943,8 @@ static void test_interleaved(struct io_uring_opaque_config cfg)
 				sizeof(seen), seen).res == (int)sizeof(seen) &&
 			!memcmp(data, seen, sizeof(data)), "interleaved complete object bytes");
 		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
-			stat.backing_bytes <= cfg.hard_limit, "interleaved quota bound");
+			stat.backing_bytes <= cfg.hard_limit + sysconf(_SC_PAGESIZE),
+			"interleaved quota bound");
 		require(!command(&r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
 			"interleaved FREE");
 		require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, stream, 0, 0, NULL).res,
@@ -1119,7 +1132,8 @@ static void test_budget_error(struct io_uring_opaque_config cfg)
 {
 	int i;
 
-	cfg.hard_limit = sysconf(_SC_PAGESIZE);
+	/* The page that the first KEEP fills, and the block that records it. */
+	cfg.hard_limit = 2 * sysconf(_SC_PAGESIZE);
 	cfg.compact_headroom = 0;
 	for (i = 0; i < 2; i++) {
 		struct ring r;
@@ -2275,7 +2289,12 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	int pair[2], i;
 	unsigned char byte = 7;
 
-	cfg.hard_limit = 3 * sysconf(_SC_PAGESIZE);
+	/*
+	 * Three pages of objects, the block that records them, and the vectors of the objects (16
+	 * bytes each) that are charged beside them: the fifth page is what the vectors leave
+	 * room for, and the fourth object does not fit in it.
+	 */
+	cfg.hard_limit = 5 * sysconf(_SC_PAGESIZE);
 	cfg.compact_headroom = 0;
 	cfg.max_object_size = 8U << 20;
 	require(!ring_init(&r, IORING_SETUP_CQE32), "budget ring");
@@ -2300,7 +2319,9 @@ static void test_budget(struct io_uring_opaque_config cfg)
 	write_all(pair[0], &byte, 1);
 	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res,
 		"STAT with a collector waiting for budget");
-	require(stat.backing_bytes == cfg.hard_limit, "budget full");
+	/* Full: the fifth page is left, and the vectors take a little of it. */
+	require(stat.backing_bytes > cfg.hard_limit - sysconf(_SC_PAGESIZE) &&
+		stat.backing_bytes <= cfg.hard_limit, "budget full");
 	require(!command(&r, context, IORING_OPAQUE_FREE, objects[0], 0, 0, NULL).res,
 		"FREE with a collector waiting for budget");
 	event = wait_tag(&r, pending);
@@ -2340,7 +2361,12 @@ static void test_budget_notifications(struct io_uring_opaque_config cfg)
 	static const unsigned int flags[] = { IORING_SETUP_CQE32, IORING_SETUP_CQE_MIXED };
 	unsigned int i;
 
-	cfg.hard_limit = 2 * sysconf(_SC_PAGESIZE);
+	/*
+	 * The cached object holds a page and the block that records it, and the inspection
+	 * of the other stream needs the same: a page and a block of its own.
+	 * The capture allowance is three pages, one more than the cached object holds.
+	 */
+	cfg.hard_limit = 4 * sysconf(_SC_PAGESIZE);
 	cfg.compact_headroom = sysconf(_SC_PAGESIZE);
 	for (i = 0; i < ARRAY_SIZE(flags); i++) {
 		struct ring r, release;
@@ -2392,7 +2418,7 @@ static void test_budget_notifications(struct io_uring_opaque_config cfg)
 		}
 		length += attempt;
 		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
-			stat.backing_bytes == cfg.hard_limit - cfg.compact_headroom,
+			stat.backing_bytes <= cfg.hard_limit - cfg.compact_headroom,
 			"pressure stays within capture allowance");
 		require(!command(&release, released_context, IORING_OPAQUE_FREE,
 				 handle, 0, 0, NULL).res, "another ring releases receive capacity");
@@ -2457,7 +2483,8 @@ static void test_budget_full_cq(struct io_uring_opaque_config cfg)
 	unsigned int i;
 	int cached[2], source[2];
 
-	cfg.hard_limit = sysconf(_SC_PAGESIZE);
+	/* The cached object holds a page and the block that records it. */
+	cfg.hard_limit = 2 * sysconf(_SC_PAGESIZE);
 	cfg.compact_headroom = 0;
 	require(!ring_init(&r, IORING_SETUP_CQE32), "pressure full CQ ring");
 	require(!register_store(&r, &cfg, &context), "pressure full CQ store");
@@ -2653,7 +2680,8 @@ static void test_unprivileged(struct io_uring_opaque_config cfg)
 		uint32_t context;
 		struct rlimit limit = { .rlim_cur = 65536, .rlim_max = 65536 };
 
-		cfg.hard_limit = sysconf(_SC_PAGESIZE);
+		/* The smallest store: a page and the block that records it. */
+		cfg.hard_limit = 2 * sysconf(_SC_PAGESIZE);
 		cfg.compact_headroom = 0;
 		cfg.max_object_size = 4096;
 		if (setrlimit(RLIMIT_MEMLOCK, &limit) || setgid(1000) || setuid(1000))
@@ -3315,7 +3343,8 @@ static void test_frame_quota(struct io_uring_opaque_config *cfg)
 	unsigned char buf[8];
 	int source[2], target[2];
 
-	small.hard_limit = 2 * sysconf(_SC_PAGESIZE);
+	/* A capture allowance of two pages: the object's page and its block. */
+	small.hard_limit = 3 * sysconf(_SC_PAGESIZE);
 	small.compact_headroom = sysconf(_SC_PAGESIZE);
 	require(!ring_init(&r, IORING_SETUP_CQE32), "frame quota ring");
 	require(!register_store(&r, &small, &context), "frame quota store");
@@ -4372,22 +4401,25 @@ static void test_create_quota(struct io_uring_opaque_config cfg)
 	struct event event;
 	struct io_uring_opaque_stat stat;
 	uint32_t context;
-	uint64_t handles[4];
+	uint64_t handles[8];
 	unsigned char source = 42;
 	unsigned int i;
 	size_t page = sysconf(_SC_PAGESIZE);
 
-	cfg.hard_limit = 6 * page;
+	/*
+	 * A capture allowance of five pages: four objects of a page each, and the records that
+	 * go with them (a block of one chunk and a vector, 144 bytes for each object) which the
+	 * fifth page does not leave room for.
+	 */
+	cfg.hard_limit = 7 * page;
 	cfg.compact_headroom = page;
 	cfg.reply_reserve = page;
 	cfg.high_watermark = 2 * page;
 	cfg.low_watermark = page;
 	cfg.max_object_size = 8 * page;
-	cfg.max_objects = 8;
-	cfg.max_extents = 4;
 	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE quota ring");
 	require(!register_store(&r, &cfg, &context), "CREATE quota store");
-	create_error(&r, context, 0, 0, 4 * page + 1, &source, -EMSGSIZE);
+	create_error(&r, context, 0, 0, 5 * page + 1, &source, -EMSGSIZE);
 	for (i = 0; i < 4; i++) {
 		event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
 		require(event.res == 1 && event.extra[0] &&
@@ -4418,8 +4450,10 @@ static void test_create_quota(struct io_uring_opaque_config cfg)
 		}
 		require(!stat.framing_bytes, "CREATE protected reply charge drains");
 	}
+	/* Four pages, and the records of four objects, which are less than a page. */
 	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0,
-			 sizeof(stat), &stat).res && stat.backing_bytes == 4 * page &&
+			 sizeof(stat), &stat).res && stat.backing_bytes >= 4 * page &&
+		stat.backing_bytes < 5 * page &&
 		stat.copied_bytes == 4 && stat.memory_mode == IORING_OPAQUE_MEMORY_LOWMEM,
 		"CREATE payload quota and copied counter");
 	for (i = 0; i < 4; i++)
@@ -4429,33 +4463,155 @@ static void test_create_quota(struct io_uring_opaque_config cfg)
 	ring_exit(&r);
 	ksft_test_result_pass("CREATE capture allowance, lowmem classification and quota unwind\n");
 
+	/*
+	 * Neither the number of extents nor of objects is a limit: the counts of the configuration
+	 * are ignored, and only the hard limit bounds the store.
+	 */
 	cfg.hard_limit = 32 * page;
-	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE extent ring");
-	require(!register_store(&r, &cfg, &context), "CREATE extent store");
-	for (i = 0; i < 4; i++) {
+	cfg.max_objects = 1;
+	cfg.max_streams = 1;
+	cfg.max_extents = 4;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE counts ring");
+	require(!register_store(&r, &cfg, &context), "CREATE counts store");
+	for (i = 0; i < ARRAY_SIZE(handles); i++) {
 		event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
-		require(event.res == 1 && event.extra[0], "CREATE extent fixture");
+		require(event.res == 1 && event.extra[0], "CREATE past the old counts");
 		handles[i] = event.extra[0];
 	}
-	create_error(&r, context, 0, 0, 1, &source, -ENOBUFS);
-	for (i = 0; i < 4; i++)
-		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i],
-				 0, 0, NULL).res, "CREATE extent FREE");
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		stat.objects == ARRAY_SIZE(handles) && stat.extents >= ARRAY_SIZE(handles),
+		"CREATE counts of objects and extents");
+	for (i = 0; i < ARRAY_SIZE(handles); i++)
+		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i], 0, 0, NULL).res,
+			"CREATE counts FREE");
 	create_drained(&r, context);
 	ring_exit(&r);
+	ksft_test_result_pass("CREATE is not limited by counts of objects or extents\n");
+}
 
+static int compare_handles(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+static void require_distinct(const uint64_t *handles, unsigned int nr, const char *what)
+{
+	uint64_t *sorted = malloc(nr * sizeof(*sorted));
+	unsigned int i;
+
+	require(sorted, what);
+	memcpy(sorted, handles, nr * sizeof(*sorted));
+	qsort(sorted, nr, sizeof(*sorted), compare_handles);
+	for (i = 1; i < nr; i++)
+		require(sorted[i] != sorted[i - 1], what);
+	free(sorted);
+}
+
+/*
+ * The tables of handles grow with the store, and the counts of the configuration are ignored.
+ * A store holds more objects than the first segment of its table does (1,024 slots) and more
+ * streams, each with a handle of its own that reads back what it holds and is stale once freed.
+ * Handles are opaque: the test compares them as numbers and does not decode them.
+ */
+static void test_tables_grow(struct io_uring_opaque_config cfg)
+{
+	enum { OBJECTS = 1100, STREAMS = 1030 };
+	struct rlimit files, wanted = { .rlim_cur = 4 * STREAMS, .rlim_max = 4 * STREAMS };
+	struct io_uring_opaque_stat stat;
+	unsigned char byte, got, buf[3];
+	uint64_t *handles, *tokens, *collectors;
+	uint32_t context;
+	struct event event;
+	struct ring r;
+	unsigned int i;
+	int (*pairs)[2];
+	bool streams = true;
+
+	cfg.hard_limit = 16U << 20;
+	cfg.compact_headroom = 0;
 	cfg.max_objects = 1;
-	require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE slot ring");
-	require(!register_store(&r, &cfg, &context), "CREATE slot store");
-	event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
-	require(event.res == 1, "CREATE slot object");
-	handles[0] = event.extra[0];
-	create_error(&r, context, 0, 0, 1, &source, -ENOSPC);
-	require(!command(&r, context, IORING_OPAQUE_FREE, handles[0], 0, 0, NULL).res,
-		"CREATE slot release");
+	cfg.max_streams = 1;
+	cfg.max_extents = 1;
+	require(!ring_init(&r, IORING_SETUP_CQE32), "tables ring");
+	require(!register_store(&r, &cfg, &context), "tables store");
+	handles = calloc(OBJECTS, sizeof(*handles));
+	require(handles, "tables handles");
+	for (i = 0; i < OBJECTS; i++) {
+		byte = i % 251;
+		event = command(&r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &byte);
+		require(event.res == 1 && event.extra[0],
+			"CREATE past the first segment of the table");
+		handles[i] = event.extra[0];
+	}
+	require_distinct(handles, OBJECTS, "the handles of a grown table are distinct");
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		stat.objects == OBJECTS, "STAT counts the objects of a grown table");
+	for (i = 0; i < OBJECTS; i++) {
+		got = 0;
+		require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handles[i], 0, 1,
+				&got).res == 1 && got == i % 251,
+			"an object of a grown table reads back what it holds");
+	}
+	for (i = 0; i < OBJECTS; i++)
+		require(!command(&r, context, IORING_OPAQUE_FREE, handles[i], 0, 0, NULL).res,
+			"FREE of an object of a grown table");
+	for (i = 0; i < OBJECTS; i += OBJECTS - 1)
+		require(command(&r, context, IORING_OPAQUE_READ_OBJECT, handles[i], 0, 1,
+				&got).res == -ESTALE, "a freed handle of a grown table is stale");
 	create_drained(&r, context);
+	free(handles);
+
+	/* More streams than the first segment of the table: a socket pair for each. */
+	require(!getrlimit(RLIMIT_NOFILE, &files), "tables file limit");
+	if (files.rlim_cur < wanted.rlim_cur) {
+		wanted.rlim_max = files.rlim_max > wanted.rlim_cur ?
+				  files.rlim_max : wanted.rlim_cur;
+		if (setrlimit(RLIMIT_NOFILE, &wanted))
+			streams = false;
+	}
+	if (streams) {
+		pairs = calloc(STREAMS, sizeof(*pairs));
+		tokens = calloc(STREAMS, sizeof(*tokens));
+		collectors = calloc(STREAMS, sizeof(*collectors));
+		require(pairs && tokens && collectors, "tables streams");
+		for (i = 0; i < STREAMS; i++) {
+			tcp_pair(pairs[i]);
+			collectors[i] = next_tag++;
+			tokens[i] = attach(&r, context, pairs[i][1], collectors[i]);
+		}
+		require_distinct(tokens, STREAMS, "the tokens of a grown table are distinct");
+		require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+			stat.streams == STREAMS, "STAT counts the streams of a grown table");
+		/* The last stream is past the first segment, and collects. */
+		write_all(pairs[STREAMS - 1][0], "abc", 3);
+		require(command(&r, context, IORING_OPAQUE_INSPECT, tokens[STREAMS - 1], 0, 3,
+				buf).res == 3 && !memcmp(buf, "abc", 3),
+			"a stream of a grown table collects");
+		for (i = 0; i < STREAMS; i++) {
+			require(!command(&r, context, IORING_OPAQUE_STREAM_CLOSE, tokens[i], 0, 0,
+					 NULL).res, "STREAM_CLOSE of a stream of a grown table");
+			event = wait_tag(&r, collectors[i]);
+			require(event.res == -ECANCELED && !(event.flags & IORING_CQE_F_MORE),
+				"the collector of a grown table ends once");
+			close(pairs[i][0]);
+			close(pairs[i][1]);
+		}
+		free(pairs);
+		free(tokens);
+		free(collectors);
+		setrlimit(RLIMIT_NOFILE, &files);
+	}
+	create_drained(&r, context);
+	require(!command(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat).res &&
+		!stat.streams, "no stream is left");
 	ring_exit(&r);
-	ksft_test_result_pass("CREATE slot exhaustion\n");
+	if (streams)
+		ksft_test_result_pass("tables grow past 1,024 slots: %u objects, %u streams\n",
+				      OBJECTS, STREAMS);
+	else
+		ksft_test_result_pass("tables grow past 1,024 slots: %u objects\n", OBJECTS);
 }
 
 static void test_create_cancel(struct io_uring_opaque_config cfg)
@@ -4542,7 +4698,7 @@ static void create_slot_reuse(struct ring *r, uint32_t context)
 
 	create_drained(r, context);
 	event = command(r, context, IORING_OPAQUE_CREATE, 0, 0, 1, &source);
-	require(event.res == 1 && event.extra[0], "CREATE failed request's only slot is reusable");
+	require(event.res == 1 && event.extra[0], "CREATE after the failed request works");
 	require(!command(r, context, IORING_OPAQUE_FREE, event.extra[0], 0, 0, NULL).res,
 		"CREATE reused slot FREE");
 	create_drained(r, context);
@@ -4679,7 +4835,6 @@ static void test_create_allocation_faults(struct io_uring_opaque_config cfg)
 					      names[i]);
 			continue;
 		}
-		cfg.max_objects = 1;
 		require(!ring_init(&r, IORING_SETUP_CQE32), "CREATE allocation fault ring");
 		require(!register_store(&r, &cfg, &context), "CREATE allocation fault store");
 		source = malloc(length);
@@ -5200,7 +5355,9 @@ static void test_maio_exhaustion(struct io_uring_opaque_config cfg)
 	 */
 	require(!maio_poll(&r, c, 500, &event), "the third object waits for a free page");
 	require(!cmd_res(&r, context, IORING_OPAQUE_STAT, 0, 0, sizeof(stat), &stat) &&
-		stat.copied_bytes >= 9 * page && stat.backing_bytes == 9 * page,
+		stat.copied_bytes >= 9 * page &&
+		stat.backing_bytes >= 9 * page + OPAQUE_BLOCK_BYTES &&
+		stat.backing_bytes < 10 * page + OPAQUE_BLOCK_BYTES,
 		"the third object holds its first page");
 
 	/* A page comes back, and the request finishes. */
@@ -6344,9 +6501,6 @@ int main(void)
 		.hard_limit = 64U << 20,
 		.compact_headroom = 16U << 20,
 		.max_object_size = 8U << 20,
-		.max_objects = 128,
-		.max_streams = 16,
-		.max_extents = 65536,
 	};
 	struct io_uring_opaque_object_stat object_stat;
 	struct io_uring_opaque_stat stat;
@@ -6381,12 +6535,13 @@ int main(void)
 		maio_ok = !maio_err;
 		ring_exit(&probe);
 	}
-	ksft_set_plan(124);
+	ksft_set_plan(125);
 	ksft_test_result_pass("register opaque store without RX device or mappings\n");
 	test_create(cfg);
 	test_create_quota(cfg);
 	test_create_cancel(cfg);
 	test_create_allocation_faults(cfg);
+	test_tables_grow(cfg);
 	tcp_pair(source);
 	tcp_pair(target);
 	stream = attach(&r, context, source[1], 100);
